@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+   The app only talks to the shop's own Supabase over HTTPS. Forbidding cleartext
+   means a hostile Wi-Fi (common in a busy retail area) can't downgrade the sync
+   connection to plain HTTP and read/modify sales traffic. If a shop self-hosts
+   Supabase on a plain-HTTP LAN address they'd need to relax this — but the secure
+   default is HTTPS-only.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+</network-security-config>

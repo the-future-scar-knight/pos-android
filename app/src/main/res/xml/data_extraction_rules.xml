@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+   Android 12+ (API 31+) backup / device-transfer rules. The app already sets
+   android:allowBackup="false", so no backup runs — but we ALSO exclude the sales
+   database and preferences here as defense-in-depth: if backup is ever switched
+   back on, a shop's financial data still never leaves the device automatically.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="database" path="spot_pos.db" />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="file" path="." />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="database" path="spot_pos.db" />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="file" path="." />
+    </device-transfer>
+</data-extraction-rules>

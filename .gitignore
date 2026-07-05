@@ -1,0 +1,31 @@
+*.iml
+.gradle/
+/local.properties
+/.idea/
+.DS_Store
+/build
+/app/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Release signing — never commit the keystore or its passwords.
+# keystore.properties.example is committed as a template; the real file isn't.
+keystore.properties
+*.jks
+*.keystore
+
+# Kotlin compiler session data
+.kotlin/
+
+# Claude Code local state (worktrees, local settings)
+/.claude/
+
+# Crash dumps and scratch build logs
+hs_err_pid*.log
+replay_pid*.log
+*.hprof
+/build-*.log
+/build-log.txt
+/build_*.txt

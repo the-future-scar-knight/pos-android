@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dark-mode variant of Theme.SpotPos. Real colours are driven by
+         Compose (PosTheme); we use a framework Material dark theme as the
+         parent so no com.google.android.material dependency is required.
+         Only references colours that actually exist in values/colors.xml. -->
+    <style name="Theme.SpotPos" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">@color/brand_primary_dark</item>
+        <item name="android:windowBackground">@color/black</item>
+    </style>
+</resources>

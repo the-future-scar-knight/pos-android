@@ -1,0 +1,285 @@
+package com.portionspot.pos.ui
+
+import android.app.Activity
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Typography
+import androidx.compose.material3.lightColorScheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.font.FontFamily
+import androidx.core.view.WindowCompat
+
+/**
+ * Spot POS theme engine — a faithful Compose port of the web app's runtime
+ * theme system (src/lib/theme.js). A single signature accent hex drives a full
+ * 50→800 "brand ramp"; backgrounds and the side-drawer style are independently
+ * pickable. Everything is light-mode (the POS is used in bright workshops).
+ *
+ * The chosen theme is persisted in the settings store and re-applied on boot,
+ * so it follows the shop. Default is Signature Red (#ff3830) — identical to the
+ * web's DEFAULT_THEME — but the cashier can switch it under Settings →
+ * Appearance, exactly like the web.
+ */
+
+// ── Color math (mirrors theme.js exactly) ───────────────────────────────────
+
+private fun clamp255(v: Double): Int = v.coerceIn(0.0, 255.0).toInt()
+
+private fun parseHexTriple(hex: String): Triple<Int, Int, Int> {
+    var h = hex.trim().removePrefix("#")
+    if (h.length == 3) h = h.map { "$it$it" }.joinToString("")
+    if (h.length != 6) h = "ff3830" // graceful fallback to signature red
+    val n = h.toLong(16)
+    return Triple(((n shr 16) and 255).toInt(), ((n shr 8) and 255).toInt(), (n and 255).toInt())
+}
+
+fun hexToColor(hex: String): Color {
+    val (r, g, b) = parseHexTriple(hex)
+    return Color(r, g, b)
+}
+
+private fun rgbToHex(r: Int, g: Int, b: Int): String =
+    "#%02x%02x%02x".format(clamp255(r.toDouble()), clamp255(g.toDouble()), clamp255(b.toDouble()))
+
+/** Mix a base color toward white (toWhite) or near-black (!toWhite) by 0..1. */
+private fun mix(hex: String, toWhite: Boolean, amt: Double): String {
+    val (ar, ag, ab) = parseHexTriple(hex)
+    val (br, bg, bb) = if (toWhite) Triple(255, 255, 255) else Triple(17, 18, 20)
+    return rgbToHex(
+        clamp255(ar + (br - ar) * amt),
+        clamp255(ag + (bg - ag) * amt),
+        clamp255(ab + (bb - ab) * amt),
+    )
+}
+
+/** Relative luminance → readable ink color on an arbitrary background. */
+fun readableInk(hex: String): Color {
+    val (r, g, b) = parseHexTriple(hex)
+    val lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+    return if (lum > 0.62) Color(0xFF111827) else Color(0xFFF9FAFB)
+}
+
+/** Full brand ramp generated from one signature hex (anchored at 500). */
+data class BrandRamp(
+    val s50: Color, val s100: Color, val s200: Color, val s400: Color,
+    val s500: Color, val s600: Color, val s700: Color, val s800: Color,
+)
+
+fun buildRamp(hex: String): BrandRamp = BrandRamp(
+    s50  = hexToColor(mix(hex, true, 0.92)),
+    s100 = hexToColor(mix(hex, true, 0.84)),
+    s200 = hexToColor(mix(hex, true, 0.68)),
+    s400 = hexToColor(mix(hex, true, 0.26)),
+    s500 = hexToColor(hex),
+    s600 = hexToColor(mix(hex, false, 0.14)),
+    s700 = hexToColor(mix(hex, false, 0.30)),
+    s800 = hexToColor(mix(hex, false, 0.42)),
+)
+
+// ── Presets (mirror theme.js) ───────────────────────────────────────────────
+
+data class AccentPreset(val id: String, val name: String, val hex: String)
+
+val ACCENT_PRESETS = listOf(
+    AccentPreset("red",     "Signature Red", "#ff3830"),
+    AccentPreset("crimson", "Crimson",       "#e11d48"),
+    AccentPreset("rose",    "Rose",          "#db2777"),
+    AccentPreset("orange",  "Sunset",        "#ea580c"),
+    AccentPreset("amber",   "Amber",         "#d97706"),
+    AccentPreset("gold",    "Gold",          "#b8860b"),
+    AccentPreset("emerald", "Emerald",       "#059669"),
+    AccentPreset("teal",    "Teal",          "#0d9488"),
+    AccentPreset("blue",    "Ocean",         "#2563eb"),
+    AccentPreset("navy",    "Navy",          "#1e3a8a"),
+    AccentPreset("indigo",  "Indigo",        "#4f46e5"),
+    AccentPreset("violet",  "Violet",        "#7c3aed"),
+    AccentPreset("slate",   "Graphite",      "#475569"),
+)
+
+data class BackgroundPreset(
+    val id: String,
+    val name: String,
+    val surface0: Color,      // solid fallback / Material background
+    val gradient: List<Color>? = null, // when set, the canvas is this gradient
+)
+
+val BACKGROUND_PRESETS = listOf(
+    BackgroundPreset("cloud", "Cloud", Color(0xFFF3F4F6)),
+    BackgroundPreset("paper", "Paper", Color(0xFFFFFFFF)),
+    BackgroundPreset("sand",  "Sand",  Color(0xFFF5F1EA)),
+    BackgroundPreset("mist",  "Mist",  Color(0xFFEEF1F6)),
+    BackgroundPreset("sky",   "Sky",   Color(0xFFEEF4FB), listOf(Color(0xFFF3F8FF), Color(0xFFE6EEFB))),
+    BackgroundPreset("mint",  "Mint",  Color(0xFFEEF6F1), listOf(Color(0xFFF1FAF4), Color(0xFFE4F1E9))),
+    BackgroundPreset("dawn",  "Dawn",  Color(0xFFFBF1EF), listOf(Color(0xFFFDF3F0), Color(0xFFF7E8EF))),
+    BackgroundPreset("dusk",  "Dusk",  Color(0xFFF0F0F7), listOf(Color(0xFFF4F3FB), Color(0xFFEAE8F5))),
+)
+
+data class SidebarPreset(val id: String, val name: String, val desc: String)
+
+val SIDEBAR_PRESETS = listOf(
+    SidebarPreset("dark",   "Graphite", "Dark neutral slate"),
+    SidebarPreset("accent", "Accent",   "Tinted with your color"),
+)
+
+/** The user's persisted theme selection. Default is Signature Red — matches
+ *  the web's DEFAULT_THEME ({ accent: 'red', accentHex: '#ff3830' }). */
+data class ThemeChoice(
+    val accent: String = "red",
+    val accentHex: String = "#ff3830",
+    val background: String = "cloud",
+    val sidebar: String = "dark",
+)
+
+val DEFAULT_THEME = ThemeChoice()
+
+fun ThemeChoice.effectiveHex(): String =
+    if (accent == "custom") accentHex
+    else ACCENT_PRESETS.firstOrNull { it.id == accent }?.hex ?: accentHex
+
+// ── Design tokens consumed across the UI ────────────────────────────────────
+
+/**
+ * The full set of resolved colors the screens read. Built once per theme change
+ * and provided via [LocalPosTokens]. [brand] is the themeable ramp; [accentBlue]
+ * is a FIXED blue used only for wholesale prices / links (never re-themed), to
+ * match the web's `accent-600`.
+ */
+data class PosTokens(
+    val brand: BrandRamp,
+    val inkOnBrand: Color,     // readable text on a brand-600 fill
+    val brandShadow: Color,    // tinted glow under brand badges/buttons
+    val canvas: Color,         // solid app canvas (behind cards)
+    val canvasBrush: Brush,    // canvas as a brush (gradient-aware)
+    val surface1: Color,       // cards
+    val surface2: Color,
+    val surface3: Color,
+    val surface4: Color,
+    val surfaceBorder: Color,
+    val inkPrimary: Color,
+    val inkSecondary: Color,
+    val inkTertiary: Color,
+    val navBg: Color,          // side drawer surface
+    val navInk: Color,         // side drawer text
+    val accentBlue: Color,     // fixed wholesale/link blue
+    val danger: Color,
+    val warning: Color,
+    val success: Color,
+    val onlinePill: Color,
+    val offlinePill: Color,
+)
+
+fun buildTokens(choice: ThemeChoice): PosTokens {
+    val hex = choice.effectiveHex()
+    val ramp = buildRamp(hex)
+    val bg = BACKGROUND_PRESETS.firstOrNull { it.id == choice.background } ?: BACKGROUND_PRESETS[0]
+    val accentSidebar = choice.sidebar == "accent"
+    val navHex = if (accentSidebar) mix(hex, false, 0.62) else "#111827"
+    val brush = bg.gradient?.let { Brush.verticalGradient(it) } ?: Brush.verticalGradient(listOf(bg.surface0, bg.surface0))
+    return PosTokens(
+        brand = ramp,
+        inkOnBrand = readableInk(mix(hex, false, 0.14)),
+        brandShadow = hexToColor(hex).copy(alpha = 0.22f),
+        canvas = bg.surface0,
+        canvasBrush = brush,
+        surface1 = Color(0xFFFFFFFF),
+        surface2 = Color(0xFFF9FAFB),
+        surface3 = Color(0xFFF3F4F6),
+        surface4 = Color(0xFFE5E7EB),
+        surfaceBorder = Color(0xFFE5E7EB),
+        inkPrimary = Color(0xFF111827),
+        inkSecondary = Color(0xFF4B5563),
+        inkTertiary = Color(0xFF9CA3AF),
+        navBg = hexToColor(navHex),
+        navInk = if (accentSidebar) readableInk(navHex) else Color(0xFFF9FAFB),
+        accentBlue = Color(0xFF1E5BFF),
+        danger = Color(0xFFEF4444),
+        warning = Color(0xFFF59E0B),
+        success = Color(0xFF10B981),
+        onlinePill = Color(0xFF34D399),
+        offlinePill = Color(0xFFFBBF24),
+    )
+}
+
+val LocalPosTokens = staticCompositionLocalOf { buildTokens(DEFAULT_THEME) }
+
+// ── App font ─────────────────────────────────────────────────────────────────
+// The web app uses Poppins, which we previously pulled via *downloadable* Google
+// Fonts. That path needs Google Play Services (the `com.google.android.gms` font
+// provider) to be installed — but the target POS hardware (Sunmi / generic AOSP
+// handhelds) often ships WITHOUT Play Services, and there the Compose font
+// resolver throws on the very first frame, so the app "blinks and closes".
+// Falling back to the always-present system font (Roboto) makes startup
+// crash-proof and faster. To restore Poppins later WITHOUT depending on Play
+// Services, drop the .ttf weights under res/font and build a FontFamily from them.
+val Poppins: FontFamily = FontFamily.Default
+
+private fun posTypography(font: FontFamily): Typography {
+    val b = Typography()
+    return b.copy(
+        displayLarge = b.displayLarge.copy(fontFamily = font),
+        displayMedium = b.displayMedium.copy(fontFamily = font),
+        displaySmall = b.displaySmall.copy(fontFamily = font),
+        headlineLarge = b.headlineLarge.copy(fontFamily = font),
+        headlineMedium = b.headlineMedium.copy(fontFamily = font),
+        headlineSmall = b.headlineSmall.copy(fontFamily = font),
+        titleLarge = b.titleLarge.copy(fontFamily = font),
+        titleMedium = b.titleMedium.copy(fontFamily = font),
+        titleSmall = b.titleSmall.copy(fontFamily = font),
+        bodyLarge = b.bodyLarge.copy(fontFamily = font),
+        bodyMedium = b.bodyMedium.copy(fontFamily = font),
+        bodySmall = b.bodySmall.copy(fontFamily = font),
+        labelLarge = b.labelLarge.copy(fontFamily = font),
+        labelMedium = b.labelMedium.copy(fontFamily = font),
+        labelSmall = b.labelSmall.copy(fontFamily = font),
+    )
+}
+
+@Composable
+fun PosTheme(
+    theme: ThemeChoice = DEFAULT_THEME,
+    content: @Composable () -> Unit
+) {
+    val tokens = buildTokens(theme)
+    val ramp = tokens.brand
+    val colors = lightColorScheme(
+        primary = ramp.s600,
+        onPrimary = tokens.inkOnBrand,
+        primaryContainer = ramp.s50,
+        onPrimaryContainer = ramp.s700,
+        secondary = tokens.accentBlue,
+        onSecondary = Color.White,
+        background = tokens.canvas,
+        onBackground = tokens.inkPrimary,
+        surface = tokens.surface1,
+        onSurface = tokens.inkPrimary,
+        surfaceVariant = tokens.surface3,
+        onSurfaceVariant = tokens.inkSecondary,
+        outline = tokens.surfaceBorder,
+        error = tokens.danger,
+        onError = Color.White,
+    )
+
+    val view = LocalView.current
+    if (!view.isInEditMode) {
+        SideEffect {
+            val window = (view.context as Activity).window
+            window.statusBarColor = ramp.s700.toArgb()
+            WindowCompat.getInsetsController(window, view).isAppearanceLightStatusBars = false
+        }
+    }
+
+    CompositionLocalProvider(LocalPosTokens provides tokens) {
+        MaterialTheme(
+            colorScheme = colors,
+            typography = posTypography(Poppins),
+            content = content
+        )
+    }
+}

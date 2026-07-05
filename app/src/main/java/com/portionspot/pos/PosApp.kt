@@ -1,0 +1,53 @@
+package com.portionspot.pos
+
+import android.app.Application
+import com.portionspot.pos.auth.AuthManager
+import com.portionspot.pos.data.PosDatabase
+import com.portionspot.pos.data.PosRepository
+import com.portionspot.pos.sync.PosSyncEngine
+import com.portionspot.pos.ui.CrashReporter
+import com.portionspot.pos.sync.SyncConfig
+import com.portionspot.pos.sync.SyncManager
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+
+/**
+ * Manual dependency container. We deliberately skip Hilt for now to keep the
+ * build simple and fast to sync; this can be swapped for Hilt later without
+ * touching call sites (everything goes through [AppContainer]).
+ */
+class AppContainer(app: Application) {
+    private val database: PosDatabase = PosDatabase.get(app)
+    val repository: PosRepository = PosRepository(database)
+
+    // ---- Auth (Supabase Auth + RLS; offline PIN unlock) ----
+    val authManager: AuthManager = AuthManager(app)
+
+    // ---- Cloud sync (bring-your-own Supabase) ----
+    val syncConfig: SyncConfig = SyncConfig(database.settingDao())
+    val syncEngine: PosSyncEngine = PosSyncEngine(
+        database.businessDao(), database.itemDao(), database.saleDao(),
+        database.customerDao(), database.creditDao(), syncConfig,
+        accessToken = authManager::accessTokenOrNull,
+        ensureFreshToken = { authManager.refreshIfNeeded() }
+    )
+    val syncManager: SyncManager = SyncManager(app.applicationContext, syncConfig, syncEngine)
+}
+
+class PosApp : Application() {
+    lateinit var container: AppContainer
+        private set
+
+    override fun onCreate() {
+        super.onCreate()
+        // Record any fatal crash so the next launch can show it (no adb needed).
+        CrashReporter.install(this)
+        container = AppContainer(this)
+        // If the user already connected a database, make sure periodic sync is armed.
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            container.syncManager.ensureScheduled()
+        }
+    }
+}

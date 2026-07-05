@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Base application theme. Colours/typography are driven by Compose (PosTheme).
+         We use a framework Material theme as the parent so no extra
+         (com.google.android.material) dependency is required. -->
+    <style name="Theme.SpotPos" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">@color/brand_primary_dark</item>
+        <item name="android:windowBackground">@color/white</item>
+    </style>
+</resources>
