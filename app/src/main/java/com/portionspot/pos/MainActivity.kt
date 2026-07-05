@@ -8,8 +8,12 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.portionspot.pos.auth.AuthGate
+import com.portionspot.pos.ui.AdminRoot
 import com.portionspot.pos.ui.AppRoot
 import com.portionspot.pos.ui.CrashReportScreen
 import com.portionspot.pos.ui.CrashReporter
@@ -51,7 +55,18 @@ class MainActivity : ComponentActivity() {
                     // Push the signed-in cashier into the ViewModel so financial
                     // writes (refunds now; the rest as Phase 2 continues) are attributed.
                     LaunchedEffect(user.id) { vm.setCurrentCashier(user.id, user.displayName) }
-                    AppRoot(vm)
+                    // Admins land in the admin shell (§9) but can drop into the cashier
+                    // POS to make a sale, then jump back. Cashiers only ever see the POS.
+                    if (user.isAdmin) {
+                        var cashierMode by remember(user.id) { mutableStateOf(false) }
+                        if (cashierMode) {
+                            AppRoot(vm, onExitToAdmin = { cashierMode = false })
+                        } else {
+                            AdminRoot(vm, onExitToCashier = { cashierMode = true })
+                        }
+                    } else {
+                        AppRoot(vm)
+                    }
                 }
             }
         }

@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.provider.CallLog
 import android.os.Build
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -46,18 +47,24 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.AdminPanelSettings
 import androidx.compose.material.icons.automirrored.filled.Assignment
 import androidx.compose.material.icons.filled.AssignmentReturn
 import androidx.compose.material.icons.filled.BarChart
+import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.CloudOff
+import androidx.compose.material.icons.filled.Contacts
 import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Inventory2
+import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.Payments
 import androidx.compose.material.icons.filled.People
+import androidx.compose.material.icons.filled.PointOfSale
 import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material.icons.filled.Print
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Receipt
@@ -143,6 +150,11 @@ import com.portionspot.pos.data.secondCurrencyActive
 import com.portionspot.pos.data.CreditTxn
 import com.portionspot.pos.data.Customer
 import com.portionspot.pos.data.CustomerWithBalance
+import com.portionspot.pos.device.CallLogAccess
+import com.portionspot.pos.device.PickedContact
+import com.portionspot.pos.device.RecentCall
+import com.portionspot.pos.device.phoneKey
+import com.portionspot.pos.device.rememberContactPicker
 import com.portionspot.pos.data.Tender
 import com.portionspot.pos.data.Expense
 import com.portionspot.pos.data.Supplier
@@ -176,8 +188,10 @@ import com.portionspot.pos.sync.ConnectionTest
 import com.portionspot.pos.sync.SyncOutcome
 import com.portionspot.pos.sync.SyncStatus
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -348,7 +362,7 @@ private fun rememberPrinterUi(prefsProvider: () -> ShopPrefs): PrinterUi {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AppRoot(vm: PosViewModel) {
+fun AppRoot(vm: PosViewModel, onExitToAdmin: (() -> Unit)? = null) {
     val t = LocalPosTokens.current
     val business by vm.business.collectAsState()
     val cart by vm.cart.collectAsState()
@@ -364,7 +378,14 @@ fun AppRoot(vm: PosViewModel) {
     Box(Modifier.fillMaxSize()) {
         Scaffold(
             containerColor = t.canvas,
-            topBar = { MobileTopBar(shopName, business?.logoUri) { drawerOpen = true } },
+            topBar = {
+                MobileTopBar(
+                    shopName = shopName,
+                    logoUri = business?.logoUri,
+                    adminBack = onExitToAdmin,
+                    onMenu = { drawerOpen = true }
+                )
+            },
             bottomBar = {
                 MobileBottomNav(
                     current = screen,
@@ -416,6 +437,246 @@ fun AppRoot(vm: PosViewModel) {
     }
 }
 
+// ─────────────────────────── ADMIN SHELL (Phase 8) ───────────────────────────
+
+/** Admin-mode destinations. Own bottom nav, distinct from the cashier POS (§9). */
+private enum class AdminTab(val label: String, val icon: androidx.compose.ui.graphics.vector.ImageVector) {
+    Dashboard("Dashboard", Icons.Filled.Dashboard),
+    Reports("Reports", Icons.Filled.BarChart),
+    Inventory("Inventory", Icons.Filled.Inventory2),
+    Alerts("Alerts", Icons.Filled.Notifications),
+    Settings("Settings", Icons.Filled.Settings),
+}
+
+/**
+ * The admin shell (prompt §9). Admins land here on login. Every tab but Alerts
+ * REUSES the existing cashier composables (Dashboard/Reports/Inventory/Settings)
+ * rather than duplicating them — the admin difference is the framing (a distinct
+ * nav + the ability to drop into the cashier POS via [onExitToCashier]) plus the
+ * new computed Alerts feed. Wiring is to existing data only; the §7 admin backend
+ * (cashier CRUD, force-disable methods, persisted notifications) is still to come.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun AdminRoot(vm: PosViewModel, onExitToCashier: () -> Unit) {
+    val t = LocalPosTokens.current
+    val business by vm.business.collectAsState()
+    var tab by remember { mutableStateOf(AdminTab.Dashboard) }
+    val printer = rememberPrinterUi { vm.shopPrefs.value }
+    val currency = business?.currency ?: "USD"
+
+    Box(Modifier.fillMaxSize()) {
+        Scaffold(
+            containerColor = t.canvas,
+            topBar = { AdminTopBar(business?.name ?: "Admin", onExitToCashier) },
+            bottomBar = { AdminBottomNav(current = tab, onSelect = { tab = it }) }
+        ) { padding ->
+            Box(Modifier.fillMaxSize().padding(padding).background(t.canvasBrush)) {
+                if (business == null) {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator()
+                    }
+                } else when (tab) {
+                    AdminTab.Dashboard -> DashboardScreen(vm, business!!)
+                    AdminTab.Reports -> ReportsScreen(vm, business!!)
+                    AdminTab.Inventory -> ItemsScreen(vm, currency)
+                    AdminTab.Alerts -> AdminAlertsScreen(vm, currency)
+                    AdminTab.Settings -> SettingsScreen(vm, business!!, printer)
+                }
+            }
+        }
+    }
+}
+
+/** Admin top bar: an ADMIN badge + shop name + a switch into the cashier POS. */
+@Composable
+private fun AdminTopBar(shopName: String, onExitToCashier: () -> Unit) {
+    val t = LocalPosTokens.current
+    Column(Modifier.fillMaxWidth().background(t.surface1)) {
+        Row(
+            Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            LogoMark(shopName, 30.dp)
+            Column(Modifier.weight(1f)) {
+                Text(
+                    shopName, color = t.inkPrimary, fontWeight = FontWeight.Black,
+                    fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    "ADMIN", color = t.brand.s600, fontSize = 10.sp,
+                    fontWeight = FontWeight.Black, letterSpacing = 1.sp
+                )
+            }
+            OutlinedButton(
+                onClick = onExitToCashier,
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+            ) {
+                Icon(Icons.Filled.PointOfSale, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("POS", fontSize = 13.sp)
+            }
+        }
+        HorizontalDivider(color = t.surfaceBorder)
+    }
+}
+
+/** Admin bottom nav — reuses the cashier [BottomNavItem] look across 5 tabs. */
+@Composable
+private fun AdminBottomNav(current: AdminTab, onSelect: (AdminTab) -> Unit) {
+    val t = LocalPosTokens.current
+    Column(Modifier.fillMaxWidth().background(t.surface1)) {
+        HorizontalDivider(color = t.surfaceBorder)
+        Row(Modifier.fillMaxWidth().navigationBarsPadding()) {
+            AdminTab.values().forEach { tabItem ->
+                BottomNavItem(
+                    icon = tabItem.icon,
+                    label = tabItem.label,
+                    active = current == tabItem,
+                    badge = 0,
+                    modifier = Modifier.weight(1f)
+                ) { onSelect(tabItem) }
+            }
+        }
+    }
+}
+
+/** Large-sale alert threshold (base currency). Configurable in the §7 admin backend. */
+private const val ADMIN_LARGE_SALE = 500.0
+
+private enum class AlertCat(val label: String) {
+    ALL("All"), INVENTORY("Inventory"), SALES("Sales"), SYSTEM("System")
+}
+
+private data class AdminAlert(
+    val cat: AlertCat,
+    val icon: androidx.compose.ui.graphics.vector.ImageVector,
+    val tint: Color,
+    val title: String,
+    val body: String,
+    val time: Long
+)
+
+/**
+ * Admin Alerts feed (prompt §8/§9), computed live from existing data — low/out of
+ * stock, refunds (flagged when still owed), large sales, and sync/debt health.
+ * This is the read-only stub of the notifications system: persistence, read-state,
+ * and push delivery are Phase 7. No new tables, no §7 backend.
+ */
+@Composable
+private fun AdminAlertsScreen(vm: PosViewModel, currency: String) {
+    val t = LocalPosTokens.current
+    val items by vm.items.collectAsState()
+    val refunds by vm.refunds.collectAsState()
+    val recent by vm.recentSales.collectAsState()
+    val customers by vm.customers.collectAsState()
+    val lastSync by vm.lastSyncAt.collectAsState()
+    var cat by remember { mutableStateOf(AlertCat.ALL) }
+    val now = System.currentTimeMillis()
+
+    val alerts = buildList {
+        // Inventory — out of stock, then low stock.
+        items.filter { it.trackStock && it.stockQty <= 0.0 }.forEach {
+            add(AdminAlert(AlertCat.INVENTORY, Icons.Filled.Inventory2, t.danger,
+                "Out of stock", "${it.name} has run out.", now))
+        }
+        items.filter {
+            it.trackStock && it.stockQty > 0.0 &&
+                it.stockQty <= (if (it.reorderLevel > 0.0) it.reorderLevel else LOW_STOCK_THRESHOLD)
+        }.forEach {
+            add(AdminAlert(AlertCat.INVENTORY, Icons.Filled.Inventory2, t.warning,
+                "Low stock", "${it.name}: ${trimQty(it.stockQty)} left.", now))
+        }
+        // Sales — refunds (owed flagged red), then large sales.
+        refunds.take(20).forEach { rw ->
+            val r = rw.refund
+            val owed = r.status == "owed"
+            add(AdminAlert(
+                AlertCat.SALES, Icons.Filled.AssignmentReturn,
+                if (owed) t.danger else t.success,
+                if (owed) "Refund still owed" else "Refund issued",
+                "${money(r.refundTotal, currency)} · ${r.customerName ?: "Walk-in"}" +
+                    (r.createdByName?.let { " · by $it" } ?: ""),
+                r.createdAt
+            ))
+        }
+        recent.filter { it.total >= ADMIN_LARGE_SALE }.take(10).forEach {
+            add(AdminAlert(AlertCat.SALES, Icons.Filled.Payments, t.warning,
+                "Large sale", "${money(it.total, currency)} · ${it.customerName ?: "Walk-in"}", it.soldAt))
+        }
+        // System — sync health + outstanding debt.
+        add(AdminAlert(
+            AlertCat.SYSTEM, Icons.Filled.Sync, t.accentBlue, "Sync status",
+            lastSync?.let { "Last synced ${relativeAgo(it)}." } ?: "Not synced yet.",
+            lastSync ?: now
+        ))
+        val owing = customers.count { it.balance > 0 }
+        if (owing > 0) {
+            val owed = customers.sumOf { it.balance.coerceAtLeast(0.0) }
+            add(AdminAlert(AlertCat.SYSTEM, Icons.Filled.People, t.warning,
+                "Outstanding debts", "$owing customer(s) owe ${money(owed, currency)}.", now))
+        }
+    }.sortedByDescending { it.time }
+
+    val shown = if (cat == AlertCat.ALL) alerts else alerts.filter { it.cat == cat }
+
+    Column(Modifier.fillMaxSize().padding(12.dp)) {
+        Text("Alerts", color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 22.sp)
+        Text(
+            "Live from your data · persistence & push arrive in Phase 7",
+            color = t.inkTertiary, fontSize = 11.sp
+        )
+        Spacer(Modifier.height(12.dp))
+        Row(
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            AlertCat.values().forEach { c ->
+                FilterChip(selected = cat == c, onClick = { cat = c }, label = { Text(c.label) })
+            }
+        }
+        Spacer(Modifier.height(12.dp))
+        if (shown.isEmpty()) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("No alerts. Everything looks healthy.", color = t.inkTertiary)
+            }
+        } else {
+            LazyColumn(Modifier.weight(1f)) {
+                items(shown) { AlertCard(it) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AlertCard(a: AdminAlert) {
+    val t = LocalPosTokens.current
+    Card(
+        Modifier.fillMaxWidth().padding(vertical = 5.dp),
+        colors = CardDefaults.cardColors(containerColor = t.surface1)
+    ) {
+        Row(
+            Modifier.fillMaxWidth().padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                Modifier.size(38.dp).clip(CircleShape).background(a.tint.copy(alpha = 0.14f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(a.icon, contentDescription = null, tint = a.tint, modifier = Modifier.size(20.dp))
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(a.title, color = t.inkPrimary, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                Text(a.body, color = t.inkSecondary, fontSize = 12.sp)
+            }
+            Spacer(Modifier.width(8.dp))
+            Text(relativeAgo(a.time), color = t.inkTertiary, fontSize = 10.sp)
+        }
+    }
+}
+
 /** Logo square (PSM mark or shop initials) used in the topbar + drawer. */
 @Composable
 private fun LogoMark(shopName: String, size: androidx.compose.ui.unit.Dp = 32.dp) {
@@ -434,9 +695,16 @@ private fun LogoMark(shopName: String, size: androidx.compose.ui.unit.Dp = 32.dp
     }
 }
 
-/** Mobile topbar: hamburger · logo · shop name · online pill (mirrors web). */
+/** Mobile topbar: hamburger · logo · shop name · online pill (mirrors web).
+ *  [adminBack], when set, shows a shortcut back to the admin shell (an admin who
+ *  dropped into the cashier POS to make a sale). */
 @Composable
-private fun MobileTopBar(shopName: String, logoUri: String?, onMenu: () -> Unit) {
+private fun MobileTopBar(
+    shopName: String,
+    logoUri: String?,
+    adminBack: (() -> Unit)? = null,
+    onMenu: () -> Unit
+) {
     val t = LocalPosTokens.current
     Column(Modifier.fillMaxWidth().background(t.surface1)) {
         Row(
@@ -457,6 +725,15 @@ private fun MobileTopBar(shopName: String, logoUri: String?, onMenu: () -> Unit)
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f)
             )
+            if (adminBack != null) {
+                IconButton(onClick = adminBack, modifier = Modifier.size(36.dp)) {
+                    Icon(
+                        Icons.Filled.AdminPanelSettings,
+                        contentDescription = "Back to admin",
+                        tint = t.brand.s600
+                    )
+                }
+            }
             Icon(Icons.Filled.Wifi, contentDescription = "Online", tint = t.onlinePill, modifier = Modifier.size(16.dp))
         }
         HorizontalDivider(color = t.surfaceBorder)
@@ -2675,6 +2952,9 @@ private fun CustomersScreen(vm: PosViewModel, currency: String) {
     val customers by vm.customers.collectAsState()
     var showAdd by remember { mutableStateOf(false) }
     var selected by remember { mutableStateOf<Customer?>(null) }
+    var showRecentCalls by remember { mutableStateOf(false) }
+    // Non-null => open the Add dialog pre-filled from a contact pick or a recent call.
+    var prefill by remember { mutableStateOf<PickedContact?>(null) }
 
     val totalOutstanding = customers.sumOf { it.balance }
 
@@ -2749,21 +3029,45 @@ private fun CustomersScreen(vm: PosViewModel, currency: String) {
                 }
             }
         }
-        FilledTonalButton(
-            onClick = { showAdd = true },
-            modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp)
+        Row(
+            modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Icon(Icons.Filled.Add, contentDescription = null)
-            Spacer(Modifier.width(8.dp))
-            Text("Add customer")
+            OutlinedButton(onClick = { showRecentCalls = true }) {
+                Icon(Icons.Filled.Call, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("Recent callers")
+            }
+            Spacer(Modifier.width(12.dp))
+            FilledTonalButton(onClick = { showAdd = true }) {
+                Icon(Icons.Filled.Add, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("Add customer")
+            }
         }
     }
 
-    if (showAdd) {
-        AddCustomerDialog(onDismiss = { showAdd = false }) { name, phone, email, address, note, wholesale ->
+    if (showAdd || prefill != null) {
+        AddCustomerDialog(
+            initialName = prefill?.name.orEmpty(),
+            initialPhone = prefill?.phone.orEmpty(),
+            onDismiss = { showAdd = false; prefill = null }
+        ) { name, phone, email, address, note, wholesale ->
             vm.addCustomer(name, phone, email, address, note, wholesale)
-            showAdd = false
+            showAdd = false; prefill = null
         }
+    }
+    if (showRecentCalls) {
+        RecentCallersDialog(
+            customers = customers,
+            currency = currency,
+            onDismiss = { showRecentCalls = false },
+            onOpenCustomer = { c -> showRecentCalls = false; selected = c },
+            onAddFromCall = { call ->
+                showRecentCalls = false
+                prefill = PickedContact(name = call.cachedName, phone = call.number)
+            }
+        )
     }
     selected?.let { cust ->
         CustomerDetailDialog(vm, cust, currency, onDismiss = { selected = null })
@@ -2784,15 +3088,23 @@ private fun WholesaleBadge() {
 
 @Composable
 private fun AddCustomerDialog(
+    initialName: String = "",
+    initialPhone: String = "",
     onDismiss: () -> Unit,
     onSave: (String, String, String, String, String, Boolean) -> Unit
 ) {
-    var name by remember { mutableStateOf("") }
-    var phone by remember { mutableStateOf("") }
+    var name by remember { mutableStateOf(initialName) }
+    var phone by remember { mutableStateOf(initialPhone) }
     var email by remember { mutableStateOf("") }
     var address by remember { mutableStateOf("") }
     var note by remember { mutableStateOf("") }
     var wholesale by remember { mutableStateOf(false) }
+    // System number picker — fills name + phone from the phone's contacts. Needs no
+    // permission (the picker grants a one-shot read on the chosen contact).
+    val pickContact = rememberContactPicker { picked ->
+        picked.name?.let { name = it }
+        picked.phone?.let { phone = it }
+    }
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = {
@@ -2805,6 +3117,11 @@ private fun AddCustomerDialog(
         title = { Text("New customer") },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState())) {
+                TextButton(onClick = pickContact, modifier = Modifier.align(Alignment.End)) {
+                    Icon(Icons.Filled.Contacts, contentDescription = null)
+                    Spacer(Modifier.width(6.dp))
+                    Text("Pick from contacts")
+                }
                 OutlinedTextField(
                     value = name, onValueChange = { name = it },
                     label = { Text("Name") }, singleLine = true, modifier = Modifier.fillMaxWidth()
@@ -2848,6 +3165,142 @@ private fun AddCustomerDialog(
             }
         }
     )
+}
+
+/**
+ * "Recent callers" quick-add (prompt §5). Lists distinct recent phone callers so a
+ * customer who just rang in an order can be opened or added in one tap. Callers already
+ * saved as customers show their name and any outstanding balance ("owes $42") and open
+ * that account on tap; unknown callers open the Add-customer dialog pre-filled with the
+ * number. Needs READ_CALL_LOG — requested on open, and the whole screen degrades to a
+ * permission prompt if denied.
+ */
+@Composable
+private fun RecentCallersDialog(
+    customers: List<CustomerWithBalance>,
+    currency: String,
+    onDismiss: () -> Unit,
+    onOpenCustomer: (Customer) -> Unit,
+    onAddFromCall: (RecentCall) -> Unit
+) {
+    val context = LocalContext.current
+    var granted by remember { mutableStateOf(CallLogAccess.hasPermission(context)) }
+    val permLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted = it }
+    LaunchedEffect(Unit) { if (!granted) permLauncher.launch(Manifest.permission.READ_CALL_LOG) }
+
+    var calls by remember { mutableStateOf<List<RecentCall>>(emptyList()) }
+    var loading by remember { mutableStateOf(false) }
+    LaunchedEffect(granted) {
+        if (granted) {
+            loading = true
+            calls = withContext(Dispatchers.IO) { CallLogAccess.recentCallers(context) }
+            loading = false
+        }
+    }
+
+    // Match callers to saved customers by the last-9-digits key.
+    val byKey = remember(customers) {
+        customers.mapNotNull { cb -> phoneKey(cb.customer.phone)?.let { it to cb } }.toMap()
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+        title = { Text("Recent callers") },
+        text = {
+            when {
+                !granted -> Column {
+                    Text(
+                        "Call-log access is needed to show recent callers.",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    Button(onClick = { permLauncher.launch(Manifest.permission.READ_CALL_LOG) }) {
+                        Text("Grant access")
+                    }
+                }
+                loading -> Box(
+                    Modifier.fillMaxWidth().height(120.dp), contentAlignment = Alignment.Center
+                ) { CircularProgressIndicator() }
+                calls.isEmpty() -> Text(
+                    "No recent calls found.", color = MaterialTheme.colorScheme.outline
+                )
+                else -> Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
+                    calls.forEach { call ->
+                        val match = byKey[phoneKey(call.number)]
+                        RecentCallerRow(
+                            call = call,
+                            match = match,
+                            currency = currency,
+                            onClick = {
+                                if (match != null) onOpenCustomer(match.customer)
+                                else onAddFromCall(call)
+                            }
+                        )
+                    }
+                }
+            }
+        }
+    )
+}
+
+@Composable
+private fun RecentCallerRow(
+    call: RecentCall,
+    match: CustomerWithBalance?,
+    currency: String,
+    onClick: () -> Unit
+) {
+    val title = match?.customer?.name ?: call.cachedName ?: call.number
+    Row(
+        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, fontWeight = FontWeight.Medium)
+            Text(
+                "${call.number} • ${callTypeLabel(call.type)} • ${relativeAgo(call.timeMillis)}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.outline
+            )
+            if (match != null && match.balance > 0) {
+                Text(
+                    "Owes ${money(match.balance, currency)}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
+        }
+        if (match != null) {
+            Icon(Icons.Filled.ChevronRight, contentDescription = "Open account")
+        } else {
+            Icon(Icons.Filled.PersonAdd, contentDescription = "Add customer")
+        }
+    }
+}
+
+private fun callTypeLabel(type: Int): String = when (type) {
+    CallLog.Calls.INCOMING_TYPE -> "Incoming"
+    CallLog.Calls.OUTGOING_TYPE -> "Outgoing"
+    CallLog.Calls.MISSED_TYPE -> "Missed"
+    CallLog.Calls.REJECTED_TYPE -> "Rejected"
+    CallLog.Calls.VOICEMAIL_TYPE -> "Voicemail"
+    else -> "Call"
+}
+
+/** Human "5 min ago" / "2 hr ago" / "3 d ago" for call timestamps. */
+private fun relativeAgo(millis: Long): String {
+    val diff = System.currentTimeMillis() - millis
+    if (diff < 60_000) return "just now"
+    val min = diff / 60_000
+    return when {
+        min < 60 -> "$min min ago"
+        min < 60 * 24 -> "${min / 60} hr ago"
+        min < 60 * 24 * 7 -> "${min / (60 * 24)} d ago"
+        else -> "${min / (60 * 24 * 7)} wk ago"
+    }
 }
 
 @Composable
