@@ -7,7 +7,7 @@
 You are extending an existing **native Android app (Kotlin)** for PortionSpot Motors, a wholesale motor spares business in Harare, Zimbabwe. The app is mostly built — your job is to add the features below and iron out details. Do not rebuild what already works.
 
 **Reference systems:**
-- The existing web POS (React/Vite/Tailwind + Supabase + Dexie offline sync) lives at `github.com/ckachale14-hash/POS`. Use it as the source of truth for the database schema, business logic, and the **mobile UI**, which the Android app must visually match.
+- The existing web POS (React/Vite/Tailwind + Supabase + Dexie offline sync) lives at `github.com/ckachale14-hash/POS`. Use it as the source of truth for the database schema, business logic, and the **mobile UI**, which the Android app must visually match. A **local copy of that repo is on this machine** at `C:\Users\User\Production\Projects\Reference\POS-main.zip` (unzip to read it without network / the right GitHub account) — prefer this for schema/logic/UI reference so a session never stalls on repo access.
 - Backend: Supabase (project ID `ucgvvxlhdooevngtraje`) — Postgres, Auth, Edge Functions, Storage.
 - Distribution: **sideloaded APK only** (never Google Play), so restricted permissions like READ_SMS and READ_CALL_LOG are acceptable.
 - Up to 4 staff use the system, across multiple devices including Sunmi handheld POS devices.
@@ -49,7 +49,7 @@ Do **not** ship the service-role key in the app. The correct architecture is:
 
 ## 3. Per-cashier attribution (critical)
 
-Every transaction, sale, credit, payment, stock movement, and order **must record which cashier created it**:
+Every transaction, sale, credit, payment, refund, stock movement, and order **must record which cashier created it**:
 
 - Every relevant table gets a `created_by` (UUID → auth user) column.
 - Records created **offline** must stamp `created_by` from the locally cached session **at creation time**, not at sync time, so attribution survives device sharing and network drops.
@@ -109,7 +109,7 @@ The admin login unlocks an admin mode with (implement all of these; propose anyt
 - Create cashier accounts; deactivate/delete cashiers (sole authority).
 - View transactions filtered by **any date range**, by cashier, by payment method, by product.
 - **Force-disable payment methods** globally (e.g., lock out Ecocash during network problems or rate volatility) — disabled methods disappear/grey out on all cashier devices on next sync, with offline devices honoring the lock once they sync.
-- Approve/perform voids, refunds, price overrides, and discounts beyond a set threshold.
+- Approve/perform voids, price overrides, and discounts beyond a set threshold. **Refunds themselves are cashier-performed** (see §11) — but the admin sees every refund and can void a wrongful one.
 - Set low-stock thresholds per product; adjust stock with reasons (audit-logged).
 - Debt management: aging report (30/60/90 days), per-customer statements, write-offs (admin-only).
 - End-of-day / shift summary per cashier: sales count, totals per method, expected cash in drawer vs recorded.
@@ -119,7 +119,8 @@ The admin login unlocks an admin mode with (implement all of these; propose anyt
 **Notifications to admin**
 - Low stock (per thresholds).
 - Large transactions above a configurable amount.
-- Voids/refunds/manual stock adjustments by cashiers.
+- Voids/manual stock adjustments by cashiers.
+- **Refunds issued by cashiers:** which sale, goods returned (and whether restocked), amount refunded, method(s), and whether the money was **fully returned or is still owed** to the customer (a refund left partially unpaid for more than N hours escalates like an unverified payment).
 - Mobile-money payments left **unverified** for more than N hours.
 - Debts crossing aging thresholds (e.g., newly older than 30 days).
 - A device that hasn't synced in more than N hours while records are pending.
@@ -141,6 +142,18 @@ The native printing stack is **already built**: `print/EscPos.kt` (ESC/POS drive
 - You decide layout, fonts, font sizes, and spacing for receipts, quotes, and statements — make them clean, legible on thermal paper, and professional. Provide 2–3 style presets I can choose between in settings.
 - Logo printing options: header logo (raster, dithered for thermal), size options, and — if feasible on the target printers — a **light watermark of the logo** behind the receipt body (implement via low-density raster; if a given printer can't render it acceptably, degrade gracefully to no watermark rather than a black smear).
 - Receipts must show: business details, receipt number, date/time, cashier name, line items, per-method payment breakdown for split payments, change/credit/debt resulting, and a footer message (configurable).
+
+## 11. Refunds & returns
+
+Refunds are a **first-class, cashier-performed** flow, built on the **immutable reversal-ledger** principle: the original sale is never edited or deleted — a refund is an append-only reversal linked back to it, so the full history (sold → refunded → repaid) is always reconstructable.
+
+- **Who:** any signed-in cashier can issue a refund; every refund records `created_by` (the cashier) and its timestamps (device time at creation, offline-safe; server time on sync). The admin is notified of every refund and can void a wrongful one (§8).
+- **Against a sale:** a refund references the original sale. It can be **full or partial** — the cashier selects which line items / quantities are being returned, so a customer can bring back 2 of 5 items.
+- **Goods returned:** the cashier marks whether the goods came back. Returned goods are **restocked** by default (a `return` stock movement, which already exists), with a per-line option to **not** restock damaged/faulty goods.
+- **Money redistributed:** the refund records how the money was given back — one or more methods/currencies, exactly like split payments (cash USD, cash ZWG, EcoCash reversal, store credit, etc.).
+- **Partial money over time:** if the full refund amount isn't handed back at once, the outstanding amount becomes a tracked **"shop owes customer"** balance and each later payout is a dated entry — the **same mechanism as change-owed and credit**, so debt/credit/refund all age and settle the same way.
+- **Time:** every refund event and every payout carries its own timestamp; the UI shows ages in human terms ("refund owed for 3 days") and exact datetimes on tap.
+- **Receipts:** a refund can print/share a refund receipt showing the original sale ref, items returned, amount refunded per method, and any balance still owed.
 
 ---
 

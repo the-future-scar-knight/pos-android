@@ -16,6 +16,9 @@ import com.portionspot.pos.data.PosRepository
 import com.portionspot.pos.data.PurchaseOrder
 import com.portionspot.pos.data.PurchaseOrderLine
 import com.portionspot.pos.data.PurchaseOrderWithLines
+import com.portionspot.pos.data.RefundLineInput
+import com.portionspot.pos.data.RefundPayment
+import com.portionspot.pos.data.RefundWithLines
 import com.portionspot.pos.data.SaleEntity
 import com.portionspot.pos.data.SaleLine
 import com.portionspot.pos.data.SalesSummary
@@ -78,6 +81,15 @@ class PosViewModel(
 ) : ViewModel() {
 
     private val businessId = MutableStateFlow<String?>(null)
+
+    // The signed-in cashier, pushed in from AuthGate (see MainActivity). Stamped onto
+    // refunds now, and onto the other financial writes as Phase-2 wiring continues.
+    private var currentCashierId: String? = null
+    private var currentCashierName: String? = null
+    fun setCurrentCashier(id: String?, name: String?) {
+        currentCashierId = id
+        currentCashierName = name
+    }
 
     val business: StateFlow<Business?> =
         repo.businessFlow.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
@@ -160,6 +172,15 @@ class PosViewModel(
                 repo.paymentBreakdownFlow(bid, from, to)
             }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Money refunded in the report window — subtract from gross for net takings. */
+    val reportRefunds: StateFlow<Double> =
+        combine(businessId.filterNotNull(), _reportRange) { bid, range -> bid to range }
+            .flatMapLatest { (bid, range) ->
+                val (from, to) = rangeBounds(range)
+                repo.refundedSinceFlow(bid, from, to)
+            }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0.0)
 
     fun setReportRange(range: ReportRange) { _reportRange.value = range }
 
@@ -422,7 +443,9 @@ class PosViewModel(
                 changeAsCredit = changeAsCredit,
                 vatEnabled = biz?.vatEnabled ?: false,
                 vatPercent = biz?.vatPercent ?: 0.0,
-                totalRounding = _shopPrefs.value.checkoutRounding
+                totalRounding = _shopPrefs.value.checkoutRounding,
+                cashierId = currentCashierId,
+                cashierName = currentCashierName
             )
             _lastReceipt.value = LastReceipt(saved.sale, saved.lines)
             _cart.value = emptyList()
@@ -458,7 +481,10 @@ class PosViewModel(
         val lines = _cart.value
         if (lines.isEmpty()) return
         viewModelScope.launch {
-            repo.parkSale(bid, lines, note = note, customer = customer)
+            repo.parkSale(
+                bid, lines, note = note, customer = customer,
+                cashierId = currentCashierId, cashierName = currentCashierName
+            )
             _cart.value = emptyList()
         }
     }
@@ -542,7 +568,9 @@ class PosViewModel(
 
     /** Set an item's on-hand to [newQty], logging the change ("adjust"/"restock"). */
     fun adjustStock(itemId: String, newQty: Double, type: String = "adjust", note: String? = null) {
-        viewModelScope.launch { repo.adjustStock(itemId, newQty, type, note) }
+        viewModelScope.launch {
+            repo.adjustStock(itemId, newQty, type, note, currentCashierId, currentCashierName)
+        }
     }
 
     // ---- Danger zone ------------------------------------------------------
@@ -594,7 +622,9 @@ class PosViewModel(
     fun recordRepayment(customerId: String, amount: Double, note: String? = null) {
         val bid = businessId.value ?: return
         if (amount <= 0) return
-        viewModelScope.launch { repo.recordRepayment(bid, customerId, amount, note) }
+        viewModelScope.launch {
+            repo.recordRepayment(bid, customerId, amount, note, currentCashierId, currentCashierName)
+        }
     }
 
     fun balanceFlow(customerId: String): Flow<Double> = repo.balanceFlow(customerId)
@@ -606,11 +636,68 @@ class PosViewModel(
     fun recordChangePayment(customerId: String, amount: Double, note: String? = null) {
         val bid = businessId.value ?: return
         if (amount <= 0) return
-        viewModelScope.launch { repo.recordChangePayment(bid, customerId, amount, note) }
+        viewModelScope.launch {
+            repo.recordChangePayment(bid, customerId, amount, note, currentCashierId, currentCashierName)
+        }
     }
 
     fun creditHistory(customerId: String): Flow<List<CreditTxn>> =
         repo.creditHistoryFlow(customerId)
+
+    // ---- Refunds & returns (prompt §11) ----------------------------------
+
+    /** Whole-shop refund history (newest first), each with its returned lines. */
+    val refunds: StateFlow<List<RefundWithLines>> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.refundsFlow(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Units of a sale line already returned across prior refunds (refundable cap). */
+    suspend fun qtyReturnedForLine(saleLineId: String): Double =
+        repo.qtyReturnedForLine(saleLineId)
+
+    /** Payout rows for a refund — used to print a refund receipt. */
+    suspend fun refundPayments(refundId: String): List<RefundPayment> =
+        repo.refundPaymentsFor(refundId)
+
+    /**
+     * Issue a refund against [sale]. [returns] are the chosen lines/quantities; [payout]
+     * is the money handed back now (null or a short amount ⇒ the remainder is owed and
+     * ages in Change & Credit). The owed-tracking customer is resolved from the sale.
+     */
+    fun createRefund(
+        sale: SaleEntity,
+        returns: List<RefundLineInput>,
+        payout: Tender?,
+        reason: String?,
+        onDone: () -> Unit = {}
+    ) {
+        val bid = businessId.value ?: return
+        if (returns.isEmpty()) return
+        viewModelScope.launch {
+            val customer = sale.customerId?.let { repo.customerById(it) }
+            repo.createRefund(
+                businessId = bid,
+                sale = sale,
+                lines = returns,
+                payouts = payout?.let { listOf(it) } ?: emptyList(),
+                reason = reason,
+                customer = customer,
+                cashierId = currentCashierId,
+                cashierName = currentCashierName
+            )
+            onDone()
+        }
+    }
+
+    /** Pay off part/all of a refund the shop still owes (writes a payout + refund_paid). */
+    fun recordRefundPayout(refundId: String, tender: Tender, onDone: () -> Unit = {}) {
+        if (tender.amount <= 0) return
+        viewModelScope.launch {
+            repo.recordRefundPayout(refundId, tender, currentCashierId, currentCashierName)
+            onDone()
+        }
+    }
 
     // ---- Expenses ---------------------------------------------------------
 

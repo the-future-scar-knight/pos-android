@@ -2,6 +2,9 @@ package com.portionspot.pos.print
 
 import android.graphics.Bitmap
 import com.portionspot.pos.data.Business
+import com.portionspot.pos.data.Refund
+import com.portionspot.pos.data.RefundLine
+import com.portionspot.pos.data.RefundPayment
 import com.portionspot.pos.data.SaleEntity
 import com.portionspot.pos.data.SaleLine
 import com.portionspot.pos.data.baseToSecond
@@ -180,6 +183,101 @@ object EscPos {
 
         cmd(ESC, 0x64, style.feedLines.coerceIn(0, 8))  // feed N lines (cut clearance)
         cmd(GS, 0x56, 0x41, 0x00)   // GS V A 0 — cut
+        return out.toByteArray()
+    }
+
+    /** Build a refund ticket for [refund] and its returned [lines] + [payments]. */
+    fun refund(
+        business: Business,
+        refund: Refund,
+        lines: List<RefundLine>,
+        payments: List<RefundPayment>,
+        paperWidth: String = "58mm",
+        style: ReceiptStyle = ReceiptStyle(),
+        logo: Bitmap? = null
+    ): ByteArray {
+        val charH = if (style.largeText) 2 else 1
+        val sizeN = (charH - 1)
+        val w = if (paperWidth == "80mm") 48 else 32
+
+        val out = ByteArrayOutputStream()
+        fun cmd(vararg b: Int) { for (x in b) out.write(x) }
+        fun line(s: String = "") { out.write(s.toByteArray(Charsets.ISO_8859_1)); out.write(0x0A) }
+
+        cmd(ESC, 0x40)
+        cmd(ESC, 0x21, 0x00)
+        cmd(GS, 0x21, 0x00)
+        cmd(ESC, 0x4D, 0x00)
+        if (sizeN != 0) cmd(GS, 0x21, sizeN)
+
+        if (style.showLogo && logo != null) {
+            val raster = logoToRaster(logo, if (paperWidth == "80mm") 320 else 160)
+            if (raster != null) { cmd(ESC, 0x61, 0x01); out.write(raster); line() }
+        }
+
+        // Header
+        cmd(ESC, 0x61, 0x01)
+        if (style.boldName) cmd(ESC, 0x45, 0x01)
+        line(business.name.ifBlank { "PORTIONSPOT MOTORS" })
+        cmd(ESC, 0x45, 0x00)
+        if (style.showAddress) {
+            business.phone?.takeIf { it.isNotBlank() }?.let { line(it) }
+        }
+        cmd(ESC, 0x61, 0x00)
+        line(dashes(w))
+
+        // *** REFUND ***
+        cmd(ESC, 0x61, 0x01); cmd(ESC, 0x45, 0x01)
+        line("*** REFUND ***")
+        cmd(ESC, 0x45, 0x00); cmd(ESC, 0x61, 0x00)
+
+        val ref = refund.saleReceiptNo ?: refund.saleId.takeLast(6).uppercase()
+        val dateStr = SimpleDateFormat("dd/MM/yy HH:mm", Locale.UK).format(Date(refund.createdAt))
+        line(twoCol("Refund of #$ref", dateStr, w))
+        line("Customer: ${refund.customerName?.takeIf { it.isNotBlank() } ?: "Walk-in"}")
+        refund.createdByName?.takeIf { it.isNotBlank() }?.let { line("Cashier: $it") }
+        refund.reason?.takeIf { it.isNotBlank() }?.let { line("Reason: ${it.take(w - 8)}") }
+        line(dashes(w))
+
+        val cur = business.currency
+        line("Items returned:")
+        lines.forEach { ln ->
+            cmd(ESC, 0x45, 0x01); line(ln.name.take(w)); cmd(ESC, 0x45, 0x00)
+            line(twoCol("  x${trimQty(ln.qty)} @ ${fmt(ln.unitPrice, cur)}", fmt(ln.lineTotal, cur), w))
+            if (!ln.restock) line("  (not restocked)")
+        }
+        line(dashes(w))
+
+        cmd(ESC, 0x45, 0x01)
+        line(twoCol("REFUND TOTAL", fmt(refund.refundTotal, cur), w))
+        cmd(ESC, 0x45, 0x00)
+
+        if (payments.isNotEmpty()) {
+            line("Paid back:")
+            payments.forEach { p ->
+                val label = PaymentMethod.fromCode(p.method)?.label
+                    ?: p.method.replaceFirstChar { it.uppercase() }
+                line(twoCol("  $label", fmt(p.amount, cur), w))
+            }
+        }
+        val owed = refund.refundTotal - payments.sumOf { it.amount }
+        if (owed > 0.005) {
+            cmd(ESC, 0x45, 0x01)
+            line(twoCol("STILL OWED", fmt(owed, cur), w))
+            cmd(ESC, 0x45, 0x00)
+        }
+
+        if (style.showFooter) {
+            business.receiptFooter?.takeIf { it.isNotBlank() }?.let { footer ->
+                line(dashes(w))
+                cmd(ESC, 0x61, 0x01)
+                footer.split("\n").forEach { line(it) }
+                cmd(ESC, 0x61, 0x00)
+            }
+        }
+
+        cmd(ESC, 0x64, style.feedLines.coerceIn(0, 8))
+        cmd(GS, 0x56, 0x41, 0x00)
         return out.toByteArray()
     }
 

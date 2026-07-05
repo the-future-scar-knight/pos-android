@@ -144,6 +144,13 @@ data class SaleEntity(
     val customerId: String? = null,        // null => walk-in
     val customerName: String? = null,      // snapshot so receipts print without a lookup
     val soldAt: Long = now(),
+    // ──── Attribution & audit (Phase 2) ────
+    // Stamped from the signed-in cashier's cached session AT creation time (offline
+    // included) so ownership survives device sharing and network drops. Nullable
+    // until Phase-2 wiring stamps them; serverCreatedAt is set from server time on sync.
+    val createdBy: String? = null,        // auth user uuid of the cashier
+    val createdByName: String? = null,    // display-name snapshot (survives account edits)
+    val serverCreatedAt: Long? = null,    // server time, set on sync
     val updatedAt: Long = now(),
     val deleted: Boolean = false,
     /** false until the WorkManager sync (later milestone) pushes it to Supabase. */
@@ -213,6 +220,10 @@ data class StockMovement(
     val delta: Double = 0.0,
     val balanceAfter: Double = 0.0,
     val note: String? = null,
+    // Attribution (Phase 2): which cashier caused this movement (a "return" movement
+    // is created by a refund; a "sale" by checkout; "adjust"/"restock" by inventory).
+    val createdBy: String? = null,
+    val createdByName: String? = null,
     val createdAt: Long = now()
 )
 
@@ -220,6 +231,99 @@ data class StockMovement(
 data class SaleWithLines(
     val sale: SaleEntity,
     val lines: List<SaleLine>
+)
+
+/**
+ * A refund / return against a completed [SaleEntity] (prompt §11). Append-only,
+ * immutable-ledger style: the original sale is NEVER edited — a refund is a
+ * reversal linked back to it, so the full history (sold → refunded → repaid) can
+ * always be reconstructed. A refund is full or partial (specific returned lines).
+ *
+ * Money model:
+ *  - [refundTotal] is what the shop owes the customer for the returned goods,
+ *    computed PROPORTIONALLY from the original sale so a partial return carries its
+ *    share of the sale's discount + VAT (see [computeRefundTotal]).
+ *  - The money actually handed back lives in [RefundPayment] rows (method + time),
+ *    so a refund supports split payouts and being paid over time.
+ *  - If it isn't fully paid at once AND a customer is set, the outstanding amount is
+ *    booked as a `refund_owed` credit-ledger row that ages in the Change & Credit
+ *    screen exactly like change/credit; each later payout writes a `refund_paid` row.
+ *
+ * Attribution: [createdBy] is the cashier, stamped at creation (offline included).
+ */
+@Entity(
+    tableName = "refunds",
+    indices = [Index("businessId"), Index("saleId"), Index("customerId")]
+)
+data class Refund(
+    @PrimaryKey val id: String = newId(),
+    val businessId: String,
+    val saleId: String,                    // the original sale being refunded
+    val saleReceiptNo: String? = null,     // snapshot of the sale's receipt no for display
+    val customerId: String? = null,        // null => walk-in (must be paid out in full now)
+    val customerName: String? = null,      // snapshot
+    val reason: String? = null,
+    val refundTotal: Double = 0.0,         // money owed back to the customer for the return
+    val status: String = "settled",        // settled (paid in full) | owed (balance outstanding)
+    val createdBy: String? = null,         // cashier auth uuid (Phase 2)
+    val createdByName: String? = null,
+    val createdAt: Long = now(),           // device time at creation (offline-safe)
+    val serverCreatedAt: Long? = null,     // server time, set on sync
+    val updatedAt: Long = now(),
+    val deleted: Boolean = false,
+    /** Local-only: true => has unsynced local edits to push. Never sent to cloud. */
+    val pendingSync: Boolean = true
+)
+
+/**
+ * One returned line within a [Refund]. name/unitPrice are SNAPSHOTS from the
+ * original [SaleLine]. [qty] is how many line-units came back; [restock] controls
+ * whether they went back on the shelf (false for damaged/faulty goods).
+ */
+@Entity(tableName = "refund_items", indices = [Index("refundId")])
+data class RefundLine(
+    @PrimaryKey val id: String = newId(),
+    val refundId: String,
+    val businessId: String,
+    val saleLineId: String? = null,        // original sale line, when known
+    val itemId: String? = null,
+    val name: String,                      // snapshot
+    val qty: Double = 1.0,                 // line-units returned
+    val unitPrice: Double = 0.0,           // snapshot
+    val lineTotal: Double = 0.0,           // pre-adjustment returned value (unitPrice * qty)
+    val mode: String = "retail",           // box | wholesale | retail (snapshot)
+    val unitsPerLine: Int = 1,             // stock units per line-unit (box size), for restock
+    val restock: Boolean = true,           // false => damaged, do NOT return to stock
+    val createdAt: Long = now()
+)
+
+/**
+ * One payout within a [Refund] — money actually handed back to the customer.
+ * Mirrors [SalePayment]: several rows model a split payout, and rows added later
+ * model a refund paid off over time. [amount] is ALWAYS base currency (the books
+ * read this); the dual-currency trio is display/reporting only.
+ */
+@Entity(tableName = "refund_payments", indices = [Index("refundId")])
+data class RefundPayment(
+    @PrimaryKey val id: String = newId(),
+    val refundId: String,
+    val businessId: String,
+    val method: String,                    // cash | ecocash | card | store_credit | …
+    val amount: Double = 0.0,              // base currency — every sum/report reads this
+    val reference: String? = null,
+    val tenderCurrency: String? = null,    // second-currency code (e.g. "ZWG") when paid in ZiG
+    val tenderAmount: Double? = null,      // amount handed over in [tenderCurrency]
+    val rate: Double? = null,              // second-per-base rate at payout time
+    val createdBy: String? = null,
+    val createdByName: String? = null,
+    val createdAt: Long = now()
+)
+
+/** A refund together with its returned lines (read model for history/receipts). */
+data class RefundWithLines(
+    @Embedded val refund: Refund,
+    @Relation(parentColumn = "id", entityColumn = "refundId")
+    val lines: List<RefundLine>
 )
 
 /**
@@ -305,6 +409,10 @@ data class CreditTxn(
     val amount: Double = 0.0,
     val note: String? = null,
     val createdAt: Long = now(),
+    // ──── Attribution & audit (Phase 2): which cashier created this ledger row ────
+    val createdBy: String? = null,
+    val createdByName: String? = null,
+    val serverCreatedAt: Long? = null,
     val updatedAt: Long = now(),
     val deleted: Boolean = false,
     /** Local-only: true => has unsynced local edits to push. Never sent to cloud. */

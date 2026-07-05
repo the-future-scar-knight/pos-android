@@ -140,6 +140,89 @@ val MIGRATION_11_12 = object : Migration(11, 12) {
     }
 }
 
+/**
+ * v12 → v13: attribution/audit + refunds (Phase 2).
+ *
+ *  1. Adds NULLABLE `createdBy` / `createdByName` (and `serverCreatedAt` where the
+ *     row can sync) to `sales`, `credit_transactions` and `stock_movements` so every
+ *     financial record can carry which cashier created it. Nullable with no default,
+ *     so existing rows keep NULL and nothing is rewritten.
+ *  2. Creates the refund ledger (prompt §11): `refunds` (header), `refund_items`
+ *     (returned lines) and `refund_payments` (money handed back, split/over-time).
+ *
+ * Real migration — additive only, no data dropped.
+ */
+val MIGRATION_12_13 = object : Migration(12, 13) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        // 1. Attribution columns on the existing financial tables.
+        db.execSQL("ALTER TABLE sales ADD COLUMN createdBy TEXT")
+        db.execSQL("ALTER TABLE sales ADD COLUMN createdByName TEXT")
+        db.execSQL("ALTER TABLE sales ADD COLUMN serverCreatedAt INTEGER")
+        db.execSQL("ALTER TABLE credit_transactions ADD COLUMN createdBy TEXT")
+        db.execSQL("ALTER TABLE credit_transactions ADD COLUMN createdByName TEXT")
+        db.execSQL("ALTER TABLE credit_transactions ADD COLUMN serverCreatedAt INTEGER")
+        db.execSQL("ALTER TABLE stock_movements ADD COLUMN createdBy TEXT")
+        db.execSQL("ALTER TABLE stock_movements ADD COLUMN createdByName TEXT")
+
+        // 2. Refund ledger: header + returned lines + payouts.
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS refunds (" +
+                "id TEXT NOT NULL PRIMARY KEY, " +
+                "businessId TEXT NOT NULL, " +
+                "saleId TEXT NOT NULL, " +
+                "saleReceiptNo TEXT, " +
+                "customerId TEXT, " +
+                "customerName TEXT, " +
+                "reason TEXT, " +
+                "refundTotal REAL NOT NULL DEFAULT 0, " +
+                "status TEXT NOT NULL DEFAULT 'settled', " +
+                "createdBy TEXT, " +
+                "createdByName TEXT, " +
+                "createdAt INTEGER NOT NULL, " +
+                "serverCreatedAt INTEGER, " +
+                "updatedAt INTEGER NOT NULL, " +
+                "deleted INTEGER NOT NULL DEFAULT 0, " +
+                "pendingSync INTEGER NOT NULL DEFAULT 1)"
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_refunds_businessId ON refunds (businessId)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_refunds_saleId ON refunds (saleId)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_refunds_customerId ON refunds (customerId)")
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS refund_items (" +
+                "id TEXT NOT NULL PRIMARY KEY, " +
+                "refundId TEXT NOT NULL, " +
+                "businessId TEXT NOT NULL, " +
+                "saleLineId TEXT, " +
+                "itemId TEXT, " +
+                "name TEXT NOT NULL, " +
+                "qty REAL NOT NULL DEFAULT 1, " +
+                "unitPrice REAL NOT NULL DEFAULT 0, " +
+                "lineTotal REAL NOT NULL DEFAULT 0, " +
+                "mode TEXT NOT NULL DEFAULT 'retail', " +
+                "unitsPerLine INTEGER NOT NULL DEFAULT 1, " +
+                "restock INTEGER NOT NULL DEFAULT 1, " +
+                "createdAt INTEGER NOT NULL)"
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_refund_items_refundId ON refund_items (refundId)")
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS refund_payments (" +
+                "id TEXT NOT NULL PRIMARY KEY, " +
+                "refundId TEXT NOT NULL, " +
+                "businessId TEXT NOT NULL, " +
+                "method TEXT NOT NULL, " +
+                "amount REAL NOT NULL DEFAULT 0, " +
+                "reference TEXT, " +
+                "tenderCurrency TEXT, " +
+                "tenderAmount REAL, " +
+                "rate REAL, " +
+                "createdBy TEXT, " +
+                "createdByName TEXT, " +
+                "createdAt INTEGER NOT NULL)"
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_refund_payments_refundId ON refund_payments (refundId)")
+    }
+}
+
 @Database(
     entities = [
         Business::class,
@@ -154,9 +237,12 @@ val MIGRATION_11_12 = object : Migration(11, 12) {
         Expense::class,
         Supplier::class,
         PurchaseOrder::class,
-        PurchaseOrderLine::class
+        PurchaseOrderLine::class,
+        Refund::class,
+        RefundLine::class,
+        RefundPayment::class
     ],
-    version = 12,
+    version = 13,
     exportSchema = false
 )
 abstract class PosDatabase : RoomDatabase() {
@@ -171,6 +257,7 @@ abstract class PosDatabase : RoomDatabase() {
     abstract fun expenseDao(): ExpenseDao
     abstract fun supplierDao(): SupplierDao
     abstract fun purchaseOrderDao(): PurchaseOrderDao
+    abstract fun refundDao(): RefundDao
 
     companion object {
         @Volatile
@@ -192,7 +279,7 @@ abstract class PosDatabase : RoomDatabase() {
                     // net for any version with no path.
                     .addMigrations(
                         MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9,
-                        MIGRATION_9_10, MIGRATION_11_12
+                        MIGRATION_9_10, MIGRATION_11_12, MIGRATION_12_13
                     )
                     .fallbackToDestructiveMigration()
                     .build()

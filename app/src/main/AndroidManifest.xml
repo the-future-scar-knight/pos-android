@@ -18,6 +18,12 @@
     <!-- Camera for barcode scanning (CameraX + zxing). Optional hardware. -->
     <uses-permission android:name="android.permission.CAMERA" />
 
+    <!-- Call log: "recent callers" quick-add on the Customers screen (Phase 4).
+         Requested at runtime; the feature degrades to hidden if denied. The
+         contact/number picker used to fill a customer's details needs NO
+         permission (the system picker grants a one-shot read on the chosen row). -->
+    <uses-permission android:name="android.permission.READ_CALL_LOG" />
+
     <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
 

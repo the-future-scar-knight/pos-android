@@ -298,10 +298,15 @@ interface CreditDao {
     )
     fun observeBalances(businessId: String): Flow<List<BalanceRow>>
 
-    /** Change the shop still owes one customer: change_owed minus change_paid. */
+    /**
+     * Money the shop still owes one customer: change AND unpaid refunds. A refund
+     * that wasn't fully paid out at once ages here exactly like change owed
+     * (prompt §11), so `change_owed`/`refund_owed` add and `change_paid`/`refund_paid`
+     * subtract into one "we owe you" balance.
+     */
     @Query(
-        "SELECT COALESCE(SUM(CASE WHEN type = 'change_owed' THEN amount " +
-            "WHEN type = 'change_paid' THEN -amount ELSE 0 END), 0) " +
+        "SELECT COALESCE(SUM(CASE WHEN type IN ('change_owed', 'refund_owed') THEN amount " +
+            "WHEN type IN ('change_paid', 'refund_paid') THEN -amount ELSE 0 END), 0) " +
             "FROM credit_transactions WHERE customerId = :customerId AND deleted = 0"
     )
     fun observeChangeBalance(customerId: String): Flow<Double>
@@ -334,6 +339,100 @@ interface CreditDao {
 
     @Upsert
     suspend fun upsert(txn: CreditTxn)
+}
+
+@Dao
+interface RefundDao {
+    @Insert
+    suspend fun insert(refund: Refund)
+
+    @Insert
+    suspend fun insertLines(lines: List<RefundLine>)
+
+    @Insert
+    suspend fun insertPayment(payment: RefundPayment)
+
+    @Upsert
+    suspend fun upsert(refund: Refund)
+
+    /** Whole-shop refund history (newest first), each with its returned lines. */
+    @Transaction
+    @Query(
+        "SELECT * FROM refunds WHERE businessId = :businessId AND deleted = 0 " +
+            "ORDER BY createdAt DESC"
+    )
+    fun observeWithLines(businessId: String): Flow<List<RefundWithLines>>
+
+    /** Refunds already made against a given sale (to cap over-refunding in the UI). */
+    @Query("SELECT * FROM refunds WHERE saleId = :saleId AND deleted = 0 ORDER BY createdAt DESC")
+    fun observeForSale(saleId: String): Flow<List<Refund>>
+
+    @Query("SELECT * FROM refunds WHERE saleId = :saleId AND deleted = 0")
+    suspend fun forSaleOnce(saleId: String): List<Refund>
+
+    @Query("SELECT * FROM refunds WHERE id = :id LIMIT 1")
+    suspend fun getById(id: String): Refund?
+
+    @Query("SELECT * FROM refund_items WHERE refundId = :refundId")
+    suspend fun linesFor(refundId: String): List<RefundLine>
+
+    @Query("SELECT * FROM refund_payments WHERE refundId = :refundId ORDER BY createdAt ASC")
+    suspend fun paymentsFor(refundId: String): List<RefundPayment>
+
+    @Query("SELECT * FROM refund_payments WHERE refundId = :refundId ORDER BY createdAt ASC")
+    fun observePaymentsFor(refundId: String): Flow<List<RefundPayment>>
+
+    /** Money actually paid back so far on a refund. Outstanding = refundTotal − this. */
+    @Query("SELECT COALESCE(SUM(amount), 0) FROM refund_payments WHERE refundId = :refundId")
+    suspend fun paidSoFar(refundId: String): Double
+
+    /**
+     * Units of a given sale line already returned across every prior refund — lets
+     * the UI stop a cashier refunding more than were sold. Sums restocked and
+     * non-restocked returns alike (both reduce what's still refundable).
+     */
+    @Query(
+        "SELECT COALESCE(SUM(ri.qty), 0) FROM refund_items ri " +
+            "JOIN refunds r ON ri.refundId = r.id " +
+            "WHERE ri.saleLineId = :saleLineId AND r.deleted = 0"
+    )
+    suspend fun qtyReturnedForLine(saleLineId: String): Double
+
+    /** Reports: total refunded per method over a window (mirrors the sale tender breakdown). */
+    @Query(
+        "SELECT p.method AS method, COUNT(*) AS count, COALESCE(SUM(p.amount), 0) AS total " +
+            "FROM refund_payments p JOIN refunds r ON p.refundId = r.id " +
+            "WHERE r.businessId = :businessId AND r.deleted = 0 " +
+            "AND p.createdAt >= :from AND p.createdAt < :to " +
+            "GROUP BY p.method ORDER BY total DESC"
+    )
+    fun observeRefundBreakdown(businessId: String, from: Long, to: Long): Flow<List<MethodBreakdown>>
+
+    /** Total refunded (money paid back) over a window — for net-of-refunds reporting. */
+    @Query(
+        "SELECT COALESCE(SUM(p.amount), 0) FROM refund_payments p " +
+            "JOIN refunds r ON p.refundId = r.id " +
+            "WHERE r.businessId = :businessId AND r.deleted = 0 " +
+            "AND p.createdAt >= :from AND p.createdAt < :to"
+    )
+    fun observeRefundedSince(businessId: String, from: Long, to: Long): Flow<Double>
+
+    // ---- sync ----
+    @Query("SELECT * FROM refunds WHERE pendingSync = 1")
+    suspend fun pending(): List<Refund>
+
+    @Query("UPDATE refunds SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun markSynced(ids: List<String>)
+
+    // ---- danger zone: wipe all refund data for a business ----
+    @Query("DELETE FROM refunds WHERE businessId = :businessId")
+    suspend fun wipe(businessId: String)
+
+    @Query("DELETE FROM refund_items WHERE businessId = :businessId")
+    suspend fun wipeLines(businessId: String)
+
+    @Query("DELETE FROM refund_payments WHERE businessId = :businessId")
+    suspend fun wipePayments(businessId: String)
 }
 
 @Dao
