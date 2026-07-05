@@ -106,7 +106,9 @@ class PosRepository(private val db: PosDatabase) {
         businessId: String,
         customerId: String,
         amount: Double,
-        note: String? = null
+        note: String? = null,
+        cashierId: String? = null,
+        cashierName: String? = null
     ) {
         if (amount <= 0) return
         creditDao.insert(
@@ -115,7 +117,9 @@ class PosRepository(private val db: PosDatabase) {
                 customerId = customerId,
                 type = "credit_paid",
                 amount = amount,
-                note = note
+                note = note,
+                createdBy = cashierId,
+                createdByName = cashierName
             )
         )
     }
@@ -270,7 +274,9 @@ class PosRepository(private val db: PosDatabase) {
         changeAsCredit: Boolean = false,
         vatEnabled: Boolean = false,
         vatPercent: Double = 0.0,
-        totalRounding: Double = 0.0
+        totalRounding: Double = 0.0,
+        cashierId: String? = null,
+        cashierName: String? = null
     ): SaleWithLines {
         // Money math (pure + unit-tested in SaleMathTest): discount clamped to the
         // goods value, VAT charged on the DISCOUNTED base, total is tax-inclusive.
@@ -323,6 +329,8 @@ class PosRepository(private val db: PosDatabase) {
             customerId = customer?.id,
             customerName = customer?.name,
             soldAt = stamp,
+            createdBy = cashierId,
+            createdByName = cashierName,
             updatedAt = stamp,
             synced = false
         )
@@ -386,6 +394,8 @@ class PosRepository(private val db: PosDatabase) {
                         delta = -c.stockUnits,
                         balanceAfter = remaining,
                         note = "Sale #$receiptNo",
+                        createdBy = cashierId,
+                        createdByName = cashierName,
                         createdAt = stamp
                     )
                 )
@@ -399,6 +409,8 @@ class PosRepository(private val db: PosDatabase) {
                         saleId = saleId,
                         type = "credit_owed",
                         amount = owed,
+                        createdBy = cashierId,
+                        createdByName = cashierName,
                         createdAt = stamp,
                         updatedAt = stamp
                     )
@@ -413,6 +425,8 @@ class PosRepository(private val db: PosDatabase) {
                         saleId = saleId,
                         type = "change_owed",
                         amount = change,
+                        createdBy = cashierId,
+                        createdByName = cashierName,
                         createdAt = stamp,
                         updatedAt = stamp
                     )
@@ -440,7 +454,9 @@ class PosRepository(private val db: PosDatabase) {
         cart: List<CartLine>,
         discount: Double = 0.0,
         note: String? = null,
-        customer: Customer? = null
+        customer: Customer? = null,
+        cashierId: String? = null,
+        cashierName: String? = null
     ): String {
         val saleId = newId()
         val stamp = now()
@@ -457,6 +473,8 @@ class PosRepository(private val db: PosDatabase) {
             customerId = customer?.id,
             customerName = customer?.name,
             soldAt = stamp,
+            createdBy = cashierId,
+            createdByName = cashierName,
             updatedAt = stamp,
             synced = false
         )
@@ -528,7 +546,9 @@ class PosRepository(private val db: PosDatabase) {
         itemId: String,
         newQty: Double,
         type: String = "adjust",
-        note: String? = null
+        note: String? = null,
+        cashierId: String? = null,
+        cashierName: String? = null
     ) {
         val item = itemDao.getById(itemId) ?: return
         val stamp = now()
@@ -543,6 +563,8 @@ class PosRepository(private val db: PosDatabase) {
                     delta = delta,
                     balanceAfter = newQty,
                     note = note,
+                    createdBy = cashierId,
+                    createdByName = cashierName,
                     createdAt = stamp
                 )
             )
@@ -577,7 +599,9 @@ class PosRepository(private val db: PosDatabase) {
         businessId: String,
         customerId: String,
         amount: Double,
-        note: String? = null
+        note: String? = null,
+        cashierId: String? = null,
+        cashierName: String? = null
     ) {
         if (amount <= 0) return
         creditDao.insert(
@@ -586,7 +610,9 @@ class PosRepository(private val db: PosDatabase) {
                 customerId = customerId,
                 type = "change_paid",
                 amount = amount,
-                note = note
+                note = note,
+                createdBy = cashierId,
+                createdByName = cashierName
             )
         )
     }

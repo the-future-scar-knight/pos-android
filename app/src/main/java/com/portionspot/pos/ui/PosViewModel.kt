@@ -17,6 +17,7 @@ import com.portionspot.pos.data.PurchaseOrder
 import com.portionspot.pos.data.PurchaseOrderLine
 import com.portionspot.pos.data.PurchaseOrderWithLines
 import com.portionspot.pos.data.RefundLineInput
+import com.portionspot.pos.data.RefundPayment
 import com.portionspot.pos.data.RefundWithLines
 import com.portionspot.pos.data.SaleEntity
 import com.portionspot.pos.data.SaleLine
@@ -171,6 +172,15 @@ class PosViewModel(
                 repo.paymentBreakdownFlow(bid, from, to)
             }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Money refunded in the report window — subtract from gross for net takings. */
+    val reportRefunds: StateFlow<Double> =
+        combine(businessId.filterNotNull(), _reportRange) { bid, range -> bid to range }
+            .flatMapLatest { (bid, range) ->
+                val (from, to) = rangeBounds(range)
+                repo.refundedSinceFlow(bid, from, to)
+            }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0.0)
 
     fun setReportRange(range: ReportRange) { _reportRange.value = range }
 
@@ -433,7 +443,9 @@ class PosViewModel(
                 changeAsCredit = changeAsCredit,
                 vatEnabled = biz?.vatEnabled ?: false,
                 vatPercent = biz?.vatPercent ?: 0.0,
-                totalRounding = _shopPrefs.value.checkoutRounding
+                totalRounding = _shopPrefs.value.checkoutRounding,
+                cashierId = currentCashierId,
+                cashierName = currentCashierName
             )
             _lastReceipt.value = LastReceipt(saved.sale, saved.lines)
             _cart.value = emptyList()
@@ -469,7 +481,10 @@ class PosViewModel(
         val lines = _cart.value
         if (lines.isEmpty()) return
         viewModelScope.launch {
-            repo.parkSale(bid, lines, note = note, customer = customer)
+            repo.parkSale(
+                bid, lines, note = note, customer = customer,
+                cashierId = currentCashierId, cashierName = currentCashierName
+            )
             _cart.value = emptyList()
         }
     }
@@ -553,7 +568,9 @@ class PosViewModel(
 
     /** Set an item's on-hand to [newQty], logging the change ("adjust"/"restock"). */
     fun adjustStock(itemId: String, newQty: Double, type: String = "adjust", note: String? = null) {
-        viewModelScope.launch { repo.adjustStock(itemId, newQty, type, note) }
+        viewModelScope.launch {
+            repo.adjustStock(itemId, newQty, type, note, currentCashierId, currentCashierName)
+        }
     }
 
     // ---- Danger zone ------------------------------------------------------
@@ -605,7 +622,9 @@ class PosViewModel(
     fun recordRepayment(customerId: String, amount: Double, note: String? = null) {
         val bid = businessId.value ?: return
         if (amount <= 0) return
-        viewModelScope.launch { repo.recordRepayment(bid, customerId, amount, note) }
+        viewModelScope.launch {
+            repo.recordRepayment(bid, customerId, amount, note, currentCashierId, currentCashierName)
+        }
     }
 
     fun balanceFlow(customerId: String): Flow<Double> = repo.balanceFlow(customerId)
@@ -617,7 +636,9 @@ class PosViewModel(
     fun recordChangePayment(customerId: String, amount: Double, note: String? = null) {
         val bid = businessId.value ?: return
         if (amount <= 0) return
-        viewModelScope.launch { repo.recordChangePayment(bid, customerId, amount, note) }
+        viewModelScope.launch {
+            repo.recordChangePayment(bid, customerId, amount, note, currentCashierId, currentCashierName)
+        }
     }
 
     fun creditHistory(customerId: String): Flow<List<CreditTxn>> =
@@ -634,6 +655,10 @@ class PosViewModel(
     /** Units of a sale line already returned across prior refunds (refundable cap). */
     suspend fun qtyReturnedForLine(saleLineId: String): Double =
         repo.qtyReturnedForLine(saleLineId)
+
+    /** Payout rows for a refund — used to print a refund receipt. */
+    suspend fun refundPayments(refundId: String): List<RefundPayment> =
+        repo.refundPaymentsFor(refundId)
 
     /**
      * Issue a refund against [sale]. [returns] are the chosen lines/quantities; [payout]

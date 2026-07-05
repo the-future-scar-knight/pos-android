@@ -151,7 +151,9 @@ import com.portionspot.pos.data.MethodBreakdown
 import com.portionspot.pos.data.PurchaseOrderLine
 import com.portionspot.pos.data.PurchaseOrderWithLines
 import com.portionspot.pos.data.Refund
+import com.portionspot.pos.data.RefundLine
 import com.portionspot.pos.data.RefundLineInput
+import com.portionspot.pos.data.RefundPayment
 import com.portionspot.pos.data.RefundWithLines
 import com.portionspot.pos.data.computeRefundTotal
 import com.portionspot.pos.data.SaleEntity
@@ -300,6 +302,22 @@ private class PrinterUi(
             }
         }
 
+    fun printRefund(
+        business: Business,
+        refund: Refund,
+        lines: List<RefundLine>,
+        loadPayments: suspend () -> List<RefundPayment>
+    ) = withPrinterReady {
+        scope.launch {
+            toast("Printing…")
+            val r = ReceiptPrinter.printRefund(context, business, refund, lines, loadPayments(), style(), useSunmi())
+            when (r) {
+                is PrintResult.Success -> toast("Printed")
+                is PrintResult.Error -> toast("Print failed: ${r.message}")
+            }
+        }
+    }
+
     fun test(business: Business) = withPrinterReady {
         scope.launch {
             when (val r = ReceiptPrinter.testPrint(context, business, useSunmi())) {
@@ -373,7 +391,7 @@ fun AppRoot(vm: PosViewModel) {
                     Screen.Purchases -> PurchaseOrdersScreen(vm, currency)
                     Screen.Reports -> ReportsScreen(vm, business!!)
                     Screen.Receipts -> ReceiptsScreen(vm, business!!, printer)
-                    Screen.Refunds -> RefundsScreen(vm, business!!)
+                    Screen.Refunds -> RefundsScreen(vm, business!!, printer)
                     Screen.Sync -> SyncScreen(vm)
                     Screen.Settings -> SettingsScreen(vm, business!!, printer)
                 }
@@ -4391,6 +4409,7 @@ private fun ReportsScreen(vm: PosViewModel, business: Business) {
     val range by vm.reportRange.collectAsState()
     val summary by vm.reportSummary.collectAsState()
     val breakdown by vm.reportBreakdown.collectAsState()
+    val refunds by vm.reportRefunds.collectAsState()
 
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp)
@@ -4447,6 +4466,11 @@ private fun ReportsScreen(vm: PosViewModel, business: Business) {
                     )
                 }
                 ReportStatRow("Discounts given", money(summary.discount, currency))
+                if (refunds > 0.0) {
+                    ReportStatRow("Refunds paid", "-${money(refunds, currency)}")
+                    HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                    ReportStatRow("Net sales", money(summary.gross - refunds, currency))
+                }
                 if (summary.count > 0) {
                     ReportStatRow("Average sale", money(summary.gross / summary.count, currency))
                 }
@@ -4778,7 +4802,7 @@ private fun RefundDialog(
 
 /** Refund history (immutable ledger). Owed refunds get a "Record payout" action. */
 @Composable
-private fun RefundsScreen(vm: PosViewModel, business: Business) {
+private fun RefundsScreen(vm: PosViewModel, business: Business, printer: PrinterUi) {
     val currency = business.currency
     val refunds by vm.refunds.collectAsState()
     var payoutFor by remember { mutableStateOf<Refund?>(null) }
@@ -4818,6 +4842,11 @@ private fun RefundsScreen(vm: PosViewModel, business: Business) {
                                     style = MaterialTheme.typography.bodySmall,
                                     color = if (owed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.outline
                                 )
+                            }
+                            IconButton(onClick = {
+                                printer.printRefund(business, r, rw.lines) { vm.refundPayments(r.id) }
+                            }) {
+                                Icon(Icons.Filled.Print, contentDescription = "Print refund")
                             }
                         }
                         val retLines = rw.lines
