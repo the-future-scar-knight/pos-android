@@ -7,6 +7,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.LaunchedEffect
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.portionspot.pos.auth.AuthGate
 import com.portionspot.pos.ui.AppRoot
@@ -46,7 +47,10 @@ class MainActivity : ComponentActivity() {
             PosTheme(theme = theme) {
                 // Everything sits behind auth: login (online), PIN unlock (offline),
                 // then the POS. Roles ride in on PosUser for later admin screens.
-                AuthGate(container.authManager) { _ ->
+                AuthGate(container.authManager) { user ->
+                    // Push the signed-in cashier into the ViewModel so financial
+                    // writes (refunds now; the rest as Phase 2 continues) are attributed.
+                    LaunchedEffect(user.id) { vm.setCurrentCashier(user.id, user.displayName) }
                     AppRoot(vm)
                 }
             }

@@ -47,6 +47,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.automirrored.filled.Assignment
+import androidx.compose.material.icons.filled.AssignmentReturn
 import androidx.compose.material.icons.filled.BarChart
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CloudDone
@@ -100,6 +101,7 @@ import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -148,6 +150,10 @@ import com.portionspot.pos.data.Item
 import com.portionspot.pos.data.MethodBreakdown
 import com.portionspot.pos.data.PurchaseOrderLine
 import com.portionspot.pos.data.PurchaseOrderWithLines
+import com.portionspot.pos.data.Refund
+import com.portionspot.pos.data.RefundLineInput
+import com.portionspot.pos.data.RefundWithLines
+import com.portionspot.pos.data.computeRefundTotal
 import com.portionspot.pos.data.SaleEntity
 import com.portionspot.pos.data.SaleLine
 import com.portionspot.pos.data.SalesSummary
@@ -192,6 +198,7 @@ private enum class Screen(val label: String, val short: String) {
     Suppliers("Suppliers", "Suppliers"),
     Purchases("Purchase Orders", "POs"),
     Receipts("Receipts", "Receipts"),
+    Refunds("Refunds", "Refunds"),
     Settings("Settings", "Settings"),
 }
 
@@ -200,7 +207,8 @@ private val PINNED_SCREENS = listOf(Screen.Sell, Screen.Reports, Screen.Sync, Sc
 private val OVERFLOW_SCREENS =
     listOf(
         Screen.Dashboard, Screen.Customers, Screen.Credit,
-        Screen.Expenses, Screen.Suppliers, Screen.Purchases, Screen.Receipts, Screen.Settings
+        Screen.Expenses, Screen.Suppliers, Screen.Purchases, Screen.Receipts,
+        Screen.Refunds, Screen.Settings
     )
 
 private fun screenIcon(s: Screen): androidx.compose.ui.graphics.vector.ImageVector = when (s) {
@@ -215,6 +223,7 @@ private fun screenIcon(s: Screen): androidx.compose.ui.graphics.vector.ImageVect
     Screen.Suppliers -> Icons.Filled.LocalShipping
     Screen.Purchases -> Icons.AutoMirrored.Filled.Assignment
     Screen.Receipts -> Icons.AutoMirrored.Filled.ReceiptLong
+    Screen.Refunds -> Icons.Filled.AssignmentReturn
     Screen.Settings -> Icons.Filled.Settings
 }
 
@@ -364,6 +373,7 @@ fun AppRoot(vm: PosViewModel) {
                     Screen.Purchases -> PurchaseOrdersScreen(vm, currency)
                     Screen.Reports -> ReportsScreen(vm, business!!)
                     Screen.Receipts -> ReceiptsScreen(vm, business!!, printer)
+                    Screen.Refunds -> RefundsScreen(vm, business!!)
                     Screen.Sync -> SyncScreen(vm)
                     Screen.Settings -> SettingsScreen(vm, business!!, printer)
                 }
@@ -4501,6 +4511,7 @@ private fun ReceiptsScreen(vm: PosViewModel, business: Business, printer: Printe
     val sales by vm.recentSales.collectAsState()
     val takings by vm.todayTakings.collectAsState()
     val countToday by vm.todayCount.collectAsState()
+    var refundFor by remember { mutableStateOf<SaleEntity?>(null) }
 
     Column(Modifier.fillMaxSize()) {
         Card(
@@ -4536,12 +4547,364 @@ private fun ReceiptsScreen(vm: PosViewModel, business: Business, printer: Printe
                         }) {
                             Icon(Icons.Filled.Print, contentDescription = "Reprint")
                         }
+                        IconButton(onClick = { refundFor = sale }) {
+                            Icon(Icons.Filled.AssignmentReturn, contentDescription = "Refund")
+                        }
                     }
                     HorizontalDivider()
                 }
             }
         }
     }
+
+    refundFor?.let { sale ->
+        RefundDialog(vm, business, sale, onDismiss = { refundFor = null })
+    }
+}
+
+// ───────────────────────── REFUNDS ─────────────────────────
+
+/** Human age for a timestamp ("3d ago"). Used in the refunds ledger. */
+private fun agoText(epoch: Long): String {
+    val mins = (System.currentTimeMillis() - epoch) / 60000
+    val hrs = mins / 60
+    val days = hrs / 24
+    return when {
+        mins < 1 -> "just now"
+        mins < 60 -> "${mins}m ago"
+        hrs < 24 -> "${hrs}h ago"
+        days < 30 -> "${days}d ago"
+        else -> "${days / 30}mo ago"
+    }
+}
+
+/** Whole numbers print without a trailing ".0" (qty steppers, ledger lines). */
+private fun fmtQty(n: Double): String =
+    if (n == n.toLong().toDouble()) n.toLong().toString() else String.format("%.2f", n)
+
+private fun refundMethodLabel(code: String): String = when (code) {
+    "cash" -> "Cash"
+    "ecocash" -> "EcoCash"
+    "innbucks" -> "InnBucks"
+    "onemoney" -> "OneMoney"
+    "omari" -> "O'mari"
+    "card" -> "Card"
+    "bank" -> "Bank"
+    "paynow" -> "Paynow"
+    "store_credit" -> "Store credit"
+    else -> code.replaceFirstChar { it.uppercase() }
+}
+
+private val REFUND_METHODS = listOf("cash", "ecocash", "innbucks", "card", "bank", "store_credit")
+
+/**
+ * Cashier refund flow (prompt §11): pick returned lines/quantities, toggle restock
+ * per line, choose the payout method and how much goes back now. The refund total is
+ * proportional to what was paid (discount + VAT carried). Any shortfall is owed to the
+ * customer and ages in Change & Credit — walk-ins must be paid in full.
+ */
+@Composable
+private fun RefundDialog(
+    vm: PosViewModel,
+    business: Business,
+    sale: SaleEntity,
+    onDismiss: () -> Unit
+) {
+    val currency = business.currency
+    val context = LocalContext.current
+    var lines by remember(sale.id) { mutableStateOf<List<SaleLine>?>(null) }
+    val returnQty = remember(sale.id) { mutableStateMapOf<String, Double>() }
+    val restock = remember(sale.id) { mutableStateMapOf<String, Boolean>() }
+    val alreadyReturned = remember(sale.id) { mutableStateMapOf<String, Double>() }
+    var reason by remember(sale.id) { mutableStateOf("") }
+    var payoutMethod by remember(sale.id) { mutableStateOf("cash") }
+    var payoutText by remember(sale.id) { mutableStateOf("") }
+    var methodOpen by remember { mutableStateOf(false) }
+    var submitting by remember { mutableStateOf(false) }
+
+    LaunchedEffect(sale.id) {
+        val loaded = vm.loadLines(sale.id)
+        loaded.forEach { l ->
+            restock[l.id] = true
+            returnQty[l.id] = 0.0
+            alreadyReturned[l.id] = vm.qtyReturnedForLine(l.id)
+        }
+        lines = loaded
+    }
+
+    val ls = lines
+    val returnedSubtotal = ls?.sumOf { (returnQty[it.id] ?: 0.0) * it.unitPrice } ?: 0.0
+    val refundTotal = computeRefundTotal(returnedSubtotal, sale.subtotal, sale.total).refundTotal
+    val payoutNow = (payoutText.toDoubleOrNull() ?: refundTotal).coerceIn(0.0, refundTotal)
+    val outstanding = (refundTotal - payoutNow).coerceAtLeast(0.0)
+    val canOwe = sale.customerId != null
+    val payoutOk = canOwe || outstanding <= 0.005
+    val confirmEnabled = refundTotal > 0.0 && payoutOk && !submitting
+
+    AlertDialog(
+        onDismissRequest = { if (!submitting) onDismiss() },
+        title = { Text("Refund #${sale.receiptNo ?: sale.id.takeLast(6).uppercase()}") },
+        text = {
+            Column(
+                Modifier.fillMaxWidth().heightIn(max = 460.dp).verticalScroll(rememberScrollState())
+            ) {
+                if (ls == null) {
+                    Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator()
+                    }
+                } else {
+                    Text(
+                        "Choose what's coming back. The refund is proportional to what was paid.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.outline
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    ls.forEach { line ->
+                        val already = alreadyReturned[line.id] ?: 0.0
+                        val maxReturn = (line.qty - already).coerceAtLeast(0.0)
+                        val qty = returnQty[line.id] ?: 0.0
+                        Column(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+                            Text(line.name, fontWeight = FontWeight.Medium)
+                            Text(
+                                "Sold ${fmtQty(line.qty)} @ ${money(line.unitPrice, currency)}" +
+                                    if (already > 0) " · ${fmtQty(already)} already returned" else "",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.outline
+                            )
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                IconButton(
+                                    enabled = qty > 0.0,
+                                    onClick = { returnQty[line.id] = (qty - 1).coerceAtLeast(0.0) }
+                                ) { Icon(Icons.Filled.Remove, contentDescription = "Less") }
+                                Text(
+                                    fmtQty(qty),
+                                    Modifier.widthIn(min = 28.dp),
+                                    textAlign = TextAlign.Center
+                                )
+                                IconButton(
+                                    enabled = qty < maxReturn,
+                                    onClick = { returnQty[line.id] = (qty + 1).coerceAtMost(maxReturn) }
+                                ) { Icon(Icons.Filled.Add, contentDescription = "More") }
+                                Spacer(Modifier.weight(1f))
+                                Text("Restock", style = MaterialTheme.typography.bodySmall)
+                                Spacer(Modifier.width(6.dp))
+                                Switch(
+                                    checked = restock[line.id] ?: true,
+                                    onCheckedChange = { restock[line.id] = it }
+                                )
+                            }
+                        }
+                        HorizontalDivider()
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("Refund total", fontWeight = FontWeight.Medium)
+                        Text(money(refundTotal, currency), fontWeight = FontWeight.Bold)
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Box {
+                        OutlinedButton(onClick = { methodOpen = true }) {
+                            Text("Refund via: ${refundMethodLabel(payoutMethod)}")
+                        }
+                        DropdownMenu(expanded = methodOpen, onDismissRequest = { methodOpen = false }) {
+                            REFUND_METHODS.forEach { m ->
+                                DropdownMenuItem(
+                                    text = { Text(refundMethodLabel(m)) },
+                                    onClick = { payoutMethod = m; methodOpen = false }
+                                )
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = payoutText,
+                        onValueChange = { payoutText = it },
+                        label = { Text("Paying back now") },
+                        placeholder = { Text(money(refundTotal, currency)) },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    if (outstanding > 0.005) {
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            if (canOwe)
+                                "Owed to ${sale.customerName ?: "customer"}: ${money(outstanding, currency)} — tracked in Change & Credit"
+                            else
+                                "Walk-in refund must be paid in full (${money(refundTotal, currency)}). Leave the amount blank to pay it all now.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (canOwe) MaterialTheme.colorScheme.outline else MaterialTheme.colorScheme.error
+                        )
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = reason,
+                        onValueChange = { reason = it },
+                        label = { Text("Reason (optional)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                enabled = confirmEnabled,
+                onClick = {
+                    val src = ls ?: return@Button
+                    submitting = true
+                    val returns = src.mapNotNull { line ->
+                        val q = returnQty[line.id] ?: 0.0
+                        if (q <= 0.0) null
+                        else RefundLineInput(
+                            saleLine = line,
+                            qtyReturned = q,
+                            restock = restock[line.id] ?: true
+                        )
+                    }
+                    val payout = if (payoutNow > 0.0) Tender(method = payoutMethod, amount = payoutNow) else null
+                    vm.createRefund(sale, returns, payout, reason.ifBlank { null }) {
+                        Toast.makeText(context, "Refund recorded", Toast.LENGTH_SHORT).show()
+                        onDismiss()
+                    }
+                }
+            ) { Text("Refund " + money(refundTotal, currency)) }
+        },
+        dismissButton = {
+            TextButton(enabled = !submitting, onClick = onDismiss) { Text("Cancel") }
+        }
+    )
+}
+
+/** Refund history (immutable ledger). Owed refunds get a "Record payout" action. */
+@Composable
+private fun RefundsScreen(vm: PosViewModel, business: Business) {
+    val currency = business.currency
+    val refunds by vm.refunds.collectAsState()
+    var payoutFor by remember { mutableStateOf<Refund?>(null) }
+
+    Column(Modifier.fillMaxSize()) {
+        if (refunds.isEmpty()) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("No refunds yet", color = MaterialTheme.colorScheme.outline)
+            }
+        } else {
+            LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(12.dp)) {
+                items(refunds, key = { it.refund.id }) { rw ->
+                    val r = rw.refund
+                    Column(Modifier.fillMaxWidth().padding(vertical = 10.dp)) {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    "Refund on #${r.saleReceiptNo ?: r.saleId.takeLast(6).uppercase()}",
+                                    fontWeight = FontWeight.Medium
+                                )
+                                Text(
+                                    (r.customerName ?: "Walk-in") + (r.createdByName?.let { " · by $it" } ?: ""),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.outline
+                                )
+                                Text(
+                                    agoText(r.createdAt),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.outline
+                                )
+                            }
+                            Column(horizontalAlignment = Alignment.End) {
+                                Text(money(r.refundTotal, currency), fontWeight = FontWeight.Bold)
+                                val owed = r.status == "owed"
+                                Text(
+                                    if (owed) "Balance owed" else "Settled",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = if (owed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.outline
+                                )
+                            }
+                        }
+                        val retLines = rw.lines
+                        if (retLines.isNotEmpty()) {
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                retLines.joinToString(", ") { "${fmtQty(it.qty)}× ${it.name}" },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.outline
+                            )
+                        }
+                        if (r.status == "owed") {
+                            Spacer(Modifier.height(6.dp))
+                            OutlinedButton(onClick = { payoutFor = r }) { Text("Record payout") }
+                        }
+                    }
+                    HorizontalDivider()
+                }
+            }
+        }
+    }
+
+    payoutFor?.let { r ->
+        RefundPayoutDialog(vm, business, r, onDismiss = { payoutFor = null })
+    }
+}
+
+/** Pay off part/all of a refund the shop still owes a customer (prompt §11). */
+@Composable
+private fun RefundPayoutDialog(
+    vm: PosViewModel,
+    business: Business,
+    refund: Refund,
+    onDismiss: () -> Unit
+) {
+    val currency = business.currency
+    val context = LocalContext.current
+    var amountText by remember(refund.id) { mutableStateOf("") }
+    var method by remember(refund.id) { mutableStateOf("cash") }
+    var methodOpen by remember { mutableStateOf(false) }
+    val amount = amountText.toDoubleOrNull() ?: 0.0
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Record refund payout") },
+        text = {
+            Column(Modifier.fillMaxWidth()) {
+                Text(
+                    "Refund on #${refund.saleReceiptNo ?: refund.saleId.takeLast(6).uppercase()} — total ${money(refund.refundTotal, currency)}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.outline
+                )
+                Spacer(Modifier.height(8.dp))
+                Box {
+                    OutlinedButton(onClick = { methodOpen = true }) {
+                        Text("Via: ${refundMethodLabel(method)}")
+                    }
+                    DropdownMenu(expanded = methodOpen, onDismissRequest = { methodOpen = false }) {
+                        REFUND_METHODS.forEach { m ->
+                            DropdownMenuItem(
+                                text = { Text(refundMethodLabel(m)) },
+                                onClick = { method = m; methodOpen = false }
+                            )
+                        }
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = amountText,
+                    onValueChange = { amountText = it },
+                    label = { Text("Amount handed back") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            Button(enabled = amount > 0.0, onClick = {
+                vm.recordRefundPayout(refund.id, Tender(method = method, amount = amount)) {
+                    Toast.makeText(context, "Payout recorded", Toast.LENGTH_SHORT).show()
+                    onDismiss()
+                }
+            }) { Text("Record") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
 }
 
 // ───────────────────────── SETTINGS ─────────────────────────

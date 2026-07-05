@@ -16,6 +16,8 @@ import com.portionspot.pos.data.PosRepository
 import com.portionspot.pos.data.PurchaseOrder
 import com.portionspot.pos.data.PurchaseOrderLine
 import com.portionspot.pos.data.PurchaseOrderWithLines
+import com.portionspot.pos.data.RefundLineInput
+import com.portionspot.pos.data.RefundWithLines
 import com.portionspot.pos.data.SaleEntity
 import com.portionspot.pos.data.SaleLine
 import com.portionspot.pos.data.SalesSummary
@@ -78,6 +80,15 @@ class PosViewModel(
 ) : ViewModel() {
 
     private val businessId = MutableStateFlow<String?>(null)
+
+    // The signed-in cashier, pushed in from AuthGate (see MainActivity). Stamped onto
+    // refunds now, and onto the other financial writes as Phase-2 wiring continues.
+    private var currentCashierId: String? = null
+    private var currentCashierName: String? = null
+    fun setCurrentCashier(id: String?, name: String?) {
+        currentCashierId = id
+        currentCashierName = name
+    }
 
     val business: StateFlow<Business?> =
         repo.businessFlow.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
@@ -611,6 +622,57 @@ class PosViewModel(
 
     fun creditHistory(customerId: String): Flow<List<CreditTxn>> =
         repo.creditHistoryFlow(customerId)
+
+    // ---- Refunds & returns (prompt §11) ----------------------------------
+
+    /** Whole-shop refund history (newest first), each with its returned lines. */
+    val refunds: StateFlow<List<RefundWithLines>> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.refundsFlow(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Units of a sale line already returned across prior refunds (refundable cap). */
+    suspend fun qtyReturnedForLine(saleLineId: String): Double =
+        repo.qtyReturnedForLine(saleLineId)
+
+    /**
+     * Issue a refund against [sale]. [returns] are the chosen lines/quantities; [payout]
+     * is the money handed back now (null or a short amount ⇒ the remainder is owed and
+     * ages in Change & Credit). The owed-tracking customer is resolved from the sale.
+     */
+    fun createRefund(
+        sale: SaleEntity,
+        returns: List<RefundLineInput>,
+        payout: Tender?,
+        reason: String?,
+        onDone: () -> Unit = {}
+    ) {
+        val bid = businessId.value ?: return
+        if (returns.isEmpty()) return
+        viewModelScope.launch {
+            val customer = sale.customerId?.let { repo.customerById(it) }
+            repo.createRefund(
+                businessId = bid,
+                sale = sale,
+                lines = returns,
+                payouts = payout?.let { listOf(it) } ?: emptyList(),
+                reason = reason,
+                customer = customer,
+                cashierId = currentCashierId,
+                cashierName = currentCashierName
+            )
+            onDone()
+        }
+    }
+
+    /** Pay off part/all of a refund the shop still owes (writes a payout + refund_paid). */
+    fun recordRefundPayout(refundId: String, tender: Tender, onDone: () -> Unit = {}) {
+        if (tender.amount <= 0) return
+        viewModelScope.launch {
+            repo.recordRefundPayout(refundId, tender, currentCashierId, currentCashierName)
+            onDone()
+        }
+    }
 
     // ---- Expenses ---------------------------------------------------------
 

@@ -98,6 +98,9 @@ class PosRepository(private val db: PosDatabase) {
     suspend fun saveCustomer(customer: Customer) =
         customerDao.upsert(customer.copy(updatedAt = now(), pendingSync = true))
 
+    /** One customer by id (e.g. to resolve the owed-refund target from a sale). */
+    suspend fun customerById(id: String): Customer? = customerDao.getById(id)
+
     /** Record a repayment against a customer's account (writes a credit_paid row). */
     suspend fun recordRepayment(
         businessId: String,
