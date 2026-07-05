@@ -3,6 +3,9 @@ package com.portionspot.pos.data
 import androidx.room.withTransaction
 import kotlinx.coroutines.flow.Flow
 
+/** Half-a-cent tolerance for money comparisons (guards Double rounding on totals). */
+private const val CENT = 0.005
+
 /**
  * The single gateway between the UI and Room. (Supabase sync will be added
  * here in a later milestone — push dirty rows where updatedAt > cursor.)
@@ -20,6 +23,7 @@ class PosRepository(private val db: PosDatabase) {
     private val expenseDao = db.expenseDao()
     private val supplierDao = db.supplierDao()
     private val poDao = db.purchaseOrderDao()
+    private val refundDao = db.refundDao()
 
     // ---- Local key/value settings (theme, etc. — never synced) -------------
 
@@ -548,12 +552,15 @@ class PosRepository(private val db: PosDatabase) {
     suspend fun resetAllStock(businessId: String) =
         itemDao.resetAllStock(businessId, now())
 
-    /** Wipe all sales history: receipts, their lines and their tenders. */
+    /** Wipe all sales history: receipts, their lines, their tenders and refunds. */
     suspend fun wipeSalesData(businessId: String) {
         db.withTransaction {
             saleDao.wipeSaleLines(businessId)
             saleDao.wipeSales(businessId)
             paymentDao.wipe(businessId)
+            refundDao.wipePayments(businessId)
+            refundDao.wipeLines(businessId)
+            refundDao.wipe(businessId)
         }
     }
 
@@ -579,6 +586,224 @@ class PosRepository(private val db: PosDatabase) {
                 note = note
             )
         )
+    }
+
+    // ---- refunds & returns (prompt §11) ----------------------------------
+
+    /** Whole-shop refund history (newest first), each with its returned lines. */
+    fun refundsFlow(businessId: String): Flow<List<RefundWithLines>> =
+        refundDao.observeWithLines(businessId)
+
+    /** Refunds already made against a given sale (UI caps over-refunding). */
+    fun refundsForSaleFlow(saleId: String): Flow<List<Refund>> =
+        refundDao.observeForSale(saleId)
+
+    /** Refund tender breakdown over a window (mirrors the sale tender breakdown). */
+    fun refundBreakdownFlow(businessId: String, from: Long, to: Long): Flow<List<MethodBreakdown>> =
+        refundDao.observeRefundBreakdown(businessId, from, to)
+
+    /** Money refunded over a window — subtract from gross for net takings. */
+    fun refundedSinceFlow(businessId: String, from: Long, to: Long): Flow<Double> =
+        refundDao.observeRefundedSince(businessId, from, to)
+
+    suspend fun refundPaymentsFor(refundId: String): List<RefundPayment> =
+        refundDao.paymentsFor(refundId)
+
+    /** Units of a sale line already returned across prior refunds (refundable cap). */
+    suspend fun qtyReturnedForLine(saleLineId: String): Double =
+        refundDao.qtyReturnedForLine(saleLineId)
+
+    /**
+     * Issue a refund against a completed sale (prompt §11). Cashier-performed and
+     * offline-first. Everything commits in ONE transaction so a crash can't restock
+     * without recording the refund (or book money owed without the goods movement):
+     *
+     *  - Writes the immutable [Refund] header + its returned [RefundLine]s. The
+     *    original sale is never edited — this is a reversal linked back to it.
+     *  - [refundTotal] is computed proportionally from the sale (carries discount +
+     *    VAT — see [computeRefundTotal]); the multiplier is applied exactly once.
+     *  - Restocks each returned line that is [RefundLineInput.restock] and tracked,
+     *    with a `return` [StockMovement] (damaged goods are refunded but not restocked).
+     *  - [payouts] is the money handed back NOW (may be empty, partial, or split);
+     *    each becomes a [RefundPayment] row carrying its method/currency/time.
+     *  - Any shortfall (refundTotal − paid-now) is booked as a `refund_owed` credit
+     *    row when a [customer] is set, so it ages in Change & Credit like change owed.
+     *    A walk-in (no customer) can't carry a balance — pay such refunds in full.
+     *
+     * Returns the saved [Refund]. [cashierId]/[cashierName] stamp attribution.
+     */
+    suspend fun createRefund(
+        businessId: String,
+        sale: SaleEntity,
+        lines: List<RefundLineInput>,
+        payouts: List<Tender> = emptyList(),
+        reason: String? = null,
+        customer: Customer? = null,
+        cashierId: String? = null,
+        cashierName: String? = null
+    ): Refund {
+        val stamp = now()
+        val refundId = newId()
+
+        // Returned goods' pre-adjustment value; ratio folds in the sale's discount+VAT.
+        val returnedSubtotal = lines.sumOf { it.saleLine.unitPrice * it.qtyReturned }
+        val refundTotal = computeRefundTotal(returnedSubtotal, sale.subtotal, sale.total).refundTotal
+
+        val paidNow = payouts.filter { it.amount != 0.0 }.sumOf { it.amount }
+        val outstanding = (refundTotal - paidNow).coerceAtLeast(0.0)
+        // A balance can only be tracked/aged against a known customer (like change_owed).
+        val owedToCustomer = outstanding > CENT && customer != null
+        val status = if (outstanding <= CENT) "settled" else "owed"
+
+        val refund = Refund(
+            id = refundId,
+            businessId = businessId,
+            saleId = sale.id,
+            saleReceiptNo = sale.receiptNo,
+            customerId = customer?.id,
+            customerName = customer?.name,
+            reason = reason,
+            refundTotal = refundTotal,
+            status = status,
+            createdBy = cashierId,
+            createdByName = cashierName,
+            createdAt = stamp,
+            updatedAt = stamp
+        )
+        val refundLines = lines.map { inp ->
+            RefundLine(
+                refundId = refundId,
+                businessId = businessId,
+                saleLineId = inp.saleLine.id,
+                itemId = inp.saleLine.itemId,
+                name = inp.saleLine.name,
+                qty = inp.qtyReturned,
+                unitPrice = inp.saleLine.unitPrice,
+                lineTotal = inp.saleLine.unitPrice * inp.qtyReturned,
+                mode = inp.saleLine.mode,
+                unitsPerLine = inp.saleLine.unitsPerLine,
+                restock = inp.restock,
+                createdAt = stamp
+            )
+        }
+        val payoutRows = payouts.filter { it.amount != 0.0 }.map { t ->
+            RefundPayment(
+                refundId = refundId,
+                businessId = businessId,
+                method = t.method,
+                amount = t.amount,
+                reference = t.reference?.takeIf { it.isNotBlank() },
+                tenderCurrency = t.currency,
+                tenderAmount = t.tenderAmount,
+                rate = t.rate,
+                createdBy = cashierId,
+                createdByName = cashierName,
+                createdAt = stamp
+            )
+        }
+        db.withTransaction {
+            refundDao.insert(refund)
+            if (refundLines.isNotEmpty()) refundDao.insertLines(refundLines)
+            payoutRows.forEach { refundDao.insertPayment(it) }
+            // Put returned goods back on the shelf (unless damaged). Box lines return
+            // qty * unitsPerLine stock units — the multiplier applied once, same as
+            // the checkout draw-down, only with the opposite sign.
+            for (inp in lines) {
+                if (!inp.restock) continue
+                val item = inp.saleLine.itemId?.let { itemDao.getById(it) } ?: continue
+                if (!item.trackStock) continue
+                val units = inp.qtyReturned * inp.saleLine.unitsPerLine
+                if (units <= 0.0) continue
+                val newQty = item.stockQty + units
+                itemDao.upsert(item.copy(stockQty = newQty, updatedAt = stamp, pendingSync = true))
+                movementDao.insert(
+                    StockMovement(
+                        businessId = businessId,
+                        itemId = item.id,
+                        type = "return",
+                        delta = units,
+                        balanceAfter = newQty,
+                        note = "Refund on #${sale.receiptNo ?: sale.id.take(8)}",
+                        createdBy = cashierId,
+                        createdByName = cashierName,
+                        createdAt = stamp
+                    )
+                )
+            }
+            // Money still owed to the customer after the immediate payout → ageable row.
+            if (owedToCustomer) {
+                creditDao.insert(
+                    CreditTxn(
+                        businessId = businessId,
+                        customerId = customer!!.id,
+                        saleId = sale.id,
+                        type = "refund_owed",
+                        amount = outstanding,
+                        note = "Refund on #${sale.receiptNo ?: ""}".trim(),
+                        createdBy = cashierId,
+                        createdByName = cashierName,
+                        createdAt = stamp,
+                        updatedAt = stamp
+                    )
+                )
+            }
+        }
+        return refund
+    }
+
+    /**
+     * Pay off part or all of a refund the shop still owes a customer (prompt §11 —
+     * "money over time, like change"). Writes a [RefundPayment] (records the method)
+     * plus a `refund_paid` credit row that reduces the aged "we owe you" balance, and
+     * flips the refund to `settled` once fully paid. Mirrors [recordChangePayment].
+     */
+    suspend fun recordRefundPayout(
+        refundId: String,
+        tender: Tender,
+        cashierId: String? = null,
+        cashierName: String? = null
+    ) {
+        if (tender.amount <= 0.0) return
+        val refund = refundDao.getById(refundId) ?: return
+        val stamp = now()
+        db.withTransaction {
+            refundDao.insertPayment(
+                RefundPayment(
+                    refundId = refundId,
+                    businessId = refund.businessId,
+                    method = tender.method,
+                    amount = tender.amount,
+                    reference = tender.reference?.takeIf { it.isNotBlank() },
+                    tenderCurrency = tender.currency,
+                    tenderAmount = tender.tenderAmount,
+                    rate = tender.rate,
+                    createdBy = cashierId,
+                    createdByName = cashierName,
+                    createdAt = stamp
+                )
+            )
+            if (refund.customerId != null) {
+                creditDao.insert(
+                    CreditTxn(
+                        businessId = refund.businessId,
+                        customerId = refund.customerId,
+                        saleId = refund.saleId,
+                        type = "refund_paid",
+                        amount = tender.amount,
+                        createdBy = cashierId,
+                        createdByName = cashierName,
+                        createdAt = stamp,
+                        updatedAt = stamp
+                    )
+                )
+            }
+            // paidSoFar already includes the row just inserted (same transaction).
+            val paid = refundDao.paidSoFar(refundId)
+            val newStatus = if (paid + CENT >= refund.refundTotal) "settled" else "owed"
+            if (newStatus != refund.status) {
+                refundDao.upsert(refund.copy(status = newStatus, updatedAt = stamp))
+            }
+        }
     }
 
     // ---- reports: tender breakdown from actual split amounts --------------
@@ -655,6 +880,19 @@ data class Tender(
     val currency: String? = null,       // second-currency code, e.g. "ZWG" (null => paid in base)
     val tenderAmount: Double? = null,   // amount actually handed over, in [currency]
     val rate: Double? = null            // second-per-base rate used to convert to [amount]
+)
+
+/**
+ * One line the cashier chose to return, for [PosRepository.createRefund]. [saleLine]
+ * is the ORIGINAL line off the sale (its unitPrice/mode/unitsPerLine are snapshots);
+ * [qtyReturned] is how many line-units come back (≤ the line's qty minus anything
+ * already returned); [restock] is false for damaged goods that shouldn't go back on
+ * the shelf.
+ */
+data class RefundLineInput(
+    val saleLine: SaleLine,
+    val qtyReturned: Double,
+    val restock: Boolean = true
 )
 
 data class CartLine(
