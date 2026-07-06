@@ -1,6 +1,11 @@
 package com.portionspot.pos.data
 
 import androidx.room.withTransaction
+import com.portionspot.pos.device.phoneKey
+import com.portionspot.pos.notify.NotifSnapshot
+import com.portionspot.pos.notify.NotifThresholds
+import com.portionspot.pos.notify.NotificationEngine
+import com.portionspot.pos.sms.ParsedPayment
 import kotlinx.coroutines.flow.Flow
 
 /** Half-a-cent tolerance for money comparisons (guards Double rounding on totals). */
@@ -24,6 +29,9 @@ class PosRepository(private val db: PosDatabase) {
     private val supplierDao = db.supplierDao()
     private val poDao = db.purchaseOrderDao()
     private val refundDao = db.refundDao()
+    private val mobileMoneyDao = db.mobileMoneyDao()
+    private val notificationDao = db.notificationDao()
+    private val auditDao = db.auditDao()
 
     // ---- Local key/value settings (theme, etc. — never synced) -------------
 
@@ -833,6 +841,357 @@ class PosRepository(private val db: PosDatabase) {
                 refundDao.upsert(refund.copy(status = newStatus, updatedAt = stamp))
             }
         }
+    }
+
+    // ---- mobile-money SMS reconciliation (prompt §6) ---------------------
+
+    /** One status bucket (needs_verification / unmatched / verified), newest first. */
+    fun mobileMoneyFlow(businessId: String, status: String): Flow<List<MobileMoneyReceipt>> =
+        mobileMoneyDao.observeByStatus(businessId, status)
+
+    /** Count still awaiting the cashier — drives the "More" badge. */
+    fun mobileMoneyPendingCountFlow(businessId: String): Flow<Int> =
+        mobileMoneyDao.observePendingCount(businessId)
+
+    suspend fun mobileMoneyById(id: String): MobileMoneyReceipt? = mobileMoneyDao.getById(id)
+
+    /**
+     * Persist a parsed payment SMS (§6). Called by the passive SMS receiver, so it is
+     * fully offline and idempotent:
+     *  - Resolves the active business; no business yet ⇒ nothing to attach to, skip.
+     *  - The unique (businessId, txnCode) index + insert-ignore means the SAME SMS can
+     *    never be stored twice (§6.6). Returns null when it was a duplicate (so the
+     *    receiver doesn't re-notify), otherwise the freshly stored receipt.
+     *  - Matches the payer's number to a saved customer by the last-9-digits [phoneKey]
+     *    (the same matcher the call-log/contacts features use) → `needs_verification`;
+     *    no match ⇒ `unmatched` for later manual assignment (§6.1/§6.5).
+     *  - [cashierId]/[cashierName] are the last-unlocked cashier (attribution on a
+     *    passive record; may be null before first login).
+     */
+    suspend fun recordMobileMoneyReceipt(
+        parsed: ParsedPayment,
+        rawBody: String,
+        cashierId: String? = null,
+        cashierName: String? = null
+    ): MobileMoneyReceipt? {
+        val businessId = businessDao.getOnce()?.id ?: return null
+        // Cheap pre-check; the unique index is the real guard against a race.
+        if (mobileMoneyDao.getByTxn(businessId, parsed.txnCode) != null) return null
+
+        val key = phoneKey(parsed.senderPhone)
+        val match = if (key != null)
+            customerDao.allForBusiness(businessId).firstOrNull { phoneKey(it.phone) == key }
+        else null
+
+        val receipt = MobileMoneyReceipt(
+            businessId = businessId,
+            provider = parsed.provider,
+            rawBody = rawBody,
+            sender = parsed.sender,
+            senderName = parsed.senderName,
+            senderPhone = parsed.senderPhone,
+            amount = parsed.amount,
+            currency = parsed.currency,
+            txnCode = parsed.txnCode,
+            receivedAt = parsed.receivedAt,
+            status = if (match != null) "needs_verification" else "unmatched",
+            matchedCustomerId = match?.id,
+            matchedCustomerName = match?.name,
+            createdBy = cashierId,
+            createdByName = cashierName,
+            updatedAt = now()
+        )
+        val row = mobileMoneyDao.insertIgnore(receipt)
+        return if (row == -1L) null else receipt
+    }
+
+    /** Manually assign an unmatched payment to a customer, moving it to needs_verification. */
+    suspend fun assignMobileMoneyCustomer(receiptId: String, customer: Customer) {
+        val r = mobileMoneyDao.getById(receiptId) ?: return
+        mobileMoneyDao.upsert(
+            r.copy(
+                matchedCustomerId = customer.id,
+                matchedCustomerName = customer.name,
+                status = "needs_verification",
+                updatedAt = now(),
+                pendingSync = true
+            )
+        )
+    }
+
+    /**
+     * Verify a payment (§6.3–6.4). The cashier says what the money was for:
+     *  - `debt`  — apply it to the customer's account as a `credit_paid` row (reuses
+     *              the exact credit-ledger mechanism as [recordRepayment]; the receipt
+     *              records the ledger row it produced via [MobileMoneyReceipt.appliedCreditTxnId]).
+     *              Over-payment lands as a negative balance the Change & Credit screen
+     *              surfaces, same as any repayment.
+     *  - `sale`  — acknowledge it against a walk-in sale already rung up in the POS; no
+     *              ledger row (the sale itself carries the money). Just marks it verified.
+     * Idempotent-ish: a re-verify simply rewrites the receipt; guard in the UI stops
+     * double-applying to a debt.
+     */
+    suspend fun verifyMobileMoney(
+        receiptId: String,
+        customer: Customer?,
+        purpose: String,
+        note: String? = null,
+        cashierId: String? = null,
+        cashierName: String? = null
+    ) {
+        val r = mobileMoneyDao.getById(receiptId) ?: return
+        if (r.status == "verified") return
+        val stamp = now()
+        db.withTransaction {
+            var appliedCreditId: String? = null
+            if (purpose == "debt" && customer != null) {
+                val txn = CreditTxn(
+                    businessId = r.businessId,
+                    customerId = customer.id,
+                    type = "credit_paid",
+                    amount = r.amount,
+                    note = note ?: "${r.provider} ${r.txnCode}",
+                    createdBy = cashierId,
+                    createdByName = cashierName,
+                    createdAt = stamp,
+                    updatedAt = stamp
+                )
+                creditDao.insert(txn)
+                appliedCreditId = txn.id
+            }
+            mobileMoneyDao.upsert(
+                r.copy(
+                    status = "verified",
+                    purpose = purpose,
+                    matchedCustomerId = customer?.id ?: r.matchedCustomerId,
+                    matchedCustomerName = customer?.name ?: r.matchedCustomerName,
+                    appliedCreditTxnId = appliedCreditId,
+                    note = note ?: r.note,
+                    updatedAt = stamp,
+                    pendingSync = true
+                )
+            )
+        }
+    }
+
+    /** Dismiss a receipt (not a real payment / handled elsewhere). Never deletes it. */
+    suspend fun ignoreMobileMoney(receiptId: String) {
+        val r = mobileMoneyDao.getById(receiptId) ?: return
+        mobileMoneyDao.upsert(r.copy(status = "ignored", updatedAt = now(), pendingSync = true))
+    }
+
+    // ---- admin: notifications backend (Phase 7, §8) ----------------------
+
+    fun notificationsFlow(businessId: String): Flow<List<AppNotification>> =
+        notificationDao.observeForBusiness(businessId)
+
+    fun unreadNotificationCountFlow(businessId: String): Flow<Int> =
+        notificationDao.observeUnreadCount(businessId)
+
+    suspend fun markNotificationRead(id: String) = notificationDao.markRead(id, now())
+
+    suspend fun markAllNotificationsRead(businessId: String) =
+        notificationDao.markAllRead(businessId, now())
+
+    /**
+     * Recompute the whole alert state and reconcile it into the `notifications` table
+     * (§8). One row per condition (keyed by dedupeKey): new conditions are inserted,
+     * existing ones updated in place (preserving read-state), and conditions that have
+     * cleared are tombstoned. Returns the rows that newly warrant a system notification
+     * (pushed once), so the caller — which owns a Context — can post them.
+     */
+    suspend fun runNotificationSweep(
+        thresholds: NotifThresholds,
+        pendingSyncCount: Int,
+        lastSyncAt: Long?
+    ): List<AppNotification> {
+        val biz = businessDao.getOnce() ?: return emptyList()
+        val businessId = biz.id
+        val nowMs = now()
+        val salesWindow = nowMs - 30L * 24 * 60 * 60 * 1000   // large sales in the last 30 days
+        val snapshot = NotifSnapshot(
+            nowMs = nowMs,
+            currency = biz.currency,
+            trackedItems = itemDao.trackedOnce(businessId),
+            owedRefunds = refundDao.owedOnce(businessId),
+            pendingPayments = mobileMoneyDao.pendingOnce(businessId),
+            largeSales = saleDao.largeSalesOnce(businessId, salesWindow, thresholds.largeSaleMin),
+            agingRows = DebtAging.compute(
+                creditDao.allForBusinessOnce(businessId),
+                customerDao.allForBusiness(businessId).associate { it.id to it.name },
+                nowMs
+            ),
+            pendingSyncCount = pendingSyncCount,
+            lastSyncAt = lastSyncAt,
+            thresholds = thresholds
+        )
+        val candidates = NotificationEngine.compute(snapshot)
+        val existing = notificationDao.allActive(businessId).associateBy { it.dedupeKey }
+        val seen = HashSet<String>()
+        val toPush = ArrayList<AppNotification>()
+        val stamp = now()
+        for (c in candidates) {
+            seen += c.dedupeKey
+            val prev = existing[c.dedupeKey]
+            if (prev == null) {
+                var n = AppNotification(
+                    businessId = businessId, category = c.category, severity = c.severity,
+                    title = c.title, body = c.body, dedupeKey = c.dedupeKey,
+                    refType = c.refType, refId = c.refId, eventAt = c.eventAt, createdAt = stamp
+                )
+                if (c.pushWorthy) { n = n.copy(pushedAt = stamp); toPush += n }
+                notificationDao.upsert(n)
+            } else {
+                var n = prev.copy(
+                    category = c.category, severity = c.severity, title = c.title,
+                    body = c.body, eventAt = c.eventAt, refType = c.refType, refId = c.refId
+                )
+                if (c.pushWorthy && prev.pushedAt == null) { n = n.copy(pushedAt = stamp); toPush += n }
+                notificationDao.upsert(n)
+            }
+        }
+        // Tombstone rows whose condition has cleared (resolved low stock, settled refund).
+        val cleared = existing.values.filter { it.dedupeKey !in seen }.map { it.id }
+        if (cleared.isNotEmpty()) notificationDao.tombstone(cleared)
+        return toPush
+    }
+
+    // ---- admin: audit log (Phase 7, §8) ----------------------------------
+
+    fun auditFlow(businessId: String): Flow<List<AuditEntry>> = auditDao.observeForBusiness(businessId)
+
+    suspend fun logAudit(
+        businessId: String,
+        action: String,
+        summary: String,
+        entityType: String? = null,
+        entityId: String? = null,
+        meta: String? = null,
+        cashierId: String? = null,
+        cashierName: String? = null
+    ) {
+        auditDao.insert(
+            AuditEntry(
+                businessId = businessId, action = action, entityType = entityType,
+                entityId = entityId, summary = summary, meta = meta,
+                createdBy = cashierId, createdByName = cashierName
+            )
+        )
+    }
+
+    // ---- admin: end-of-day / shift summary (Phase 7, §8) -----------------
+
+    fun cashierDayFlow(businessId: String, from: Long, to: Long): Flow<List<CashierDay>> =
+        saleDao.observeCashierDay(businessId, from, to)
+
+    /** Change handed back in the window — cash-in-drawer = cash tenders − this. */
+    fun changeGivenFlow(businessId: String, from: Long, to: Long): Flow<Double> =
+        saleDao.observeChangeGiven(businessId, from, to)
+
+    // ---- admin: void a wrongful refund (Phase 7, §8) ---------------------
+
+    /**
+     * Void a refund an admin judges wrongful. The refund ledger stays immutable in
+     * spirit — we tombstone the refund and post COMPENSATING entries: re-draw any
+     * restocked goods back down (a `adjust` movement) and settle any still-owed balance
+     * with a `refund_paid` row so the customer's "we owe you" balance returns to zero.
+     * Audit-logged.
+     */
+    suspend fun voidRefund(refundId: String, cashierId: String? = null, cashierName: String? = null) {
+        val r = refundDao.getById(refundId) ?: return
+        if (r.deleted) return
+        val stamp = now()
+        db.withTransaction {
+            for (ln in refundDao.linesFor(refundId)) {
+                if (!ln.restock) continue
+                val item = ln.itemId?.let { itemDao.getById(it) } ?: continue
+                if (!item.trackStock) continue
+                val units = ln.qty * ln.unitsPerLine
+                if (units <= 0.0) continue
+                val newQty = (item.stockQty - units).coerceAtLeast(0.0)
+                itemDao.upsert(item.copy(stockQty = newQty, updatedAt = stamp, pendingSync = true))
+                movementDao.insert(
+                    StockMovement(
+                        businessId = r.businessId, itemId = item.id, type = "adjust",
+                        delta = -units, balanceAfter = newQty,
+                        note = "Void refund #${r.saleReceiptNo ?: ""}".trim(),
+                        createdBy = cashierId, createdByName = cashierName, createdAt = stamp
+                    )
+                )
+            }
+            val outstanding = r.refundTotal - refundDao.paidSoFar(refundId)
+            if (r.customerId != null && outstanding > CENT) {
+                creditDao.insert(
+                    CreditTxn(
+                        businessId = r.businessId, customerId = r.customerId, saleId = r.saleId,
+                        type = "refund_paid", amount = outstanding, note = "Void refund",
+                        createdBy = cashierId, createdByName = cashierName,
+                        createdAt = stamp, updatedAt = stamp
+                    )
+                )
+            }
+            refundDao.softDelete(refundId, stamp)
+            auditDao.insert(
+                AuditEntry(
+                    businessId = r.businessId, action = "void_refund", entityType = "refund",
+                    entityId = refundId,
+                    summary = "Voided refund of ${fmtMoney(r.refundTotal)} on #${r.saleReceiptNo ?: ""}".trim(),
+                    createdBy = cashierId, createdByName = cashierName
+                )
+            )
+        }
+    }
+
+    // ---- admin: write off a customer's debt (Phase 7, §8) ----------------
+
+    /** Admin-only debt write-off: a `credit_paid` row that clears the balance, audited. */
+    suspend fun writeOffDebt(
+        businessId: String,
+        customerId: String,
+        amount: Double,
+        cashierId: String? = null,
+        cashierName: String? = null
+    ) {
+        if (amount <= 0.0) return
+        db.withTransaction {
+            creditDao.insert(
+                CreditTxn(
+                    businessId = businessId, customerId = customerId, type = "credit_paid",
+                    amount = amount, note = "Debt write-off",
+                    createdBy = cashierId, createdByName = cashierName
+                )
+            )
+            auditDao.insert(
+                AuditEntry(
+                    businessId = businessId, action = "debt_writeoff", entityType = "customer",
+                    entityId = customerId, summary = "Wrote off ${fmtMoney(amount)}",
+                    createdBy = cashierId, createdByName = cashierName
+                )
+            )
+        }
+    }
+
+    private fun fmtMoney(n: Double): String = String.format(java.util.Locale.US, "%.2f", n)
+
+    /** Count of local rows not yet pushed to the cloud — feeds the "not synced" alert. */
+    suspend fun pendingSyncCount(): Int =
+        businessDao.pending().size + itemDao.pending().size + saleDao.pendingSales().size +
+            customerDao.pending().size + creditDao.pending().size + refundDao.pending().size +
+            mobileMoneyDao.pending().size
+
+    /** Admin notification thresholds (§8), read from device-local settings with defaults. */
+    suspend fun loadNotifThresholds(): NotifThresholds = NotifThresholds(
+        largeSaleMin = settingDao.get(KEY_ADMIN_LARGE_SALE)?.toDoubleOrNull() ?: 500.0,
+        escalateHours = settingDao.get(KEY_ESC_HOURS)?.toIntOrNull() ?: 4,
+        unsyncedHours = settingDao.get(KEY_UNSYNCED_HOURS)?.toIntOrNull() ?: 6
+    )
+
+    companion object {
+        // Shared setting keys for admin notification thresholds (used by the VM to
+        // persist and by the background worker to read — same source of truth).
+        const val KEY_ADMIN_LARGE_SALE = "admin_large_sale"
+        const val KEY_ESC_HOURS = "admin_escalate_hours"
+        const val KEY_UNSYNCED_HOURS = "admin_unsynced_hours"
     }
 
     // ---- reports: tender breakdown from actual split amounts --------------

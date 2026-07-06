@@ -169,6 +169,19 @@ class AuthManager(
         }
     }
 
+    /**
+     * The signed-in (or last-unlocked) cashier, for stamping attribution on records
+     * created OUTSIDE the UI — notably the passive SMS receiver (Phase 5), which fires
+     * while the app may be backgrounded or PIN-locked. Prefers the live Active user;
+     * falls back to the cached vault session so a locked device still attributes to
+     * the cashier who last used it. Null before any first login.
+     */
+    suspend fun cachedUserOrNull(): PosUser? = withContext(Dispatchers.IO) {
+        (state.value as? AuthState.Active)?.user
+            ?: (state.value as? AuthState.PinSetup)?.user
+            ?: vault.loadSession()?.toUser()
+    }
+
     // ── tokens for the sync layer ─────────────────────────────────────────
 
     /** Snapshot for request headers; may be stale, see [refreshIfNeeded]. */

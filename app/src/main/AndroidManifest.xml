@@ -24,6 +24,17 @@
          permission (the system picker grants a one-shot read on the chosen row). -->
     <uses-permission android:name="android.permission.READ_CALL_LOG" />
 
+    <!-- Mobile-money SMS reconciliation (Phase 5, §6). RECEIVE_SMS delivers the
+         confirmation message to SmsReceiver; READ_SMS lets a future backfill re-scan
+         the inbox. Sideload-only distribution makes these acceptable (§5). Requested
+         at runtime; if denied, reconciliation simply stays empty. -->
+    <uses-permission android:name="android.permission.RECEIVE_SMS" />
+    <uses-permission android:name="android.permission.READ_SMS" />
+
+    <!-- Post the "payment received — verify" notification (Android 13+ needs a
+         runtime grant; declaration alone is not enough). -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
 
@@ -42,6 +53,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTop"
             android:label="@string/app_name"
             android:theme="@style/Theme.SpotPos">
             <intent-filter>
@@ -49,6 +61,29 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Mobile-money SMS listener (Phase 5, §6). Guarded by BROADCAST_SMS so only
+             the system can deliver the broadcast; exported because SMS_RECEIVED is a
+             system broadcast. -->
+        <receiver
+            android:name=".sms.SmsReceiver"
+            android:exported="true"
+            android:permission="android.permission.BROADCAST_SMS">
+            <intent-filter android:priority="999">
+                <action android:name="android.provider.Telephony.SMS_RECEIVED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Share/re-open generated PDFs (Phase 6, §5) via a content:// URI. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 
 </manifest>

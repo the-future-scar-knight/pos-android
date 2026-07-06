@@ -11,7 +11,13 @@ import com.portionspot.pos.data.CustomerWithBalance
 import com.portionspot.pos.data.Expense
 import com.portionspot.pos.data.Supplier
 import com.portionspot.pos.data.Item
+import com.portionspot.pos.data.AppNotification
+import com.portionspot.pos.data.AuditEntry
+import com.portionspot.pos.data.CashierDay
+import com.portionspot.pos.data.DebtAging
+import com.portionspot.pos.data.DebtAgingRow
 import com.portionspot.pos.data.MethodBreakdown
+import com.portionspot.pos.data.MobileMoneyReceipt
 import com.portionspot.pos.data.PosRepository
 import com.portionspot.pos.data.PurchaseOrder
 import com.portionspot.pos.data.PurchaseOrderLine
@@ -303,8 +309,12 @@ class PosViewModel(
             marginFormula = repo.getSetting(KEY_MARGIN_FORMULA) ?: d.marginFormula,
             autoConvertUnitsToBoxes = repo.getSetting(KEY_AUTO_BOXES)?.toBooleanStrictOrNull() ?: d.autoConvertUnitsToBoxes,
             printerType = repo.getSetting(KEY_PRINTER_TYPE) ?: d.printerType,
+            receiptPreset = repo.getSetting(KEY_RC_PRESET) ?: d.receiptPreset,
             secondCurrencyCode = repo.getSetting(KEY_CUR2_CODE) ?: d.secondCurrencyCode,
             secondCurrencyRate = repo.getSetting(KEY_CUR2_RATE)?.toDoubleOrNull() ?: d.secondCurrencyRate,
+            adminLargeSale = repo.getSetting(PosRepository.KEY_ADMIN_LARGE_SALE)?.toDoubleOrNull() ?: d.adminLargeSale,
+            escalateHours = repo.getSetting(PosRepository.KEY_ESC_HOURS)?.toIntOrNull() ?: d.escalateHours,
+            unsyncedHours = repo.getSetting(PosRepository.KEY_UNSYNCED_HOURS)?.toIntOrNull() ?: d.unsyncedHours,
         )
     }
 
@@ -325,8 +335,12 @@ class PosViewModel(
             repo.putSetting(KEY_MARGIN_FORMULA, prefs.marginFormula)
             repo.putSetting(KEY_AUTO_BOXES, prefs.autoConvertUnitsToBoxes.toString())
             repo.putSetting(KEY_PRINTER_TYPE, prefs.printerType)
+            repo.putSetting(KEY_RC_PRESET, prefs.receiptPreset)
             repo.putSetting(KEY_CUR2_CODE, prefs.secondCurrencyCode)
             repo.putSetting(KEY_CUR2_RATE, prefs.secondCurrencyRate.toString())
+            repo.putSetting(PosRepository.KEY_ADMIN_LARGE_SALE, prefs.adminLargeSale.toString())
+            repo.putSetting(PosRepository.KEY_ESC_HOURS, prefs.escalateHours.toString())
+            repo.putSetting(PosRepository.KEY_UNSYNCED_HOURS, prefs.unsyncedHours.toString())
         }
     }
 
@@ -699,6 +713,181 @@ class PosViewModel(
         }
     }
 
+    // ---- Mobile-money SMS reconciliation (prompt §6) ---------------------
+
+    /** Matched-to-a-customer, awaiting the cashier saying what it was for. */
+    val mmNeedsVerification: StateFlow<List<MobileMoneyReceipt>> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.mobileMoneyFlow(it, "needs_verification") }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Parsed but no customer matched — awaits manual assignment (§6.5). */
+    val mmUnmatched: StateFlow<List<MobileMoneyReceipt>> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.mobileMoneyFlow(it, "unmatched") }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Already applied/acknowledged (history). */
+    val mmVerified: StateFlow<List<MobileMoneyReceipt>> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.mobileMoneyFlow(it, "verified") }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Count awaiting the cashier (needs_verification + unmatched) — the "More" badge. */
+    val mmPendingCount: StateFlow<Int> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.mobileMoneyPendingCountFlow(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0)
+
+    suspend fun mobileMoneyById(id: String): MobileMoneyReceipt? = repo.mobileMoneyById(id)
+
+    /** Assign an unmatched payment to a customer (then it awaits verification). */
+    fun assignMobileMoneyCustomer(receiptId: String, customer: Customer) {
+        viewModelScope.launch { repo.assignMobileMoneyCustomer(receiptId, customer) }
+    }
+
+    /**
+     * Verify a payment: `debt` applies it to the customer's account (credit_paid),
+     * `sale` acknowledges it against a walk-in sale already rung up. Attribution is
+     * stamped from the signed-in cashier.
+     */
+    fun verifyMobileMoney(
+        receiptId: String,
+        customer: Customer?,
+        purpose: String,
+        note: String? = null,
+        onDone: () -> Unit = {}
+    ) {
+        viewModelScope.launch {
+            repo.verifyMobileMoney(receiptId, customer, purpose, note, currentCashierId, currentCashierName)
+            onDone()
+        }
+    }
+
+    /** Dismiss a receipt (not a real payment / handled elsewhere). Never deletes it. */
+    fun ignoreMobileMoney(receiptId: String) {
+        viewModelScope.launch { repo.ignoreMobileMoney(receiptId) }
+    }
+
+    // ---- Admin: notifications / audit / end-of-day / aging (Phase 7, §8) --
+
+    /** Persisted admin notification feed (newest event first). */
+    val notifications: StateFlow<List<AppNotification>> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.notificationsFlow(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Unread notification count → the admin Alerts tab badge. */
+    val unreadNotifications: StateFlow<Int> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.unreadNotificationCountFlow(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0)
+
+    fun markNotificationRead(id: String) {
+        viewModelScope.launch { repo.markNotificationRead(id) }
+    }
+
+    fun markAllNotificationsRead() {
+        val bid = businessId.value ?: return
+        viewModelScope.launch { repo.markAllNotificationsRead(bid) }
+    }
+
+    /**
+     * Reconcile the feed against current state immediately (e.g. when the admin opens
+     * Alerts) so it reflects the latest without waiting for the periodic worker. This
+     * only updates the table; the background worker owns firing system notifications.
+     */
+    fun sweepNotifications() {
+        viewModelScope.launch {
+            val thresholds = repo.loadNotifThresholds()
+            val pending = repo.pendingSyncCount()
+            val lastSync = sync.lastSyncAt()
+            repo.runNotificationSweep(thresholds, pending, lastSync)
+        }
+    }
+
+    /** Append-only audit trail (newest first) for the admin audit-log viewer. */
+    val auditLog: StateFlow<List<AuditEntry>> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.auditFlow(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    // End-of-day / shift summary — the selected day (start-of-day millis).
+    private val _eodDay = MutableStateFlow(startOfToday())
+    val eodDay: StateFlow<Long> = _eodDay.asStateFlow()
+    fun setEodDay(startOfDayMs: Long) { _eodDay.value = startOfDayMs }
+    private val eodKey = combine(businessId.filterNotNull(), _eodDay) { b, d -> b to d }
+
+    val eodCashiers: StateFlow<List<CashierDay>> =
+        eodKey.flatMapLatest { (b, d) -> repo.cashierDayFlow(b, d, d + DAY_MS) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    val eodMethods: StateFlow<List<MethodBreakdown>> =
+        eodKey.flatMapLatest { (b, d) -> repo.paymentBreakdownFlow(b, d, d + DAY_MS) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    val eodChangeGiven: StateFlow<Double> =
+        eodKey.flatMapLatest { (b, d) -> repo.changeGivenFlow(b, d, d + DAY_MS) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0.0)
+
+    /** Per-customer debt split into 30/60/90 aging buckets (recomputed live). */
+    val debtAging: StateFlow<List<DebtAgingRow>> =
+        businessId.filterNotNull()
+            .flatMapLatest { bid ->
+                combine(repo.creditLedgerFlow(bid), repo.customersFlow(bid)) { txns, custs ->
+                    DebtAging.compute(txns, custs.associate { it.id to it.name }, System.currentTimeMillis())
+                }
+            }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Admin void of a wrongful refund (§8) — reverses stock + owed balance, audited. */
+    fun voidRefund(refundId: String, onDone: () -> Unit = {}) {
+        viewModelScope.launch {
+            repo.voidRefund(refundId, currentCashierId, currentCashierName)
+            onDone()
+        }
+    }
+
+    /** Admin-only debt write-off (§8). */
+    fun writeOffDebt(customerId: String, amount: Double, onDone: () -> Unit = {}) {
+        val bid = businessId.value ?: return
+        if (amount <= 0.0) return
+        viewModelScope.launch {
+            repo.writeOffDebt(bid, customerId, amount, currentCashierId, currentCashierName)
+            onDone()
+        }
+    }
+
+    /**
+     * Force-enable/disable a payment method globally (§8). Updates the business record
+     * (honored by the cashier tender picker) and audit-logs the change. Cross-device
+     * propagation rides the existing business sync (deferred parity phase).
+     */
+    fun setPaymentMethodEnabled(method: String, enabled: Boolean) {
+        val biz = business.value ?: return
+        val updated = when (method) {
+            "cash" -> biz.copy(cashEnabled = enabled)
+            "card" -> biz.copy(cardEnabled = enabled)
+            "bank" -> biz.copy(bankEnabled = enabled)
+            "paynow" -> biz.copy(paynowEnabled = enabled)
+            "ecocash" -> biz.copy(ecocashEnabled = enabled)
+            "innbucks" -> biz.copy(innbucksEnabled = enabled)
+            "onemoney" -> biz.copy(onemoneyEnabled = enabled)
+            "omari" -> biz.copy(omariEnabled = enabled)
+            else -> return
+        }
+        viewModelScope.launch {
+            repo.saveBusiness(updated)
+            repo.logAudit(
+                businessId = biz.id,
+                action = if (enabled) "payment_unlock" else "payment_lock",
+                summary = "${if (enabled) "Enabled" else "Disabled"} $method payments",
+                entityType = "business", entityId = biz.id,
+                cashierId = currentCashierId, cashierName = currentCashierName
+            )
+        }
+    }
+
     // ---- Expenses ---------------------------------------------------------
 
     /** Insert (id == null) or update an expense. No-op on a non-positive amount. */
@@ -932,6 +1121,7 @@ class PosViewModel(
         private const val KEY_MARGIN_FORMULA = "margin_formula"
         private const val KEY_AUTO_BOXES = "auto_units_to_boxes"
         private const val KEY_PRINTER_TYPE = "printer_type"
+        private const val KEY_RC_PRESET = "rc_preset"
         private const val KEY_CUR2_CODE = "second_currency_code"
         private const val KEY_CUR2_RATE = "second_currency_rate"
 

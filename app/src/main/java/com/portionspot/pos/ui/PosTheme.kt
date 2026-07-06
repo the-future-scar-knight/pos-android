@@ -195,7 +195,11 @@ fun buildTokens(choice: ThemeChoice): PosTokens {
         surfaceBorder = Color(0xFFE5E7EB),
         inkPrimary = Color(0xFF111827),
         inkSecondary = Color(0xFF4B5563),
-        inkTertiary = Color(0xFF9CA3AF),
+        // gray-500 (not gray-400): the muted small-label ink is used widely at 10–11sp,
+        // and gray-400 on the white/near-white surfaces is only ~2.5:1 — below the WCAG
+        // AA 4.5:1 floor (prompt §1.1). gray-500 (#6B7280) clears it (~4.8:1) while
+        // staying visibly muted below inkSecondary.
+        inkTertiary = Color(0xFF6B7280),
         navBg = hexToColor(navHex),
         navInk = if (accentSidebar) readableInk(navHex) else Color(0xFFF9FAFB),
         accentBlue = Color(0xFF1E5BFF),

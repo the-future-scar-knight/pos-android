@@ -23,7 +23,7 @@ object ReceiptPrinter {
         sale: SaleEntity,
         lines: List<SaleLine>,
         style: ReceiptStyle = ReceiptStyle(),
-        sunmi: Boolean = false
+        target: String = "bluetooth"
     ): PrintResult {
         val data = EscPos.receipt(
             business = business,
@@ -33,10 +33,7 @@ object ReceiptPrinter {
             style = style,
             logo = loadLogo(context, business.logoUri)
         )
-        if (sunmi) return SunmiPrinter.send(context, data)
-        val mac = business.btPrinterMac
-            ?: return PrintResult.Error("No printer selected. Go to Settings → Printer.")
-        return BluetoothPrinter.send(context, mac, data)
+        return dispatch(context, business, data, target)
     }
 
     suspend fun printRefund(
@@ -46,7 +43,7 @@ object ReceiptPrinter {
         lines: List<RefundLine>,
         payments: List<RefundPayment>,
         style: ReceiptStyle = ReceiptStyle(),
-        sunmi: Boolean = false
+        target: String = "bluetooth"
     ): PrintResult {
         val data = EscPos.refund(
             business = business,
@@ -57,22 +54,35 @@ object ReceiptPrinter {
             style = style,
             logo = loadLogo(context, business.logoUri)
         )
-        if (sunmi) return SunmiPrinter.send(context, data)
-        val mac = business.btPrinterMac
-            ?: return PrintResult.Error("No printer selected. Go to Settings → Printer.")
-        return BluetoothPrinter.send(context, mac, data)
+        return dispatch(context, business, data, target)
     }
 
     suspend fun testPrint(
         context: Context,
         business: Business,
-        sunmi: Boolean = false
+        target: String = "bluetooth"
     ): PrintResult {
         val data = EscPos.testTicket(business)
-        if (sunmi) return SunmiPrinter.send(context, data)
-        val mac = business.btPrinterMac
-            ?: return PrintResult.Error("No printer selected. Go to Settings → Printer.")
-        return BluetoothPrinter.send(context, mac, data)
+        return dispatch(context, business, data, target)
+    }
+
+    /**
+     * Route the built ESC/POS stream to the chosen printer (prompt §10):
+     * "sunmi" internal printer · "rawbt" RawBT service · "bluetooth" paired ESC/POS.
+     */
+    private suspend fun dispatch(
+        context: Context,
+        business: Business,
+        data: ByteArray,
+        target: String
+    ): PrintResult = when (target) {
+        "sunmi" -> SunmiPrinter.send(context, data)
+        "rawbt" -> RawBtPrinter.send(context, data)
+        else -> {
+            val mac = business.btPrinterMac
+                ?: return PrintResult.Error("No printer selected. Go to Settings → Printer.")
+            BluetoothPrinter.send(context, mac, data)
+        }
     }
 
     private fun loadLogo(context: Context, uriString: String?): Bitmap? {

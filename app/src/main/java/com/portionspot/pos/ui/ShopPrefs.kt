@@ -27,7 +27,12 @@ data class ShopPrefs(
     val marginFormula: String = "markup",    // "markup" (over cost) or "gross" (of price)
     val autoConvertUnitsToBoxes: Boolean = false, // show stock as N boxes + loose units
     // ── Printer ──
-    val printerType: String = "bluetooth",   // "bluetooth" (ESC/POS) or "sunmi" (internal)
+    val printerType: String = "bluetooth",   // "bluetooth" (ESC/POS) · "sunmi" (internal) · "rawbt" (RawBT service)
+    // ── Receipt style preset ──
+    // A quick look applied over the individual receipt toggles below (Phase 6, §10):
+    // "standard" keeps the toggles as-is; "compact"/"detailed" override a few for a
+    // tighter or fuller ticket. Presets win only on the knobs they touch.
+    val receiptPreset: String = "standard",  // "compact" | "standard" | "detailed"
     // ── Second currency (Zimbabwe dual-currency) ──
     // The shop keeps its books in Business.currency (the BASE, e.g. USD) but may
     // also accept a SECOND currency (e.g. ZiG) at [secondCurrencyRate] units per 1
@@ -35,6 +40,10 @@ data class ShopPrefs(
     // single-currency shop behaves exactly as before.
     val secondCurrencyCode: String = "",     // e.g. "ZWG"; blank = off
     val secondCurrencyRate: Double = 0.0,    // second-currency units per 1 base unit
+    // ── Admin notification thresholds (Phase 7, §8) ──
+    val adminLargeSale: Double = 500.0,      // flag sales at/above this amount
+    val escalateHours: Int = 4,              // unverified payment / owed refund → escalate after N hours
+    val unsyncedHours: Int = 6,              // device unsynced (with pending records) → alert after N hours
 )
 
 val DEFAULT_SHOP_PREFS = ShopPrefs()
@@ -44,6 +53,49 @@ val RECEIPT_FONT_SCALES = listOf(
     0.85f to "Small",
     1.0f to "Normal",
     1.2f to "Large",
+)
+
+/** Printer targets surfaced as chips in Settings (Phase 6, §10). */
+val PRINTER_TYPES = listOf(
+    "bluetooth" to "Bluetooth",
+    "sunmi" to "Sunmi",
+    "rawbt" to "RawBT",
+)
+
+/** Receipt style presets surfaced as chips in Settings (Phase 6, §10). */
+val RECEIPT_PRESETS = listOf(
+    "compact" to "Compact",
+    "standard" to "Standard",
+    "detailed" to "Detailed",
+)
+
+/** Thermal paper widths surfaced as chips in Settings (drives ESC/POS column count). */
+val PAPER_WIDTHS = listOf(
+    "58mm" to "58 mm",
+    "80mm" to "80 mm",
+)
+
+/**
+ * Fold a receipt style [preset] over an already-built [base] style. Presets only
+ * override the knobs they own, so the individual toggles and the second-currency
+ * settings survive. "standard" is a no-op.
+ */
+fun applyReceiptPreset(base: ReceiptStyleFlags, preset: String): ReceiptStyleFlags = when (preset) {
+    "compact" -> base.copy(largeText = false, feedLines = minOf(base.feedLines, 1), showTagline = false, showFooter = false)
+    "detailed" -> base.copy(largeText = true, feedLines = maxOf(base.feedLines, 3), showTagline = true, showAddress = true, showFooter = true)
+    else -> base
+}
+
+/**
+ * The subset of [com.portionspot.pos.print.ReceiptStyle] knobs a preset can flip.
+ * Kept as a small local record so ShopPrefs doesn't depend on the print module.
+ */
+data class ReceiptStyleFlags(
+    val largeText: Boolean,
+    val feedLines: Int,
+    val showTagline: Boolean,
+    val showAddress: Boolean,
+    val showFooter: Boolean,
 )
 
 /** Rounding-step presets surfaced as chips for the tax/price rounding pickers. */

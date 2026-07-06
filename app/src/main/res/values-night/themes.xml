@@ -1,11 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Dark-mode variant of Theme.SpotPos. Real colours are driven by
-         Compose (PosTheme); we use a framework Material dark theme as the
-         parent so no com.google.android.material dependency is required.
-         Only references colours that actually exist in values/colors.xml. -->
-    <style name="Theme.SpotPos" parent="android:Theme.Material.NoActionBar">
+    <!-- The POS UI is LIGHT-only by design: every colour is driven by Compose
+         (PosTheme), which always resolves a light palette, and all background
+         presets are light. Previously this night variant used a DARK framework
+         parent + a black window, so under system dark mode the always-light
+         Compose content sat on a black window and framework defaults flipped dark
+         — the "unreadable in values-night" contrast bug (prompt §1.1).
+
+         Keeping the night theme IDENTICAL to the day theme (light parent, white
+         window) removes that mismatch: the app looks the same whether or not the
+         phone is in dark mode, and nothing sits on a stray dark surface. -->
+    <style name="Theme.SpotPos" parent="android:Theme.Material.Light.NoActionBar">
         <item name="android:statusBarColor">@color/brand_primary_dark</item>
-        <item name="android:windowBackground">@color/black</item>
+        <item name="android:windowBackground">@color/white</item>
     </style>
 </resources>
