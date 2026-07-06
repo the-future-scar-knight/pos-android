@@ -57,6 +57,10 @@ class MainActivity : ComponentActivity() {
             return
         }
 
+        // Ask once to be exempt from battery optimization so payment SMS + admin alerts
+        // keep arriving while the app is backgrounded/closed (no-ops if already exempt).
+        com.portionspot.pos.device.BackgroundReliability.requestExemptionOnce(this)
+
         val container = (application as PosApp).container
         setContent {
             val vm: PosViewModel = viewModel(

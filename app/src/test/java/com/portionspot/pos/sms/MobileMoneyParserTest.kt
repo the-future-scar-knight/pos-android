@@ -55,6 +55,38 @@ class MobileMoneyParserTest {
         assertEquals("0771111111", p.senderPhone)
     }
 
+    // ── Real device captures (EcoCash USD "Cashin Confirmation" format) ──────
+    // The reference is an "Approval Code", and the payer is an agent/till code +
+    // name rather than a phone. These are the exact messages from Ryan's phone.
+
+    @Test fun ecocash_cashin_confirmation_approval_code_parses() {
+        val body = "Cashin Confirmation: USD 358.00 received from 062340-AMBASSADOR PROFESSOR. " +
+            "Approval Code: CI260706.0923.T1610618. New balance: USD 361.98."
+        val p = MobileMoneyParser.parse("+263164USD", body, 2000L)!!
+        assertEquals("ecocash", p.provider)
+        assertEquals(358.00, p.amount, 0.001)          // received amount, not the 361.98 balance
+        assertEquals("USD", p.currency)
+        assertEquals("CI260706.0923.T1610618", p.txnCode)  // Approval Code, trailing period stripped
+        assertEquals("AMBASSADOR PROFESSOR", p.senderName) // name after the agent/till code
+        assertNull(p.senderPhone)                          // agent code is not a phone → unmatched
+        assertEquals(2000L, p.receivedAt)
+    }
+
+    @Test fun ecocash_cashin_second_capture_distinct_txn() {
+        val body = "Cashin Confirmation: USD 54.00 received from 062340-AMBASSADOR PROFESSOR. " +
+            "Approval Code: CI260706.0947.T1818129. New balance: USD 415.98."
+        val p = MobileMoneyParser.parse("+263164USD", body)!!
+        assertEquals(54.00, p.amount, 0.001)
+        assertEquals("CI260706.0947.T1818129", p.txnCode) // different txn ⇒ not a duplicate
+    }
+
+    @Test fun ecocash_cashout_confirmation_is_not_a_payment() {
+        // Money OUT: "sent to", no "received … from" ⇒ never becomes a phantom receipt.
+        val body = "Cashout Confirmation: USD 405.00 sent to PSD INVESTMENTS-044623. " +
+            "Approval Code: CO260706.1820.T6696786. New balance: USD 4.50."
+        assertNull(MobileMoneyParser.parse("+263164USD", body))
+    }
+
     @Test fun balance_enquiry_is_not_a_payment() {
         assertNull(MobileMoneyParser.parse("EcoCash", "Your EcoCash balance is USD35.50"))
     }

@@ -70,6 +70,14 @@ class PosRepository(private val db: PosDatabase) {
     fun grossProfitFlow(businessId: String, from: Long, to: Long): Flow<Double> =
         saleDao.observeGrossProfit(businessId, from, to)
 
+    /** Refunded value per sale (for the Receipts "refunded" badge). Presentation only. */
+    fun refundedBySaleFlow(businessId: String): Flow<List<SaleRefundSum>> =
+        refundDao.observeRefundedBySale(businessId)
+
+    /** Revenue of costed lines only — the honest denominator for the margin figure. */
+    fun costedRevenueFlow(businessId: String, from: Long, to: Long): Flow<Double> =
+        saleDao.observeCostedRevenue(businessId, from, to)
+
     fun stampsSinceFlow(businessId: String, from: Long): Flow<List<SaleStamp>> =
         saleDao.observeStampsSince(businessId, from)
 

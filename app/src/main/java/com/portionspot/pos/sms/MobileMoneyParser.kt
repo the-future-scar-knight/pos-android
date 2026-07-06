@@ -37,13 +37,34 @@ object MobileMoneyParser {
         return null
     }
 
+    /**
+     * The unique reference on many Zimbabwean wallet/bank SMS is labelled "Approval
+     * Code", not "Ref"/"Txn ID" — e.g. EcoCash USD "Cashin Confirmation" messages.
+     * Without this the message parses everything EXCEPT the txn code and is dropped
+     * (verified on a real device, 2026-07). Shared so every rule can accept it.
+     */
+    private val APPROVAL_CODE =
+        Regex("""(?i)\bapproval\s*code\s*[:.]?\s*([A-Za-z0-9][A-Za-z0-9.\-]{3,})""")
+
     // Order matters only for disambiguation; keywords keep them from cross-firing.
     val RULES: List<SmsRule> = listOf(
+        // EcoCash USD agent/merchant "Cashin Confirmation" format — distinct wording:
+        // "Cashin Confirmation: USD 358.00 received from 062340-AMBASSADOR PROFESSOR.
+        //  Approval Code: CI260706.0923.T1610618. New balance: USD 361.98."
+        // The payer id is an agent/till code (not a phone), so it stays unmatched-by-
+        // phone and awaits manual assignment. Placed first: its "cashin confirmation"
+        // hint is specific, so it never steals a normal EcoCash "you have received" SMS.
+        SmsRule(
+            provider = "ecocash",
+            hints = listOf("cashin confirmation", "cash-in confirmation", "cash in confirmation"),
+            txnRegexes = listOf(APPROVAL_CODE)
+        ),
         SmsRule(
             provider = "ecocash",
             hints = listOf("ecocash"),
             txnRegexes = listOf(
-                Regex("""(?i)\b(?:ref(?:erence)?|txn(?:\s*id)?)\s*[:.]?\s*([A-Za-z0-9][A-Za-z0-9.\-]{3,})""")
+                Regex("""(?i)\b(?:ref(?:erence)?|txn(?:\s*id)?)\s*[:.]?\s*([A-Za-z0-9][A-Za-z0-9.\-]{3,})"""),
+                APPROVAL_CODE
             )
         ),
         SmsRule(
@@ -74,7 +95,8 @@ object MobileMoneyParser {
             provider = "unknown",
             hints = emptyList(),
             txnRegexes = listOf(
-                Regex("""(?i)\b(?:ref(?:erence)?|txn(?:\s*id)?|transaction\s*id)\s*[:.]?\s*([A-Za-z0-9][A-Za-z0-9.\-]{3,})""")
+                Regex("""(?i)\b(?:ref(?:erence)?|txn(?:\s*id)?|transaction\s*id)\s*[:.]?\s*([A-Za-z0-9][A-Za-z0-9.\-]{3,})"""),
+                APPROVAL_CODE
             )
         )
     )
@@ -131,7 +153,9 @@ class SmsRule(
 
         /** Money-IN clause: "from <name> <number>" / "from <number> <name>". */
         private val PHONE = Regex("""(?i)from\b[^0-9]{0,40}?([0-9]{9,13})""")
-        private val NAME = Regex("""(?i)from\s+([A-Za-z][A-Za-z .'\-]{1,40}?)(?=\s*(?:[0-9]|,|\.|\bon\b|\bnew\b|$))""")
+        // The name may follow an optional leading agent/till code + separator, e.g.
+        // "from 062340-AMBASSADOR PROFESSOR" or "from 0782123456 MARY M".
+        private val NAME = Regex("""(?i)from\s+(?:[0-9][\w]*[- ]+)?([A-Za-z][A-Za-z .'\-]{1,40}?)(?=\s*(?:[0-9]|,|\.|\bon\b|\bnew\b|$))""")
 
         /** Returns (normalisedCurrency, amount) or null. Amount handles thousands commas. */
         fun extractAmount(body: String): Pair<String, Double>? {

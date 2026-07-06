@@ -221,6 +221,21 @@ class PosViewModel(
             repo.grossProfitFlow(bid, from, to)
         }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0.0)
 
+    /** Revenue over the same costed lines as [dashGrossProfit] — the margin denominator. */
+    val dashCostedRevenue: StateFlow<Double> =
+        dashKey.flatMapLatest { (bid, range) ->
+            val (from, to) = rangeBounds(range)
+            repo.costedRevenueFlow(bid, from, to)
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0.0)
+
+    /** saleId → refunded value, for the Receipts "refunded / partial refund" badge.
+     *  Presentation only: the sale row and every money aggregate are untouched. */
+    val refundedBySale: StateFlow<Map<String, Double>> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.refundedBySaleFlow(it) }
+            .map { rows -> rows.associate { r -> r.saleId to r.refunded } }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyMap())
+
     /** Always the last 7 calendar days, independent of the range chips above. */
     val dashDailyBars: StateFlow<List<DayBar>> =
         businessId.filterNotNull()
@@ -761,6 +776,29 @@ class PosViewModel(
         viewModelScope.launch {
             repo.verifyMobileMoney(receiptId, customer, purpose, note, currentCashierId, currentCashierName)
             onDone()
+        }
+    }
+
+    /** New receipts found by the last inbox backfill (0 = none / not run). UI shows a
+     *  note then clears it. See [backfillSmsInbox]. */
+    private val _smsBackfill = MutableStateFlow(0)
+    val smsBackfill: StateFlow<Int> = _smsBackfill.asStateFlow()
+    fun clearSmsBackfillNote() { _smsBackfill.value = 0 }
+
+    /**
+     * Re-scan the SMS inbox for payments that arrived while the app was closed (§6).
+     * Idempotent — already-stored txns are skipped — so it is safe to call on every
+     * screen open and from a manual "Scan inbox" action. [appContext] must be an
+     * application context (the VM must not hold an Activity).
+     */
+    fun backfillSmsInbox(appContext: android.content.Context) {
+        viewModelScope.launch {
+            val n = withContext(Dispatchers.IO) {
+                com.portionspot.pos.sms.SmsInboxScanner.backfill(
+                    appContext, repo, currentCashierId, currentCashierName
+                )
+            }
+            if (n > 0) _smsBackfill.value = n
         }
     }
 
