@@ -52,10 +52,8 @@ class SyncConfig(private val dao: SettingDao) {
         const val KEY_KEY = "supabase_key"
         const val KEY_LAST_SYNC = "last_sync_at"
 
-        /** Cloud table names, in FK-safe push order (parents first). */
-        val TABLES = listOf(
-            "businesses", "customers", "items", "sales", "sale_items", "credit_transactions"
-        )
+        /** Cloud tables Android syncs (the shared web-POS schema). */
+        val TABLES = listOf("products", "customers", "sales")
 
         private fun cursorKey(table: String) = "cursor_$table"
     }

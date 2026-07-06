@@ -1,11 +1,10 @@
 package com.portionspot.pos.sync
 
-import com.portionspot.pos.data.Business
-import com.portionspot.pos.data.CreditTxn
 import com.portionspot.pos.data.Customer
 import com.portionspot.pos.data.Item
 import com.portionspot.pos.data.SaleEntity
 import com.portionspot.pos.data.SaleLine
+import com.portionspot.pos.data.newId
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -14,18 +13,35 @@ import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 
-/** Shared JSON. Tolerant on read; sends every column on write so upserts overwrite. */
+/**
+ * Sync DTOs for the SHARED PortionSpot Supabase (the same database the web POS and
+ * the marketing site use). These mirror the WEB POS contract exactly — see
+ * Reference/POS-main.zip src/lib/sync.js + db.js — so Android is a peer on the live
+ * dataset, not a separate schema:
+ *
+ *  - products      keyed by `sku`             (bigint id is server-owned; we bridge on sku)
+ *  - customers     keyed by `local_id`        (= the Android UUID)
+ *  - sales         id = the ref string, line items + tenders live in JSONB columns
+ *  - refunds       are `type='return'` sales rows with NEGATIVE totals
+ *
+ * PostgREST returns `numeric` columns as JSON STRINGS (to keep precision), so every
+ * money field below is a String parsed with [toMoney]; `integer`/`bigint` come as
+ * numbers. Stage 1 is PULL-ONLY (see PosSyncEngine) — the push mappings arrive with
+ * Stage 2, which is why only the read (`toEntity`) direction is defined here.
+ */
 internal val syncJson = Json {
     ignoreUnknownKeys = true
     encodeDefaults = true
     isLenient = true
 }
 
+/** numeric-as-string (or null) → Double. */
+private fun String?.toMoney(): Double = this?.toDoubleOrNull() ?: 0.0
+
 /**
- * Fixed-format UTC ISO time. Room stores epoch millis; the cloud stores these
- * strings as TEXT. Because the format is fixed-width, lexicographic order ==
- * chronological order, which keeps the `gt.<cursor>` pull cursor dead simple
- * and dodges java.time (not available pre-API 26 without desugaring).
+ * Fixed-format UTC ISO time. Room stores epoch millis; the cloud stores TEXT/timestamptz
+ * strings. Fixed-width format ⇒ lexicographic order == chronological, which keeps the
+ * `updated_at=gt.<cursor>` pull cursor trivial and dodges java.time (pre-API-26).
  */
 internal object IsoTime {
     private const val PATTERN = "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"
@@ -36,268 +52,199 @@ internal object IsoTime {
 
     fun toIso(millis: Long): String = formatter().format(Date(millis))
 
-    fun toMillis(iso: String): Long =
-        runCatching { formatter().parse(iso)?.time }.getOrNull()
-            ?: runCatching {
-                SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
+    /** Parse the several timestamp shapes PostgREST emits (with/without millis or zone). */
+    fun toMillis(iso: String?): Long {
+        if (iso.isNullOrBlank()) return 0L
+        val patterns = listOf(
+            PATTERN,
+            "yyyy-MM-dd'T'HH:mm:ss'Z'",
+            "yyyy-MM-dd'T'HH:mm:ss.SSSXXX",
+            "yyyy-MM-dd'T'HH:mm:ssXXX",
+            "yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX",
+        )
+        for (p in patterns) {
+            runCatching {
+                SimpleDateFormat(p, Locale.US)
                     .apply { timeZone = TimeZone.getTimeZone("UTC") }
                     .parse(iso)?.time
-            }.getOrNull()
-            ?: 0L
+            }.getOrNull()?.let { return it }
+        }
+        return 0L
+    }
 }
 
-// ── businesses ──────────────────────────────────────────────────────────────
-// NB: device-local fields (logo uri, printer config) are deliberately NOT part
-// of this DTO — they stay on the phone and are never synced.
+// ── products (keyed by sku) ───────────────────────────────────────────────────
 @Serializable
-data class BusinessDto(
-    val id: String,
+data class ProductDto(
+    val id: Long? = null,                                   // server-owned bigint; unused on pull
+    val sku: String,
     val name: String,
-    val currency: String,
-    val tagline: String? = null,
-    val address: String? = null,
+    val category: String? = null,
+    @SerialName("box_price") val boxPrice: String? = null,
+    @SerialName("box_size") val boxSize: Int = 1,
+    @SerialName("wholesale_price") val wholesalePrice: String? = null,
+    @SerialName("retail_price") val retailPrice: String? = null,
+    @SerialName("cost_price") val costPrice: String? = null,
+    @SerialName("stock_boxes") val stockBoxes: Int = 0,
+    @SerialName("stock_units") val stockUnits: Int = 0,
+    @SerialName("low_stock_threshold") val lowStockThreshold: Int = 5,
+    val active: Boolean = true,
+    @SerialName("product_type") val productType: String = "box",
+    @SerialName("box_only") val boxOnly: Boolean = false,
+    @SerialName("updated_at") val updatedAt: String? = null,
+)
+
+/** Merge a pulled product onto the local [Item] (bridged by sku), preserving the
+ *  Android-only fields the cloud doesn't carry (barcode, colour, unit, tax rate). */
+fun ProductDto.toItem(businessId: String, local: Item?): Item {
+    val boxSz = if (boxSize < 1) 1 else boxSize
+    val base = local ?: Item(businessId = businessId, name = name, sku = sku)
+    return base.copy(
+        businessId = businessId,
+        name = name,
+        sku = sku,
+        category = category,
+        price = retailPrice.toMoney(),
+        wholesalePrice = wholesalePrice.toMoney(),
+        boxPrice = boxPrice.toMoney(),
+        boxSize = boxSz,
+        // cloud cost_price defaults to 0 = "unknown"; keep Android's null-means-unknown
+        cost = costPrice?.toDoubleOrNull()?.takeIf { it > 0.0 },
+        trackStock = true,
+        stockQty = (stockBoxes * boxSz + stockUnits).toDouble(),
+        reorderLevel = lowStockThreshold.toDouble(),
+        isActive = active,
+        updatedAt = IsoTime.toMillis(updatedAt),
+        deleted = false,
+        pendingSync = false,
+    )
+}
+
+// ── customers (keyed by local_id = Android UUID) ──────────────────────────────
+@Serializable
+data class CustomerDto(
+    val id: Long? = null,
+    @SerialName("local_id") val localId: String? = null,
+    val name: String,
     val phone: String? = null,
     val email: String? = null,
-    val website: String? = null,
-    @SerialName("receipt_header") val receiptHeader: String? = null,
-    @SerialName("receipt_footer") val receiptFooter: String? = null,
-    // ── VAT / ZIMRA ──
-    @SerialName("vat_enabled") val vatEnabled: Boolean = false,
-    @SerialName("vat_number") val vatNumber: String? = null,
-    @SerialName("vat_percent") val vatPercent: Double = 15.0,
-    // ── payment method toggles ──
-    @SerialName("cash_enabled") val cashEnabled: Boolean = true,
-    @SerialName("card_enabled") val cardEnabled: Boolean = false,
-    @SerialName("bank_enabled") val bankEnabled: Boolean = false,
-    @SerialName("paynow_enabled") val paynowEnabled: Boolean = false,
-    @SerialName("ecocash_enabled") val ecocashEnabled: Boolean = false,
-    @SerialName("innbucks_enabled") val innbucksEnabled: Boolean = false,
-    @SerialName("onemoney_enabled") val onemoneyEnabled: Boolean = false,
-    @SerialName("omari_enabled") val omariEnabled: Boolean = false,
-    // ── bank transfer ──
-    @SerialName("bank_name") val bankName: String? = null,
-    @SerialName("bank_branch") val bankBranch: String? = null,
-    @SerialName("bank_account_name") val bankAccountName: String? = null,
-    @SerialName("bank_account_number") val bankAccountNumber: String? = null,
-    // ── mobile money ──
-    @SerialName("ecocash_account_name") val ecocashAccountName: String? = null,
-    @SerialName("ecocash_phone") val ecocashPhone: String? = null,
-    @SerialName("ecocash_merchant_code") val ecocashMerchantCode: String? = null,
-    @SerialName("innbucks_account_name") val innbucksAccountName: String? = null,
-    @SerialName("innbucks_phone") val innbucksPhone: String? = null,
-    @SerialName("onemoney_account_name") val onemoneyAccountName: String? = null,
-    @SerialName("onemoney_phone") val onemoneyPhone: String? = null,
-    @SerialName("omari_account_name") val omariAccountName: String? = null,
-    @SerialName("omari_phone") val omariPhone: String? = null,
-    // ── Paynow: ID only; the secret KEY is never synced ──
-    @SerialName("paynow_integration_id") val paynowIntegrationId: String? = null,
-    @SerialName("updated_at") val updatedAt: String,
-    val deleted: Boolean = false
+    val address: String? = null,
+    val notes: String? = null,
+    val balance: String? = null,
+    @SerialName("is_trade_account") val isTradeAccount: Boolean = false,
+    @SerialName("updated_at") val updatedAt: String? = null,
 )
 
-fun Business.toDto() = BusinessDto(
-    id = id, name = name, currency = currency, tagline = tagline, address = address,
-    phone = phone, email = email, website = website, receiptHeader = receiptHeader,
-    receiptFooter = receiptFooter,
-    vatEnabled = vatEnabled, vatNumber = vatNumber, vatPercent = vatPercent,
-    cashEnabled = cashEnabled, cardEnabled = cardEnabled, bankEnabled = bankEnabled,
-    paynowEnabled = paynowEnabled, ecocashEnabled = ecocashEnabled, innbucksEnabled = innbucksEnabled,
-    onemoneyEnabled = onemoneyEnabled, omariEnabled = omariEnabled,
-    bankName = bankName, bankBranch = bankBranch, bankAccountName = bankAccountName,
-    bankAccountNumber = bankAccountNumber,
-    ecocashAccountName = ecocashAccountName, ecocashPhone = ecocashPhone,
-    ecocashMerchantCode = ecocashMerchantCode,
-    innbucksAccountName = innbucksAccountName, innbucksPhone = innbucksPhone,
-    onemoneyAccountName = onemoneyAccountName, onemoneyPhone = onemoneyPhone,
-    omariAccountName = omariAccountName, omariPhone = omariPhone,
-    paynowIntegrationId = paynowIntegrationId,
-    updatedAt = IsoTime.toIso(updatedAt), deleted = deleted
-)
+/** Stable Android id for a pulled customer: its local_id, or a cloud-id-derived one. */
+fun CustomerDto.bridgeId(): String = localId?.ifBlank { null } ?: "cust-${id ?: newId()}"
 
-/** Merge a pulled row into the local row, KEEPING device-local fields. */
-fun BusinessDto.toEntity(local: Business?): Business =
-    (local ?: Business(id = id)).copy(
-        id = id, name = name, currency = currency, tagline = tagline, address = address,
-        phone = phone, email = email, website = website, receiptHeader = receiptHeader,
-        receiptFooter = receiptFooter,
-        vatEnabled = vatEnabled, vatNumber = vatNumber, vatPercent = vatPercent,
-        cashEnabled = cashEnabled, cardEnabled = cardEnabled, bankEnabled = bankEnabled,
-        paynowEnabled = paynowEnabled, ecocashEnabled = ecocashEnabled, innbucksEnabled = innbucksEnabled,
-        onemoneyEnabled = onemoneyEnabled, omariEnabled = omariEnabled,
-        bankName = bankName, bankBranch = bankBranch, bankAccountName = bankAccountName,
-        bankAccountNumber = bankAccountNumber,
-        ecocashAccountName = ecocashAccountName, ecocashPhone = ecocashPhone,
-        ecocashMerchantCode = ecocashMerchantCode,
-        innbucksAccountName = innbucksAccountName, innbucksPhone = innbucksPhone,
-        onemoneyAccountName = onemoneyAccountName, onemoneyPhone = onemoneyPhone,
-        omariAccountName = omariAccountName, omariPhone = omariPhone,
-        paynowIntegrationId = paynowIntegrationId,
+fun CustomerDto.toCustomer(businessId: String, local: Customer?): Customer {
+    val bid = bridgeId()
+    val base = local ?: Customer(id = bid, businessId = businessId, name = name)
+    return base.copy(
+        id = bid,
+        businessId = businessId,
+        name = name,
+        phone = phone,
+        email = email,
+        address = address,
+        note = notes,
+        wholesale = isTradeAccount,
         updatedAt = IsoTime.toMillis(updatedAt),
-        deleted = deleted, pendingSync = false
-        // logoUri, btPrinterMac, btPrinterName, paperWidth, receiptLargeText,
-        // paynowIntegrationKey (secret): all preserved from `local`.
+        deleted = false,
+        pendingSync = false,
     )
+}
 
-// ── items ───────────────────────────────────────────────────────────────────
+// ── sales (id = ref string; line items + tenders in JSONB) ────────────────────
+/** One line inside `sales.items` JSONB — camelCase keys, real numbers (not strings). */
 @Serializable
-data class ItemDto(
-    val id: String,
-    @SerialName("business_id") val businessId: String,
-    @SerialName("category_id") val categoryId: String? = null,
-    val name: String,
-    val barcode: String? = null,
+data class SaleItemJson(
+    val qty: Double = 1.0,
     val sku: String? = null,
-    val category: String? = null,
-    val price: Double = 0.0,
-    @SerialName("wholesale_price") val wholesalePrice: Double = 0.0,
-    @SerialName("box_price") val boxPrice: Double = 0.0,
-    @SerialName("box_size") val boxSize: Int = 1,
-    val cost: Double? = null,
-    @SerialName("tax_rate") val taxRate: Double = 0.0,
-    @SerialName("track_stock") val trackStock: Boolean = false,
-    @SerialName("stock_qty") val stockQty: Double = 0.0,
-    val unit: String = "pc",
-    val color: String? = null,
-    @SerialName("is_active") val isActive: Boolean = true,
-    @SerialName("updated_at") val updatedAt: String,
-    val deleted: Boolean = false
+    val mode: String = "retail",         // retail | wholesale | box
+    val name: String = "",
+    val label: String? = null,
+    val subMode: String? = null,
+    val unitPrice: Double = 0.0,
+    val lineDiscount: Double = 0.0,
+    val unitsPerLine: Int = 1,
+    val boxSize: Int? = null,
 )
 
-fun Item.toDto() = ItemDto(
-    id = id, businessId = businessId, categoryId = categoryId, name = name, barcode = barcode,
-    sku = sku, category = category, price = price, wholesalePrice = wholesalePrice,
-    boxPrice = boxPrice, boxSize = boxSize, cost = cost, taxRate = taxRate, trackStock = trackStock,
-    stockQty = stockQty, unit = unit, color = colorHex, isActive = isActive,
-    updatedAt = IsoTime.toIso(updatedAt), deleted = deleted
+/** One tender inside `sales.payments` JSONB. */
+@Serializable
+data class SalePaymentJson(
+    val amount: Double = 0.0,
+    val method: String = "cash",
 )
 
-fun ItemDto.toEntity() = Item(
-    id = id, businessId = businessId, categoryId = categoryId, name = name, barcode = barcode,
-    sku = sku, category = category, price = price, wholesalePrice = wholesalePrice,
-    boxPrice = boxPrice, boxSize = boxSize, cost = cost, taxRate = taxRate, trackStock = trackStock,
-    stockQty = stockQty, unit = unit, colorHex = color, isActive = isActive,
-    updatedAt = IsoTime.toMillis(updatedAt), deleted = deleted, pendingSync = false
-)
-
-// ── sales ────────────────────────────────────────────────────────────────────
 @Serializable
 data class SaleDto(
     val id: String,
-    @SerialName("business_id") val businessId: String,
-    @SerialName("receipt_no") val receiptNo: String? = null,
+    val ref: String? = null,
+    val type: String = "sale",            // sale | return | quote
     val status: String = "completed",
-    val subtotal: Double = 0.0,
-    @SerialName("discount_total") val discountTotal: Double = 0.0,
-    @SerialName("tax_total") val taxTotal: Double = 0.0,
-    val total: Double = 0.0,
-    @SerialName("payment_method") val paymentMethod: String = "cash",
-    val tendered: Double? = null,
-    @SerialName("change_due") val changeDue: Double? = null,
-    @SerialName("payment_ref") val paymentRef: String? = null,
-    @SerialName("payment_status") val paymentStatus: String = "paid",
-    val note: String? = null,
     @SerialName("customer_id") val customerId: String? = null,
     @SerialName("customer_name") val customerName: String? = null,
-    @SerialName("sold_at") val soldAt: String,
-    @SerialName("updated_at") val updatedAt: String,
-    val deleted: Boolean = false
+    val items: List<SaleItemJson> = emptyList(),
+    val subtotal: String? = null,
+    @SerialName("total_discount") val totalDiscount: String? = null,
+    @SerialName("vat_amount") val vatAmount: String? = null,
+    @SerialName("grand_total") val grandTotal: String? = null,
+    val payments: List<SalePaymentJson> = emptyList(),
+    @SerialName("amount_paid") val amountPaid: String? = null,
+    @SerialName("change_given") val changeGiven: String? = null,
+    @SerialName("amount_owing") val amountOwing: String? = null,
+    @SerialName("pay_method") val payMethod: String? = null,
+    val cashier: String? = null,
+    @SerialName("cashier_id") val cashierId: String? = null,
+    val notes: String? = null,
+    @SerialName("created_at") val createdAt: String? = null,
+    @SerialName("updated_at") val updatedAt: String? = null,
+) {
+    /** Cursor value — prefer updated_at, fall back to created_at, then EPOCH. */
+    fun cursorStamp(): String = updatedAt ?: createdAt ?: IsoTime.EPOCH
+}
+
+fun SaleDto.toSaleEntity(businessId: String): SaleEntity = SaleEntity(
+    id = id,
+    businessId = businessId,
+    receiptNo = ref ?: id,
+    status = status,
+    subtotal = subtotal.toMoney(),
+    discountTotal = totalDiscount.toMoney(),
+    taxTotal = vatAmount.toMoney(),
+    total = grandTotal.toMoney(),
+    paymentMethod = payMethod ?: "cash",
+    amountPaid = amountPaid.toMoney(),
+    changeDue = changeGiven?.toDoubleOrNull(),
+    paymentStatus = "paid",
+    note = notes?.ifBlank { null },
+    customerId = customerId?.ifBlank { null },
+    customerName = customerName?.ifBlank { null },
+    soldAt = IsoTime.toMillis(createdAt),
+    createdBy = cashierId?.ifBlank { null },
+    createdByName = cashier?.ifBlank { null },
+    updatedAt = IsoTime.toMillis(updatedAt ?: createdAt),
+    deleted = false,
+    synced = true,
 )
 
-fun SaleEntity.toDto() = SaleDto(
-    id = id, businessId = businessId, receiptNo = receiptNo, status = status, subtotal = subtotal,
-    discountTotal = discountTotal, taxTotal = taxTotal, total = total, paymentMethod = paymentMethod,
-    tendered = tendered, changeDue = changeDue, paymentRef = paymentRef, paymentStatus = paymentStatus,
-    note = note, customerId = customerId,
-    customerName = customerName, soldAt = IsoTime.toIso(soldAt),
-    updatedAt = IsoTime.toIso(updatedAt), deleted = deleted
-)
-
-fun SaleDto.toEntity() = SaleEntity(
-    id = id, businessId = businessId, receiptNo = receiptNo, status = status, subtotal = subtotal,
-    discountTotal = discountTotal, taxTotal = taxTotal, total = total, paymentMethod = paymentMethod,
-    tendered = tendered, changeDue = changeDue, paymentRef = paymentRef, paymentStatus = paymentStatus,
-    note = note, customerId = customerId,
-    customerName = customerName, soldAt = IsoTime.toMillis(soldAt),
-    updatedAt = IsoTime.toMillis(updatedAt), deleted = deleted, synced = true
-)
-
-// ── sale_items ────────────────────────────────────────────────────────────────
-@Serializable
-data class SaleLineDto(
-    val id: String,
-    @SerialName("sale_id") val saleId: String,
-    @SerialName("business_id") val businessId: String,
-    @SerialName("item_id") val itemId: String? = null,
-    val name: String,
-    val qty: Double = 1.0,
-    @SerialName("unit_price") val unitPrice: Double = 0.0,
-    @SerialName("line_discount") val lineDiscount: Double = 0.0,
-    @SerialName("line_tax") val lineTax: Double = 0.0,
-    @SerialName("line_total") val lineTotal: Double = 0.0,
-    @SerialName("updated_at") val updatedAt: String,
-    val deleted: Boolean = false
-)
-
-fun SaleLine.toDto() = SaleLineDto(
-    id = id, saleId = saleId, businessId = businessId, itemId = itemId, name = name, qty = qty,
-    unitPrice = unitPrice, lineDiscount = lineDiscount, lineTax = lineTax, lineTotal = lineTotal,
-    updatedAt = IsoTime.toIso(updatedAt), deleted = deleted
-)
-
-fun SaleLineDto.toEntity() = SaleLine(
-    id = id, saleId = saleId, businessId = businessId, itemId = itemId, name = name, qty = qty,
-    unitPrice = unitPrice, lineDiscount = lineDiscount, lineTax = lineTax, lineTotal = lineTotal,
-    updatedAt = IsoTime.toMillis(updatedAt), deleted = deleted
-)
-
-// ── customers ─────────────────────────────────────────────────────────────────
-@Serializable
-data class CustomerDto(
-    val id: String,
-    @SerialName("business_id") val businessId: String,
-    val name: String,
-    val phone: String? = null,
-    val email: String? = null,
-    val address: String? = null,
-    val note: String? = null,
-    @SerialName("updated_at") val updatedAt: String,
-    val deleted: Boolean = false
-)
-
-fun Customer.toDto() = CustomerDto(
-    id = id, businessId = businessId, name = name, phone = phone, email = email,
-    address = address, note = note, updatedAt = IsoTime.toIso(updatedAt), deleted = deleted
-)
-
-fun CustomerDto.toEntity() = Customer(
-    id = id, businessId = businessId, name = name, phone = phone, email = email,
-    address = address, note = note, updatedAt = IsoTime.toMillis(updatedAt),
-    deleted = deleted, pendingSync = false
-)
-
-// ── credit_transactions ─────────────────────────────────────────────────────────
-@Serializable
-data class CreditTxnDto(
-    val id: String,
-    @SerialName("business_id") val businessId: String,
-    @SerialName("customer_id") val customerId: String,
-    @SerialName("sale_id") val saleId: String? = null,
-    val type: String,
-    val amount: Double = 0.0,
-    val note: String? = null,
-    @SerialName("created_at") val createdAt: String,
-    @SerialName("updated_at") val updatedAt: String,
-    val deleted: Boolean = false
-)
-
-fun CreditTxn.toDto() = CreditTxnDto(
-    id = id, businessId = businessId, customerId = customerId, saleId = saleId, type = type,
-    amount = amount, note = note, createdAt = IsoTime.toIso(createdAt),
-    updatedAt = IsoTime.toIso(updatedAt), deleted = deleted
-)
-
-fun CreditTxnDto.toEntity() = CreditTxn(
-    id = id, businessId = businessId, customerId = customerId, saleId = saleId, type = type,
-    amount = amount, note = note, createdAt = IsoTime.toMillis(createdAt),
-    updatedAt = IsoTime.toMillis(updatedAt), deleted = deleted, pendingSync = false
-)
+/** Materialise the JSONB line items into Room [SaleLine]s. [resolveItemId] maps a sku
+ *  to the local item id so reports/profit joins work; unknown skus stay null. */
+fun SaleDto.toSaleLines(businessId: String, resolveItemId: (String?) -> String?): List<SaleLine> =
+    items.map { li ->
+        SaleLine(
+            saleId = id,
+            businessId = businessId,
+            itemId = resolveItemId(li.sku),
+            name = li.name,
+            qty = li.qty,
+            unitPrice = li.unitPrice,
+            lineDiscount = li.lineDiscount,
+            lineTotal = li.unitPrice * li.qty - li.lineDiscount,
+            mode = li.mode,
+            unitsPerLine = if (li.unitsPerLine < 1) 1 else li.unitsPerLine,
+        )
+    }
