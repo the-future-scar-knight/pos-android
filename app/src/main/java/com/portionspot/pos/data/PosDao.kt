@@ -175,6 +175,21 @@ interface SaleDao {
     )
     fun observeGrossProfit(businessId: String, from: Long, to: Long): Flow<Double>
 
+    /**
+     * Revenue of only those sold lines whose item has a cost — the correct margin
+     * denominator when the catalog is partially costed (profit is computed over the
+     * same costed lines, so margin = profit / this stays honest).
+     */
+    @Query(
+        "SELECT COALESCE(SUM(li.unitPrice * li.qty), 0) " +
+            "FROM sale_items li JOIN sales s ON li.saleId = s.id " +
+            "JOIN items i ON li.itemId = i.id " +
+            "WHERE s.businessId = :businessId AND s.deleted = 0 AND li.deleted = 0 " +
+            "AND s.status = 'completed' AND s.soldAt >= :from AND s.soldAt < :to " +
+            "AND i.cost IS NOT NULL"
+    )
+    fun observeCostedRevenue(businessId: String, from: Long, to: Long): Flow<Double>
+
     /** Bare (timestamp,total) rows since [from], bucketed in-app into the 7-day chart. */
     @Query(
         "SELECT soldAt AS soldAt, total AS total FROM sales " +
@@ -407,6 +422,16 @@ interface RefundDao {
     /** Refunds already made against a given sale (to cap over-refunding in the UI). */
     @Query("SELECT * FROM refunds WHERE saleId = :saleId AND deleted = 0 ORDER BY createdAt DESC")
     fun observeForSale(saleId: String): Flow<List<Refund>>
+
+    /**
+     * Refunded value grouped by original sale — drives the Receipts "refunded" badge
+     * (full vs partial) without touching the sale row, so no money aggregate shifts.
+     */
+    @Query(
+        "SELECT saleId AS saleId, COALESCE(SUM(refundTotal), 0) AS refunded " +
+            "FROM refunds WHERE businessId = :businessId AND deleted = 0 GROUP BY saleId"
+    )
+    fun observeRefundedBySale(businessId: String): Flow<List<SaleRefundSum>>
 
     @Query("SELECT * FROM refunds WHERE saleId = :saleId AND deleted = 0")
     suspend fun forSaleOnce(saleId: String): List<Refund>

@@ -35,6 +35,11 @@
          runtime grant; declaration alone is not enough). -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Keep delivering payment SMS + admin alerts in the background: ask the owner to
+         exempt the app from Doze / battery optimization (§6/§8). Standard for a POS;
+         prompted once. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
 

@@ -319,6 +319,17 @@ data class RefundPayment(
     val createdAt: Long = now()
 )
 
+/**
+ * Refunded value totalled per original sale (read model). Drives the "refunded"
+ * badge on the Receipts list WITHOUT editing the sale — the ledger stays immutable
+ * and every money aggregate keeps reading the original completed sale (gross), while
+ * Reports still nets refunds out separately. Presentation only.
+ */
+data class SaleRefundSum(
+    val saleId: String,
+    val refunded: Double = 0.0
+)
+
 /** A refund together with its returned lines (read model for history/receipts). */
 data class RefundWithLines(
     @Embedded val refund: Refund,

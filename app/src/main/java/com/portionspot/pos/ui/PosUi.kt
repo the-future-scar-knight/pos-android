@@ -45,6 +45,7 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AdminPanelSettings
@@ -539,7 +540,10 @@ private fun MobileMoneyScreen(vm: PosViewModel, currency: String) {
     val context = LocalContext.current
     val permLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { }
+    ) {
+        // Whatever the grant outcome, try a backfill: the scanner no-ops without READ_SMS.
+        vm.backfillSmsInbox(context.applicationContext)
+    }
     LaunchedEffect(Unit) {
         val wanted = buildList {
             if (context.checkSelfPermission(Manifest.permission.RECEIVE_SMS) != PackageManager.PERMISSION_GRANTED)
@@ -551,11 +555,38 @@ private fun MobileMoneyScreen(vm: PosViewModel, currency: String) {
             ) add(Manifest.permission.POST_NOTIFICATIONS)
         }
         if (wanted.isNotEmpty()) permLauncher.launch(wanted.toTypedArray())
+        // Already granted from a prior visit → pull anything that arrived while closed.
+        else vm.backfillSmsInbox(context.applicationContext)
+    }
+
+    // Surface the result of an inbox scan (messages caught while the app was closed).
+    val backfillCount by vm.smsBackfill.collectAsState()
+    LaunchedEffect(backfillCount) {
+        if (backfillCount > 0) {
+            val n = backfillCount
+            Toast.makeText(
+                context,
+                "Found $n payment${if (n == 1) "" else "s"} from your inbox",
+                Toast.LENGTH_LONG
+            ).show()
+            vm.clearSmsBackfillNote()
+        }
     }
 
     Column(Modifier.fillMaxSize().padding(horizontal = 14.dp)) {
         Spacer(Modifier.height(12.dp))
-        Text("Mobile money", color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 20.sp)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "Mobile money",
+                color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 20.sp,
+                modifier = Modifier.weight(1f)
+            )
+            TextButton(onClick = { vm.backfillSmsInbox(context.applicationContext) }) {
+                Icon(Icons.Filled.Sync, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(4.dp))
+                Text("Scan inbox")
+            }
+        }
         Text(
             "EcoCash & mobile-money payments read from SMS. Match each to a customer and confirm what it paid for.",
             color = t.inkSecondary, fontSize = 12.sp
@@ -2275,7 +2306,7 @@ private fun PaymentDialog(
                         Text(
                             "≈ ${money(baseToSecond(total, secondRate), secondCode)} @ ${trimPct(secondRate)}",
                             style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.outline
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 }
@@ -2311,7 +2342,7 @@ private fun PaymentDialog(
                                     Text(
                                         "= ${money(t.amount, currency)}",
                                         style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.outline
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                 }
                             } else {
@@ -2339,7 +2370,7 @@ private fun PaymentDialog(
                                 Text(
                                     "or ${money(baseToSecond(remaining, secondRate), secondCode)}",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.outline
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
                         }
@@ -2350,7 +2381,7 @@ private fun PaymentDialog(
                                 Text(
                                     "or ${money(baseToSecond(overpay, secondRate), secondCode)}",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.outline
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
                         }
@@ -2407,7 +2438,7 @@ private fun PaymentDialog(
                         Text(
                             "= ${money(baseEquiv, currency)}",
                             style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.outline,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.padding(top = 2.dp)
                         )
                     }
@@ -3260,6 +3291,16 @@ private fun ItemDialog(
     var stock by remember {
         mutableStateOf(existing?.let { if (it.trackStock) trimQty(it.stockQty) else "" } ?: "")
     }
+    // Box items are stocked as N boxes + loose units (like the web POS); we split the
+    // existing total by the item's box size and re-sum to total units on save.
+    var stockBoxes by remember {
+        mutableStateOf(existing?.takeIf { it.trackStock && it.boxSize > 1 }
+            ?.let { (it.stockQty.toInt() / it.boxSize).toString() } ?: "")
+    }
+    var stockLoose by remember {
+        mutableStateOf(existing?.takeIf { it.trackStock && it.boxSize > 1 }
+            ?.let { trimQty(it.stockQty % it.boxSize) } ?: "")
+    }
     var reorder by remember {
         mutableStateOf(existing?.reorderLevel?.takeIf { it > 0 }?.let { trimQty(it) } ?: "")
     }
@@ -3268,10 +3309,15 @@ private fun ItemDialog(
     val priceVal = price.toDoubleOrNull()
     val taxVal = tax.toDoubleOrNull() ?: 0.0
     val costVal = cost.toDoubleOrNull()
-    val stockVal = stock.toDoubleOrNull() ?: 0.0
     val wholesaleVal = wholesale.toDoubleOrNull() ?: 0.0
     val boxPriceVal = boxPrice.toDoubleOrNull() ?: 0.0
     val boxSizeVal = boxSize.toIntOrNull()?.coerceAtLeast(1) ?: 1
+    // Total on-hand units. For a box item it's dynamically summed from boxes + loose;
+    // otherwise it's the single unit count.
+    val boxesVal = stockBoxes.toIntOrNull() ?: 0
+    val looseVal = stockLoose.toDoubleOrNull() ?: 0.0
+    val stockVal = if (boxSizeVal > 1) boxesVal * boxSizeVal + looseVal
+    else (stock.toDoubleOrNull() ?: 0.0)
     val unitText = unit.trim().ifBlank { "pc" }
 
     AlertDialog(
@@ -3435,23 +3481,60 @@ private fun ItemDialog(
                     Switch(checked = track, onCheckedChange = { track = it })
                 }
                 if (track) {
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedTextField(
-                            value = stock,
-                            onValueChange = { stock = it.filter { ch -> ch.isDigit() || ch == '.' } },
-                            label = { Text(if (existing == null) "Opening stock" else "Stock on hand") },
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                            modifier = Modifier.weight(1f)
+                    if (boxSizeVal > 1) {
+                        // Box item: enter boxes + loose units; total is computed live.
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedTextField(
+                                value = stockBoxes,
+                                onValueChange = { stockBoxes = it.filter { ch -> ch.isDigit() } },
+                                label = { Text("Boxes") },
+                                singleLine = true,
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                modifier = Modifier.weight(1f)
+                            )
+                            OutlinedTextField(
+                                value = stockLoose,
+                                onValueChange = { stockLoose = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                                label = { Text("Loose $unitText") },
+                                singleLine = true,
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "Total: ${trimQty(stockVal)} $unitText  ($boxesVal box${if (boxesVal == 1) "" else "es"} × $boxSizeVal + $looseVal loose)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
+                        Spacer(Modifier.height(8.dp))
                         OutlinedTextField(
                             value = reorder,
                             onValueChange = { reorder = it.filter { ch -> ch.isDigit() || ch == '.' } },
-                            label = { Text("Reorder at") },
+                            label = { Text("Reorder at ($unitText)") },
                             singleLine = true,
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                            modifier = Modifier.weight(1f)
+                            modifier = Modifier.fillMaxWidth()
                         )
+                    } else {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedTextField(
+                                value = stock,
+                                onValueChange = { stock = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                                label = { Text(if (existing == null) "Opening stock" else "Stock on hand") },
+                                singleLine = true,
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                                modifier = Modifier.weight(1f)
+                            )
+                            OutlinedTextField(
+                                value = reorder,
+                                onValueChange = { reorder = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                                label = { Text("Reorder at") },
+                                singleLine = true,
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
                     }
                     if (existing != null) {
                         Spacer(Modifier.height(4.dp))
@@ -3556,7 +3639,7 @@ private fun CustomersScreen(vm: PosViewModel, currency: String) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Text(
                         "No customers yet.\nAdd one to sell on credit.",
-                        color = MaterialTheme.colorScheme.outline, textAlign = TextAlign.Center
+                        color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center
                     )
                 }
             } else {
@@ -3581,7 +3664,7 @@ private fun CustomersScreen(vm: PosViewModel, currency: String) {
                                     cb.customer.phone?.takeIf { it.isNotBlank() }?.let {
                                         Text(
                                             it, style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.outline
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
                                         )
                                     }
                                 }
@@ -3593,7 +3676,7 @@ private fun CustomersScreen(vm: PosViewModel, currency: String) {
                                 } else {
                                     Text(
                                         "Settled", style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.outline
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                 }
                             }
@@ -3730,7 +3813,7 @@ private fun AddCustomerDialog(
                         Text(
                             "Charge trade / box prices",
                             style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.outline
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                     Switch(checked = wholesale, onCheckedChange = { wholesale = it })
@@ -3798,7 +3881,7 @@ private fun RecentCallersDialog(
                     Modifier.fillMaxWidth().height(120.dp), contentAlignment = Alignment.Center
                 ) { CircularProgressIndicator() }
                 calls.isEmpty() -> Text(
-                    "No recent calls found.", color = MaterialTheme.colorScheme.outline
+                    "No recent calls found.", color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 else -> Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
                     calls.forEach { call ->
@@ -3836,7 +3919,7 @@ private fun RecentCallerRow(
             Text(
                 "${call.number} • ${callTypeLabel(call.type)} • ${relativeAgo(call.timeMillis)}",
                 style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.outline
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             if (match != null && match.balance > 0) {
                 Text(
@@ -3903,13 +3986,13 @@ private fun CustomerDetailDialog(
         text = {
             Column {
                 customer.phone?.takeIf { it.isNotBlank() }?.let {
-                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline)
+                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 customer.email?.takeIf { it.isNotBlank() }?.let {
-                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline)
+                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 customer.address?.takeIf { it.isNotBlank() }?.let {
-                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline)
+                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 Spacer(Modifier.height(12.dp))
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -3957,7 +4040,7 @@ private fun CustomerDetailDialog(
                 HorizontalDivider()
                 Spacer(Modifier.height(8.dp))
                 if (history.isEmpty()) {
-                    Text("No credit activity yet.", color = MaterialTheme.colorScheme.outline)
+                    Text("No credit activity yet.", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 } else {
                     Column(Modifier.heightIn(max = 240.dp).verticalScroll(rememberScrollState())) {
                         history.forEach { txn ->
@@ -3971,7 +4054,7 @@ private fun CustomerDetailDialog(
                                         style = MaterialTheme.typography.bodyMedium)
                                     Text(syncTimeLabel(txn.createdAt),
                                         style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.outline)
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
                                 Text(
                                     (if (owed) "+" else "-") + money(txn.amount, currency),
@@ -4019,7 +4102,7 @@ private fun RecordPaymentDialog(
         text = {
             Column {
                 Text("Owed: ${money(maxAmount, currency)}",
-                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline)
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(
                     value = amountText,
@@ -5146,6 +5229,7 @@ private fun DashboardScreen(vm: PosViewModel, business: Business) {
     val breakdown by vm.dashBreakdown.collectAsState()
     val topProducts by vm.dashTopProducts.collectAsState()
     val grossProfit by vm.dashGrossProfit.collectAsState()
+    val costedRevenue by vm.dashCostedRevenue.collectAsState()
     val dailyBars by vm.dashDailyBars.collectAsState()
     val items by vm.items.collectAsState()
     val customers by vm.customers.collectAsState()
@@ -5161,9 +5245,12 @@ private fun DashboardScreen(vm: PosViewModel, business: Business) {
     }
     val noCost = items.count { it.cost == null }
     val pendingCredit = customers.sumOf { it.balance.coerceAtLeast(0.0) }
-    val showProfit = noCost == 0 && items.isNotEmpty()
+    // Show profit as long as SOME item is costed (profit/margin are computed over the
+    // costed lines only). Previously this required EVERY item to have a cost, so one
+    // un-costed product hid profit entirely.
+    val showProfit = items.any { it.cost != null }
     val avgSale = if (summary.count > 0) summary.gross / summary.count else 0.0
-    val marginPct = if (showProfit && summary.net > 0) grossProfit / summary.net * 100 else 0.0
+    val marginPct = if (showProfit && costedRevenue > 0) grossProfit / costedRevenue * 100 else 0.0
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp)) {
         // Header: title + Z-Report.
@@ -5213,6 +5300,18 @@ private fun DashboardScreen(vm: PosViewModel, business: Business) {
             } else {
                 DashKpiCard("Pending credit", money(pendingCredit, currency), Modifier.weight(1f), valueColor = t.warning)
                 DashKpiCard("Discounts", money(summary.discount, currency), Modifier.weight(1f))
+            }
+        }
+        // Guide the owner to complete profit data (the #1 reason profit reads low/blank).
+        if (items.isNotEmpty()) {
+            val hint = when {
+                !showProfit -> "Set a cost price on your items (Inventory) to see profit and margin."
+                noCost > 0 -> "$noCost of ${items.size} items have no cost set — profit and margin exclude them."
+                else -> null
+            }
+            if (hint != null) {
+                Spacer(Modifier.height(6.dp))
+                Text(hint, color = t.warning, fontSize = 11.sp)
             }
         }
         Spacer(Modifier.height(12.dp))
@@ -5540,7 +5639,7 @@ private fun ReportsScreen(vm: PosViewModel, business: Business) {
                 if (breakdown.isEmpty()) {
                     Text(
                         "No sales in this period.",
-                        color = MaterialTheme.colorScheme.outline,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                         style = MaterialTheme.typography.bodySmall
                     )
                 } else {
@@ -5557,7 +5656,7 @@ private fun ReportsScreen(vm: PosViewModel, business: Business) {
                                 Text(
                                     "${row.count} sale${if (row.count == 1) "" else "s"}",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.outline
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
                             Text(money(row.total, currency), fontWeight = FontWeight.SemiBold)
@@ -5587,6 +5686,7 @@ private fun ReportStatRow(label: String, value: String) {
 private fun ReceiptsScreen(vm: PosViewModel, business: Business, printer: PrinterUi) {
     val currency = business.currency
     val sales by vm.recentSales.collectAsState()
+    val refundedBySale by vm.refundedBySale.collectAsState()
     val takings by vm.todayTakings.collectAsState()
     val countToday by vm.todayCount.collectAsState()
     var refundFor by remember { mutableStateOf<SaleEntity?>(null) }
@@ -5605,21 +5705,33 @@ private fun ReceiptsScreen(vm: PosViewModel, business: Business, printer: Printe
         HorizontalDivider()
         if (sales.isEmpty()) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("No sales yet", color = MaterialTheme.colorScheme.outline)
+                Text("No sales yet", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         } else {
             LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(12.dp)) {
                 items(sales, key = { it.id }) { sale ->
+                    val refunded = refundedBySale[sale.id] ?: 0.0
+                    val fullyRefunded = refunded > 0.0 && refunded >= sale.total - 0.01
                     Row(Modifier.fillMaxWidth().padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
-                            Text("#${sale.receiptNo ?: sale.id.takeLast(6).uppercase()}", fontWeight = FontWeight.Medium)
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("#${sale.receiptNo ?: sale.id.takeLast(6).uppercase()}", fontWeight = FontWeight.Medium)
+                                if (refunded > 0.0) {
+                                    Spacer(Modifier.width(6.dp))
+                                    RefundedBadge(fully = fullyRefunded)
+                                }
+                            }
                             Text(
                                 if (sale.synced) "Synced" else "On device",
                                 style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.outline
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
-                        Text(money(sale.total, currency), fontWeight = FontWeight.Bold)
+                        Text(
+                            money(sale.total, currency),
+                            fontWeight = FontWeight.Bold,
+                            textDecoration = if (fullyRefunded) TextDecoration.LineThrough else null
+                        )
                         IconButton(onClick = {
                             printer.printReceipt(business, sale) { vm.loadLines(sale.id) }
                         }) {
@@ -5642,6 +5754,30 @@ private fun ReceiptsScreen(vm: PosViewModel, business: Business, printer: Printe
 
     refundFor?.let { sale ->
         RefundDialog(vm, business, sale, onDismiss = { refundFor = null })
+    }
+}
+
+/**
+ * Small pill marking a receipt that has been refunded. "REFUNDED" when the whole sale
+ * value came back, "PART REFUND" for a partial return. Purely a marker — the receipt
+ * stays fully tappable (reprint / share / further partial refund).
+ */
+@Composable
+private fun RefundedBadge(fully: Boolean) {
+    val bg = if (fully) MaterialTheme.colorScheme.errorContainer
+    else MaterialTheme.colorScheme.tertiaryContainer
+    val fg = if (fully) MaterialTheme.colorScheme.onErrorContainer
+    else MaterialTheme.colorScheme.onTertiaryContainer
+    Box(
+        Modifier.clip(RoundedCornerShape(4.dp)).background(bg)
+            .padding(horizontal = 6.dp, vertical = 2.dp)
+    ) {
+        Text(
+            if (fully) "REFUNDED" else "PART REFUND",
+            color = fg,
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Bold
+        )
     }
 }
 
@@ -5739,7 +5875,7 @@ private fun RefundDialog(
                     Text(
                         "Choose what's coming back. The refund is proportional to what was paid.",
                         style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.outline
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Spacer(Modifier.height(8.dp))
                     ls.forEach { line ->
@@ -5752,7 +5888,7 @@ private fun RefundDialog(
                                 "Sold ${fmtQty(line.qty)} @ ${money(line.unitPrice, currency)}" +
                                     if (already > 0) " · ${fmtQty(already)} already returned" else "",
                                 style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.outline
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 IconButton(
@@ -5869,7 +6005,7 @@ private fun RefundsScreen(vm: PosViewModel, business: Business, printer: Printer
     Column(Modifier.fillMaxSize()) {
         if (refunds.isEmpty()) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("No refunds yet", color = MaterialTheme.colorScheme.outline)
+                Text("No refunds yet", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         } else {
             LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(12.dp)) {
@@ -5885,12 +6021,12 @@ private fun RefundsScreen(vm: PosViewModel, business: Business, printer: Printer
                                 Text(
                                     (r.customerName ?: "Walk-in") + (r.createdByName?.let { " · by $it" } ?: ""),
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.outline
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                                 Text(
                                     agoText(r.createdAt),
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.outline
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
                             Column(horizontalAlignment = Alignment.End) {
@@ -5919,7 +6055,7 @@ private fun RefundsScreen(vm: PosViewModel, business: Business, printer: Printer
                             Text(
                                 retLines.joinToString(", ") { "${fmtQty(it.qty)}× ${it.name}" },
                                 style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.outline
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                         if (r.status == "owed") {
@@ -5961,7 +6097,7 @@ private fun RefundPayoutDialog(
                 Text(
                     "Refund on #${refund.saleReceiptNo ?: refund.saleId.takeLast(6).uppercase()} — total ${money(refund.refundTotal, currency)}",
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.outline
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Spacer(Modifier.height(8.dp))
                 Box {
@@ -6166,7 +6302,7 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
                 "Choose which methods cashiers can use at checkout. Money goes directly " +
                     "to your own accounts — never through ON-SPOT POS.",
                 style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.outline
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Spacer(Modifier.height(4.dp))
             SettingsSwitch("Cash", cashEnabled) { cashEnabled = it }
@@ -6188,7 +6324,7 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
                     "The Integration Key is kept on this device only — it is never uploaded " +
                         "to the cloud or shared with the ON-SPOT POS platform.",
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.outline
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
 
@@ -6230,7 +6366,7 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
                     "currency at the till (handy for USD + ZiG). Leave the code blank or the " +
                     "rate at 0 to switch it off.",
                 style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.outline
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             SettingsField("Second currency code (e.g. ZWG)", prefs.secondCurrencyCode) {
                 vm.savePrefs(prefs.copy(secondCurrencyCode = it.uppercase().trim()))
@@ -6288,7 +6424,7 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
                     Text(
                         printerName ?: "No printer selected",
                         style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.outline
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Spacer(Modifier.height(8.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -6308,7 +6444,7 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
                     Text(
                         "Prints through the RawBT app (install it separately). RawBT can drive Bluetooth, USB and network printers it supports.",
                         style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.outline
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Spacer(Modifier.height(8.dp))
                     OutlinedButton(onClick = { printer.test(edited()) }) {
@@ -6321,7 +6457,7 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
                     Text(
                         "Prints to the built-in printer on a Sunmi handheld device.",
                         style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.outline
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Spacer(Modifier.height(8.dp))
                     OutlinedButton(onClick = { printer.test(edited()) }) {
@@ -6359,7 +6495,7 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
             Text(
                 "A quick look layered over the toggles below.",
                 style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.outline
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Spacer(Modifier.height(4.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -6389,7 +6525,7 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
             Text(
                 "These actions cannot be undone.",
                 style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.outline
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Spacer(Modifier.height(8.dp))
             OutlinedButton(
@@ -6477,7 +6613,7 @@ private fun CloudSyncSection(vm: PosViewModel) {
         "Optional. The app works fully offline. Connect your own Supabase database " +
             "to back up sales and sync across devices — the data stays in your account, not ours.",
         style = MaterialTheme.typography.bodySmall,
-        color = MaterialTheme.colorScheme.outline
+        color = MaterialTheme.colorScheme.onSurfaceVariant
     )
     Spacer(Modifier.height(12.dp))
 
@@ -6633,7 +6769,7 @@ private fun PrinterPickerDialog(
                         ) {
                             Text(dev.name, fontWeight = FontWeight.Medium)
                             Text(dev.mac, style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.outline)
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     }
                 }
