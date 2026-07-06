@@ -348,6 +348,27 @@ data class MethodBreakdown(
     val total: Double
 )
 
+/** Per-cashier totals over a window (read model for the admin end-of-day summary). */
+data class CashierDay(
+    val cashierId: String?,
+    val cashierName: String?,
+    val count: Int,
+    val total: Double
+)
+
+/** One customer's debt split into aging buckets (read model for the aging report). */
+data class DebtAgingRow(
+    val customerId: String,
+    val customerName: String,
+    val bucket0to30: Double = 0.0,
+    val bucket30to60: Double = 0.0,
+    val bucket60to90: Double = 0.0,
+    val bucket90plus: Double = 0.0,
+    val oldestAt: Long = 0L
+) {
+    val total: Double get() = bucket0to30 + bucket30to60 + bucket60to90 + bucket90plus
+}
+
 /** A top-selling product over a date window (read model for the Dashboard). */
 data class TopProduct(
     val name: String,
@@ -518,6 +539,115 @@ data class PurchaseOrderWithLines(
     @Embedded val po: PurchaseOrder,
     @Relation(parentColumn = "id", entityColumn = "poId")
     val lines: List<PurchaseOrderLine>
+)
+
+/**
+ * A parsed mobile-money confirmation SMS (prompt §6 — the flagship reconciliation
+ * feature). One row per incoming payment message (EcoCash primarily; OneMoney,
+ * InnBucks, Omari and bank alerts add by a parser RULE, not new columns).
+ *
+ * Idempotency: [txnCode] is the provider's unique transaction code and is the
+ * dedupe key — a unique index on (businessId, txnCode) plus an insert-ignore means
+ * the same SMS (redelivered, or read again) can never be recorded twice (§6.6).
+ *
+ * Lifecycle ([status]):
+ *  - `unmatched`         — parsed, no customer found by phone; awaits manual assignment.
+ *  - `needs_verification`— matched a customer by phone; awaits the cashier confirming
+ *                          what the money is for (§6.1–6.2).
+ *  - `verified`          — the cashier applied it (to a debt, a sale, or just logged it);
+ *                          [appliedCreditTxnId]/[appliedSaleId] link where it went.
+ *  - `ignored`           — dismissed (not a real payment / duplicate handled manually).
+ *
+ * Attribution: [createdBy]/[createdByName] are stamped from the last-unlocked cashier's
+ * cached session AT arrival (offline included), so a passive receipt still has an owner.
+ * Local-first: carries [pendingSync] but cloud push is deferred to the sync-parity phase.
+ */
+@Entity(
+    tableName = "mobile_money_receipts",
+    indices = [
+        Index("businessId"),
+        Index(value = ["businessId", "txnCode"], unique = true)
+    ]
+)
+data class MobileMoneyReceipt(
+    @PrimaryKey val id: String = newId(),
+    val businessId: String,
+    val provider: String = "unknown",     // ecocash | onemoney | innbucks | omari | bank | unknown
+    val rawBody: String = "",              // the original SMS text (audit / re-parse)
+    val sender: String? = null,           // SMS originating address (e.g. "EcoCash")
+    val senderName: String? = null,        // payer name parsed from the body, if present
+    val senderPhone: String? = null,       // payer number parsed from the body, if present
+    val amount: Double = 0.0,
+    val currency: String = "USD",
+    val txnCode: String,                   // provider's unique reference — the idempotency key
+    val receivedAt: Long = now(),          // device time the SMS arrived
+    val status: String = "unmatched",      // unmatched | needs_verification | verified | ignored
+    val matchedCustomerId: String? = null,
+    val matchedCustomerName: String? = null,
+    val purpose: String? = null,           // debt | sale (what the cashier said it was for)
+    val appliedCreditTxnId: String? = null, // the credit_paid / change_owed row it produced
+    val appliedSaleId: String? = null,
+    val note: String? = null,
+    val createdBy: String? = null,
+    val createdByName: String? = null,
+    val serverCreatedAt: Long? = null,
+    val updatedAt: Long = now(),
+    val deleted: Boolean = false,
+    /** Local-only: true => has unsynced local edits to push. Never sent to cloud yet. */
+    val pendingSync: Boolean = true
+)
+
+/**
+ * A persisted admin notification (prompt §8, Phase 7). The [NotificationEngine]
+ * recomputes the shop's alert state on a schedule and upserts rows here keyed by a
+ * stable [dedupeKey], so a recurring condition (a low-stock item, an owed refund)
+ * is ONE row that updates — never a fresh duplicate each cycle.
+ *
+ * Read-state ([readAt]) and push-state ([pushedAt]) live on the row: the admin sees
+ * unread badges; [pushedAt] stops a system notification firing twice for the same
+ * escalation. [eventAt] is the UNDERLYING event time (a refund's creation, a payment's
+ * arrival) so the N-hour escalation in §8 is measured from when it really happened,
+ * not from when the engine noticed. Local-only — never synced.
+ */
+@Entity(
+    tableName = "notifications",
+    indices = [Index("businessId"), Index(value = ["businessId", "dedupeKey"], unique = true)]
+)
+data class AppNotification(
+    @PrimaryKey val id: String = newId(),
+    val businessId: String,
+    val category: String,                 // inventory | sales | system | payments | refunds
+    val severity: String = "info",        // info | warn | danger
+    val title: String,
+    val body: String,
+    val dedupeKey: String,                // stable natural key: recompute updates this row
+    val refType: String? = null,          // sale | refund | item | customer | mm_receipt | device
+    val refId: String? = null,
+    val eventAt: Long = now(),            // underlying event time (drives escalation age)
+    val createdAt: Long = now(),          // first seen
+    val readAt: Long? = null,             // null => unread
+    val pushedAt: Long? = null,           // when a system notification was last fired for it
+    val deleted: Boolean = false
+)
+
+/**
+ * One immutable audit-trail entry (prompt §8 "full audit log"). Written whenever an
+ * admin/cashier performs a sensitive action — voiding a refund, adjusting stock,
+ * overriding a price, locking a payment method, writing off a debt. Append-only and
+ * local-only. Attribution ([createdBy]/[createdByName]) is stamped at write time.
+ */
+@Entity(tableName = "audit_log", indices = [Index("businessId")])
+data class AuditEntry(
+    @PrimaryKey val id: String = newId(),
+    val businessId: String,
+    val action: String,                   // void_refund | stock_adjust | payment_lock | debt_writeoff | …
+    val entityType: String? = null,
+    val entityId: String? = null,
+    val summary: String,
+    val meta: String? = null,
+    val createdBy: String? = null,
+    val createdByName: String? = null,
+    val createdAt: Long = now()
 )
 
 /**

@@ -2,6 +2,7 @@ package com.portionspot.pos.data
 
 import androidx.room.Dao
 import androidx.room.Insert
+import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Transaction
 import androidx.room.Upsert
@@ -59,6 +60,12 @@ interface ItemDao {
             "ORDER BY stockQty ASC"
     )
     fun observeLowStock(businessId: String): Flow<List<Item>>
+
+    /** Tracked, active items — one-shot for the notification engine (low/out of stock). */
+    @Query(
+        "SELECT * FROM items WHERE businessId = :businessId AND deleted = 0 AND isActive = 1 AND trackStock = 1"
+    )
+    suspend fun trackedOnce(businessId: String): List<Item>
 
     /** Danger zone: zero out every item's on-hand for a business. */
     @Query("UPDATE items SET stockQty = 0, updatedAt = :at, pendingSync = 1 WHERE businessId = :businessId")
@@ -176,6 +183,29 @@ interface SaleDao {
     )
     fun observeStampsSince(businessId: String, from: Long): Flow<List<SaleStamp>>
 
+    // ---- admin: end-of-day / shift summary + large-sale feed (Phase 7) ----
+    @Query(
+        "SELECT createdBy AS cashierId, createdByName AS cashierName, COUNT(*) AS count, " +
+            "COALESCE(SUM(total), 0) AS total FROM sales " +
+            "WHERE businessId = :businessId AND deleted = 0 AND status = 'completed' " +
+            "AND soldAt >= :from AND soldAt < :to GROUP BY createdBy ORDER BY total DESC"
+    )
+    fun observeCashierDay(businessId: String, from: Long, to: Long): Flow<List<CashierDay>>
+
+    /** Change actually handed back in a window — for the cash-in-drawer estimate. */
+    @Query(
+        "SELECT COALESCE(SUM(changeDue), 0) FROM sales WHERE businessId = :businessId " +
+            "AND deleted = 0 AND status = 'completed' AND soldAt >= :from AND soldAt < :to"
+    )
+    fun observeChangeGiven(businessId: String, from: Long, to: Long): Flow<Double>
+
+    /** Large sales since [since] at/above [min] — one-shot for the notification engine. */
+    @Query(
+        "SELECT * FROM sales WHERE businessId = :businessId AND deleted = 0 AND status = 'completed' " +
+            "AND soldAt >= :since AND total >= :min ORDER BY soldAt DESC LIMIT 50"
+    )
+    suspend fun largeSalesOnce(businessId: String, since: Long, min: Double): List<SaleEntity>
+
     // ---- sync ----
     @Query("SELECT * FROM sales WHERE synced = 0")
     suspend fun pendingSales(): List<SaleEntity>
@@ -264,6 +294,10 @@ interface CustomerDao {
     @Query("SELECT * FROM customers WHERE id = :id LIMIT 1")
     suspend fun getById(id: String): Customer?
 
+    /** One-shot snapshot (e.g. to match an incoming payment SMS to a saved number). */
+    @Query("SELECT * FROM customers WHERE businessId = :businessId AND deleted = 0")
+    suspend fun allForBusiness(businessId: String): List<Customer>
+
     @Upsert
     suspend fun upsert(customer: Customer)
 
@@ -327,6 +361,13 @@ interface CreditDao {
     )
     fun observeForBusiness(businessId: String): Flow<List<CreditTxn>>
 
+    /** Chronological one-shot of the whole ledger — FIFO debt-aging computation. */
+    @Query(
+        "SELECT * FROM credit_transactions WHERE businessId = :businessId AND deleted = 0 " +
+            "ORDER BY createdAt ASC"
+    )
+    suspend fun allForBusinessOnce(businessId: String): List<CreditTxn>
+
     // ---- sync ----
     @Query("SELECT * FROM credit_transactions WHERE pendingSync = 1")
     suspend fun pending(): List<CreditTxn>
@@ -369,6 +410,14 @@ interface RefundDao {
 
     @Query("SELECT * FROM refunds WHERE saleId = :saleId AND deleted = 0")
     suspend fun forSaleOnce(saleId: String): List<Refund>
+
+    /** Refunds still owing money — one-shot for the notification engine (§8). */
+    @Query("SELECT * FROM refunds WHERE businessId = :businessId AND deleted = 0 AND status = 'owed'")
+    suspend fun owedOnce(businessId: String): List<Refund>
+
+    /** Tombstone a refund (admin void of a wrongful refund, §8). */
+    @Query("UPDATE refunds SET deleted = 1, updatedAt = :at, pendingSync = 1 WHERE id = :id")
+    suspend fun softDelete(id: String, at: Long)
 
     @Query("SELECT * FROM refunds WHERE id = :id LIMIT 1")
     suspend fun getById(id: String): Refund?
@@ -433,6 +482,110 @@ interface RefundDao {
 
     @Query("DELETE FROM refund_payments WHERE businessId = :businessId")
     suspend fun wipePayments(businessId: String)
+}
+
+@Dao
+interface MobileMoneyDao {
+    /**
+     * Insert a parsed receipt, IGNORING a collision on the (businessId, txnCode)
+     * unique index. This is the idempotency guarantee (§6.6): the same SMS parsed
+     * twice can never create a second row. Returns the inserted rowId, or -1 when
+     * the txn code was already present (so the receiver can skip notifying again).
+     */
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertIgnore(receipt: MobileMoneyReceipt): Long
+
+    @Query("SELECT * FROM mobile_money_receipts WHERE businessId = :businessId AND txnCode = :txnCode LIMIT 1")
+    suspend fun getByTxn(businessId: String, txnCode: String): MobileMoneyReceipt?
+
+    /** Still awaiting the cashier — one-shot for the notification engine (§8). */
+    @Query(
+        "SELECT * FROM mobile_money_receipts WHERE businessId = :businessId AND deleted = 0 " +
+            "AND status IN ('needs_verification', 'unmatched')"
+    )
+    suspend fun pendingOnce(businessId: String): List<MobileMoneyReceipt>
+
+    @Query("SELECT * FROM mobile_money_receipts WHERE id = :id LIMIT 1")
+    suspend fun getById(id: String): MobileMoneyReceipt?
+
+    /** One status bucket (needs_verification / unmatched / verified), newest first. */
+    @Query(
+        "SELECT * FROM mobile_money_receipts WHERE businessId = :businessId AND deleted = 0 " +
+            "AND status = :status ORDER BY receivedAt DESC"
+    )
+    fun observeByStatus(businessId: String, status: String): Flow<List<MobileMoneyReceipt>>
+
+    /** Count still awaiting the cashier (matched-but-unverified + unmatched) → the "More" badge. */
+    @Query(
+        "SELECT COUNT(*) FROM mobile_money_receipts WHERE businessId = :businessId AND deleted = 0 " +
+            "AND status IN ('needs_verification', 'unmatched')"
+    )
+    fun observePendingCount(businessId: String): Flow<Int>
+
+    @Upsert
+    suspend fun upsert(receipt: MobileMoneyReceipt)
+
+    // ---- sync (deferred to the parity phase, but kept ready) ----
+    @Query("SELECT * FROM mobile_money_receipts WHERE pendingSync = 1")
+    suspend fun pending(): List<MobileMoneyReceipt>
+
+    @Query("UPDATE mobile_money_receipts SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun markSynced(ids: List<String>)
+
+    @Query("DELETE FROM mobile_money_receipts WHERE businessId = :businessId")
+    suspend fun wipe(businessId: String)
+}
+
+@Dao
+interface NotificationDao {
+    /** Whole-shop feed (newest event first) for the admin Alerts screen. */
+    @Query(
+        "SELECT * FROM notifications WHERE businessId = :businessId AND deleted = 0 " +
+            "ORDER BY eventAt DESC"
+    )
+    fun observeForBusiness(businessId: String): Flow<List<AppNotification>>
+
+    /** Unread count → the admin Alerts tab badge. */
+    @Query("SELECT COUNT(*) FROM notifications WHERE businessId = :businessId AND deleted = 0 AND readAt IS NULL")
+    fun observeUnreadCount(businessId: String): Flow<Int>
+
+    /** All live rows — the engine reconciles the current state against these. */
+    @Query("SELECT * FROM notifications WHERE businessId = :businessId AND deleted = 0")
+    suspend fun allActive(businessId: String): List<AppNotification>
+
+    @Query("SELECT * FROM notifications WHERE businessId = :businessId AND dedupeKey = :key LIMIT 1")
+    suspend fun getByKey(businessId: String, key: String): AppNotification?
+
+    @Upsert
+    suspend fun upsert(notification: AppNotification)
+
+    @Query("UPDATE notifications SET readAt = :at WHERE id = :id")
+    suspend fun markRead(id: String, at: Long)
+
+    @Query("UPDATE notifications SET readAt = :at WHERE businessId = :businessId AND readAt IS NULL AND deleted = 0")
+    suspend fun markAllRead(businessId: String, at: Long)
+
+    /** Tombstone rows whose condition has cleared (resolved low stock, settled refund). */
+    @Query("UPDATE notifications SET deleted = 1 WHERE id IN (:ids)")
+    suspend fun tombstone(ids: List<String>)
+
+    @Query("DELETE FROM notifications WHERE businessId = :businessId")
+    suspend fun wipe(businessId: String)
+}
+
+@Dao
+interface AuditDao {
+    @Insert
+    suspend fun insert(entry: AuditEntry)
+
+    @Query(
+        "SELECT * FROM audit_log WHERE businessId = :businessId " +
+            "ORDER BY createdAt DESC LIMIT :limit"
+    )
+    fun observeForBusiness(businessId: String, limit: Int = 300): Flow<List<AuditEntry>>
+
+    @Query("DELETE FROM audit_log WHERE businessId = :businessId")
+    suspend fun wipe(businessId: String)
 }
 
 @Dao

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider roots for sharing/re-opening generated PDFs (Phase 6, §5).
+     Covers the app's private external Documents folder (fallback path) and the
+     internal cache used for transient share files. -->
+<paths>
+    <external-files-path name="documents" path="Documents/" />
+    <external-files-path name="pos_docs" path="PortionSpot/" />
+    <cache-path name="cache" path="." />
+    <external-cache-path name="external_cache" path="." />
+</paths>

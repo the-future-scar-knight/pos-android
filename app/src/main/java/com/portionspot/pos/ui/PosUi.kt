@@ -135,6 +135,8 @@ import androidx.compose.material.icons.filled.Logout
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Sms
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material.icons.filled.WifiOff
 import androidx.compose.ui.draw.alpha
@@ -150,10 +152,13 @@ import com.portionspot.pos.data.secondCurrencyActive
 import com.portionspot.pos.data.CreditTxn
 import com.portionspot.pos.data.Customer
 import com.portionspot.pos.data.CustomerWithBalance
+import com.portionspot.pos.data.DebtAgingRow
 import com.portionspot.pos.device.CallLogAccess
 import com.portionspot.pos.device.PickedContact
 import com.portionspot.pos.device.RecentCall
 import com.portionspot.pos.device.phoneKey
+import android.content.pm.PackageManager
+import com.portionspot.pos.data.MobileMoneyReceipt
 import com.portionspot.pos.device.rememberContactPicker
 import com.portionspot.pos.data.Tender
 import com.portionspot.pos.data.Expense
@@ -182,6 +187,8 @@ import com.portionspot.pos.payments.payInstructions
 import com.portionspot.pos.print.BluetoothPrinter
 import com.portionspot.pos.print.PrintResult
 import com.portionspot.pos.print.PrinterDevice
+import com.portionspot.pos.pdf.PdfDocs
+import com.portionspot.pos.pdf.PdfFiles
 import com.portionspot.pos.print.ReceiptPrinter
 import com.portionspot.pos.print.ReceiptStyle
 import com.portionspot.pos.sync.ConnectionTest
@@ -215,6 +222,7 @@ private enum class Screen(val label: String, val short: String) {
     Purchases("Purchase Orders", "POs"),
     Receipts("Receipts", "Receipts"),
     Refunds("Refunds", "Refunds"),
+    MobileMoney("Mobile Money", "MoMo"),
     Settings("Settings", "Settings"),
 }
 
@@ -224,7 +232,7 @@ private val OVERFLOW_SCREENS =
     listOf(
         Screen.Dashboard, Screen.Customers, Screen.Credit,
         Screen.Expenses, Screen.Suppliers, Screen.Purchases, Screen.Receipts,
-        Screen.Refunds, Screen.Settings
+        Screen.Refunds, Screen.MobileMoney, Screen.Settings
     )
 
 private fun screenIcon(s: Screen): androidx.compose.ui.graphics.vector.ImageVector = when (s) {
@@ -240,6 +248,7 @@ private fun screenIcon(s: Screen): androidx.compose.ui.graphics.vector.ImageVect
     Screen.Purchases -> Icons.AutoMirrored.Filled.Assignment
     Screen.Receipts -> Icons.AutoMirrored.Filled.ReceiptLong
     Screen.Refunds -> Icons.Filled.AssignmentReturn
+    Screen.MobileMoney -> Icons.Filled.Sms
     Screen.Settings -> Icons.Filled.Settings
 }
 
@@ -270,21 +279,33 @@ private class PrinterUi(
 ) {
     private fun style(): ReceiptStyle {
         val p = prefsProvider()
+        // Layer the chosen preset (Compact/Standard/Detailed) over the individual toggles.
+        val flags = applyReceiptPreset(
+            ReceiptStyleFlags(
+                largeText = p.receiptFontScale >= 1.2f,
+                feedLines = p.receiptFeedLines,
+                showTagline = p.receiptShowTagline,
+                showAddress = p.receiptShowAddress,
+                showFooter = p.receiptShowFooter,
+            ),
+            p.receiptPreset
+        )
         return ReceiptStyle(
-            largeText = p.receiptFontScale >= 1.2f,
-            feedLines = p.receiptFeedLines,
+            largeText = flags.largeText,
+            feedLines = flags.feedLines,
             boldName = p.receiptBoldName,
             showLogo = p.receiptShowLogo,
-            showTagline = p.receiptShowTagline,
-            showAddress = p.receiptShowAddress,
+            showTagline = flags.showTagline,
+            showAddress = flags.showAddress,
             showVat = p.receiptShowVat,
-            showFooter = p.receiptShowFooter,
+            showFooter = flags.showFooter,
             secondCode = p.secondCurrencyCode,
             secondRate = p.secondCurrencyRate
         )
     }
 
-    private fun useSunmi(): Boolean = prefsProvider().printerType == "sunmi"
+    /** Chosen printer target: "bluetooth" (paired ESC/POS) · "sunmi" · "rawbt". */
+    private fun target(): String = prefsProvider().printerType
     /** Run [action] now if we hold BLUETOOTH_CONNECT, else request it first. */
     private fun withPermission(action: () -> Unit) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
@@ -300,15 +321,15 @@ private class PrinterUi(
     /** Ask permission (if needed) then run [block] — used to open the picker. */
     fun ensurePermission(block: () -> Unit) = withPermission(block)
 
-    /** Sunmi prints over an internal service (no BT permission); BT needs CONNECT. */
+    /** Only the Bluetooth path needs BLUETOOTH_CONNECT; Sunmi/RawBT do not. */
     private fun withPrinterReady(action: () -> Unit) =
-        if (useSunmi()) action() else withPermission(action)
+        if (target() == "bluetooth") withPermission(action) else action()
 
     fun printReceipt(business: Business, sale: SaleEntity, loadLines: suspend () -> List<SaleLine>) =
         withPrinterReady {
             scope.launch {
                 toast("Printing…")
-                val r = ReceiptPrinter.print(context, business, sale, loadLines(), style(), useSunmi())
+                val r = ReceiptPrinter.print(context, business, sale, loadLines(), style(), target())
                 when (r) {
                     is PrintResult.Success -> toast("Printed")
                     is PrintResult.Error -> toast("Print failed: ${r.message}")
@@ -324,7 +345,7 @@ private class PrinterUi(
     ) = withPrinterReady {
         scope.launch {
             toast("Printing…")
-            val r = ReceiptPrinter.printRefund(context, business, refund, lines, loadPayments(), style(), useSunmi())
+            val r = ReceiptPrinter.printRefund(context, business, refund, lines, loadPayments(), style(), target())
             when (r) {
                 is PrintResult.Success -> toast("Printed")
                 is PrintResult.Error -> toast("Print failed: ${r.message}")
@@ -334,10 +355,50 @@ private class PrinterUi(
 
     fun test(business: Business) = withPrinterReady {
         scope.launch {
-            when (val r = ReceiptPrinter.testPrint(context, business, useSunmi())) {
+            when (val r = ReceiptPrinter.testPrint(context, business, target())) {
                 is PrintResult.Success -> toast("Test sent to printer")
                 is PrintResult.Error -> toast(r.message)
             }
+        }
+    }
+
+    // ---- PDF export (Phase 6, §5) — no printer/permission needed ----
+
+    fun sharePdfReceipt(business: Business, sale: SaleEntity, loadLines: suspend () -> List<SaleLine>) {
+        scope.launch {
+            toast("Building PDF…")
+            val file = withContext(Dispatchers.IO) { PdfDocs.saleReceipt(context, business, sale, loadLines()) }
+            PdfFiles.share(context, file, "Receipt #${sale.receiptNo ?: sale.id.takeLast(6)}")
+        }
+    }
+
+    fun sharePdfRefund(
+        business: Business,
+        refund: Refund,
+        lines: List<RefundLine>,
+        loadPayments: suspend () -> List<RefundPayment>
+    ) {
+        scope.launch {
+            toast("Building PDF…")
+            val file = withContext(Dispatchers.IO) {
+                PdfDocs.refundReceipt(context, business, refund, lines, loadPayments())
+            }
+            PdfFiles.share(context, file, "Refund #${refund.saleReceiptNo ?: ""}")
+        }
+    }
+
+    fun sharePdfStatement(
+        business: Business,
+        heading: String,
+        customerName: String,
+        entries: List<PdfDocs.StatementEntry>
+    ) {
+        scope.launch {
+            toast("Building PDF…")
+            val file = withContext(Dispatchers.IO) {
+                PdfDocs.customerStatement(context, business, heading, customerName, entries)
+            }
+            PdfFiles.share(context, file, "$heading — $customerName")
         }
     }
 
@@ -362,7 +423,14 @@ private fun rememberPrinterUi(prefsProvider: () -> ShopPrefs): PrinterUi {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AppRoot(vm: PosViewModel, onExitToAdmin: (() -> Unit)? = null) {
+fun AppRoot(
+    vm: PosViewModel,
+    onExitToAdmin: (() -> Unit)? = null,
+    // Set when launched from a mobile-money notification (§6.2). Jumps to the
+    // Mobile Money screen once, then calls [onOpenConsumed] so it doesn't re-fire.
+    openMobileMoney: Boolean = false,
+    onOpenConsumed: () -> Unit = {}
+) {
     val t = LocalPosTokens.current
     val business by vm.business.collectAsState()
     val cart by vm.cart.collectAsState()
@@ -371,9 +439,14 @@ fun AppRoot(vm: PosViewModel, onExitToAdmin: (() -> Unit)? = null) {
     var moreOpen by remember { mutableStateOf(false) }
     val printer = rememberPrinterUi { vm.shopPrefs.value }
 
+    LaunchedEffect(openMobileMoney) {
+        if (openMobileMoney) { screen = Screen.MobileMoney; onOpenConsumed() }
+    }
+
     val currency = business?.currency ?: "USD"
     val shopName = business?.name ?: "Spot POS"
     val cartCount = cart.sumOf { it.qty }.toInt()
+    val mmPending by vm.mmPendingCount.collectAsState()
 
     Box(Modifier.fillMaxSize()) {
         Scaffold(
@@ -392,7 +465,8 @@ fun AppRoot(vm: PosViewModel, onExitToAdmin: (() -> Unit)? = null) {
                     cartCount = cartCount,
                     moreOpen = moreOpen,
                     onSelect = { screen = it; moreOpen = false },
-                    onMore = { moreOpen = !moreOpen }
+                    onMore = { moreOpen = !moreOpen },
+                    moreBadge = mmPending
                 )
             }
         ) { padding ->
@@ -413,6 +487,7 @@ fun AppRoot(vm: PosViewModel, onExitToAdmin: (() -> Unit)? = null) {
                     Screen.Reports -> ReportsScreen(vm, business!!)
                     Screen.Receipts -> ReceiptsScreen(vm, business!!, printer)
                     Screen.Refunds -> RefundsScreen(vm, business!!, printer)
+                    Screen.MobileMoney -> MobileMoneyScreen(vm, currency)
                     Screen.Sync -> SyncScreen(vm)
                     Screen.Settings -> SettingsScreen(vm, business!!, printer)
                 }
@@ -437,6 +512,286 @@ fun AppRoot(vm: PosViewModel, onExitToAdmin: (() -> Unit)? = null) {
     }
 }
 
+// ─────────────────── MOBILE MONEY RECONCILIATION (Phase 5, §6) ───────────────────
+
+private enum class MmTab(val label: String) {
+    NEEDS("To verify"), UNMATCHED("Unmatched"), DONE("Verified")
+}
+
+/**
+ * Mobile-money reconciliation (prompt §6). Payments parsed from SMS land here in
+ * three buckets: matched-to-a-customer awaiting the cashier's confirmation, unmatched
+ * awaiting manual assignment, and a verified history. Verifying a debt payment applies
+ * it to the customer's account; a walk-in sale payment is simply acknowledged.
+ */
+@Composable
+private fun MobileMoneyScreen(vm: PosViewModel, currency: String) {
+    val t = LocalPosTokens.current
+    val needs by vm.mmNeedsVerification.collectAsState()
+    val unmatched by vm.mmUnmatched.collectAsState()
+    val verified by vm.mmVerified.collectAsState()
+    val customers by vm.customers.collectAsState()
+    var tab by remember { mutableStateOf(MmTab.NEEDS) }
+    var verifyTarget by remember { mutableStateOf<MobileMoneyReceipt?>(null) }
+
+    // Ask for SMS + notification permissions on first visit (declaration ≠ grant on
+    // 13+). If denied, reconciliation just stays empty — nothing else breaks.
+    val context = LocalContext.current
+    val permLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { }
+    LaunchedEffect(Unit) {
+        val wanted = buildList {
+            if (context.checkSelfPermission(Manifest.permission.RECEIVE_SMS) != PackageManager.PERMISSION_GRANTED)
+                add(Manifest.permission.RECEIVE_SMS)
+            if (context.checkSelfPermission(Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED)
+                add(Manifest.permission.READ_SMS)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+            ) add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        if (wanted.isNotEmpty()) permLauncher.launch(wanted.toTypedArray())
+    }
+
+    Column(Modifier.fillMaxSize().padding(horizontal = 14.dp)) {
+        Spacer(Modifier.height(12.dp))
+        Text("Mobile money", color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 20.sp)
+        Text(
+            "EcoCash & mobile-money payments read from SMS. Match each to a customer and confirm what it paid for.",
+            color = t.inkSecondary, fontSize = 12.sp
+        )
+        Spacer(Modifier.height(10.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            MmTabChip(MmTab.NEEDS, tab, needs.size) { tab = it }
+            MmTabChip(MmTab.UNMATCHED, tab, unmatched.size) { tab = it }
+            MmTabChip(MmTab.DONE, tab, verified.size) { tab = it }
+        }
+        Spacer(Modifier.height(10.dp))
+
+        val list = when (tab) {
+            MmTab.NEEDS -> needs
+            MmTab.UNMATCHED -> unmatched
+            MmTab.DONE -> verified
+        }
+        if (list.isEmpty()) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(Icons.Filled.Sms, contentDescription = null, tint = t.inkTertiary, modifier = Modifier.size(40.dp))
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        when (tab) {
+                            MmTab.NEEDS -> "No payments waiting to be verified."
+                            MmTab.UNMATCHED -> "No unmatched payments."
+                            MmTab.DONE -> "No verified payments yet."
+                        },
+                        color = t.inkTertiary, fontSize = 13.sp
+                    )
+                }
+            }
+        } else {
+            LazyColumn(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(list, key = { it.id }) { r ->
+                    MmReceiptCard(
+                        r = r,
+                        onVerify = { verifyTarget = r },
+                        onLogAsSale = { vm.verifyMobileMoney(r.id, null, "sale") },
+                        onIgnore = { vm.ignoreMobileMoney(r.id) }
+                    )
+                }
+                item { Spacer(Modifier.height(24.dp)) }
+            }
+        }
+    }
+
+    verifyTarget?.let { r ->
+        MmVerifyDialog(
+            r = r,
+            customers = customers,
+            currency = currency,
+            onDismiss = { verifyTarget = null },
+            onConfirm = { cw, purpose, note ->
+                vm.verifyMobileMoney(r.id, cw?.customer, purpose, note)
+                verifyTarget = null
+            }
+        )
+    }
+}
+
+@Composable
+private fun MmTabChip(tab: MmTab, current: MmTab, count: Int, onSelect: (MmTab) -> Unit) {
+    val label = if (count > 0) "${tab.label} ($count)" else tab.label
+    FilterChip(selected = current == tab, onClick = { onSelect(tab) }, label = { Text(label) })
+}
+
+@Composable
+private fun MmReceiptCard(
+    r: MobileMoneyReceipt,
+    onVerify: () -> Unit,
+    onLogAsSale: () -> Unit,
+    onIgnore: () -> Unit
+) {
+    val t = LocalPosTokens.current
+    val who = r.matchedCustomerName ?: r.senderName ?: r.senderPhone ?: "Unknown sender"
+    Card(
+        Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = t.surface1)
+    ) {
+        Column(Modifier.fillMaxWidth().padding(14.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    Modifier.size(38.dp).clip(CircleShape).background(t.brand.s500.copy(alpha = 0.14f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(Icons.Filled.Sms, contentDescription = null, tint = t.brand.s600, modifier = Modifier.size(20.dp))
+                }
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        money(r.amount, r.currency),
+                        color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 18.sp
+                    )
+                    Text(
+                        "${r.provider.replaceFirstChar { it.uppercase() }} · $who",
+                        color = t.inkSecondary, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Text(relativeAgo(r.receivedAt), color = t.inkTertiary, fontSize = 10.sp)
+            }
+            Spacer(Modifier.height(8.dp))
+            Text("Ref ${r.txnCode}", color = t.inkTertiary, fontSize = 11.sp)
+            if (r.status == "verified") {
+                val what = when (r.purpose) {
+                    "debt" -> "Applied to ${r.matchedCustomerName ?: "account"}"
+                    "sale" -> "Logged as a walk-in sale"
+                    else -> "Verified"
+                }
+                Spacer(Modifier.height(6.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Filled.CheckCircle, contentDescription = null, tint = t.success, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(what, color = t.success, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                }
+            } else {
+                Spacer(Modifier.height(10.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = onVerify,
+                        colors = ButtonDefaults.buttonColors(containerColor = t.brand.s600, contentColor = t.inkOnBrand),
+                        modifier = Modifier.weight(1f)
+                    ) { Text("Verify") }
+                    if (r.matchedCustomerId == null) {
+                        OutlinedButton(onClick = onLogAsSale) { Text("Log sale") }
+                    }
+                    TextButton(onClick = onIgnore) { Text("Ignore", color = t.inkTertiary) }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Verify dialog (§6.3): confirm what the money was for and, for a debt payment,
+ * which customer's account it settles. Over-payment on a debt lands as a negative
+ * balance the Change & Credit screen surfaces (like any repayment).
+ */
+@Composable
+private fun MmVerifyDialog(
+    r: MobileMoneyReceipt,
+    customers: List<CustomerWithBalance>,
+    currency: String,
+    onDismiss: () -> Unit,
+    onConfirm: (CustomerWithBalance?, String, String?) -> Unit
+) {
+    val t = LocalPosTokens.current
+    var purpose by remember { mutableStateOf("debt") }
+    var selected by remember {
+        mutableStateOf(customers.firstOrNull { it.customer.id == r.matchedCustomerId })
+    }
+    var query by remember { mutableStateOf("") }
+    var note by remember { mutableStateOf("") }
+
+    val filtered = remember(query, customers) {
+        val q = query.trim().lowercase()
+        if (q.isEmpty()) customers
+        else customers.filter {
+            it.customer.name.lowercase().contains(q) || (it.customer.phone ?: "").contains(q)
+        }
+    }
+    val canConfirm = purpose == "sale" || selected != null
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = {
+            Button(
+                onClick = { onConfirm(if (purpose == "debt") selected else selected, purpose, note.ifBlank { null }) },
+                enabled = canConfirm
+            ) { Text("Confirm") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+        title = { Text("Verify ${money(r.amount, r.currency)}") },
+        text = {
+            Column {
+                Text(
+                    "From ${r.senderName ?: r.senderPhone ?: "unknown"} · Ref ${r.txnCode}",
+                    color = t.inkTertiary, fontSize = 11.sp
+                )
+                Spacer(Modifier.height(10.dp))
+                Text("What was this for?", color = t.inkSecondary, fontSize = 12.sp)
+                Spacer(Modifier.height(6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(selected = purpose == "debt", onClick = { purpose = "debt" }, label = { Text("Settle debt") })
+                    FilterChip(selected = purpose == "sale", onClick = { purpose = "sale" }, label = { Text("Walk-in sale") })
+                }
+                if (purpose == "debt") {
+                    Spacer(Modifier.height(10.dp))
+                    Text("Customer", color = t.inkSecondary, fontSize = 12.sp)
+                    OutlinedTextField(
+                        value = query,
+                        onValueChange = { query = it },
+                        placeholder = { Text("Search name or number") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    LazyColumn(Modifier.fillMaxWidth().height(180.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        items(filtered, key = { it.customer.id }) { cw ->
+                            val on = selected?.customer?.id == cw.customer.id
+                            Row(
+                                Modifier.fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(if (on) t.brand.s500.copy(alpha = 0.16f) else t.surface2)
+                                    .clickable { selected = cw }
+                                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(cw.customer.name, color = t.inkPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                                    cw.customer.phone?.let { Text(it, color = t.inkTertiary, fontSize = 11.sp) }
+                                }
+                                if (cw.balance > 0.005) {
+                                    Text("owes ${money(cw.balance, currency)}", color = t.warning, fontSize = 11.sp)
+                                }
+                                if (on) {
+                                    Spacer(Modifier.width(6.dp))
+                                    Icon(Icons.Filled.CheckCircle, contentDescription = null, tint = t.brand.s600, modifier = Modifier.size(16.dp))
+                                }
+                            }
+                        }
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = note,
+                    onValueChange = { note = it },
+                    placeholder = { Text("Note (optional)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        }
+    )
+}
+
 // ─────────────────────────── ADMIN SHELL (Phase 8) ───────────────────────────
 
 /** Admin-mode destinations. Own bottom nav, distinct from the cashier POS (§9). */
@@ -445,6 +800,7 @@ private enum class AdminTab(val label: String, val icon: androidx.compose.ui.gra
     Reports("Reports", Icons.Filled.BarChart),
     Inventory("Inventory", Icons.Filled.Inventory2),
     Alerts("Alerts", Icons.Filled.Notifications),
+    Manage("Admin", Icons.Filled.AdminPanelSettings),
     Settings("Settings", Icons.Filled.Settings),
 }
 
@@ -458,18 +814,29 @@ private enum class AdminTab(val label: String, val icon: androidx.compose.ui.gra
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AdminRoot(vm: PosViewModel, onExitToCashier: () -> Unit) {
+fun AdminRoot(
+    vm: PosViewModel,
+    onExitToCashier: () -> Unit,
+    openAlerts: Boolean = false,
+    onOpenConsumed: () -> Unit = {}
+) {
     val t = LocalPosTokens.current
     val business by vm.business.collectAsState()
     var tab by remember { mutableStateOf(AdminTab.Dashboard) }
     val printer = rememberPrinterUi { vm.shopPrefs.value }
     val currency = business?.currency ?: "USD"
+    val unread by vm.unreadNotifications.collectAsState()
+
+    // Keep the persisted feed fresh whenever the admin is in the shell.
+    LaunchedEffect(Unit) { vm.sweepNotifications() }
+    // Deep-link from an admin notification → jump to the Alerts tab.
+    LaunchedEffect(openAlerts) { if (openAlerts) { tab = AdminTab.Alerts; onOpenConsumed() } }
 
     Box(Modifier.fillMaxSize()) {
         Scaffold(
             containerColor = t.canvas,
             topBar = { AdminTopBar(business?.name ?: "Admin", onExitToCashier) },
-            bottomBar = { AdminBottomNav(current = tab, onSelect = { tab = it }) }
+            bottomBar = { AdminBottomNav(current = tab, alertsBadge = unread, onSelect = { tab = it }) }
         ) { padding ->
             Box(Modifier.fillMaxSize().padding(padding).background(t.canvasBrush)) {
                 if (business == null) {
@@ -481,6 +848,7 @@ fun AdminRoot(vm: PosViewModel, onExitToCashier: () -> Unit) {
                     AdminTab.Reports -> ReportsScreen(vm, business!!)
                     AdminTab.Inventory -> ItemsScreen(vm, currency)
                     AdminTab.Alerts -> AdminAlertsScreen(vm, currency)
+                    AdminTab.Manage -> AdminManageScreen(vm, currency)
                     AdminTab.Settings -> SettingsScreen(vm, business!!, printer)
                 }
             }
@@ -522,9 +890,9 @@ private fun AdminTopBar(shopName: String, onExitToCashier: () -> Unit) {
     }
 }
 
-/** Admin bottom nav — reuses the cashier [BottomNavItem] look across 5 tabs. */
+/** Admin bottom nav — reuses the cashier [BottomNavItem] look; Alerts shows unread. */
 @Composable
-private fun AdminBottomNav(current: AdminTab, onSelect: (AdminTab) -> Unit) {
+private fun AdminBottomNav(current: AdminTab, alertsBadge: Int, onSelect: (AdminTab) -> Unit) {
     val t = LocalPosTokens.current
     Column(Modifier.fillMaxWidth().background(t.surface1)) {
         HorizontalDivider(color = t.surfaceBorder)
@@ -534,7 +902,7 @@ private fun AdminBottomNav(current: AdminTab, onSelect: (AdminTab) -> Unit) {
                     icon = tabItem.icon,
                     label = tabItem.label,
                     active = current == tabItem,
-                    badge = 0,
+                    badge = if (tabItem == AdminTab.Alerts) alertsBadge else 0,
                     modifier = Modifier.weight(1f)
                 ) { onSelect(tabItem) }
             }
@@ -542,98 +910,43 @@ private fun AdminBottomNav(current: AdminTab, onSelect: (AdminTab) -> Unit) {
     }
 }
 
-/** Large-sale alert threshold (base currency). Configurable in the §7 admin backend. */
-private const val ADMIN_LARGE_SALE = 500.0
-
-private enum class AlertCat(val label: String) {
-    ALL("All"), INVENTORY("Inventory"), SALES("Sales"), SYSTEM("System")
-}
-
-private data class AdminAlert(
-    val cat: AlertCat,
-    val icon: androidx.compose.ui.graphics.vector.ImageVector,
-    val tint: Color,
-    val title: String,
-    val body: String,
-    val time: Long
+private val ALERT_CATS = listOf(
+    "all" to "All", "inventory" to "Inventory", "sales" to "Sales",
+    "payments" to "Payments", "refunds" to "Refunds", "system" to "System"
 )
 
 /**
- * Admin Alerts feed (prompt §8/§9), computed live from existing data — low/out of
- * stock, refunds (flagged when still owed), large sales, and sync/debt health.
- * This is the read-only stub of the notifications system: persistence, read-state,
- * and push delivery are Phase 7. No new tables, no §7 backend.
+ * Admin Alerts feed (prompt §8), now backed by the PERSISTED `notifications` table
+ * (Phase 7). The background [com.portionspot.pos.notify.AdminNotificationWorker]
+ * computes + escalates; this screen reads the stored rows, shows unread state, marks
+ * them read on tap, and filters by category. A sweep runs when the shell opens so it
+ * is current without waiting for the periodic worker.
  */
 @Composable
 private fun AdminAlertsScreen(vm: PosViewModel, currency: String) {
     val t = LocalPosTokens.current
-    val items by vm.items.collectAsState()
-    val refunds by vm.refunds.collectAsState()
-    val recent by vm.recentSales.collectAsState()
-    val customers by vm.customers.collectAsState()
-    val lastSync by vm.lastSyncAt.collectAsState()
-    var cat by remember { mutableStateOf(AlertCat.ALL) }
-    val now = System.currentTimeMillis()
+    val all by vm.notifications.collectAsState()
+    var cat by remember { mutableStateOf("all") }
 
-    val alerts = buildList {
-        // Inventory — out of stock, then low stock.
-        items.filter { it.trackStock && it.stockQty <= 0.0 }.forEach {
-            add(AdminAlert(AlertCat.INVENTORY, Icons.Filled.Inventory2, t.danger,
-                "Out of stock", "${it.name} has run out.", now))
-        }
-        items.filter {
-            it.trackStock && it.stockQty > 0.0 &&
-                it.stockQty <= (if (it.reorderLevel > 0.0) it.reorderLevel else LOW_STOCK_THRESHOLD)
-        }.forEach {
-            add(AdminAlert(AlertCat.INVENTORY, Icons.Filled.Inventory2, t.warning,
-                "Low stock", "${it.name}: ${trimQty(it.stockQty)} left.", now))
-        }
-        // Sales — refunds (owed flagged red), then large sales.
-        refunds.take(20).forEach { rw ->
-            val r = rw.refund
-            val owed = r.status == "owed"
-            add(AdminAlert(
-                AlertCat.SALES, Icons.Filled.AssignmentReturn,
-                if (owed) t.danger else t.success,
-                if (owed) "Refund still owed" else "Refund issued",
-                "${money(r.refundTotal, currency)} · ${r.customerName ?: "Walk-in"}" +
-                    (r.createdByName?.let { " · by $it" } ?: ""),
-                r.createdAt
-            ))
-        }
-        recent.filter { it.total >= ADMIN_LARGE_SALE }.take(10).forEach {
-            add(AdminAlert(AlertCat.SALES, Icons.Filled.Payments, t.warning,
-                "Large sale", "${money(it.total, currency)} · ${it.customerName ?: "Walk-in"}", it.soldAt))
-        }
-        // System — sync health + outstanding debt.
-        add(AdminAlert(
-            AlertCat.SYSTEM, Icons.Filled.Sync, t.accentBlue, "Sync status",
-            lastSync?.let { "Last synced ${relativeAgo(it)}." } ?: "Not synced yet.",
-            lastSync ?: now
-        ))
-        val owing = customers.count { it.balance > 0 }
-        if (owing > 0) {
-            val owed = customers.sumOf { it.balance.coerceAtLeast(0.0) }
-            add(AdminAlert(AlertCat.SYSTEM, Icons.Filled.People, t.warning,
-                "Outstanding debts", "$owing customer(s) owe ${money(owed, currency)}.", now))
-        }
-    }.sortedByDescending { it.time }
-
-    val shown = if (cat == AlertCat.ALL) alerts else alerts.filter { it.cat == cat }
+    val shown = if (cat == "all") all else all.filter { it.category == cat }
 
     Column(Modifier.fillMaxSize().padding(12.dp)) {
-        Text("Alerts", color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 22.sp)
-        Text(
-            "Live from your data · persistence & push arrive in Phase 7",
-            color = t.inkTertiary, fontSize = 11.sp
-        )
-        Spacer(Modifier.height(12.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Alerts", color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 22.sp)
+                Text("Low stock, refunds, payments, aging debts & sync health.", color = t.inkTertiary, fontSize = 11.sp)
+            }
+            if (all.any { it.readAt == null }) {
+                TextButton(onClick = { vm.markAllNotificationsRead() }) { Text("Mark all read") }
+            }
+        }
+        Spacer(Modifier.height(10.dp))
         Row(
             Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            AlertCat.values().forEach { c ->
-                FilterChip(selected = cat == c, onClick = { cat = c }, label = { Text(c.label) })
+            ALERT_CATS.forEach { (id, label) ->
+                FilterChip(selected = cat == id, onClick = { cat = id }, label = { Text(label) })
             }
         }
         Spacer(Modifier.height(12.dp))
@@ -642,39 +955,298 @@ private fun AdminAlertsScreen(vm: PosViewModel, currency: String) {
                 Text("No alerts. Everything looks healthy.", color = t.inkTertiary)
             }
         } else {
-            LazyColumn(Modifier.weight(1f)) {
-                items(shown) { AlertCard(it) }
+            LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                items(shown, key = { it.id }) { n ->
+                    NotificationCard(n, onClick = { if (n.readAt == null) vm.markNotificationRead(n.id) })
+                }
             }
         }
     }
 }
 
 @Composable
-private fun AlertCard(a: AdminAlert) {
+private fun NotificationCard(n: com.portionspot.pos.data.AppNotification, onClick: () -> Unit) {
     val t = LocalPosTokens.current
+    val tint = when (n.severity) {
+        "danger" -> t.danger
+        "warn" -> t.warning
+        else -> t.accentBlue
+    }
+    val icon = when (n.category) {
+        "inventory" -> Icons.Filled.Inventory2
+        "sales" -> Icons.Filled.Payments
+        "refunds" -> Icons.Filled.AssignmentReturn
+        "payments" -> Icons.Filled.Sms
+        else -> Icons.Filled.Sync
+    }
+    val unread = n.readAt == null
     Card(
-        Modifier.fillMaxWidth().padding(vertical = 5.dp),
-        colors = CardDefaults.cardColors(containerColor = t.surface1)
+        Modifier.fillMaxWidth().clickable(onClick = onClick),
+        colors = CardDefaults.cardColors(containerColor = if (unread) t.surface2 else t.surface1)
     ) {
-        Row(
-            Modifier.fillMaxWidth().padding(14.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
+        Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
             Box(
-                Modifier.size(38.dp).clip(CircleShape).background(a.tint.copy(alpha = 0.14f)),
+                Modifier.size(38.dp).clip(CircleShape).background(tint.copy(alpha = 0.14f)),
                 contentAlignment = Alignment.Center
-            ) {
-                Icon(a.icon, contentDescription = null, tint = a.tint, modifier = Modifier.size(20.dp))
-            }
+            ) { Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(20.dp)) }
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
-                Text(a.title, color = t.inkPrimary, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
-                Text(a.body, color = t.inkSecondary, fontSize = 12.sp)
+                Text(
+                    n.title, color = t.inkPrimary,
+                    fontWeight = if (unread) FontWeight.Black else FontWeight.SemiBold, fontSize = 14.sp
+                )
+                Text(n.body, color = t.inkSecondary, fontSize = 12.sp)
             }
             Spacer(Modifier.width(8.dp))
-            Text(relativeAgo(a.time), color = t.inkTertiary, fontSize = 10.sp)
+            Column(horizontalAlignment = Alignment.End) {
+                if (unread) Box(Modifier.size(8.dp).clip(CircleShape).background(tint))
+                Spacer(Modifier.height(2.dp))
+                Text(relativeAgo(n.eventAt), color = t.inkTertiary, fontSize = 10.sp)
+            }
         }
     }
+}
+
+/**
+ * Admin console (prompt §8, Phase 7) — the admin-only tools that don't fit the reused
+ * cashier screens: end-of-day / shift summary, debt aging + write-offs, force-disable
+ * payment methods, void a wrongful refund, and the audit-log viewer. (Server-enforced
+ * cashier account CRUD is deferred with the sync-parity phase.)
+ */
+@Composable
+private fun AdminManageScreen(vm: PosViewModel, currency: String) {
+    val t = LocalPosTokens.current
+    val business by vm.business.collectAsState()
+    val cashiers by vm.eodCashiers.collectAsState()
+    val methods by vm.eodMethods.collectAsState()
+    val changeGiven by vm.eodChangeGiven.collectAsState()
+    val eodDay by vm.eodDay.collectAsState()
+    val aging by vm.debtAging.collectAsState()
+    val refunds by vm.refunds.collectAsState()
+    val audit by vm.auditLog.collectAsState()
+
+    var writeOffFor by remember { mutableStateOf<DebtAgingRow?>(null) }
+    var voidFor by remember { mutableStateOf<String?>(null) }
+    var countedCash by remember { mutableStateOf("") }
+    val dayMs = 24L * 60 * 60 * 1000
+    val dayFmt = remember { SimpleDateFormat("EEE dd MMM yyyy", Locale.getDefault()) }
+    val cashRecorded = (methods.firstOrNull { it.method == "cash" }?.total ?: 0.0) - changeGiven
+
+    LazyColumn(Modifier.fillMaxSize().padding(horizontal = 14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        item {
+            Spacer(Modifier.height(10.dp))
+            Text("Admin console", color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 22.sp)
+        }
+
+        // ---- End of day / shift summary ----
+        item { AdminSectionHeader("End of day") }
+        item {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                TextButton(onClick = { vm.setEodDay(eodDay - dayMs) }) { Text("‹ Prev") }
+                Text(dayFmt.format(Date(eodDay)), color = t.inkPrimary, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f), textAlign = TextAlign.Center)
+                val isToday = eodDay >= todayStartMs()
+                TextButton(onClick = { if (!isToday) vm.setEodDay(eodDay + dayMs) }, enabled = !isToday) { Text("Next ›") }
+            }
+        }
+        item {
+            Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = t.surface1)) {
+                Column(Modifier.padding(14.dp)) {
+                    if (cashiers.isEmpty()) {
+                        Text("No sales this day.", color = t.inkTertiary, fontSize = 13.sp)
+                    } else {
+                        cashiers.forEach { c ->
+                            Row(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
+                                Text(c.cashierName ?: "Unattributed", color = t.inkPrimary, fontSize = 13.sp, modifier = Modifier.weight(1f))
+                                Text("${c.count} sales", color = t.inkTertiary, fontSize = 12.sp)
+                                Spacer(Modifier.width(10.dp))
+                                Text(money(c.total, currency), color = t.inkPrimary, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                            }
+                        }
+                        HorizontalDivider(Modifier.padding(vertical = 6.dp), color = t.surfaceBorder)
+                        methods.forEach { m ->
+                            Row(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+                                Text(m.method.replaceFirstChar { it.uppercase() }, color = t.inkSecondary, fontSize = 12.sp, modifier = Modifier.weight(1f))
+                                Text(money(m.total, currency), color = t.inkSecondary, fontSize = 12.sp)
+                            }
+                        }
+                        HorizontalDivider(Modifier.padding(vertical = 6.dp), color = t.surfaceBorder)
+                        Row(Modifier.fillMaxWidth()) {
+                            Text("Expected cash in drawer", color = t.inkPrimary, fontSize = 12.sp, modifier = Modifier.weight(1f))
+                            Text(money(cashRecorded, currency), color = t.inkPrimary, fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        OutlinedTextField(
+                            value = countedCash, onValueChange = { countedCash = it },
+                            label = { Text("Counted cash") }, singleLine = true, modifier = Modifier.fillMaxWidth()
+                        )
+                        countedCash.toDoubleOrNull()?.let { counted ->
+                            val variance = counted - cashRecorded
+                            Text(
+                                "Variance: ${money(variance, currency)}",
+                                color = if (kotlin.math.abs(variance) < 0.005) t.success else t.danger,
+                                fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(top = 4.dp)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- Debt aging (30/60/90) ----
+        item { AdminSectionHeader("Debt aging") }
+        if (aging.isEmpty()) {
+            item { Text("No outstanding debts.", color = t.inkTertiary, fontSize = 13.sp) }
+        } else {
+            items(aging, key = { it.customerId }) { row ->
+                Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = t.surface1)) {
+                    Column(Modifier.padding(14.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(row.customerName, color = t.inkPrimary, fontWeight = FontWeight.SemiBold, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                            Text(money(row.total, currency), color = t.danger, fontWeight = FontWeight.Black, fontSize = 14.sp)
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "0–30: ${money(row.bucket0to30, currency)} · 30–60: ${money(row.bucket30to60, currency)} · " +
+                                "60–90: ${money(row.bucket60to90, currency)} · 90+: ${money(row.bucket90plus, currency)}",
+                            color = t.inkTertiary, fontSize = 11.sp
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        OutlinedButton(onClick = { writeOffFor = row }) { Text("Write off") }
+                    }
+                }
+            }
+        }
+
+        // ---- Force-disable payment methods ----
+        item { AdminSectionHeader("Payment methods") }
+        item {
+            Text("Disabled methods are hidden on all cashier devices (on next sync).", color = t.inkTertiary, fontSize = 11.sp)
+        }
+        business?.let { biz ->
+            val methodFlags = listOf(
+                Triple("cash", "Cash", biz.cashEnabled),
+                Triple("card", "Card", biz.cardEnabled),
+                Triple("bank", "Bank transfer", biz.bankEnabled),
+                Triple("ecocash", "EcoCash", biz.ecocashEnabled),
+                Triple("innbucks", "InnBucks", biz.innbucksEnabled),
+                Triple("onemoney", "OneMoney", biz.onemoneyEnabled),
+                Triple("omari", "O'mari", biz.omariEnabled),
+                Triple("paynow", "Paynow", biz.paynowEnabled),
+            )
+            item {
+                Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = t.surface1)) {
+                    Column(Modifier.padding(horizontal = 14.dp, vertical = 4.dp)) {
+                        methodFlags.forEach { (id, label, enabled) ->
+                            Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Text(label, color = t.inkPrimary, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                                Switch(checked = enabled, onCheckedChange = { vm.setPaymentMethodEnabled(id, it) })
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- Void a wrongful refund ----
+        item { AdminSectionHeader("Void a refund") }
+        val recentRefunds = refunds.take(15)
+        if (recentRefunds.isEmpty()) {
+            item { Text("No refunds recorded.", color = t.inkTertiary, fontSize = 13.sp) }
+        } else {
+            items(recentRefunds, key = { it.refund.id }) { rw ->
+                val r = rw.refund
+                Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("${money(r.refundTotal, currency)} · ${r.customerName ?: "Walk-in"}", color = t.inkPrimary, fontSize = 13.sp)
+                        Text("#${r.saleReceiptNo ?: r.saleId.takeLast(6)} · ${relativeAgo(r.createdAt)}", color = t.inkTertiary, fontSize = 11.sp)
+                    }
+                    OutlinedButton(
+                        onClick = { voidFor = r.id },
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = t.danger)
+                    ) { Text("Void") }
+                }
+            }
+        }
+
+        // ---- Audit log ----
+        item { AdminSectionHeader("Audit log") }
+        if (audit.isEmpty()) {
+            item { Text("No audited actions yet.", color = t.inkTertiary, fontSize = 13.sp) }
+        } else {
+            items(audit, key = { it.id }) { e ->
+                Row(Modifier.fillMaxWidth().padding(vertical = 5.dp)) {
+                    Column(Modifier.weight(1f)) {
+                        Text(e.summary, color = t.inkPrimary, fontSize = 13.sp)
+                        Text(
+                            (e.createdByName?.let { "$it · " } ?: "") + relativeAgo(e.createdAt),
+                            color = t.inkTertiary, fontSize = 11.sp
+                        )
+                    }
+                    Text(e.action, color = t.inkTertiary, fontSize = 10.sp)
+                }
+            }
+        }
+        item { Spacer(Modifier.height(24.dp)) }
+    }
+
+    writeOffFor?.let { row ->
+        WriteOffDialog(row, currency, onDismiss = { writeOffFor = null }, onConfirm = { amt ->
+            vm.writeOffDebt(row.customerId, amt); writeOffFor = null
+        })
+    }
+    voidFor?.let { id ->
+        ConfirmDialog(
+            title = "Void this refund?",
+            message = "The refund is reversed: restocked goods are drawn back down and any balance owed to the customer is cleared. This is audit-logged.",
+            confirmLabel = "Void refund",
+            onConfirm = { vm.voidRefund(id); voidFor = null },
+            onDismiss = { voidFor = null }
+        )
+    }
+}
+
+@Composable
+private fun AdminSectionHeader(title: String) {
+    val t = LocalPosTokens.current
+    Text(
+        title, color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 15.sp,
+        modifier = Modifier.padding(top = 10.dp, bottom = 2.dp)
+    )
+}
+
+@Composable
+private fun WriteOffDialog(
+    row: DebtAgingRow,
+    currency: String,
+    onDismiss: () -> Unit,
+    onConfirm: (Double) -> Unit
+) {
+    var amount by remember { mutableStateOf(String.format(Locale.US, "%.2f", row.total)) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = {
+            Button(
+                onClick = { amount.toDoubleOrNull()?.let { if (it > 0) onConfirm(it) } },
+                enabled = (amount.toDoubleOrNull() ?: 0.0) > 0.0
+            ) { Text("Write off") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+        title = { Text("Write off ${row.customerName}'s debt") },
+        text = {
+            Column {
+                Text("Owes ${money(row.total, currency)}. Writing off records a payment that clears the balance (audit-logged).", fontSize = 12.sp)
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(value = amount, onValueChange = { amount = it }, label = { Text("Amount") }, singleLine = true)
+            }
+        }
+    )
+}
+
+private fun todayStartMs(): Long {
+    val c = Calendar.getInstance()
+    c.set(Calendar.HOUR_OF_DAY, 0); c.set(Calendar.MINUTE, 0); c.set(Calendar.SECOND, 0); c.set(Calendar.MILLISECOND, 0)
+    return c.timeInMillis
 }
 
 /** Logo square (PSM mark or shop initials) used in the topbar + drawer. */
@@ -747,7 +1319,8 @@ private fun MobileBottomNav(
     cartCount: Int,
     moreOpen: Boolean,
     onSelect: (Screen) -> Unit,
-    onMore: () -> Unit
+    onMore: () -> Unit,
+    moreBadge: Int = 0
 ) {
     val t = LocalPosTokens.current
     val overflowActive = current in OVERFLOW_SCREENS
@@ -767,7 +1340,7 @@ private fun MobileBottomNav(
                 icon = if (moreOpen) Icons.Filled.ExpandLess else Icons.Filled.MoreHoriz,
                 label = "More",
                 active = overflowActive || moreOpen,
-                badge = 0,
+                badge = moreBadge,
                 modifier = Modifier.weight(1f),
                 onClick = onMore
             )
@@ -3312,6 +3885,9 @@ private fun CustomerDetailDialog(
 ) {
     val balance by vm.balanceFlow(customer.id).collectAsState(initial = 0.0)
     val history by vm.creditHistory(customer.id).collectAsState(initial = emptyList())
+    val bizForPdf by vm.business.collectAsState()
+    val pdfCtx = LocalContext.current
+    val pdfScope = rememberCoroutineScope()
     var showPay by remember { mutableStateOf(false) }
     var wholesale by remember { mutableStateOf(customer.wholesale) }
 
@@ -3353,6 +3929,31 @@ private fun CustomerDetailDialog(
                     )
                 }
                 Spacer(Modifier.height(8.dp))
+                TextButton(
+                    onClick = {
+                        val biz = bizForPdf ?: return@TextButton
+                        val entries = history.sortedBy { it.createdAt }
+                            .filter { it.type == "credit_owed" || it.type == "credit_paid" }
+                            .map {
+                                PdfDocs.StatementEntry(
+                                    date = it.createdAt,
+                                    label = if (it.type == "credit_owed") "Charged" else "Payment",
+                                    amount = if (it.type == "credit_owed") it.amount else -it.amount
+                                )
+                            }
+                        pdfScope.launch {
+                            val file = withContext(Dispatchers.IO) {
+                                PdfDocs.customerStatement(pdfCtx, biz, "Debt Statement", customer.name, entries)
+                            }
+                            PdfFiles.share(pdfCtx, file, "Statement — ${customer.name}")
+                        }
+                    }
+                ) {
+                    Icon(Icons.Filled.Share, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Share debt statement PDF")
+                }
+                Spacer(Modifier.height(4.dp))
                 HorizontalDivider()
                 Spacer(Modifier.height(8.dp))
                 if (history.isEmpty()) {
@@ -5024,6 +5625,11 @@ private fun ReceiptsScreen(vm: PosViewModel, business: Business, printer: Printe
                         }) {
                             Icon(Icons.Filled.Print, contentDescription = "Reprint")
                         }
+                        IconButton(onClick = {
+                            printer.sharePdfReceipt(business, sale) { vm.loadLines(sale.id) }
+                        }) {
+                            Icon(Icons.Filled.Share, contentDescription = "Share PDF")
+                        }
                         IconButton(onClick = { refundFor = sale }) {
                             Icon(Icons.Filled.AssignmentReturn, contentDescription = "Refund")
                         }
@@ -5300,6 +5906,11 @@ private fun RefundsScreen(vm: PosViewModel, business: Business, printer: Printer
                                 printer.printRefund(business, r, rw.lines) { vm.refundPayments(r.id) }
                             }) {
                                 Icon(Icons.Filled.Print, contentDescription = "Print refund")
+                            }
+                            IconButton(onClick = {
+                                printer.sharePdfRefund(business, r, rw.lines) { vm.refundPayments(r.id) }
+                            }) {
+                                Icon(Icons.Filled.Share, contentDescription = "Share refund PDF")
                             }
                         }
                         val retLines = rw.lines
@@ -5663,48 +6274,61 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
             Text("Printer type", style = MaterialTheme.typography.bodyMedium)
             Spacer(Modifier.height(4.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(
-                    selected = prefs.printerType == "bluetooth",
-                    onClick = { vm.savePrefs(prefs.copy(printerType = "bluetooth")) },
-                    label = { Text("Bluetooth thermal") }
-                )
-                FilterChip(
-                    selected = prefs.printerType == "sunmi",
-                    onClick = { vm.savePrefs(prefs.copy(printerType = "sunmi")) },
-                    label = { Text("Sunmi (internal)") }
-                )
+                PRINTER_TYPES.forEach { (id, label) ->
+                    FilterChip(
+                        selected = prefs.printerType == id,
+                        onClick = { vm.savePrefs(prefs.copy(printerType = id)) },
+                        label = { Text(label) }
+                    )
+                }
             }
             Spacer(Modifier.height(8.dp))
-            if (prefs.printerType == "bluetooth") {
-                Text(
-                    printerName ?: "No printer selected",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.outline
-                )
-                Spacer(Modifier.height(8.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(onClick = { printer.ensurePermission { showPicker = true } }) {
-                        Text("Select Bluetooth printer")
-                    }
-                    if (printerMac != null) {
-                        OutlinedButton(onClick = { printer.test(edited()) }) {
-                            Icon(Icons.Filled.Print, contentDescription = null)
-                            Spacer(Modifier.width(8.dp))
-                            Text("Test")
+            when (prefs.printerType) {
+                "bluetooth" -> {
+                    Text(
+                        printerName ?: "No printer selected",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.outline
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick = { printer.ensurePermission { showPicker = true } }) {
+                            Text("Select Bluetooth printer")
+                        }
+                        if (printerMac != null) {
+                            OutlinedButton(onClick = { printer.test(edited()) }) {
+                                Icon(Icons.Filled.Print, contentDescription = null)
+                                Spacer(Modifier.width(8.dp))
+                                Text("Test")
+                            }
                         }
                     }
                 }
-            } else {
-                Text(
-                    "Prints to the built-in printer on a Sunmi handheld device.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.outline
-                )
-                Spacer(Modifier.height(8.dp))
-                OutlinedButton(onClick = { printer.test(edited()) }) {
-                    Icon(Icons.Filled.Print, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text("Test print")
+                "rawbt" -> {
+                    Text(
+                        "Prints through the RawBT app (install it separately). RawBT can drive Bluetooth, USB and network printers it supports.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.outline
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(onClick = { printer.test(edited()) }) {
+                        Icon(Icons.Filled.Print, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Test print via RawBT")
+                    }
+                }
+                else -> {
+                    Text(
+                        "Prints to the built-in printer on a Sunmi handheld device.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.outline
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(onClick = { printer.test(edited()) }) {
+                        Icon(Icons.Filled.Print, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Test print")
+                    }
                 }
             }
 
@@ -5728,6 +6352,24 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("Large receipt text", Modifier.weight(1f))
                 Switch(checked = largeText, onCheckedChange = { largeText = it })
+            }
+
+            Spacer(Modifier.height(12.dp))
+            Text("Receipt style preset", style = MaterialTheme.typography.bodyMedium)
+            Text(
+                "A quick look layered over the toggles below.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.outline
+            )
+            Spacer(Modifier.height(4.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                RECEIPT_PRESETS.forEach { (id, label) ->
+                    FilterChip(
+                        selected = prefs.receiptPreset == id,
+                        onClick = { vm.savePrefs(prefs.copy(receiptPreset = id)) },
+                        label = { Text(label) }
+                    )
+                }
             }
 
             // ---- Receipt template (saves live, device-local) ----

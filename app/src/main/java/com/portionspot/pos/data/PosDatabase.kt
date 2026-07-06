@@ -223,6 +223,99 @@ val MIGRATION_12_13 = object : Migration(12, 13) {
     }
 }
 
+/**
+ * v13 → v14: mobile-money SMS reconciliation (Phase 5, prompt §6). Adds the
+ * `mobile_money_receipts` table: one parsed payment SMS per row, with a UNIQUE
+ * index on (businessId, txnCode) so the provider's transaction code enforces
+ * idempotency at the DB level (the same SMS can never be stored twice). Local-
+ * first (carries pendingSync); cloud push is deferred to the parity phase.
+ * Real migration — additive only, no data dropped.
+ */
+val MIGRATION_13_14 = object : Migration(13, 14) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS mobile_money_receipts (" +
+                "id TEXT NOT NULL PRIMARY KEY, " +
+                "businessId TEXT NOT NULL, " +
+                "provider TEXT NOT NULL DEFAULT 'unknown', " +
+                "rawBody TEXT NOT NULL DEFAULT '', " +
+                "sender TEXT, " +
+                "senderName TEXT, " +
+                "senderPhone TEXT, " +
+                "amount REAL NOT NULL DEFAULT 0, " +
+                "currency TEXT NOT NULL DEFAULT 'USD', " +
+                "txnCode TEXT NOT NULL, " +
+                "receivedAt INTEGER NOT NULL, " +
+                "status TEXT NOT NULL DEFAULT 'unmatched', " +
+                "matchedCustomerId TEXT, " +
+                "matchedCustomerName TEXT, " +
+                "purpose TEXT, " +
+                "appliedCreditTxnId TEXT, " +
+                "appliedSaleId TEXT, " +
+                "note TEXT, " +
+                "createdBy TEXT, " +
+                "createdByName TEXT, " +
+                "serverCreatedAt INTEGER, " +
+                "updatedAt INTEGER NOT NULL, " +
+                "deleted INTEGER NOT NULL DEFAULT 0, " +
+                "pendingSync INTEGER NOT NULL DEFAULT 1)"
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_mobile_money_receipts_businessId ON mobile_money_receipts (businessId)")
+        db.execSQL(
+            "CREATE UNIQUE INDEX IF NOT EXISTS index_mobile_money_receipts_businessId_txnCode " +
+                "ON mobile_money_receipts (businessId, txnCode)"
+        )
+    }
+}
+
+/**
+ * v14 → v15: admin notifications + audit log (Phase 7, prompt §8). Adds the
+ * `notifications` table (persisted admin feed with read/push/escalation state, a
+ * UNIQUE (businessId, dedupeKey) index so recomputes update one row) and the
+ * `audit_log` table (append-only sensitive-action trail). Both local-only. Real
+ * migration — additive, nothing dropped.
+ */
+val MIGRATION_14_15 = object : Migration(14, 15) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS notifications (" +
+                "id TEXT NOT NULL PRIMARY KEY, " +
+                "businessId TEXT NOT NULL, " +
+                "category TEXT NOT NULL, " +
+                "severity TEXT NOT NULL DEFAULT 'info', " +
+                "title TEXT NOT NULL, " +
+                "body TEXT NOT NULL, " +
+                "dedupeKey TEXT NOT NULL, " +
+                "refType TEXT, " +
+                "refId TEXT, " +
+                "eventAt INTEGER NOT NULL, " +
+                "createdAt INTEGER NOT NULL, " +
+                "readAt INTEGER, " +
+                "pushedAt INTEGER, " +
+                "deleted INTEGER NOT NULL DEFAULT 0)"
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_notifications_businessId ON notifications (businessId)")
+        db.execSQL(
+            "CREATE UNIQUE INDEX IF NOT EXISTS index_notifications_businessId_dedupeKey " +
+                "ON notifications (businessId, dedupeKey)"
+        )
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS audit_log (" +
+                "id TEXT NOT NULL PRIMARY KEY, " +
+                "businessId TEXT NOT NULL, " +
+                "action TEXT NOT NULL, " +
+                "entityType TEXT, " +
+                "entityId TEXT, " +
+                "summary TEXT NOT NULL, " +
+                "meta TEXT, " +
+                "createdBy TEXT, " +
+                "createdByName TEXT, " +
+                "createdAt INTEGER NOT NULL)"
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_audit_log_businessId ON audit_log (businessId)")
+    }
+}
+
 @Database(
     entities = [
         Business::class,
@@ -240,9 +333,12 @@ val MIGRATION_12_13 = object : Migration(12, 13) {
         PurchaseOrderLine::class,
         Refund::class,
         RefundLine::class,
-        RefundPayment::class
+        RefundPayment::class,
+        MobileMoneyReceipt::class,
+        AppNotification::class,
+        AuditEntry::class
     ],
-    version = 13,
+    version = 15,
     exportSchema = false
 )
 abstract class PosDatabase : RoomDatabase() {
@@ -258,6 +354,9 @@ abstract class PosDatabase : RoomDatabase() {
     abstract fun supplierDao(): SupplierDao
     abstract fun purchaseOrderDao(): PurchaseOrderDao
     abstract fun refundDao(): RefundDao
+    abstract fun mobileMoneyDao(): MobileMoneyDao
+    abstract fun notificationDao(): NotificationDao
+    abstract fun auditDao(): AuditDao
 
     companion object {
         @Volatile
@@ -279,7 +378,8 @@ abstract class PosDatabase : RoomDatabase() {
                     // net for any version with no path.
                     .addMigrations(
                         MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9,
-                        MIGRATION_9_10, MIGRATION_11_12, MIGRATION_12_13
+                        MIGRATION_9_10, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14,
+                        MIGRATION_14_15
                     )
                     .fallbackToDestructiveMigration()
                     .build()

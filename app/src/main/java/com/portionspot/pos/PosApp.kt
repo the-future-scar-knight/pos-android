@@ -4,6 +4,8 @@ import android.app.Application
 import com.portionspot.pos.auth.AuthManager
 import com.portionspot.pos.data.PosDatabase
 import com.portionspot.pos.data.PosRepository
+import com.portionspot.pos.notify.AdminNotificationWorker
+import com.portionspot.pos.notify.Notifier
 import com.portionspot.pos.sync.PosSyncEngine
 import com.portionspot.pos.ui.CrashReporter
 import com.portionspot.pos.sync.SyncConfig
@@ -44,10 +46,18 @@ class PosApp : Application() {
         super.onCreate()
         // Record any fatal crash so the next launch can show it (no adb needed).
         CrashReporter.install(this)
+        // Mobile-money notification channel (Phase 5) — create early so the SMS
+        // receiver can post the moment a payment lands, even before the UI opens.
+        Notifier.ensureChannel(this)
         container = AppContainer(this)
         // If the user already connected a database, make sure periodic sync is armed.
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             container.syncManager.ensureScheduled()
         }
+        // Arm the admin notifications backend (§8): periodic recompute + one sweep now
+        // so escalations (unverified payments, owed refunds, aging debts, low stock,
+        // unsynced device) fire even while the admin isn't looking at the app.
+        AdminNotificationWorker.schedule(this)
+        AdminNotificationWorker.runNow(this)
     }
 }
