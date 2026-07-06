@@ -8,7 +8,6 @@ import com.portionspot.pos.data.SaleDao
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.decodeFromString
-import kotlinx.serialization.encodeToString
 
 /** Outcome of one sync pass, surfaced to the UI. */
 sealed class SyncOutcome {
@@ -45,6 +44,8 @@ class PosSyncEngine(
         ensureFreshToken()
         val api = SupabaseRest(conn.url, conn.anonKey, accessToken)
         try {
+            // STAGE 1: PULL-ONLY. Push is intentionally disabled until the repoint is
+            // proven on-device, so local test data can never reach the shared prod DB.
             val pushed = push(api)
             val pulled = pull(api)
             config.setLastSyncAt(System.currentTimeMillis())
@@ -54,157 +55,90 @@ class PosSyncEngine(
         }
     }
 
-    // ── push ──────────────────────────────────────────────────────────────
-    private suspend fun push(api: SupabaseRest): Int {
+    // ── push (Stage 2) ──────────────────────────────────────────────────────
+    // Deliberately a no-op for Stage 1. The web-contract push (products on sku,
+    // sales on id/ref with JSONB items, refunds as type='return' rows, customers on
+    // local_id) lands once pull is verified against the live shared database.
+    @Suppress("UNUSED_PARAMETER")
+    private suspend fun push(api: SupabaseRest): Int = 0
+
+    // ── pull ──────────────────────────────────────────────────────────────
+    /** Pull the shared catalog/customers/sales onto this device. Read-only: nothing
+     *  is ever written to the cloud here, so a mapping bug can't corrupt prod data. */
+    private suspend fun pull(api: SupabaseRest): Int {
+        val bid = businessDao.getOnce()?.id ?: return 0
         var n = 0
-
-        businessDao.pending().let { rows ->
-            if (rows.isNotEmpty()) {
-                api.upsert("businesses", syncJson.encodeToString(rows.map { it.toDto() }), "id")
-                rows.forEach { businessDao.markSynced(it.id) }
-                n += rows.size
-            }
-        }
-
-        customerDao.pending().let { rows ->
-            if (rows.isNotEmpty()) {
-                api.upsert("customers", syncJson.encodeToString(rows.map { it.toDto() }), "id")
-                customerDao.markSynced(rows.map { it.id })
-                n += rows.size
-            }
-        }
-
-        itemDao.pending().let { rows ->
-            if (rows.isNotEmpty()) {
-                api.upsert("items", syncJson.encodeToString(rows.map { it.toDto() }), "id")
-                itemDao.markSynced(rows.map { it.id })
-                n += rows.size
-            }
-        }
-
-        saleDao.pendingSales().let { sales ->
-            if (sales.isNotEmpty()) {
-                api.upsert("sales", syncJson.encodeToString(sales.map { it.toDto() }), "id")
-                val lines = sales.flatMap { saleDao.allLinesForSale(it.id) }
-                if (lines.isNotEmpty())
-                    api.upsert("sale_items", syncJson.encodeToString(lines.map { it.toDto() }), "id")
-                sales.forEach { saleDao.markSaleSynced(it.id) }
-                n += sales.size
-            }
-        }
-
-        creditDao.pending().let { rows ->
-            if (rows.isNotEmpty()) {
-                api.upsert("credit_transactions", syncJson.encodeToString(rows.map { it.toDto() }), "id")
-                creditDao.markSynced(rows.map { it.id })
-                n += rows.size
-            }
-        }
-
+        n += pullProducts(api, bid)
+        n += pullCustomers(api, bid)
+        n += pullSales(api, bid)
         return n
     }
 
-    // ── pull ──────────────────────────────────────────────────────────────
-    private suspend fun pull(api: SupabaseRest): Int =
-        pullBusinesses(api) + pullCustomers(api) + pullItems(api) +
-            pullSales(api) + pullSaleLines(api) + pullCredit(api)
-
-    private suspend fun pullBusinesses(api: SupabaseRest): Int {
-        val rows = syncJson.decodeFromString<List<BusinessDto>>(
-            api.selectSince("businesses", config.cursor("businesses"), PAGE)
+    /** products → items, bridged by sku (the cloud has no per-row local id here). */
+    private suspend fun pullProducts(api: SupabaseRest, bid: String): Int {
+        val rows = syncJson.decodeFromString<List<ProductDto>>(
+            api.selectSince("products", config.cursor("products"), PAGE)
         )
         if (rows.isEmpty()) return 0
+        val bySku = itemDao.allForBusinessOnce(bid)
+            .filter { !it.sku.isNullOrBlank() }
+            .associateBy { it.sku!!.lowercase() }
         var applied = 0
         for (dto in rows) {
-            val local = businessDao.getById(dto.id)
+            val local = bySku[dto.sku.lowercase()]
             if (local == null || IsoTime.toMillis(dto.updatedAt) > local.updatedAt) {
-                businessDao.upsert(dto.toEntity(local))
+                itemDao.upsert(dto.toItem(bid, local))
                 applied++
             }
         }
-        config.setCursor("businesses", rows.maxOf { it.updatedAt })
+        config.setCursor("products", rows.maxOf { it.updatedAt ?: IsoTime.EPOCH })
         return applied
     }
 
-    private suspend fun pullCustomers(api: SupabaseRest): Int {
+    /** customers → customers, bridged by local_id (= the Android UUID). */
+    private suspend fun pullCustomers(api: SupabaseRest, bid: String): Int {
         val rows = syncJson.decodeFromString<List<CustomerDto>>(
             api.selectSince("customers", config.cursor("customers"), PAGE)
         )
         if (rows.isEmpty()) return 0
         var applied = 0
         for (dto in rows) {
-            val local = customerDao.getById(dto.id)
+            val local = customerDao.getById(dto.bridgeId())
             if (local == null || IsoTime.toMillis(dto.updatedAt) > local.updatedAt) {
-                // `wholesale` is a local-only flag the cloud doesn't carry — keep
-                // whatever this device already has so a pull never resets it.
-                customerDao.upsert(dto.toEntity().copy(wholesale = local?.wholesale ?: false))
+                customerDao.upsert(dto.toCustomer(bid, local))
                 applied++
             }
         }
-        config.setCursor("customers", rows.maxOf { it.updatedAt })
+        config.setCursor("customers", rows.maxOf { it.updatedAt ?: IsoTime.EPOCH })
         return applied
     }
 
-    private suspend fun pullCredit(api: SupabaseRest): Int {
-        val rows = syncJson.decodeFromString<List<CreditTxnDto>>(
-            api.selectSince("credit_transactions", config.cursor("credit_transactions"), PAGE)
-        )
-        if (rows.isEmpty()) return 0
-        var applied = 0
-        for (dto in rows) {
-            val local = creditDao.getById(dto.id)
-            if (local == null || IsoTime.toMillis(dto.updatedAt) > local.updatedAt) {
-                creditDao.upsert(dto.toEntity())
-                applied++
-            }
-        }
-        config.setCursor("credit_transactions", rows.maxOf { it.updatedAt })
-        return applied
-    }
-
-    private suspend fun pullItems(api: SupabaseRest): Int {
-        val rows = syncJson.decodeFromString<List<ItemDto>>(
-            api.selectSince("items", config.cursor("items"), PAGE)
-        )
-        if (rows.isEmpty()) return 0
-        var applied = 0
-        for (dto in rows) {
-            val local = itemDao.getById(dto.id)
-            if (local == null || IsoTime.toMillis(dto.updatedAt) > local.updatedAt) {
-                itemDao.upsert(dto.toEntity())
-                applied++
-            }
-        }
-        config.setCursor("items", rows.maxOf { it.updatedAt })
-        return applied
-    }
-
-    private suspend fun pullSales(api: SupabaseRest): Int {
+    /**
+     * sales → sales + sale_items. id is the ref, line items come from the JSONB
+     * `items` column. Insert-once (matches the web's ignoreDuplicates) so re-pulling
+     * never double-writes lines. `type='return'` refunds and quotes/holds are skipped
+     * in Stage 1 — reconstructing them into the local refund tables is a later stage.
+     */
+    private suspend fun pullSales(api: SupabaseRest, bid: String): Int {
         val rows = syncJson.decodeFromString<List<SaleDto>>(
             api.selectSince("sales", config.cursor("sales"), PAGE)
         )
         if (rows.isEmpty()) return 0
+        // sku → local item id, so pulled sale lines join to the catalog for reports.
+        val skuToId = itemDao.allForBusinessOnce(bid)
+            .filter { !it.sku.isNullOrBlank() }
+            .associate { it.sku!!.lowercase() to it.id }
         var applied = 0
         for (dto in rows) {
-            val local = saleDao.getSaleById(dto.id)
-            if (local == null || IsoTime.toMillis(dto.updatedAt) > local.updatedAt) {
-                saleDao.upsertSale(dto.toEntity())
-                applied++
-            }
+            if (dto.type != "sale") continue
+            if (saleDao.getSaleById(dto.id) != null) continue
+            saleDao.upsertSale(dto.toSaleEntity(bid))
+            val lines = dto.toSaleLines(bid) { sku -> sku?.lowercase()?.let { skuToId[it] } }
+            if (lines.isNotEmpty()) saleDao.upsertLines(lines)
+            applied++
         }
-        config.setCursor("sales", rows.maxOf { it.updatedAt })
+        config.setCursor("sales", rows.maxOf { it.cursorStamp() })
         return applied
-    }
-
-    private suspend fun pullSaleLines(api: SupabaseRest): Int {
-        val rows = syncJson.decodeFromString<List<SaleLineDto>>(
-            api.selectSince("sale_items", config.cursor("sale_items"), PAGE)
-        )
-        if (rows.isEmpty()) return 0
-        // Sale lines are immutable snapshots, never edited locally — just mirror them.
-        saleDao.upsertLines(rows.map { it.toEntity() })
-        config.setCursor("sale_items", rows.maxOf { it.updatedAt })
-        return rows.size
     }
 
     companion object {

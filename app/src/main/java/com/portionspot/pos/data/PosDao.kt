@@ -44,6 +44,10 @@ interface ItemDao {
     @Query("SELECT * FROM items WHERE id = :id LIMIT 1")
     suspend fun getById(id: String): Item?
 
+    /** All non-deleted items for a business — one-shot, for the sku↔id sync bridge. */
+    @Query("SELECT * FROM items WHERE businessId = :businessId AND deleted = 0")
+    suspend fun allForBusinessOnce(businessId: String): List<Item>
+
     @Query("SELECT * FROM items WHERE businessId = :businessId AND barcode = :barcode AND deleted = 0 LIMIT 1")
     suspend fun getByBarcode(businessId: String, barcode: String): Item?
 

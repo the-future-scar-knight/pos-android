@@ -41,10 +41,10 @@ class SupabaseRest(
     private fun rest(table: String) = "$baseUrl/rest/v1/$table"
 
     fun test(): ConnectionTest {
-        val url = (rest("businesses").toHttpUrlOrNull()
+        val url = (rest("products").toHttpUrlOrNull()
             ?: return ConnectionTest.Failed("That doesn't look like a valid URL"))
             .newBuilder()
-            .addQueryParameter("select", "id")
+            .addQueryParameter("select", "sku")
             .addQueryParameter("limit", "1")
             .build()
         return try {
