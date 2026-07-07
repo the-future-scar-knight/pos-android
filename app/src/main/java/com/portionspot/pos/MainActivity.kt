@@ -64,7 +64,9 @@ class MainActivity : ComponentActivity() {
         val container = (application as PosApp).container
         setContent {
             val vm: PosViewModel = viewModel(
-                factory = PosViewModel.factory(container.repository, container.syncManager)
+                factory = PosViewModel.factory(
+                    container.repository, container.syncManager, container.authManager
+                )
             )
             val theme by vm.themeChoice.collectAsState()
             PosTheme(theme = theme) {

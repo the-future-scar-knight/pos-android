@@ -81,6 +81,10 @@ interface ItemDao {
 
     @Query("UPDATE items SET pendingSync = 0 WHERE id IN (:ids)")
     suspend fun markSynced(ids: List<String>)
+
+    /** Danger zone: delete every item for a business (device reset before a fresh pull). */
+    @Query("DELETE FROM items WHERE businessId = :businessId")
+    suspend fun wipe(businessId: String)
 }
 
 @Dao
@@ -326,6 +330,10 @@ interface CustomerDao {
 
     @Query("UPDATE customers SET pendingSync = 0 WHERE id IN (:ids)")
     suspend fun markSynced(ids: List<String>)
+
+    /** Danger zone: delete every customer for a business (device reset before a fresh pull). */
+    @Query("DELETE FROM customers WHERE businessId = :businessId")
+    suspend fun wipe(businessId: String)
 }
 
 @Dao

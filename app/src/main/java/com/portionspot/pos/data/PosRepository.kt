@@ -78,6 +78,30 @@ class PosRepository(private val db: PosDatabase) {
     fun costedRevenueFlow(businessId: String, from: Long, to: Long): Flow<Double> =
         saleDao.observeCostedRevenue(businessId, from, to)
 
+    /**
+     * Danger zone: wipe this DEVICE's re-pullable data (sales, catalog, customers and
+     * ledgers) so a fresh cloud pull can repopulate them from the shared dataset. Used
+     * to clear local TEST data before enabling push. Keeps the business profile,
+     * device settings (printer/theme) and the cloud connection.
+     */
+    suspend fun resetLocalData() {
+        val bid = businessDao.getOnce()?.id ?: return
+        db.withTransaction {
+            saleDao.wipeSales(bid)
+            saleDao.wipeSaleLines(bid)
+            paymentDao.wipe(bid)
+            movementDao.wipe(bid)
+            creditDao.wipe(bid)
+            refundDao.wipe(bid)
+            refundDao.wipeLines(bid)
+            refundDao.wipePayments(bid)
+            mobileMoneyDao.wipe(bid)
+            notificationDao.wipe(bid)
+            itemDao.wipe(bid)
+            customerDao.wipe(bid)
+        }
+    }
+
     fun stampsSinceFlow(businessId: String, from: Long): Flow<List<SaleStamp>> =
         saleDao.observeStampsSince(businessId, from)
 
