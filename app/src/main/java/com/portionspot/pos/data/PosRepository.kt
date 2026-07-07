@@ -476,6 +476,80 @@ class PosRepository(private val db: PosDatabase) {
         return SaleWithLines(savedSale, lines)
     }
 
+    // ---- quotes (§1.2 parity) --------------------------------------------
+
+    /**
+     * Save a QUOTE: a `sales` row with status='quote' — no payment taken, no stock
+     * drawn down, no ledger. It carries full priced totals (so the printed/PDF quote
+     * shows the amounts) and a [validUntil] lapse date from the shop's quote-validity
+     * setting. status='quote' keeps it out of every sales report and the sync push
+     * (both filter status='completed'), so a quote is a purely local document the
+     * cashier prints or shares. Returns it for the receipt/PDF like [checkout].
+     */
+    suspend fun saveQuote(
+        businessId: String,
+        cart: List<CartLine>,
+        discount: Double = 0.0,
+        note: String? = null,
+        customer: Customer? = null,
+        vatEnabled: Boolean = false,
+        vatPercent: Double = 0.0,
+        validityDays: Int = 7,
+        cashierId: String? = null,
+        cashierName: String? = null
+    ): SaleWithLines {
+        val subtotal = cart.sumOf { it.lineSubtotal }
+        val totals = computeSaleTotals(subtotal, discount, vatEnabled, vatPercent)
+        val saleId = newId()
+        val stamp = now()
+        val validUntil = stamp + validityDays.coerceAtLeast(0) * 24L * 60 * 60 * 1000
+        val sale = SaleEntity(
+            id = saleId,
+            businessId = businessId,
+            receiptNo = genRef("QTN"),
+            status = "quote",
+            validUntil = validUntil,
+            subtotal = subtotal,
+            discountTotal = totals.discount,
+            taxTotal = totals.taxTotal,
+            total = totals.total,
+            paymentMethod = "quote",
+            amountPaid = 0.0,
+            paymentStatus = "unpaid",
+            note = note,
+            customerId = customer?.id,
+            customerName = customer?.name,
+            soldAt = stamp,
+            createdBy = cashierId,
+            createdByName = cashierName,
+            updatedAt = stamp,
+            synced = false
+        )
+        val lines = cart.map { c ->
+            SaleLine(
+                saleId = saleId,
+                businessId = businessId,
+                itemId = c.itemId,
+                name = if (c.mode == "box") "${c.name} (Box of ${c.unitsPerLine})" else c.name,
+                qty = c.qty,
+                unitPrice = c.unitPrice,
+                lineTotal = c.lineSubtotal,
+                mode = c.mode,
+                unitsPerLine = c.unitsPerLine,
+                updatedAt = stamp
+            )
+        }
+        db.withTransaction {
+            saleDao.insertSale(sale)
+            saleDao.insertLines(lines)
+        }
+        return SaleWithLines(sale, lines)
+    }
+
+    /** Saved quotes (newest first) for the Quotes list. */
+    fun quotesFlow(businessId: String): Flow<List<SaleEntity>> =
+        saleDao.observeQuotes(businessId)
+
     // ---- parked / held sales ---------------------------------------------
 
     fun parkedSalesFlow(businessId: String): Flow<List<SaleEntity>> =

@@ -23,6 +23,8 @@ data class ShopPrefs(
     // Rounding step applied to a computed price. 0.0 = off; 0.01/0.05/0.10/0.50/1.0.
     val wholesaleRounding: Double = 0.0,     // applied to wholesale unit prices
     val checkoutRounding: Double = 0.0,      // applied to the checkout grand total
+    // ── Quotes (§1.2 parity) ──
+    val defaultQuoteValidityDays: Int = 7,   // a generated quote lapses after N days
     // ── Margins ──
     val marginFormula: String = "markup",    // "markup" (over cost) or "gross" (of price)
     val autoConvertUnitsToBoxes: Boolean = false, // show stock as N boxes + loose units

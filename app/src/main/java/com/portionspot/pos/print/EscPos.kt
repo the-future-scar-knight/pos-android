@@ -62,6 +62,7 @@ object EscPos {
         style: ReceiptStyle = ReceiptStyle(),
         logo: Bitmap? = null
     ): ByteArray {
+        val isQuote = sale.status == "quote"
         val charW = 1
         val charH = if (style.largeText) 2 else 1
         // GS ! n: bits 4-6 = width-1, bits 0-2 = height-1
@@ -109,15 +110,19 @@ object EscPos {
         cmd(ESC, 0x61, 0x00)
         line(dashes(w))
 
-        // *** RECEIPT ***
+        // *** RECEIPT ***  /  *** QUOTATION ***
         cmd(ESC, 0x61, 0x01); cmd(ESC, 0x45, 0x01)
-        line("*** RECEIPT ***")
+        line(if (isQuote) "*** QUOTATION ***" else "*** RECEIPT ***")
         cmd(ESC, 0x45, 0x00); cmd(ESC, 0x61, 0x00)
 
         val ref = sale.receiptNo ?: sale.id.takeLast(6).uppercase()
         val dateStr = SimpleDateFormat("dd/MM/yy HH:mm", Locale.UK).format(Date(sale.soldAt))
         line(twoCol("Ref: $ref", dateStr, w))
         line("Customer: ${sale.customerName?.takeIf { it.isNotBlank() } ?: "Walk-in"}")
+        if (isQuote) {
+            val vu = sale.validUntil?.let { SimpleDateFormat("dd/MM/yy", Locale.UK).format(Date(it)) } ?: "-"
+            line("Valid until: $vu")
+        }
         line(dashes(w))
 
         // Items
@@ -149,7 +154,8 @@ object EscPos {
         }
 
         // Payment — credit, cash + change, or another tender with its reference.
-        when (sale.paymentMethod) {
+        // A quote takes no payment, so the whole block is skipped.
+        if (!isQuote) when (sale.paymentMethod) {
             "credit" -> {
                 cmd(ESC, 0x45, 0x01)
                 line(twoCol("ON CREDIT", fmt(sale.total, cur), w))

@@ -42,12 +42,14 @@ object PdfDocs {
         val page = doc.startPage(PdfDocument.PageInfo.Builder(PAGE_W, PAGE_H, 1).create())
         val c = page.canvas
         val cur = business.currency
+        val isQuote = sale.status == "quote"
         var y = header(c, business)
 
-        y = title(c, "RECEIPT", y)
+        y = title(c, if (isQuote) "QUOTATION" else "RECEIPT", y)
         val ref = sale.receiptNo ?: sale.id.takeLast(6).uppercase()
-        y = kv(c, "Receipt no", ref, y)
+        y = kv(c, if (isQuote) "Quote no" else "Receipt no", ref, y)
         y = kv(c, "Date", dateTime(sale.soldAt), y)
+        if (isQuote) sale.validUntil?.let { y = kv(c, "Valid until", dateOnly(it), y) }
         sale.createdByName?.takeIf { it.isNotBlank() }?.let { y = kv(c, "Cashier", it, y) }
         y = kv(c, "Customer", sale.customerName?.takeIf { it.isNotBlank() } ?: "Walk-in", y)
         y = rule(c, y)
@@ -64,7 +66,7 @@ object PdfDocs {
 
         footer(c, business)
         doc.finishPage(page)
-        return write(context, doc, "Receipt-$ref")
+        return write(context, doc, "${if (isQuote) "Quote" else "Receipt"}-$ref")
     }
 
     fun refundReceipt(

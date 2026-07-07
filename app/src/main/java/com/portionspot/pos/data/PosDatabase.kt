@@ -316,6 +316,14 @@ val MIGRATION_14_15 = object : Migration(14, 15) {
     }
 }
 
+/** v15 → v16: quotes. A quote is a `sales` row with status='quote'; add its
+ *  lapse date. Additive + nullable, so existing sales are untouched. */
+val MIGRATION_15_16 = object : Migration(15, 16) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE sales ADD COLUMN validUntil INTEGER")
+    }
+}
+
 @Database(
     entities = [
         Business::class,
@@ -338,7 +346,7 @@ val MIGRATION_14_15 = object : Migration(14, 15) {
         AppNotification::class,
         AuditEntry::class
     ],
-    version = 15,
+    version = 16,
     exportSchema = false
 )
 abstract class PosDatabase : RoomDatabase() {
@@ -379,7 +387,7 @@ abstract class PosDatabase : RoomDatabase() {
                     .addMigrations(
                         MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9,
                         MIGRATION_9_10, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14,
-                        MIGRATION_14_15
+                        MIGRATION_14_15, MIGRATION_15_16
                     )
                     .fallbackToDestructiveMigration()
                     .build()

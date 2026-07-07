@@ -114,6 +114,13 @@ interface SaleDao {
     @Query("SELECT COUNT(*) FROM sales WHERE businessId = :businessId AND deleted = 0 AND status = 'parked'")
     fun observeParkedCount(businessId: String): Flow<Int>
 
+    // ---- quotes (status = 'quote') ----
+    @Query(
+        "SELECT * FROM sales WHERE businessId = :businessId AND deleted = 0 " +
+            "AND status = 'quote' ORDER BY soldAt DESC"
+    )
+    fun observeQuotes(businessId: String): Flow<List<SaleEntity>>
+
     /** Hard-delete a sale + its lines + tenders (used when resuming a parked sale). */
     @Query("DELETE FROM sales WHERE id = :saleId")
     suspend fun hardDeleteSale(saleId: String)

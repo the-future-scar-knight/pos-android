@@ -129,7 +129,9 @@ data class SaleEntity(
     @PrimaryKey val id: String = newId(),
     val businessId: String,
     val receiptNo: String? = null,
-    val status: String = "completed",     // completed | parked | refunded | void
+    val status: String = "completed",     // completed | parked | refunded | void | quote
+    /** For quotes (status='quote'): the date the quote lapses. Null for real sales. */
+    val validUntil: Long? = null,
     val subtotal: Double = 0.0,
     val discountTotal: Double = 0.0,
     val taxTotal: Double = 0.0,

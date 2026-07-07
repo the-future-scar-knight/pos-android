@@ -328,6 +328,7 @@ class PosViewModel(
             receiptShowFooter = repo.getSetting(KEY_RC_FOOTER)?.toBooleanStrictOrNull() ?: d.receiptShowFooter,
             wholesaleRounding = repo.getSetting(KEY_ROUND_WS)?.toDoubleOrNull() ?: d.wholesaleRounding,
             checkoutRounding = repo.getSetting(KEY_ROUND_CO)?.toDoubleOrNull() ?: d.checkoutRounding,
+            defaultQuoteValidityDays = repo.getSetting(KEY_QUOTE_DAYS)?.toIntOrNull() ?: d.defaultQuoteValidityDays,
             marginFormula = repo.getSetting(KEY_MARGIN_FORMULA) ?: d.marginFormula,
             autoConvertUnitsToBoxes = repo.getSetting(KEY_AUTO_BOXES)?.toBooleanStrictOrNull() ?: d.autoConvertUnitsToBoxes,
             printerType = repo.getSetting(KEY_PRINTER_TYPE) ?: d.printerType,
@@ -354,6 +355,7 @@ class PosViewModel(
             repo.putSetting(KEY_RC_FOOTER, prefs.receiptShowFooter.toString())
             repo.putSetting(KEY_ROUND_WS, prefs.wholesaleRounding.toString())
             repo.putSetting(KEY_ROUND_CO, prefs.checkoutRounding.toString())
+            repo.putSetting(KEY_QUOTE_DAYS, prefs.defaultQuoteValidityDays.toString())
             repo.putSetting(KEY_MARGIN_FORMULA, prefs.marginFormula)
             repo.putSetting(KEY_AUTO_BOXES, prefs.autoConvertUnitsToBoxes.toString())
             repo.putSetting(KEY_PRINTER_TYPE, prefs.printerType)
@@ -491,6 +493,39 @@ class PosViewModel(
     fun dismissReceipt() {
         _lastReceipt.value = null
     }
+
+    /**
+     * Generate a QUOTE from the current cart (§1.2 parity): no payment is taken and
+     * nothing is drawn down — it's a priced document. The result rides the SAME
+     * [lastReceipt] path as a sale, so the receipt sheet prints/shares it (quote-aware
+     * rendering keys off status='quote'). Clears the cart afterwards.
+     */
+    fun generateQuote(discount: Double = 0.0, customer: Customer? = null, note: String? = null) {
+        val bid = businessId.value ?: return
+        val lines = _cart.value
+        if (lines.isEmpty()) return
+        val biz = business.value
+        viewModelScope.launch {
+            val saved = repo.saveQuote(
+                bid, lines, discount,
+                note = note,
+                customer = customer,
+                vatEnabled = biz?.vatEnabled ?: false,
+                vatPercent = biz?.vatPercent ?: 0.0,
+                validityDays = _shopPrefs.value.defaultQuoteValidityDays,
+                cashierId = currentCashierId,
+                cashierName = currentCashierName
+            )
+            _lastReceipt.value = LastReceipt(saved.sale, saved.lines)
+            _cart.value = emptyList()
+        }
+    }
+
+    /** Saved quotes (newest first) for the Quotes list. */
+    val quotes: StateFlow<List<SaleEntity>> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.quotesFlow(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     /** Create a customer on the fly from a typed name, then hand it back. */
     fun createCustomer(name: String, phone: String? = null, onCreated: (Customer) -> Unit) {
@@ -1252,6 +1287,7 @@ class PosViewModel(
         private const val KEY_RC_FOOTER = "rc_show_footer"
         private const val KEY_ROUND_WS = "round_wholesale"
         private const val KEY_ROUND_CO = "round_checkout"
+        private const val KEY_QUOTE_DAYS = "quote_validity_days"
         private const val KEY_MARGIN_FORMULA = "margin_formula"
         private const val KEY_AUTO_BOXES = "auto_units_to_boxes"
         private const val KEY_PRINTER_TYPE = "printer_type"

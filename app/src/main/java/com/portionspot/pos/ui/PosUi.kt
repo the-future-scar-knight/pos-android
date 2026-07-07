@@ -1763,6 +1763,8 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
     var selectedCat by remember { mutableStateOf("All") }
     var showCart by remember { mutableStateOf(false) }
     var showPayment by remember { mutableStateOf(false) }
+    var quoteMode by remember { mutableStateOf(false) }
+    var showQuote by remember { mutableStateOf(false) }
     var priceModalItem by remember { mutableStateOf<Item?>(null) }
     var scanning by remember { mutableStateOf(false) }
     val context = LocalContext.current
@@ -1866,6 +1868,8 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
             count = count,
             total = total,
             currency = currency,
+            quoteMode = quoteMode,
+            onToggleMode = { quoteMode = it },
             onOpenCart = { if (count > 0) showCart = true },
             onHold = {
                 if (count > 0) {
@@ -1873,7 +1877,7 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
                     Toast.makeText(context, "Sale held", Toast.LENGTH_SHORT).show()
                 }
             },
-            onCharge = { if (count > 0) showPayment = true }
+            onCharge = { if (count > 0) { if (quoteMode) showQuote = true else showPayment = true } }
         )
     }
 
@@ -1929,6 +1933,19 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
         ) { payments, discount, customer, onCredit, changeAsCredit ->
             vm.checkout(payments, discount, customer, onCredit, changeAsCredit)
             showPayment = false
+        }
+    }
+    if (showQuote) {
+        QuoteDialog(
+            subtotal = cart.sumOf { it.lineSubtotal },
+            currency = currency,
+            customers = customers,
+            validityDays = prefs.defaultQuoteValidityDays,
+            onDismiss = { showQuote = false }
+        ) { discount, customer ->
+            vm.generateQuote(discount, customer)
+            showQuote = false
+            quoteMode = false
         }
     }
     lastReceipt?.let { receipt ->
@@ -2090,40 +2107,103 @@ private fun CartBar(
     count: Int,
     total: Double,
     currency: String,
+    quoteMode: Boolean,
+    onToggleMode: (Boolean) -> Unit,
     onOpenCart: () -> Unit,
     onHold: () -> Unit,
     onCharge: () -> Unit
 ) {
     val t = LocalPosTokens.current
     HorizontalDivider(color = t.surfaceBorder)
-    Row(
-        Modifier.fillMaxWidth().background(t.surface1).padding(12.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Column(Modifier.weight(1f).clickable(enabled = count > 0, onClick = onOpenCart)) {
-            Text(
-                if (count == 0) "Cart empty" else "$count item${if (count == 1) "" else "s"} · tap to edit",
-                color = t.inkTertiary, fontSize = 11.sp, fontWeight = FontWeight.Medium
+    Column(Modifier.fillMaxWidth().background(t.surface1).padding(horizontal = 12.dp, vertical = 10.dp)) {
+        // Sale ⇄ Quote mode toggle (§1.2 parity). Quote mode swaps the action for
+        // "Generate quote": a priced document with no payment taken.
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilterChip(selected = !quoteMode, onClick = { onToggleMode(false) }, label = { Text("Sale") })
+            FilterChip(
+                selected = quoteMode, onClick = { onToggleMode(true) },
+                leadingIcon = { Icon(Icons.AutoMirrored.Filled.ReceiptLong, contentDescription = null, modifier = Modifier.size(16.dp)) },
+                label = { Text("Quote") }
             )
-            Text(money(total, currency), color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 20.sp)
         }
-        OutlinedButton(
-            onClick = onHold,
-            enabled = count > 0,
-            shape = RoundedCornerShape(12.dp)
-        ) {
-            Text("Hold")
-        }
-        Spacer(Modifier.width(8.dp))
-        Button(
-            onClick = onCharge,
-            enabled = count > 0,
-            colors = ButtonDefaults.buttonColors(containerColor = t.brand.s600, contentColor = t.inkOnBrand),
-            shape = RoundedCornerShape(12.dp)
-        ) {
-            Text("Charge", fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(8.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f).clickable(enabled = count > 0, onClick = onOpenCart)) {
+                Text(
+                    if (count == 0) "Cart empty" else "$count item${if (count == 1) "" else "s"} · tap to edit",
+                    color = t.inkTertiary, fontSize = 11.sp, fontWeight = FontWeight.Medium
+                )
+                Text(money(total, currency), color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 20.sp)
+            }
+            if (!quoteMode) {
+                OutlinedButton(onClick = onHold, enabled = count > 0, shape = RoundedCornerShape(12.dp)) {
+                    Text("Hold")
+                }
+                Spacer(Modifier.width(8.dp))
+            }
+            Button(
+                onClick = onCharge,
+                enabled = count > 0,
+                colors = ButtonDefaults.buttonColors(containerColor = t.brand.s600, contentColor = t.inkOnBrand),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Text(if (quoteMode) "Generate quote" else "Charge", fontWeight = FontWeight.Bold)
+            }
         }
     }
+}
+
+/**
+ * Quote dialog (§1.2 parity): pick an optional customer + discount, then generate a
+ * priced quote (no payment). The quote prints/shares via the same receipt sheet as a
+ * sale, headed "QUOTATION" with a valid-until date.
+ */
+@Composable
+private fun QuoteDialog(
+    subtotal: Double,
+    currency: String,
+    customers: List<CustomerWithBalance>,
+    validityDays: Int,
+    onDismiss: () -> Unit,
+    onConfirm: (discount: Double, customer: Customer?) -> Unit
+) {
+    var customer by remember { mutableStateOf<Customer?>(null) }
+    var discountText by remember { mutableStateOf("") }
+    val discount = (discountText.toDoubleOrNull() ?: 0.0).coerceIn(0.0, subtotal)
+    val total = (subtotal - discount).coerceAtLeast(0.0)
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = {
+            Button(onClick = { onConfirm(discount, customer) }) { Text("Generate quote") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+        title = { Text("New quote") },
+        text = {
+            Column {
+                CustomerPicker(customers = customers, selected = customer, onSelect = { customer = it })
+                Spacer(Modifier.height(10.dp))
+                OutlinedTextField(
+                    value = discountText,
+                    onValueChange = { discountText = it },
+                    label = { Text("Discount ($currency)") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(12.dp))
+                Row(Modifier.fillMaxWidth()) {
+                    Text("Quote total", modifier = Modifier.weight(1f), fontWeight = FontWeight.SemiBold)
+                    Text(money(total, currency), fontWeight = FontWeight.Black)
+                }
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "Valid for $validityDays day${if (validityDays == 1) "" else "s"}. No payment is taken.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    )
 }
 
 /** Held sales: tap one to load it back into the cart (replacing the current cart). */
@@ -3291,15 +3371,22 @@ private fun ReceiptDialog(
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
+    val isQuote = sale.status == "quote"
     AlertDialog(
         onDismissRequest = onDismiss,
-        confirmButton = { Button(onClick = onDismiss) { Text("New sale") } },
-        title = { Text("Sale complete") },
+        confirmButton = { Button(onClick = onDismiss) { Text(if (isQuote) "Done" else "New sale") } },
+        title = { Text(if (isQuote) "Quote ready" else "Sale complete") },
         text = {
             Column {
-                Text("Receipt #${sale.receiptNo ?: sale.id.takeLast(6).uppercase()}")
+                Text("${if (isQuote) "Quote" else "Receipt"} #${sale.receiptNo ?: sale.id.takeLast(6).uppercase()}")
                 sale.customerName?.takeIf { it.isNotBlank() }?.let {
                     Text("Customer: $it", style = MaterialTheme.typography.bodySmall)
+                }
+                if (isQuote) sale.validUntil?.let {
+                    val vu = remember(it) {
+                        SimpleDateFormat("dd MMM yyyy", Locale.getDefault()).format(Date(it))
+                    }
+                    Text("Valid until: $vu", style = MaterialTheme.typography.bodySmall)
                 }
                 Spacer(Modifier.height(8.dp))
                 TotalRow("Subtotal", money(sale.subtotal, currency))
@@ -3307,21 +3394,29 @@ private fun ReceiptDialog(
                 if (sale.taxTotal > 0) TotalRow("VAT", money(sale.taxTotal, currency))
                 Spacer(Modifier.height(4.dp))
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text(if (sale.paymentMethod == "credit") "Charged to account" else "Total paid",
-                        fontWeight = FontWeight.Bold)
+                    Text(
+                        when {
+                            isQuote -> "Quote total"
+                            sale.paymentMethod == "credit" -> "Charged to account"
+                            else -> "Total paid"
+                        },
+                        fontWeight = FontWeight.Bold
+                    )
                     Text(money(sale.total, currency), fontWeight = FontWeight.Bold)
                 }
-                // Tender + reference for non-cash, non-credit methods.
-                if (sale.paymentMethod != "cash" && sale.paymentMethod != "credit") {
-                    TotalRow("Paid via", PaymentMethod.fromCode(sale.paymentMethod)?.label ?: sale.paymentMethod)
+                // Payment/change lines are meaningless on a quote — sale only.
+                if (!isQuote) {
+                    if (sale.paymentMethod != "cash" && sale.paymentMethod != "credit") {
+                        TotalRow("Paid via", PaymentMethod.fromCode(sale.paymentMethod)?.label ?: sale.paymentMethod)
+                    }
+                    sale.paymentRef?.takeIf { it.isNotBlank() }?.let { TotalRow("Reference", it) }
+                    sale.changeDue?.takeIf { it > 0 }?.let { TotalRow("Change given", money(it, currency)) }
                 }
-                sale.paymentRef?.takeIf { it.isNotBlank() }?.let { TotalRow("Reference", it) }
-                sale.changeDue?.takeIf { it > 0 }?.let { TotalRow("Change given", money(it, currency)) }
                 Spacer(Modifier.height(12.dp))
                 OutlinedButton(onClick = onPrint, modifier = Modifier.fillMaxWidth()) {
                     Icon(Icons.Filled.Print, contentDescription = null)
                     Spacer(Modifier.width(8.dp))
-                    Text("Print receipt")
+                    Text(if (isQuote) "Print quote" else "Print receipt")
                 }
                 Spacer(Modifier.height(8.dp))
                 OutlinedButton(
@@ -3346,11 +3441,15 @@ private fun shareReceipt(
     lines: List<SaleLine>,
     currency: String
 ) {
+    val isQuote = sale.status == "quote"
     val sb = StringBuilder()
     sb.appendLine(business.name)
     business.receiptHeader?.takeIf { it.isNotBlank() }?.let { sb.appendLine(it) }
-    sb.appendLine("Receipt #${sale.receiptNo ?: sale.id.takeLast(6).uppercase()}")
+    sb.appendLine("${if (isQuote) "QUOTATION" else "Receipt"} #${sale.receiptNo ?: sale.id.takeLast(6).uppercase()}")
     sale.customerName?.takeIf { it.isNotBlank() }?.let { sb.appendLine("Customer: $it") }
+    if (isQuote) sale.validUntil?.let {
+        sb.appendLine("Valid until: ${SimpleDateFormat("dd MMM yyyy", Locale.getDefault()).format(Date(it))}")
+    }
     sb.appendLine("--------------------------------")
     lines.forEach { line ->
         sb.appendLine("${trimQty(line.qty)} x ${line.name}")
@@ -3361,10 +3460,12 @@ private fun shareReceipt(
     if (sale.discountTotal > 0) sb.appendLine("Discount: -${money(sale.discountTotal, currency)}")
     if (sale.taxTotal > 0) sb.appendLine("VAT: ${money(sale.taxTotal, currency)}")
     sb.appendLine("TOTAL: ${money(sale.total, currency)}")
-    if (sale.paymentMethod != "cash" && sale.paymentMethod != "credit") {
-        sb.appendLine("Paid via: ${PaymentMethod.fromCode(sale.paymentMethod)?.label ?: sale.paymentMethod}")
+    if (!isQuote) {
+        if (sale.paymentMethod != "cash" && sale.paymentMethod != "credit") {
+            sb.appendLine("Paid via: ${PaymentMethod.fromCode(sale.paymentMethod)?.label ?: sale.paymentMethod}")
+        }
+        sale.changeDue?.takeIf { it > 0 }?.let { sb.appendLine("Change: ${money(it, currency)}") }
     }
-    sale.changeDue?.takeIf { it > 0 }?.let { sb.appendLine("Change: ${money(it, currency)}") }
     business.receiptFooter?.takeIf { it.isNotBlank() }?.let { sb.appendLine(); sb.appendLine(it) }
 
     val send = Intent(Intent.ACTION_SEND).apply {
@@ -5884,10 +5985,12 @@ private fun ReportStatRow(label: String, value: String) {
 private fun ReceiptsScreen(vm: PosViewModel, business: Business, printer: PrinterUi) {
     val currency = business.currency
     val sales by vm.recentSales.collectAsState()
+    val quotes by vm.quotes.collectAsState()
     val refundedBySale by vm.refundedBySale.collectAsState()
     val takings by vm.todayTakings.collectAsState()
     val countToday by vm.todayCount.collectAsState()
     var refundFor by remember { mutableStateOf<SaleEntity?>(null) }
+    var showQuotes by remember { mutableStateOf(false) }
 
     Column(Modifier.fillMaxSize()) {
         Card(
@@ -5900,8 +6003,19 @@ private fun ReceiptsScreen(vm: PosViewModel, business: Business, printer: Printe
                 Text("$countToday sale${if (countToday == 1) "" else "s"}")
             }
         }
+        // Receipts ⇄ Quotes (§1.2 parity). Quotes are local documents, never a sale.
+        Row(Modifier.padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilterChip(selected = !showQuotes, onClick = { showQuotes = false }, label = { Text("Receipts") })
+            FilterChip(
+                selected = showQuotes, onClick = { showQuotes = true },
+                label = { Text(if (quotes.isNotEmpty()) "Quotes (${quotes.size})" else "Quotes") }
+            )
+        }
+        Spacer(Modifier.height(8.dp))
         HorizontalDivider()
-        if (sales.isEmpty()) {
+        if (showQuotes) {
+            QuotesList(quotes, currency, business, printer, vm)
+        } else if (sales.isEmpty()) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text("No sales yet", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
@@ -5952,6 +6066,52 @@ private fun ReceiptsScreen(vm: PosViewModel, business: Business, printer: Printe
 
     refundFor?.let { sale ->
         RefundDialog(vm, business, sale, onDismiss = { refundFor = null })
+    }
+}
+
+/** Saved quotes (§1.2 parity): reprint or re-share; no refund (a quote isn't a sale). */
+@Composable
+private fun QuotesList(
+    quotes: List<SaleEntity>,
+    currency: String,
+    business: Business,
+    printer: PrinterUi,
+    vm: PosViewModel
+) {
+    if (quotes.isEmpty()) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Text("No quotes yet", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        return
+    }
+    val now = System.currentTimeMillis()
+    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(12.dp)) {
+        items(quotes, key = { it.id }) { q ->
+            val expired = q.validUntil != null && q.validUntil < now
+            Row(Modifier.fillMaxWidth().padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("#${q.receiptNo ?: q.id.takeLast(6).uppercase()}", fontWeight = FontWeight.Medium)
+                    val vu = q.validUntil?.let { SimpleDateFormat("dd MMM yyyy", Locale.getDefault()).format(Date(it)) }
+                    Text(
+                        when {
+                            vu == null -> q.customerName ?: "Quote"
+                            expired -> "Expired $vu"
+                            else -> "Valid until $vu"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (expired) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Text(money(q.total, currency), fontWeight = FontWeight.Bold)
+                IconButton(onClick = { printer.printReceipt(business, q) { vm.loadLines(q.id) } }) {
+                    Icon(Icons.Filled.Print, contentDescription = "Reprint quote")
+                }
+                IconButton(onClick = { printer.sharePdfReceipt(business, q) { vm.loadLines(q.id) } }) {
+                    Icon(Icons.Filled.Share, contentDescription = "Share quote PDF")
+                }
+            }
+            HorizontalDivider()
+        }
     }
 }
 
@@ -6555,6 +6715,15 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
             Spacer(Modifier.height(20.dp))
             SettingsSectionHeader("Tax & margins")
             TaxMarginsSection(prefs = prefs, onChange = { vm.savePrefs(it) })
+
+            // ---- Quotes (saves live, device-local) ----
+            Spacer(Modifier.height(20.dp))
+            SettingsSectionHeader("Quotes")
+            SettingsField("Quote validity (days)", prefs.defaultQuoteValidityDays.toString()) {
+                it.toIntOrNull()?.coerceIn(0, 365)?.let { d ->
+                    vm.savePrefs(prefs.copy(defaultQuoteValidityDays = d))
+                }
+            }
 
             // ---- Second currency (dual-currency tender, saves live, device-local) ----
             Spacer(Modifier.height(20.dp))
