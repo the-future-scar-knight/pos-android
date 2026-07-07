@@ -67,7 +67,9 @@ class SyncConfig(private val dao: SettingDao) {
         const val KEY_PUSH = "sync_push_enabled"
 
         /** Cloud tables Android syncs (the shared web-POS schema). */
-        val TABLES = listOf("products", "customers", "sales")
+        val TABLES = listOf(
+            "products", "customers", "sales", "credit_transactions", "mobile_money_receipts"
+        )
 
         private fun cursorKey(table: String) = "cursor_$table"
     }

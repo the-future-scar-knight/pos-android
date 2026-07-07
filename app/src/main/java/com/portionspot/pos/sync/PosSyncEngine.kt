@@ -4,6 +4,7 @@ import com.portionspot.pos.data.BusinessDao
 import com.portionspot.pos.data.CreditDao
 import com.portionspot.pos.data.CustomerDao
 import com.portionspot.pos.data.ItemDao
+import com.portionspot.pos.data.MobileMoneyDao
 import com.portionspot.pos.data.RefundDao
 import com.portionspot.pos.data.SaleDao
 import com.portionspot.pos.data.SalePaymentDao
@@ -38,6 +39,7 @@ class PosSyncEngine(
     private val customerDao: CustomerDao,
     private val creditDao: CreditDao,
     private val refundDao: RefundDao,
+    private val mobileMoneyDao: MobileMoneyDao,
     private val config: SyncConfig,
     /** Current signed-in user's JWT for RLS; null falls back to anon (denied). */
     private val accessToken: () -> String? = { null },
@@ -87,6 +89,38 @@ class PosSyncEngine(
             n += products.size
         }
 
+        // customers (upsert on local_id; balance/credit_limit deliberately not sent).
+        val customers = customerDao.pending()
+        if (customers.isNotEmpty()) {
+            api.upsert("customers", syncJson.encodeToString(customers.map { it.toCustomerPush() }), "local_id")
+            customerDao.markSynced(customers.map { it.id })
+            n += customers.size
+        }
+
+        // credit — after customers, so every referenced customer has a cloud bigint id
+        // to resolve customer_id to. Unresolved rows are left for a later pass.
+        val credit = creditDao.pending()
+        if (credit.isNotEmpty()) {
+            val localToCloud = customerIdMap(api).entries.associate { (cloud, local) -> local to cloud }
+            val pushable = credit.mapNotNull { c ->
+                val cloudCid = localToCloud[c.customerId] ?: return@mapNotNull null
+                c to c.toCreditPush(cloudCid, null)
+            }
+            if (pushable.isNotEmpty()) {
+                api.upsert("credit_transactions", syncJson.encodeToString(pushable.map { it.second }), "local_id")
+                creditDao.markSynced(pushable.map { it.first.id })
+                n += pushable.size
+            }
+        }
+
+        // mobile-money receipts (upsert on txn_code — idempotent).
+        val mm = mobileMoneyDao.pending()
+        if (mm.isNotEmpty()) {
+            api.upsert("mobile_money_receipts", syncJson.encodeToString(mm.map { it.toPush() }), "txn_code")
+            mobileMoneyDao.markSynced(mm.map { it.id })
+            n += mm.size
+        }
+
         val sales = saleDao.pendingSales().filter { it.status == "completed" }
         if (sales.isNotEmpty()) {
             val dtos = sales.map { s ->
@@ -117,7 +151,56 @@ class PosSyncEngine(
         n += pullProducts(api, bid)
         n += pullCustomers(api, bid)
         n += pullSales(api, bid)
+        n += pullCredit(api, bid)
+        n += pullMobileMoney(api, bid)
         return n
+    }
+
+    /** cloud customers.id (as text) → Android customer id (its local_id). The bridge
+     *  for credit, whose customer_id column holds the customers BIGINT id, not local_id. */
+    private suspend fun customerIdMap(api: SupabaseRest): Map<String, String> =
+        syncJson.decodeFromString<List<CustomerIdRow>>(api.selectAll("customers", "id,local_id"))
+            .associate { it.id.toString() to it.bridge() }
+
+    /** credit_transactions → credit, bridging customer_id(bigint)→customers.local_id.
+     *  Rows whose customer can't be resolved are skipped (kept for a later pass). */
+    private suspend fun pullCredit(api: SupabaseRest, bid: String): Int {
+        val rows = syncJson.decodeFromString<List<CreditDto>>(
+            api.selectSince("credit_transactions", config.cursor("credit_transactions"), PAGE)
+        )
+        if (rows.isEmpty()) return 0
+        val cloudIdToLocal = customerIdMap(api)
+        var applied = 0
+        for (dto in rows) {
+            val cid = dto.customerId ?: continue
+            val androidCustomerId = cloudIdToLocal[cid] ?: continue
+            val bridge = dto.localId?.ifBlank { null } ?: "ctx-${dto.id ?: ""}"
+            val local = creditDao.getById(bridge)
+            if (local == null || IsoTime.toMillis(dto.updatedAt) > local.updatedAt) {
+                creditDao.upsert(dto.toCreditTxn(bid, androidCustomerId, local))
+                applied++
+            }
+        }
+        config.setCursor("credit_transactions", rows.maxOf { it.cursorStamp() })
+        return applied
+    }
+
+    /** mobile_money_receipts → local, deduped by txn_code (the idempotency key). */
+    private suspend fun pullMobileMoney(api: SupabaseRest, bid: String): Int {
+        val rows = syncJson.decodeFromString<List<MobileMoneyDto>>(
+            api.selectSince("mobile_money_receipts", config.cursor("mobile_money_receipts"), PAGE)
+        )
+        if (rows.isEmpty()) return 0
+        var applied = 0
+        for (dto in rows) {
+            val local = mobileMoneyDao.getByTxn(bid, dto.txnCode)
+            if (local == null || IsoTime.toMillis(dto.updatedAt) > local.updatedAt) {
+                mobileMoneyDao.upsert(dto.toReceipt(bid, local))
+                applied++
+            }
+        }
+        config.setCursor("mobile_money_receipts", rows.maxOf { it.cursorStamp() })
+        return applied
     }
 
     /** products → items, bridged by sku (the cloud has no per-row local id here). */
