@@ -1012,6 +1012,41 @@ class PosRepository(private val db: PosDatabase) {
         mobileMoneyDao.upsert(r.copy(status = "ignored", updatedAt = now(), pendingSync = true))
     }
 
+    /**
+     * Undo a verification made in error (§6). The reverse of [verifyMobileMoney]:
+     *  - `debt`  — soft-deletes the `credit_paid` ledger row it created (via the
+     *              receipt's [MobileMoneyReceipt.appliedCreditTxnId]), which restores
+     *              the customer's balance; the row is kept (deleted=1) for audit/sync.
+     *  - `sale`  — nothing was applied to a ledger, so just clears the flag.
+     * The receipt returns to the queue: `needs_verification` if it still has a matched
+     * customer, otherwise `unmatched`. No-op unless the receipt is currently verified.
+     */
+    suspend fun unverifyMobileMoney(
+        receiptId: String,
+        cashierId: String? = null,
+        cashierName: String? = null
+    ) {
+        val r = mobileMoneyDao.getById(receiptId) ?: return
+        if (r.status != "verified") return
+        val stamp = now()
+        db.withTransaction {
+            r.appliedCreditTxnId?.let { txnId ->
+                creditDao.getById(txnId)?.let { txn ->
+                    creditDao.upsert(txn.copy(deleted = true, updatedAt = stamp, pendingSync = true))
+                }
+            }
+            mobileMoneyDao.upsert(
+                r.copy(
+                    status = if (r.matchedCustomerId != null) "needs_verification" else "unmatched",
+                    purpose = null,
+                    appliedCreditTxnId = null,
+                    updatedAt = stamp,
+                    pendingSync = true
+                )
+            )
+        }
+    }
+
     // ---- admin: notifications backend (Phase 7, §8) ----------------------
 
     fun notificationsFlow(businessId: String): Flow<List<AppNotification>> =

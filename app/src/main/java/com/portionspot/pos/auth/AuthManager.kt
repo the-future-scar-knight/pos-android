@@ -25,11 +25,17 @@ sealed class AuthState {
     /** Reading the vault on process start. */
     object Loading : AuthState()
 
-    /** No cached session — online email+password login required. */
+    /** No accounts on this device — online email+password login required. */
     object LoggedOut : AuthState()
 
-    /** Session cached and a PIN is set: offline unlock. */
-    data class Locked(val displayName: String) : AuthState()
+    /** Adding another account from the picker (keeps existing accounts). */
+    object AddAccount : AuthState()
+
+    /** One or more accounts provisioned: pick who's using the device. */
+    data class Picker(val accounts: List<AccountSummary>) : AuthState()
+
+    /** A picked account with a PIN set: enter it to unlock offline. */
+    data class Locked(val account: AccountSummary) : AuthState()
 
     /** Fresh online login succeeded; offer to set an offline-unlock PIN. */
     data class PinSetup(val user: PosUser) : AuthState()
@@ -44,11 +50,17 @@ sealed class LoginResult {
 }
 
 /**
- * Owns the auth lifecycle: online login, encrypted session cache, offline PIN
- * unlock, token refresh, and role plumbing.
+ * Owns the auth lifecycle: online login, encrypted multi-account session cache,
+ * offline PIN unlock, account switching, token refresh, and role plumbing.
  *
- * Offline-first contract (prompt §2): first login needs internet; after that
- * the cashier unlocks with a PIN and works fully offline. If the refresh token
+ * Multi-account (prompt: a device the admin set up must let cashiers sign in with
+ * their own PIN without wiping the admin): the [SessionVault] holds every account
+ * provisioned on the device. The lock screen is an account picker; each account
+ * unlocks with its own PIN and lands in its own role's UI. "Switch user" returns
+ * to the picker without touching any cached session.
+ *
+ * Offline-first contract: adding an account needs internet once; after that the
+ * staff member unlocks with a PIN and works fully offline. If the refresh token
  * dies while we're back online, we NEVER touch local data — we just raise
  * [reloginRequired] so the UI prompts, and unsynced records stay queued.
  */
@@ -70,29 +82,69 @@ class AuthManager(
     @Volatile
     private var currentAccessToken: String? = null
 
+    /** Which account [refreshIfNeeded] refreshes: the last one unlocked / added. */
+    @Volatile
+    private var activeUserId: String? = null
+
     init {
         scope.launch {
-            val cached = withContext(Dispatchers.IO) { vault.loadSession() }
-            if (cached == null) {
-                _state.value = AuthState.LoggedOut
-            } else {
-                currentAccessToken = cached.accessToken
-                _state.value = if (vault.hasPin()) {
-                    AuthState.Locked(cached.displayName)
+            withContext(Dispatchers.IO) {
+                activeUserId = vault.activeUserId()
+                currentAccessToken = vault.activeSession()?.accessToken
+                _state.value = if (vault.hasAnyAccount()) {
+                    AuthState.Picker(vault.accounts())
                 } else {
-                    AuthState.Active(cached.toUser())
+                    AuthState.LoggedOut
                 }
             }
         }
     }
 
-    // ── online login ──────────────────────────────────────────────────────
+    // ── account picker / switching ────────────────────────────────────────
+
+    /** Go to the account picker without dropping any cached session. */
+    fun switchUser() {
+        _state.value = AuthState.Picker(vault.accounts())
+    }
+
+    /** From the picker: add another account via online login. */
+    fun addAccount() {
+        _state.value = AuthState.AddAccount
+    }
+
+    /** Back out of add-account / PIN entry to the picker. */
+    fun backToPicker() {
+        _state.value = AuthState.Picker(vault.accounts())
+    }
+
+    /** User tapped an account in the picker. */
+    fun chooseAccount(userId: String) {
+        val summary = vault.accounts().firstOrNull { it.userId == userId } ?: run {
+            switchUser(); return
+        }
+        if (summary.hasPin) {
+            _state.value = AuthState.Locked(summary)
+        } else {
+            // No PIN was ever set for this account (they skipped it): activate directly.
+            activate(userId)
+        }
+    }
+
+    private fun activate(userId: String) {
+        val session = vault.sessionFor(userId) ?: run { switchUser(); return }
+        vault.setActive(userId)
+        activeUserId = userId
+        currentAccessToken = session.accessToken
+        _state.value = AuthState.Active(session.toUser())
+    }
+
+    // ── online login (first account or "add account") ─────────────────────
 
     suspend fun login(email: String, password: String): LoginResult =
         withContext(Dispatchers.IO) {
             when (val result = api.signIn(email.trim(), password)) {
                 is AuthResult.Offline ->
-                    LoginResult.Error("No connection — first login needs internet")
+                    LoginResult.Error("No connection — signing in needs internet")
                 is AuthResult.Rejected -> LoginResult.Error(result.message)
                 is AuthResult.Success -> {
                     val session = result.session
@@ -117,12 +169,13 @@ class AuthManager(
                         refreshToken = session.refreshToken,
                         expiresAt = session.expiryEpochSeconds(),
                     )
-                    vault.saveSession(cached)
-                    vault.resetPinFailures()
+                    vault.upsertSession(cached, makeActive = true)
+                    vault.resetPinFailures(userId)
+                    activeUserId = userId
                     currentAccessToken = cached.accessToken
                     _reloginRequired.value = false
 
-                    _state.value = if (vault.hasPin()) {
+                    _state.value = if (vault.hasPin(userId)) {
                         AuthState.Active(cached.toUser())
                     } else {
                         AuthState.PinSetup(cached.toUser())
@@ -136,7 +189,7 @@ class AuthManager(
 
     fun setPin(pin: String) {
         val user = (state.value as? AuthState.PinSetup)?.user ?: return
-        vault.setPin(pin)
+        vault.setPin(user.id, pin)
         _state.value = AuthState.Active(user)
     }
 
@@ -145,23 +198,23 @@ class AuthManager(
         _state.value = AuthState.Active(user)
     }
 
-    /** Offline unlock. After [MAX_PIN_ATTEMPTS] failures the PIN is wiped and a
-     *  full password login is required (which needs internet). */
+    /** Offline unlock of the account currently shown on the [AuthState.Locked] screen.
+     *  After [MAX_PIN_ATTEMPTS] failures that account is removed from the device and a
+     *  fresh online login is required to re-add it. */
     suspend fun unlockWithPin(pin: String): LoginResult = withContext(Dispatchers.IO) {
-        val cached = vault.loadSession()
-            ?: return@withContext LoginResult.Error("Session missing — sign in again").also {
-                _state.value = AuthState.LoggedOut
-            }
-        if (vault.verifyPin(pin)) {
-            vault.resetPinFailures()
-            currentAccessToken = cached.accessToken
-            _state.value = AuthState.Active(cached.toUser())
+        val account = (state.value as? AuthState.Locked)?.account
+            ?: return@withContext LoginResult.Error("Pick an account first").also { switchUser() }
+        val userId = account.userId
+        if (vault.verifyPin(userId, pin)) {
+            vault.resetPinFailures(userId)
+            activate(userId)
             LoginResult.Ok
         } else {
-            val fails = vault.recordPinFailure()
+            val fails = vault.recordPinFailure(userId)
             if (fails >= MAX_PIN_ATTEMPTS) {
-                vault.clearPin()
-                _state.value = AuthState.LoggedOut
+                val remaining = vault.removeAccount(userId)
+                if (userId == activeUserId) { activeUserId = null; currentAccessToken = null }
+                _state.value = if (remaining.isEmpty()) AuthState.LoggedOut else AuthState.Picker(remaining)
                 LoginResult.Error("Too many attempts — sign in with your password")
             } else {
                 LoginResult.Error("Wrong PIN (${MAX_PIN_ATTEMPTS - fails} attempts left)")
@@ -170,16 +223,16 @@ class AuthManager(
     }
 
     /**
-     * The signed-in (or last-unlocked) cashier, for stamping attribution on records
+     * The signed-in (or last-active) cashier, for stamping attribution on records
      * created OUTSIDE the UI — notably the passive SMS receiver (Phase 5), which fires
      * while the app may be backgrounded or PIN-locked. Prefers the live Active user;
-     * falls back to the cached vault session so a locked device still attributes to
+     * falls back to the active vault session so a locked device still attributes to
      * the cashier who last used it. Null before any first login.
      */
     suspend fun cachedUserOrNull(): PosUser? = withContext(Dispatchers.IO) {
         (state.value as? AuthState.Active)?.user
             ?: (state.value as? AuthState.PinSetup)?.user
-            ?: vault.loadSession()?.toUser()
+            ?: vault.activeSession()?.toUser()
     }
 
     // ── tokens for the sync layer ─────────────────────────────────────────
@@ -188,14 +241,15 @@ class AuthManager(
     fun accessTokenOrNull(): String? = currentAccessToken
 
     /**
-     * Called before a sync pass. Refreshes the access token when it's within
-     * a minute of expiry. Offline: keep what we have (sync only runs online
-     * anyway, and a failed pass just retries later — records stay queued).
+     * Called before a sync pass. Refreshes the active account's access token when
+     * it's within a minute of expiry. Offline: keep what we have (sync only runs
+     * online anyway, and a failed pass just retries later — records stay queued).
      * Server-rejected refresh: raise [reloginRequired]; never drop local data.
      */
     suspend fun refreshIfNeeded() = withContext(Dispatchers.IO) {
         refreshMutex.withLock {
-            val cached = vault.loadSession() ?: return@withLock
+            val userId = activeUserId ?: return@withLock
+            val cached = vault.sessionFor(userId) ?: return@withLock
             val now = System.currentTimeMillis() / 1000
             if (now < cached.expiresAt - 60) {
                 currentAccessToken = cached.accessToken
@@ -209,7 +263,7 @@ class AuthManager(
                         refreshToken = s.refreshToken,
                         expiresAt = s.expiryEpochSeconds(),
                     )
-                    vault.saveSession(updated)
+                    vault.updateSession(userId, updated)
                     currentAccessToken = updated.accessToken
                     _reloginRequired.value = false
                 }
@@ -221,20 +275,23 @@ class AuthManager(
 
     // ── sign out / re-login ───────────────────────────────────────────────
 
-    /** Clears the vault (session + PIN). Local Room data is untouched. */
-    suspend fun logout() = withContext(Dispatchers.IO) {
+    /** Remove the active account from this device (session + PIN). Local Room data is
+     *  untouched. Drops to the picker if other accounts remain, else to login. */
+    suspend fun signOut() = withContext(Dispatchers.IO) {
+        val userId = (state.value as? AuthState.Active)?.user?.id ?: activeUserId
         currentAccessToken?.let { api.signOut(it) }
-        vault.clearAll()
+        val remaining = if (userId != null) vault.removeAccount(userId) else vault.accounts()
+        activeUserId = null
         currentAccessToken = null
         _reloginRequired.value = false
-        _state.value = AuthState.LoggedOut
+        _state.value = if (remaining.isEmpty()) AuthState.LoggedOut else AuthState.Picker(remaining)
     }
 
-    /** From the "session expired" banner: go to the login screen. The vault
-     *  session is kept until the new login overwrites it, so nothing is lost
-     *  if the user backs out. */
+    /** From the "session expired" banner: go to re-login (add-account), keeping the
+     *  cached session until the new login overwrites it, so nothing is lost if the
+     *  user backs out. */
     fun promptRelogin() {
-        _state.value = AuthState.LoggedOut
+        _state.value = if (vault.hasAnyAccount()) AuthState.AddAccount else AuthState.LoggedOut
     }
 
     private fun CachedAuth.toUser() = PosUser(userId, email, role, displayName)

@@ -814,6 +814,15 @@ class PosViewModel(
         viewModelScope.launch { repo.ignoreMobileMoney(receiptId) }
     }
 
+    /**
+     * Undo a verification done in error (§6). Reverses any debt payment it applied
+     * (soft-deletes the `credit_paid` ledger row) and returns the receipt to the
+     * queue — back to "To verify" if it still has a matched customer, else "Unmatched".
+     */
+    fun unverifyMobileMoney(receiptId: String) {
+        viewModelScope.launch { repo.unverifyMobileMoney(receiptId, currentCashierId, currentCashierName) }
+    }
+
     // ---- Admin: notifications / audit / end-of-day / aging (Phase 7, §8) --
 
     /** Persisted admin notification feed (newest event first). */
@@ -1062,6 +1071,18 @@ class PosViewModel(
             sync.runNow()
             refreshSyncState()
         }
+    }
+
+    // ---- Account switching on this device (multi-account vault) ----
+
+    /** Lock this device and return to the account picker. Every cached account is
+     *  kept, so another cashier (or the admin) can unlock with their own PIN. */
+    fun switchUser() = authManager.switchUser()
+
+    /** Remove the CURRENT account from this device (session + PIN), then drop to the
+     *  picker if other accounts remain, else to login. Local Room data is untouched. */
+    fun signOut() {
+        viewModelScope.launch { authManager.signOut() }
     }
 
     // ---- Staff / cashier accounts (admin, via the create-cashier Edge Function) ----

@@ -1,5 +1,6 @@
 package com.portionspot.pos.auth
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,15 +17,21 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.rounded.AccountCircle
 import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material.icons.rounded.PersonAdd
 import androidx.compose.material.icons.rounded.Storefront
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -38,6 +45,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -45,9 +53,9 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 
 /**
- * Wraps the whole app: routes between login / PIN setup / PIN unlock and the
- * real POS content depending on [AuthManager.state]. Also shows the
- * "session expired" banner when a refresh is rejected server-side.
+ * Wraps the whole app: routes between the account picker / login / PIN setup /
+ * PIN unlock and the real POS content depending on [AuthManager.state]. Also shows
+ * the "session expired" banner when a refresh is rejected server-side.
  */
 @Composable
 fun AuthGate(auth: AuthManager, content: @Composable (PosUser) -> Unit) {
@@ -56,8 +64,10 @@ fun AuthGate(auth: AuthManager, content: @Composable (PosUser) -> Unit) {
 
     when (val s = state) {
         is AuthState.Loading -> Box(Modifier.fillMaxSize()) {}
-        is AuthState.LoggedOut -> LoginScreen(auth)
-        is AuthState.Locked -> PinUnlockScreen(auth, s.displayName)
+        is AuthState.LoggedOut -> LoginScreen(auth, onBack = null)
+        is AuthState.AddAccount -> LoginScreen(auth, onBack = { auth.backToPicker() })
+        is AuthState.Picker -> AccountPickerScreen(auth, s.accounts)
+        is AuthState.Locked -> PinUnlockScreen(auth, s.account)
         is AuthState.PinSetup -> PinSetupScreen(auth)
         is AuthState.Active -> Column(Modifier.fillMaxSize()) {
             if (reloginRequired) {
@@ -88,36 +98,46 @@ fun AuthGate(auth: AuthManager, content: @Composable (PosUser) -> Unit) {
 private fun AuthScaffold(
     title: String,
     subtitle: String,
+    onBack: (() -> Unit)? = null,
     content: @Composable () -> Unit,
 ) {
     Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-        Column(
-            Modifier
-                .fillMaxSize()
-                .safeDrawingPadding()
-                .imePadding()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
-        ) {
-            Icon(
-                Icons.Rounded.Storefront,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.width(48.dp).height(48.dp)
-            )
-            Spacer(Modifier.height(12.dp))
-            Text(title, style = MaterialTheme.typography.headlineSmall,
-                color = MaterialTheme.colorScheme.onBackground)
-            Spacer(Modifier.height(4.dp))
-            Text(
-                subtitle,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Spacer(Modifier.height(24.dp))
-            content()
+        Column(Modifier.fillMaxSize()) {
+            if (onBack != null) {
+                Row(Modifier.fillMaxWidth().safeDrawingPadding().padding(horizontal = 4.dp)) {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "Back to accounts")
+                    }
+                }
+            }
+            Column(
+                Modifier
+                    .fillMaxSize()
+                    .then(if (onBack == null) Modifier.safeDrawingPadding() else Modifier)
+                    .imePadding()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                Icon(
+                    Icons.Rounded.Storefront,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.width(48.dp).height(48.dp)
+                )
+                Spacer(Modifier.height(12.dp))
+                Text(title, style = MaterialTheme.typography.headlineSmall,
+                    color = MaterialTheme.colorScheme.onBackground)
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    subtitle,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(24.dp))
+                content()
+            }
         }
     }
 }
@@ -134,8 +154,65 @@ private fun ErrorText(message: String?) {
     }
 }
 
+/** The lock screen when the device already has accounts: pick who's using it. */
 @Composable
-private fun LoginScreen(auth: AuthManager) {
+private fun AccountPickerScreen(auth: AuthManager, accounts: List<AccountSummary>) {
+    AuthScaffold("Who's using this device?", "Tap your name, then enter your PIN") {
+        accounts.forEach { acc ->
+            Card(
+                Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable { auth.chooseAccount(acc.userId) },
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant
+                )
+            ) {
+                Row(
+                    Modifier.fillMaxWidth().padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Icon(
+                        Icons.Rounded.AccountCircle,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.width(36.dp).height(36.dp)
+                    )
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            acc.displayName.ifBlank { acc.email },
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            if (acc.isAdmin) "Admin" else "Cashier",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    if (!acc.hasPin) {
+                        Text(
+                            "Set PIN",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
+            }
+        }
+        Spacer(Modifier.height(16.dp))
+        OutlinedButton(
+            onClick = { auth.addAccount() },
+            modifier = Modifier.fillMaxWidth().height(48.dp)
+        ) {
+            Icon(Icons.Rounded.PersonAdd, contentDescription = null, modifier = Modifier.width(18.dp).height(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("Add another account")
+        }
+    }
+}
+
+@Composable
+private fun LoginScreen(auth: AuthManager, onBack: (() -> Unit)?) {
     val scope = rememberCoroutineScope()
     var email by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
@@ -155,7 +232,7 @@ private fun LoginScreen(auth: AuthManager) {
         }
     }
 
-    AuthScaffold("PortionSpot POS", "Sign in to start selling") {
+    AuthScaffold("PortionSpot POS", "Sign in to start selling", onBack = onBack) {
         OutlinedTextField(
             value = email,
             onValueChange = { email = it },
@@ -200,7 +277,7 @@ private fun LoginScreen(auth: AuthManager) {
         }
         Spacer(Modifier.height(12.dp))
         Text(
-            "First sign-in needs internet. After that you can unlock and sell offline.",
+            "Signing in needs internet once. After that this person can unlock and sell offline with a PIN.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -254,7 +331,7 @@ private fun PinSetupScreen(auth: AuthManager) {
 }
 
 @Composable
-private fun PinUnlockScreen(auth: AuthManager, displayName: String) {
+private fun PinUnlockScreen(auth: AuthManager, account: AccountSummary) {
     val scope = rememberCoroutineScope()
     var pin by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
@@ -272,7 +349,11 @@ private fun PinUnlockScreen(auth: AuthManager, displayName: String) {
         }
     }
 
-    AuthScaffold("Welcome back, $displayName", "Enter your PIN to unlock") {
+    AuthScaffold(
+        "Welcome back, ${account.displayName.ifBlank { account.email }}",
+        "Enter your PIN to unlock",
+        onBack = { auth.backToPicker() }
+    ) {
         Icon(
             Icons.Rounded.Lock,
             contentDescription = null,
@@ -293,8 +374,6 @@ private fun PinUnlockScreen(auth: AuthManager, displayName: String) {
                 strokeWidth = 2.dp
             ) else Text("Unlock")
         }
-        TextButton(onClick = {
-            scope.launch { auth.logout() }
-        }) { Text("Sign in with password instead") }
+        TextButton(onClick = { auth.addAccount() }) { Text("Sign in with password instead") }
     }
 }

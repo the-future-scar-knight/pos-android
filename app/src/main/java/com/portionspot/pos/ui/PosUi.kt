@@ -50,6 +50,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AdminPanelSettings
 import androidx.compose.material.icons.automirrored.filled.Assignment
+import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.AssignmentReturn
 import androidx.compose.material.icons.filled.BarChart
 import androidx.compose.material.icons.filled.Call
@@ -74,6 +75,7 @@ import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.ShoppingCart
+import androidx.compose.material.icons.filled.SwitchAccount
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -507,7 +509,9 @@ fun AppRoot(
                 shopName = shopName,
                 current = screen,
                 onSelect = { screen = it; drawerOpen = false },
-                onDismiss = { drawerOpen = false }
+                onDismiss = { drawerOpen = false },
+                onSwitchUser = { drawerOpen = false; vm.switchUser() },
+                onSignOut = { drawerOpen = false; vm.signOut() }
             )
         }
     }
@@ -534,6 +538,7 @@ private fun MobileMoneyScreen(vm: PosViewModel, currency: String) {
     val customers by vm.customers.collectAsState()
     var tab by remember { mutableStateOf(MmTab.NEEDS) }
     var verifyTarget by remember { mutableStateOf<MobileMoneyReceipt?>(null) }
+    var undoTarget by remember { mutableStateOf<MobileMoneyReceipt?>(null) }
 
     // Ask for SMS + notification permissions on first visit (declaration ≠ grant on
     // 13+). If denied, reconciliation just stays empty — nothing else breaks.
@@ -626,7 +631,8 @@ private fun MobileMoneyScreen(vm: PosViewModel, currency: String) {
                         r = r,
                         onVerify = { verifyTarget = r },
                         onLogAsSale = { vm.verifyMobileMoney(r.id, null, "sale") },
-                        onIgnore = { vm.ignoreMobileMoney(r.id) }
+                        onIgnore = { vm.ignoreMobileMoney(r.id) },
+                        onUndo = { undoTarget = r }
                     )
                 }
                 item { Spacer(Modifier.height(24.dp)) }
@@ -646,6 +652,21 @@ private fun MobileMoneyScreen(vm: PosViewModel, currency: String) {
             }
         )
     }
+
+    undoTarget?.let { r ->
+        val reverses = r.purpose == "debt" && r.appliedCreditTxnId != null
+        ConfirmDialog(
+            title = "Undo this verification?",
+            message = if (reverses)
+                "This reverses the ${money(r.amount, r.currency)} payment applied to " +
+                    "${r.matchedCustomerName ?: "the customer"}'s account and puts the payment back in the queue to verify again."
+            else
+                "This puts the ${money(r.amount, r.currency)} payment back in the queue to verify again.",
+            confirmLabel = "Undo",
+            onConfirm = { vm.unverifyMobileMoney(r.id); undoTarget = null },
+            onDismiss = { undoTarget = null }
+        )
+    }
 }
 
 @Composable
@@ -659,7 +680,8 @@ private fun MmReceiptCard(
     r: MobileMoneyReceipt,
     onVerify: () -> Unit,
     onLogAsSale: () -> Unit,
-    onIgnore: () -> Unit
+    onIgnore: () -> Unit,
+    onUndo: () -> Unit
 ) {
     val t = LocalPosTokens.current
     val who = r.matchedCustomerName ?: r.senderName ?: r.senderPhone ?: "Unknown sender"
@@ -700,7 +722,8 @@ private fun MmReceiptCard(
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.Filled.CheckCircle, contentDescription = null, tint = t.success, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(6.dp))
-                    Text(what, color = t.success, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    Text(what, color = t.success, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                    TextButton(onClick = onUndo) { Text("Undo", color = t.danger) }
                 }
             } else {
                 Spacer(Modifier.height(10.dp))
@@ -1074,6 +1097,27 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
             Text("Admin console", color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 22.sp)
         }
 
+        // ---- Account (switch to a cashier / sign this admin out) ----
+        item { AdminSectionHeader("Account") }
+        item {
+            Text(
+                "Hand this device to a cashier: 'Switch user' returns to the account picker where they unlock with their own PIN (or 'Add another account' to sign them in the first time).",
+                color = t.inkTertiary, fontSize = 12.sp
+            )
+        }
+        item {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { vm.switchUser() }) {
+                    Icon(Icons.Filled.SwitchAccount, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp)); Text("Switch user")
+                }
+                OutlinedButton(
+                    onClick = { vm.signOut() },
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = t.danger)
+                ) { Text("Sign out") }
+            }
+        }
+
         // ---- End of day / shift summary ----
         item { AdminSectionHeader("End of day") }
         item {
@@ -1384,7 +1428,7 @@ private fun AddCashierDialog(
         text = {
             Column {
                 Text(
-                    "Creates a login the cashier uses on their own device. They're attributed on every sale; only an admin can deactivate them.",
+                    "Creates a login. The cashier signs in with it — on their own device, or on this one via 'Add another account' on the lock screen. They're attributed on every sale; only an admin can deactivate them.",
                     fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Spacer(Modifier.height(8.dp))
@@ -1612,7 +1656,9 @@ private fun SideDrawer(
     shopName: String,
     current: Screen,
     onSelect: (Screen) -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    onSwitchUser: () -> Unit,
+    onSignOut: () -> Unit
 ) {
     val t = LocalPosTokens.current
     Row(
@@ -1669,7 +1715,31 @@ private fun SideDrawer(
                     }
                 }
             }
+            HorizontalDivider(color = t.navInk.copy(alpha = 0.12f))
+            Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                DrawerAction(Icons.Filled.SwitchAccount, "Switch user", onSwitchUser)
+                DrawerAction(Icons.AutoMirrored.Filled.Logout, "Sign out", onSignOut)
+            }
         }
+    }
+}
+
+/** A tappable action row in the side drawer footer (switch user / sign out). */
+@Composable
+private fun DrawerAction(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    onClick: () -> Unit
+) {
+    val t = LocalPosTokens.current
+    Row(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 11.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Icon(icon, contentDescription = label, tint = t.navInk.copy(alpha = 0.75f), modifier = Modifier.size(18.dp))
+        Text(label, color = t.navInk, fontWeight = FontWeight.Medium, fontSize = 14.sp)
     }
 }
 
