@@ -1059,6 +1059,11 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
     var writeOffFor by remember { mutableStateOf<DebtAgingRow?>(null) }
     var voidFor by remember { mutableStateOf<String?>(null) }
     var countedCash by remember { mutableStateOf("") }
+    var showAddCashier by remember { mutableStateOf(false) }
+    var resetConfirm by remember { mutableStateOf(false) }
+    val staff by vm.staff.collectAsState()
+    val syncConnection by vm.connection.collectAsState()
+    LaunchedEffect(syncConnection) { if (syncConnection != null) vm.refreshStaff() }
     val dayMs = 24L * 60 * 60 * 1000
     val dayFmt = remember { SimpleDateFormat("EEE dd MMM yyyy", Locale.getDefault()) }
     val cashRecorded = (methods.firstOrNull { it.method == "cash" }?.total ?: 0.0) - changeGiven
@@ -1218,7 +1223,78 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
                 }
             }
         }
+        // ---- Cashiers (staff accounts) ----
+        item { AdminSectionHeader("Cashiers") }
+        if (syncConnection == null) {
+            item {
+                Text(
+                    "Connect cloud sync to add cashier accounts. Each cashier logs in on their own device and is attributed on every sale.",
+                    color = t.inkTertiary, fontSize = 12.sp
+                )
+            }
+        } else {
+            if (staff.isEmpty()) {
+                item { Text("No staff loaded yet — tap Refresh.", color = t.inkTertiary, fontSize = 13.sp) }
+            } else {
+                items(staff, key = { it.id }) { s ->
+                    Row(Modifier.fillMaxWidth().padding(vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(s.displayName.ifBlank { "(no name)" }, color = t.inkPrimary, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                            Text(
+                                s.role.replaceFirstChar { it.uppercase() } + if (!s.active) " · inactive" else "",
+                                color = if (s.active) t.inkTertiary else t.danger, fontSize = 11.sp
+                            )
+                        }
+                        // Admins aren't toggled here; only cashiers are (de)activated.
+                        if (s.role != "admin") {
+                            Switch(checked = s.active, onCheckedChange = { on -> vm.setCashierActive(s.id, on) })
+                        }
+                    }
+                }
+            }
+            item {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = { showAddCashier = true }) {
+                        Icon(Icons.Filled.PersonAdd, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp)); Text("Add cashier")
+                    }
+                    OutlinedButton(onClick = { vm.refreshStaff() }) { Text("Refresh") }
+                }
+            }
+        }
+
+        // ---- Danger zone ----
+        item { AdminSectionHeader("Danger zone") }
+        item {
+            Text(
+                "Clear this device's local data (sales, catalog, customers) and re-pull the shared database fresh. Use this to remove test data before turning on upload in Sync.",
+                color = t.inkTertiary, fontSize = 12.sp
+            )
+        }
+        item {
+            OutlinedButton(
+                onClick = { resetConfirm = true },
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = t.danger)
+            ) { Text("Reset local data") }
+        }
+
         item { Spacer(Modifier.height(24.dp)) }
+    }
+
+    if (showAddCashier) {
+        AddCashierDialog(
+            onDismiss = { showAddCashier = false },
+            onCreate = { email, pass, name, cb -> vm.createCashier(email, pass, name, "cashier", cb) }
+        )
+    }
+    if (resetConfirm) {
+        ConfirmDialog(
+            title = "Reset this device's data?",
+            message = "Deletes local sales, catalog and customers, then re-pulls the shared database. The cloud data is not affected. Do this to clear test data before enabling upload.",
+            confirmLabel = "Reset & re-pull",
+            onConfirm = { vm.resetLocalData(); resetConfirm = false },
+            onDismiss = { resetConfirm = false }
+        )
     }
 
     writeOffFor?.let { row ->
@@ -1269,6 +1345,58 @@ private fun WriteOffDialog(
                 Text("Owes ${money(row.total, currency)}. Writing off records a payment that clears the balance (audit-logged).", fontSize = 12.sp)
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(value = amount, onValueChange = { amount = it }, label = { Text("Amount") }, singleLine = true)
+            }
+        }
+    )
+}
+
+/** Admin dialog to create a cashier login via the create-cashier Edge Function. */
+@Composable
+private fun AddCashierDialog(
+    onDismiss: () -> Unit,
+    onCreate: (String, String, String, (com.portionspot.pos.auth.StaffResult) -> Unit) -> Unit,
+) {
+    var name by remember { mutableStateOf("") }
+    var email by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    val valid = name.isNotBlank() && email.contains("@") && password.length >= 6
+    AlertDialog(
+        onDismissRequest = { if (!busy) onDismiss() },
+        confirmButton = {
+            Button(
+                enabled = valid && !busy,
+                onClick = {
+                    busy = true; error = null
+                    onCreate(email.trim(), password, name.trim()) { res ->
+                        busy = false
+                        when (res) {
+                            is com.portionspot.pos.auth.StaffResult.Ok -> onDismiss()
+                            is com.portionspot.pos.auth.StaffResult.Err -> error = res.message
+                        }
+                    }
+                }
+            ) { Text(if (busy) "Creating…" else "Create") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss, enabled = !busy) { Text("Cancel") } },
+        title = { Text("Add cashier") },
+        text = {
+            Column {
+                Text(
+                    "Creates a login the cashier uses on their own device. They're attributed on every sale; only an admin can deactivate them.",
+                    fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(name, { name = it }, label = { Text("Name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                Spacer(Modifier.height(6.dp))
+                OutlinedTextField(email, { email = it }, label = { Text("Email") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                Spacer(Modifier.height(6.dp))
+                OutlinedTextField(password, { password = it }, label = { Text("Password (6+ characters)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                error?.let {
+                    Spacer(Modifier.height(6.dp))
+                    Text(it, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+                }
             }
         }
     )

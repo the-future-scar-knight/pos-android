@@ -83,7 +83,8 @@ private const val DAY_MS = 24L * 60 * 60 * 1000
 @OptIn(ExperimentalCoroutinesApi::class)
 class PosViewModel(
     private val repo: PosRepository,
-    private val sync: SyncManager
+    private val sync: SyncManager,
+    private val authManager: com.portionspot.pos.auth.AuthManager,
 ) : ViewModel() {
 
     private val businessId = MutableStateFlow<String?>(null)
@@ -1063,6 +1064,64 @@ class PosViewModel(
         }
     }
 
+    // ---- Staff / cashier accounts (admin, via the create-cashier Edge Function) ----
+
+    private val _staff = MutableStateFlow<List<com.portionspot.pos.auth.StaffRow>>(emptyList())
+    val staff: StateFlow<List<com.portionspot.pos.auth.StaffRow>> = _staff.asStateFlow()
+
+    private suspend fun staffClient(): com.portionspot.pos.auth.StaffAdminClient? {
+        val conn = sync.connection() ?: return null
+        return com.portionspot.pos.auth.StaffAdminClient(conn) { authManager.accessTokenOrNull() }
+    }
+
+    /** Reload the staff list from the cloud (admin only; needs a connection). */
+    fun refreshStaff() {
+        viewModelScope.launch {
+            val client = staffClient() ?: run { _staff.value = emptyList(); return@launch }
+            _staff.value = withContext(Dispatchers.IO) { client.listStaff() }
+        }
+    }
+
+    /** Create a cashier login via the Edge Function, then refresh the list. */
+    fun createCashier(
+        email: String, password: String, displayName: String, role: String = "cashier",
+        onResult: (com.portionspot.pos.auth.StaffResult) -> Unit,
+    ) {
+        viewModelScope.launch {
+            val client = staffClient()
+                ?: return@launch onResult(com.portionspot.pos.auth.StaffResult.Err("Connect cloud sync first"))
+            val r = withContext(Dispatchers.IO) { client.createCashier(email, password, displayName, role) }
+            if (r is com.portionspot.pos.auth.StaffResult.Ok) refreshStaff()
+            onResult(r)
+        }
+    }
+
+    /** Activate/deactivate a staff member (admin-only delete = deactivate). */
+    fun setCashierActive(
+        staffId: String, active: Boolean,
+        onResult: (com.portionspot.pos.auth.StaffResult) -> Unit = {},
+    ) {
+        viewModelScope.launch {
+            val client = staffClient()
+                ?: return@launch onResult(com.portionspot.pos.auth.StaffResult.Err("Connect cloud sync first"))
+            val r = withContext(Dispatchers.IO) { client.setActive(staffId, active) }
+            if (r is com.portionspot.pos.auth.StaffResult.Ok) refreshStaff()
+            onResult(r)
+        }
+    }
+
+    /** Danger zone: wipe this device's local test data, forget the pull cursors, then
+     *  re-pull the shared dataset clean. */
+    fun resetLocalData(onDone: () -> Unit = {}) {
+        viewModelScope.launch {
+            repo.resetLocalData()
+            sync.config.resetCursors()
+            sync.runNow()
+            refreshSyncState()
+            onDone()
+        }
+    }
+
     // ---- Paynow online --------------------------------------------------
 
     /**
@@ -1179,11 +1238,15 @@ class PosViewModel(
         private const val KEY_CUR2_CODE = "second_currency_code"
         private const val KEY_CUR2_RATE = "second_currency_rate"
 
-        fun factory(repo: PosRepository, sync: SyncManager): ViewModelProvider.Factory =
+        fun factory(
+            repo: PosRepository,
+            sync: SyncManager,
+            authManager: com.portionspot.pos.auth.AuthManager,
+        ): ViewModelProvider.Factory =
             object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")
                 override fun <T : ViewModel> create(modelClass: Class<T>): T =
-                    PosViewModel(repo, sync) as T
+                    PosViewModel(repo, sync, authManager) as T
             }
     }
 }

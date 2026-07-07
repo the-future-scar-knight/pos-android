@@ -52,6 +52,10 @@ class SyncConfig(private val dao: SettingDao) {
     suspend fun setCursor(table: String, value: String) =
         dao.put(Setting(cursorKey(table), value))
 
+    /** Forget every pull cursor so the next sync re-pulls the whole shared dataset
+     *  from scratch (used after a local-data reset). Connection is left intact. */
+    suspend fun resetCursors() = TABLES.forEach { dao.delete(cursorKey(it)) }
+
     suspend fun lastSyncAt(): Long? = dao.get(KEY_LAST_SYNC)?.toLongOrNull()
 
     suspend fun setLastSyncAt(ts: Long) = dao.put(Setting(KEY_LAST_SYNC, ts.toString()))
