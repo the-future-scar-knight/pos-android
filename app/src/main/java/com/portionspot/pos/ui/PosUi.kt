@@ -6715,6 +6715,22 @@ private fun CloudSyncSection(vm: PosViewModel) {
             }
             OutlinedButton(onClick = { vm.disconnect() }) { Text("Disconnect") }
         }
+        Spacer(Modifier.height(16.dp))
+        HorizontalDivider()
+        Spacer(Modifier.height(12.dp))
+        val pushOn by vm.cloudPushEnabled.collectAsState()
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Upload this device's data", fontWeight = FontWeight.Medium)
+                Text(
+                    "Off = pull only (safe). On also PUSHES this device's sales, refunds " +
+                        "and edited products up to the shared database — clear any test data first.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Switch(checked = pushOn, onCheckedChange = { vm.setCloudPushEnabled(it) })
+        }
     }
     Spacer(Modifier.height(24.dp))
 }

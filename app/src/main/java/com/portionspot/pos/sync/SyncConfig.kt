@@ -38,6 +38,15 @@ class SyncConfig(private val dao: SettingDao) {
         dao.delete(KEY_LAST_SYNC)
     }
 
+    /**
+     * Master switch for PUSHING local data up (Stage 2). Default OFF so the repoint
+     * ships pull-only: nothing this device holds can reach the shared production DB
+     * until the owner has verified the pull and cleared any local test data.
+     */
+    suspend fun pushEnabled(): Boolean = dao.get(KEY_PUSH)?.toBooleanStrictOrNull() ?: false
+
+    suspend fun setPushEnabled(on: Boolean) = dao.put(Setting(KEY_PUSH, on.toString()))
+
     suspend fun cursor(table: String): String = dao.get(cursorKey(table)) ?: IsoTime.EPOCH
 
     suspend fun setCursor(table: String, value: String) =
@@ -51,6 +60,7 @@ class SyncConfig(private val dao: SettingDao) {
         const val KEY_URL = "supabase_url"
         const val KEY_KEY = "supabase_key"
         const val KEY_LAST_SYNC = "last_sync_at"
+        const val KEY_PUSH = "sync_push_enabled"
 
         /** Cloud tables Android syncs (the shared web-POS schema). */
         val TABLES = listOf("products", "customers", "sales")

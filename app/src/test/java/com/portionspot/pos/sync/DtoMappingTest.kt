@@ -84,4 +84,55 @@ class DtoMappingTest {
         assertEquals(4, lines[0].unitsPerLine)
         assertEquals(160.0, lines[0].lineTotal, eps)    // unitPrice*qty − lineDiscount
     }
+
+    // ── Stage 2 push shapes (must match the web sales row exactly) ───────────
+
+    @Test
+    fun salePush_usesRefAsIdAndCarriesSkuInJsonb() {
+        val sale = com.portionspot.pos.data.SaleEntity(
+            id = "uuid-1", businessId = "biz1", receiptNo = "PSM-260707-1234",
+            status = "completed", subtotal = 160.0, total = 160.0, taxTotal = 0.0,
+            paymentMethod = "cash", amountPaid = 160.0, createdBy = "admin",
+            createdByName = "Admin", soldAt = 1_700_000_000_000L, updatedAt = 1_700_000_000_000L,
+        )
+        val line = com.portionspot.pos.data.SaleLine(
+            saleId = "uuid-1", businessId = "biz1", itemId = "item-1", name = "Delo 5L",
+            qty = 2.0, unitPrice = 80.0, mode = "box", unitsPerLine = 4, lineTotal = 160.0,
+        )
+        val pay = com.portionspot.pos.data.SalePayment(
+            saleId = "uuid-1", businessId = "biz1", method = "cash", amount = 160.0,
+        )
+        val dto = buildSalePush(sale, listOf(line), listOf(pay)) { id ->
+            if (id == "item-1") "OIL-DELO-5L" else null
+        }
+        assertEquals("PSM-260707-1234", dto.id)         // id = ref (web convention)
+        assertEquals("PSM-260707-1234", dto.ref)
+        assertEquals("sale", dto.type)
+        assertEquals(160.0, dto.grandTotal, eps)
+        assertEquals(1, dto.items.size)
+        assertEquals("OIL-DELO-5L", dto.items[0].sku)   // sku resolved onto the line
+        assertEquals("box", dto.items[0].mode)
+        assertEquals(4, dto.items[0].boxSize)
+        assertEquals(1, dto.payments.size)
+        assertEquals("cash", dto.payments[0].method)
+    }
+
+    @Test
+    fun refundPush_isNegativeReturnRow() {
+        val refund = com.portionspot.pos.data.Refund(
+            id = "ref-1", businessId = "biz1", saleId = "uuid-1", saleReceiptNo = "PSM-260707-1234",
+            refundTotal = 80.0, createdBy = "admin", createdByName = "Admin",
+            createdAt = 1_700_000_000_000L, updatedAt = 1_700_000_000_000L,
+        )
+        val rl = com.portionspot.pos.data.RefundLine(
+            refundId = "ref-1", businessId = "biz1", itemId = "item-1", name = "Delo 5L",
+            qty = 1.0, unitPrice = 80.0, mode = "box", unitsPerLine = 4,
+        )
+        val dto = buildRefundPush(refund, listOf(rl)) { id -> if (id == "item-1") "OIL-DELO-5L" else null }
+        assertEquals("return", dto.type)                // web refunds are type='return'
+        assertEquals(-80.0, dto.grandTotal, eps)        // NEGATIVE = cash going back out
+        assertEquals(-80.0, dto.subtotal, eps)
+        assertTrue(dto.ref.startsWith("RTN-"))
+        assertEquals("OIL-DELO-5L", dto.items[0].sku)
+    }
 }

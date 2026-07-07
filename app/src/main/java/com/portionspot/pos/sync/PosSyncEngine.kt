@@ -4,10 +4,13 @@ import com.portionspot.pos.data.BusinessDao
 import com.portionspot.pos.data.CreditDao
 import com.portionspot.pos.data.CustomerDao
 import com.portionspot.pos.data.ItemDao
+import com.portionspot.pos.data.RefundDao
 import com.portionspot.pos.data.SaleDao
+import com.portionspot.pos.data.SalePaymentDao
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
 
 /** Outcome of one sync pass, surfaced to the UI. */
 sealed class SyncOutcome {
@@ -31,8 +34,10 @@ class PosSyncEngine(
     private val businessDao: BusinessDao,
     private val itemDao: ItemDao,
     private val saleDao: SaleDao,
+    private val salePaymentDao: SalePaymentDao,
     private val customerDao: CustomerDao,
     private val creditDao: CreditDao,
+    private val refundDao: RefundDao,
     private val config: SyncConfig,
     /** Current signed-in user's JWT for RLS; null falls back to anon (denied). */
     private val accessToken: () -> String? = { null },
@@ -56,11 +61,52 @@ class PosSyncEngine(
     }
 
     // ── push (Stage 2) ──────────────────────────────────────────────────────
-    // Deliberately a no-op for Stage 1. The web-contract push (products on sku,
-    // sales on id/ref with JSONB items, refunds as type='return' rows, customers on
-    // local_id) lands once pull is verified against the live shared database.
-    @Suppress("UNUSED_PARAMETER")
-    private suspend fun push(api: SupabaseRest): Int = 0
+    /**
+     * Push local data up — but ONLY when [SyncConfig.pushEnabled] is on (default OFF),
+     * so the repoint ships pull-only and no local/test data can reach the shared prod
+     * DB until the owner opts in. Scope is the APPEND-ONLY tables: completed sales and
+     * refunds (as `type='return'` rows), both upserted with ignore-duplicates so a
+     * re-push never rewrites an existing shared row. Products and customers/credit push
+     * (overwrite / derived-balance risk) are separate later sub-stages.
+     */
+    private suspend fun push(api: SupabaseRest): Int {
+        if (!config.pushEnabled()) return 0
+        val bid = businessDao.getOnce()?.id ?: return 0
+        // local itemId → sku, so pushed line items carry the cloud product reference.
+        val skuById = itemDao.allForBusinessOnce(bid)
+            .filter { !it.sku.isNullOrBlank() }
+            .associate { it.id to it.sku!! }
+        val skuOf: (String?) -> String? = { itemId -> itemId?.let { skuById[it] } }
+        var n = 0
+
+        // products — only locally-edited items that carry a sku (the cloud conflict key).
+        val products = itemDao.pending().filter { !it.sku.isNullOrBlank() && !it.deleted }
+        if (products.isNotEmpty()) {
+            api.upsert("products", syncJson.encodeToString(products.map { it.toProductPush() }), "sku")
+            itemDao.markSynced(products.map { it.id })
+            n += products.size
+        }
+
+        val sales = saleDao.pendingSales().filter { it.status == "completed" }
+        if (sales.isNotEmpty()) {
+            val dtos = sales.map { s ->
+                buildSalePush(s, saleDao.allLinesForSale(s.id), salePaymentDao.forSale(s.id), skuOf)
+            }
+            api.upsert("sales", syncJson.encodeToString(dtos), "id", ignoreDuplicates = true)
+            sales.forEach { saleDao.markSaleSynced(it.id) }
+            n += sales.size
+        }
+
+        val refunds = refundDao.pending()
+        if (refunds.isNotEmpty()) {
+            val dtos = refunds.map { r -> buildRefundPush(r, refundDao.linesFor(r.id), skuOf) }
+            api.upsert("sales", syncJson.encodeToString(dtos), "id", ignoreDuplicates = true)
+            refundDao.markSynced(refunds.map { it.id })
+            n += refunds.size
+        }
+
+        return n
+    }
 
     // ── pull ──────────────────────────────────────────────────────────────
     /** Pull the shared catalog/customers/sales onto this device. Read-only: nothing
