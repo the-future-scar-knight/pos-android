@@ -19,6 +19,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -82,6 +83,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Surface
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -128,7 +130,12 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.unit.IntOffset
+import kotlin.math.roundToInt
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
@@ -495,6 +502,13 @@ fun AppRoot(
                     Screen.Settings -> SettingsScreen(vm, business!!, printer)
                 }
             }
+        }
+
+        // Floating cart (§1.2 parity): on every cashier screen EXCEPT Sell (which has
+        // its own cart bar) and while a sheet/drawer is open, so a cart-in-progress
+        // stays visible and one tap jumps back to the till.
+        if (screen != Screen.Sell && !drawerOpen && !moreOpen) {
+            FloatingCart(vm, currency, onGoToSell = { screen = Screen.Sell })
         }
 
         if (moreOpen) {
@@ -2204,6 +2218,145 @@ private fun QuoteDialog(
             }
         }
     )
+}
+
+/**
+ * Floating cart (web SessionHUD parity): a draggable pill that appears on non-Sell
+ * cashier screens whenever the cart has items or held sales exist. Tap to expand a
+ * mini-cart (qty ±, remove, clear, Go to POS) with a Held tab to resume a parked sale.
+ */
+@Composable
+private fun BoxScope.FloatingCart(
+    vm: PosViewModel,
+    currency: String,
+    onGoToSell: () -> Unit
+) {
+    val cart by vm.cart.collectAsState()
+    val parked by vm.parkedSales.collectAsState()
+    val count = cart.sumOf { it.qty }.toInt()
+    val total = cart.sumOf { it.lineTotal }
+    if (count == 0 && parked.isEmpty()) return
+
+    val t = LocalPosTokens.current
+    var expanded by remember { mutableStateOf(false) }
+    var tab by remember { mutableStateOf(0) }            // 0 = cart, 1 = held
+    var offset by remember { mutableStateOf(Offset.Zero) }
+    // If the cart empties out while showing the cart tab and holds remain, flip tabs.
+    if (count == 0 && tab == 0 && parked.isNotEmpty()) tab = 1
+
+    Column(
+        Modifier
+            .align(Alignment.BottomEnd)
+            .offset { IntOffset(offset.x.roundToInt(), offset.y.roundToInt()) }
+            .padding(end = 16.dp, bottom = 84.dp),
+        horizontalAlignment = Alignment.End
+    ) {
+        if (expanded) {
+            Card(
+                Modifier.width(300.dp),
+                colors = CardDefaults.cardColors(containerColor = t.surface1),
+                elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
+            ) {
+                Column(Modifier.padding(12.dp)) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(selected = tab == 0, onClick = { tab = 0 },
+                            label = { Text(if (count > 0) "Cart ($count)" else "Cart") })
+                        if (parked.isNotEmpty()) FilterChip(selected = tab == 1, onClick = { tab = 1 },
+                            label = { Text("Held (${parked.size})") })
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    if (tab == 1) {
+                        LazyColumn(Modifier.heightIn(max = 280.dp)) {
+                            items(parked, key = { it.id }) { p ->
+                                Row(
+                                    Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+                                        .clickable { expanded = false; vm.resumeParked(p.id); onGoToSell() }
+                                        .padding(10.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text(p.customerName?.takeIf { it.isNotBlank() } ?: "Held sale",
+                                            color = t.inkPrimary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                                        Text(money(p.total, currency), color = t.inkTertiary, fontSize = 10.sp)
+                                    }
+                                    Text("Resume", color = t.brand.s600, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                                }
+                            }
+                        }
+                    } else if (cart.isEmpty()) {
+                        Text("Cart is empty", color = t.inkTertiary, fontSize = 12.sp,
+                            modifier = Modifier.padding(12.dp))
+                    } else {
+                        LazyColumn(Modifier.heightIn(max = 260.dp)) {
+                            items(cart, key = { it.lineKey }) { line ->
+                                Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text(line.name, color = t.inkPrimary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
+                                            maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                        Text("${modeLabel(line.mode)} · ${money(line.unitPrice, currency)}",
+                                            color = t.inkTertiary, fontSize = 10.sp)
+                                    }
+                                    QtyStepper(
+                                        qty = line.qty.toInt(),
+                                        onMinus = { vm.changeQty(line.lineKey, -1.0) },
+                                        onPlus = { vm.changeQty(line.lineKey, +1.0) },
+                                        onQtyClick = {}
+                                    )
+                                    IconButton(onClick = { vm.removeLine(line.lineKey) }, modifier = Modifier.size(30.dp)) {
+                                        Icon(Icons.Filled.Delete, "Remove", tint = t.inkTertiary, modifier = Modifier.size(16.dp))
+                                    }
+                                }
+                            }
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        Row(Modifier.fillMaxWidth()) {
+                            Text("Total", Modifier.weight(1f), color = t.inkPrimary, fontWeight = FontWeight.Black)
+                            Text(money(total, currency), color = t.brand.s600, fontWeight = FontWeight.Black)
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        Button(
+                            onClick = { expanded = false; onGoToSell() },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.buttonColors(containerColor = t.brand.s600, contentColor = t.inkOnBrand)
+                        ) { Text("Go to POS") }
+                        TextButton(onClick = { vm.clearCart() }, modifier = Modifier.fillMaxWidth()) {
+                            Text("Clear cart", color = t.inkTertiary)
+                        }
+                    }
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+        }
+
+        Surface(
+            shape = RoundedCornerShape(24.dp),
+            color = t.brand.s600,
+            contentColor = t.inkOnBrand,
+            shadowElevation = 6.dp,
+            modifier = Modifier
+                .pointerInput(Unit) {
+                    detectDragGestures { change, dragAmount ->
+                        change.consume()
+                        offset = Offset(offset.x + dragAmount.x, offset.y + dragAmount.y)
+                    }
+                }
+                .clickable { expanded = !expanded }
+        ) {
+            Row(
+                Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(Icons.Filled.ShoppingCart, contentDescription = "Cart")
+                Text(if (count > 0) money(total, currency) else "${parked.size} held", fontWeight = FontWeight.Bold)
+                if (count > 0) {
+                    Box(Modifier.size(20.dp).clip(CircleShape).background(t.inkOnBrand), contentAlignment = Alignment.Center) {
+                        Text("$count", color = t.brand.s600, fontSize = 11.sp, fontWeight = FontWeight.Black)
+                    }
+                }
+            }
+        }
+    }
 }
 
 /** Held sales: tap one to load it back into the cart (replacing the current cart). */
