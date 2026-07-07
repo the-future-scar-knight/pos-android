@@ -118,6 +118,50 @@ class DtoMappingTest {
     }
 
     @Test
+    fun credit_pullResolvesCustomerAndParsesAmount() {
+        // cloud credit.customer_id is the customers BIGINT (as text); the engine
+        // resolves it to the Android local id before calling this mapping.
+        val dto = CreditDto(
+            id = 1, localId = "CTX-1", customerId = "1", customerName = "Pachedu",
+            type = "change_owed", amount = "20",
+            createdAt = "2026-07-06T09:00:00.000Z", updatedAt = "2026-07-06T09:00:00.000Z",
+        )
+        val c = dto.toCreditTxn("biz1", "CUST-abc", null)
+        assertEquals("CTX-1", c.id)
+        assertEquals("CUST-abc", c.customerId)     // resolved local id, not the bigint "1"
+        assertEquals("change_owed", c.type)
+        assertEquals(20.0, c.amount, eps)
+    }
+
+    @Test
+    fun mobileMoney_pullAndPushRoundTrip() {
+        val dto = MobileMoneyDto(
+            localId = "mm-1", provider = "ecocash", txnCode = "CI260706.T1",
+            amount = "358", currency = "USD", status = "unmatched",
+            receivedAt = "2026-07-06T09:00:00.000Z", updatedAt = "2026-07-06T09:00:00.000Z",
+        )
+        val r = dto.toReceipt("biz1", null)
+        assertEquals("mm-1", r.id)
+        assertEquals("CI260706.T1", r.txnCode)
+        assertEquals(358.0, r.amount, eps)
+        val push = r.toPush()
+        assertEquals("mm-1", push.localId)
+        assertEquals("CI260706.T1", push.txnCode)  // upsert key stays stable
+        assertEquals(358.0, push.amount, eps)
+    }
+
+    @Test
+    fun customerPush_carriesTradeFlag() {
+        val cust = com.portionspot.pos.data.Customer(
+            id = "CUST-abc", businessId = "biz1", name = "Spartan Motors", wholesale = true, updatedAt = 1L,
+        )
+        val push = cust.toCustomerPush()
+        assertEquals("CUST-abc", push.localId)
+        assertTrue(push.isTradeAccount)            // is_trade_account = wholesale
+        // CustomerPushDto has no `balance` field by design → it can never overwrite the cloud balance.
+    }
+
+    @Test
     fun refundPush_isNegativeReturnRow() {
         val refund = com.portionspot.pos.data.Refund(
             id = "ref-1", businessId = "biz1", saleId = "uuid-1", saleReceiptNo = "PSM-260707-1234",

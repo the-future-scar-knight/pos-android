@@ -1,7 +1,9 @@
 package com.portionspot.pos.sync
 
+import com.portionspot.pos.data.CreditTxn
 import com.portionspot.pos.data.Customer
 import com.portionspot.pos.data.Item
+import com.portionspot.pos.data.MobileMoneyReceipt
 import com.portionspot.pos.data.Refund
 import com.portionspot.pos.data.RefundLine
 import com.portionspot.pos.data.SaleEntity
@@ -153,6 +155,109 @@ fun CustomerDto.toCustomer(businessId: String, local: Customer?): Customer {
         address = address,
         note = notes,
         wholesale = isTradeAccount,
+        updatedAt = IsoTime.toMillis(updatedAt),
+        deleted = false,
+        pendingSync = false,
+    )
+}
+
+// ── customers id map (bridges credit.customer_id bigint → local_id) ───────────
+// Cloud credit_transactions.customer_id holds the customers BIGINT id (as text),
+// NOT the local_id — so credit sync must translate through this.
+@Serializable
+data class CustomerIdRow(
+    val id: Long,
+    @SerialName("local_id") val localId: String? = null,
+) {
+    fun bridge(): String = localId?.ifBlank { null } ?: "cust-$id"
+}
+
+// ── credit_transactions (keyed by local_id) ───────────────────────────────────
+@Serializable
+data class CreditDto(
+    val id: Long? = null,
+    @SerialName("local_id") val localId: String? = null,
+    @SerialName("customer_id") val customerId: String? = null,
+    @SerialName("customer_name") val customerName: String? = null,
+    val type: String,
+    val amount: String? = null,
+    val note: String? = null,
+    val cashier: String? = null,
+    @SerialName("created_at") val createdAt: String? = null,
+    @SerialName("updated_at") val updatedAt: String? = null,
+) {
+    fun cursorStamp(): String = updatedAt ?: createdAt ?: IsoTime.EPOCH
+}
+
+/** [androidCustomerId] is the resolved local customer id (credit.customer_id →
+ *  customers.id → local_id). Bridged on local_id like customers. */
+fun CreditDto.toCreditTxn(businessId: String, androidCustomerId: String, local: CreditTxn?): CreditTxn {
+    val bid = localId?.ifBlank { null } ?: local?.id ?: "ctx-${id ?: newId()}"
+    val base = local ?: CreditTxn(id = bid, businessId = businessId, customerId = androidCustomerId, type = type)
+    return base.copy(
+        id = bid,
+        businessId = businessId,
+        customerId = androidCustomerId,
+        type = type,
+        amount = amount.toMoney(),
+        note = note,
+        createdByName = cashier,
+        createdAt = IsoTime.toMillis(createdAt),
+        updatedAt = IsoTime.toMillis(updatedAt),
+        deleted = false,
+        pendingSync = false,
+    )
+}
+
+// ── mobile_money_receipts (keyed by txn_code; local_id bridge) ────────────────
+@Serializable
+data class MobileMoneyDto(
+    val id: Long? = null,
+    @SerialName("local_id") val localId: String? = null,
+    val provider: String = "unknown",
+    @SerialName("txn_code") val txnCode: String,
+    val amount: String? = null,
+    val currency: String = "USD",
+    val sender: String? = null,
+    @SerialName("sender_name") val senderName: String? = null,
+    @SerialName("sender_phone") val senderPhone: String? = null,
+    @SerialName("raw_body") val rawBody: String? = null,
+    @SerialName("received_at") val receivedAt: String? = null,
+    val status: String = "unmatched",
+    @SerialName("matched_customer_id") val matchedCustomerId: String? = null,
+    @SerialName("matched_customer_name") val matchedCustomerName: String? = null,
+    val purpose: String? = null,
+    val note: String? = null,
+    val cashier: String? = null,
+    @SerialName("cashier_id") val cashierId: String? = null,
+    @SerialName("updated_at") val updatedAt: String? = null,
+) {
+    fun cursorStamp(): String = updatedAt ?: IsoTime.EPOCH
+}
+
+fun MobileMoneyDto.toReceipt(businessId: String, local: MobileMoneyReceipt?): MobileMoneyReceipt {
+    val rid = localId?.ifBlank { null } ?: local?.id ?: newId()
+    val base = local ?: MobileMoneyReceipt(id = rid, businessId = businessId, txnCode = txnCode)
+    val recvAt = IsoTime.toMillis(receivedAt).takeIf { it > 0 } ?: base.receivedAt
+    return base.copy(
+        id = rid,
+        businessId = businessId,
+        provider = provider,
+        txnCode = txnCode,
+        amount = amount.toMoney(),
+        currency = currency,
+        sender = sender,
+        senderName = senderName,
+        senderPhone = senderPhone,
+        rawBody = rawBody ?: base.rawBody,
+        receivedAt = recvAt,
+        status = status,
+        matchedCustomerId = matchedCustomerId,
+        matchedCustomerName = matchedCustomerName,
+        purpose = purpose,
+        note = note,
+        createdBy = cashierId,
+        createdByName = cashier,
         updatedAt = IsoTime.toMillis(updatedAt),
         deleted = false,
         pendingSync = false,
@@ -407,4 +512,100 @@ fun buildRefundPush(
     notes = refund.reason ?: "",
     createdAt = IsoTime.toIso(refund.createdAt),
     updatedAt = IsoTime.toIso(refund.updatedAt),
+)
+
+/** Customer push (upsert on local_id). Deliberately OMITS `balance`/`credit_limit`:
+ *  those are ledger-derived and owned by whoever computes them — never overwrite them. */
+@Serializable
+data class CustomerPushDto(
+    @SerialName("local_id") val localId: String,
+    val name: String,
+    val phone: String? = null,
+    val email: String? = null,
+    val address: String? = null,
+    @SerialName("is_trade_account") val isTradeAccount: Boolean = false,
+    val notes: String? = null,
+    @SerialName("updated_at") val updatedAt: String,
+)
+
+fun Customer.toCustomerPush() = CustomerPushDto(
+    localId = id,
+    name = name,
+    phone = phone,
+    email = email,
+    address = address,
+    isTradeAccount = wholesale,
+    notes = note,
+    updatedAt = IsoTime.toIso(updatedAt),
+)
+
+/** Credit push (upsert on local_id). [cloudCustomerId] is the customers BIGINT id
+ *  (as text) the web keys credit on — resolved from the local customer at push time. */
+@Serializable
+data class CreditPushDto(
+    @SerialName("local_id") val localId: String,
+    @SerialName("customer_id") val customerId: String,
+    @SerialName("customer_name") val customerName: String? = null,
+    val type: String,
+    val amount: Double = 0.0,
+    val note: String? = null,
+    val cashier: String? = null,
+    @SerialName("created_at") val createdAt: String,
+    @SerialName("updated_at") val updatedAt: String,
+)
+
+fun CreditTxn.toCreditPush(cloudCustomerId: String, customerName: String?) = CreditPushDto(
+    localId = id,
+    customerId = cloudCustomerId,
+    customerName = customerName,
+    type = type,
+    amount = amount,
+    note = note,
+    cashier = createdByName,
+    createdAt = IsoTime.toIso(createdAt),
+    updatedAt = IsoTime.toIso(updatedAt),
+)
+
+/** Mobile-money receipt push (upsert on txn_code — idempotent). */
+@Serializable
+data class MobileMoneyPushDto(
+    @SerialName("local_id") val localId: String,
+    val provider: String,
+    @SerialName("txn_code") val txnCode: String,
+    val amount: Double = 0.0,
+    val currency: String = "USD",
+    val sender: String? = null,
+    @SerialName("sender_name") val senderName: String? = null,
+    @SerialName("sender_phone") val senderPhone: String? = null,
+    @SerialName("raw_body") val rawBody: String? = null,
+    @SerialName("received_at") val receivedAt: String,
+    val status: String = "unmatched",
+    @SerialName("matched_customer_id") val matchedCustomerId: String? = null,
+    @SerialName("matched_customer_name") val matchedCustomerName: String? = null,
+    val purpose: String? = null,
+    val note: String? = null,
+    val cashier: String? = null,
+    @SerialName("cashier_id") val cashierId: String? = null,
+    @SerialName("updated_at") val updatedAt: String,
+)
+
+fun MobileMoneyReceipt.toPush() = MobileMoneyPushDto(
+    localId = id,
+    provider = provider,
+    txnCode = txnCode,
+    amount = amount,
+    currency = currency,
+    sender = sender,
+    senderName = senderName,
+    senderPhone = senderPhone,
+    rawBody = rawBody,
+    receivedAt = IsoTime.toIso(receivedAt),
+    status = status,
+    matchedCustomerId = matchedCustomerId,
+    matchedCustomerName = matchedCustomerName,
+    purpose = purpose,
+    note = note,
+    cashier = createdByName,
+    cashierId = createdBy,
+    updatedAt = IsoTime.toIso(updatedAt),
 )

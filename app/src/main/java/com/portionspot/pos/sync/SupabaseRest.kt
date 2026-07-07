@@ -87,6 +87,19 @@ class SupabaseRest(
      * [ignoreDuplicates] = true skips existing rows entirely (matches the web's
      * `ignoreDuplicates` on the append-only `sales` table) instead of overwriting.
      */
+    /** GET selected [columns] for every row of [table] (no cursor). Small lookups only. */
+    fun selectAll(table: String, columns: String): String {
+        val url = (rest(table).toHttpUrlOrNull() ?: throw IOException("Bad URL"))
+            .newBuilder()
+            .addQueryParameter("select", columns)
+            .build()
+        client.newCall(Request.Builder().url(url).get().authed().build()).execute().use { resp ->
+            val body = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) throw IOException("select $table: HTTP ${resp.code} $body")
+            return body
+        }
+    }
+
     fun upsert(table: String, jsonArray: String, onConflict: String, ignoreDuplicates: Boolean = false) {
         val url = (rest(table).toHttpUrlOrNull() ?: throw IOException("Bad URL"))
             .newBuilder()
