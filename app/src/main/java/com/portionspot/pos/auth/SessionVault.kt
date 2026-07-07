@@ -218,6 +218,16 @@ class SessionVault(context: Context) {
         return MessageDigest.isEqual(expected, pbkdf2(pin, salt))
     }
 
+    /** True if [pin] matches ANY admin account provisioned on this device. Used to
+     *  authorise a cashier action that needs manager approval (e.g. a big discount). */
+    fun verifyAnyAdminPin(pin: String): Boolean = load().accounts.any { acc ->
+        acc.auth.role == "admin" && acc.hasPin &&
+            MessageDigest.isEqual(
+                Base64.decode(acc.pinHash, Base64.NO_WRAP),
+                pbkdf2(pin, Base64.decode(acc.pinSalt, Base64.NO_WRAP))
+            )
+    }
+
     fun recordPinFailure(userId: String): Int {
         var fails = 0
         mutateAccount(userId) { fails = it.pinFails + 1; it.copy(pinFails = fails) }

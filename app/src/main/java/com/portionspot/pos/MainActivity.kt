@@ -75,7 +75,7 @@ class MainActivity : ComponentActivity() {
                 AuthGate(container.authManager) { user ->
                     // Push the signed-in cashier into the ViewModel so financial
                     // writes (refunds now; the rest as Phase 2 continues) are attributed.
-                    LaunchedEffect(user.id) { vm.setCurrentCashier(user.id, user.displayName) }
+                    LaunchedEffect(user.id) { vm.setCurrentCashier(user.id, user.displayName, user.isAdmin) }
                     val open by openTarget
                     val wantMobileMoney = open == Notifier.OPEN_MOBILE_MONEY
                     val wantAdminAlerts = open == Notifier.OPEN_ADMIN_ALERTS

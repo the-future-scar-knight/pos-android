@@ -18,6 +18,10 @@ data class ShopPrefs(
     val receiptShowTagline: Boolean = true,
     val receiptShowAddress: Boolean = true,
     val receiptShowVat: Boolean = true,      // show the VAT line + VAT number
+    val receiptShowCashier: Boolean = true,  // "Served by <cashier>" line
+    val receiptShowPayment: Boolean = true,  // the tender/paid-via block
+    val receiptShowChange: Boolean = true,   // the change-given line
+    val receiptBoldTotals: Boolean = true,   // embolden the TOTAL line
     val receiptShowFooter: Boolean = true,
     // ── Tax / price rounding ──
     // Rounding step applied to a computed price. 0.0 = off; 0.01/0.05/0.10/0.50/1.0.
@@ -25,6 +29,10 @@ data class ShopPrefs(
     val checkoutRounding: Double = 0.0,      // applied to the checkout grand total
     // ── Quotes (§1.2 parity) ──
     val defaultQuoteValidityDays: Int = 7,   // a generated quote lapses after N days
+    // ── Discounts (§1.2 parity) ──
+    // A cashier applying a discount above this % of the goods value needs a manager/
+    // admin PIN to approve it. Admins are never gated. 0 = no approval ever required.
+    val discountThresholdPct: Double = 5.0,
     // ── Margins ──
     val marginFormula: String = "markup",    // "markup" (over cost) or "gross" (of price)
     val autoConvertUnitsToBoxes: Boolean = false, // show stock as N boxes + loose units

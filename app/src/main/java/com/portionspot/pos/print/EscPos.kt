@@ -42,6 +42,10 @@ data class ReceiptStyle(
     val showTagline: Boolean = true,
     val showAddress: Boolean = true,
     val showVat: Boolean = true,
+    val showCashier: Boolean = true,
+    val showPayment: Boolean = true,
+    val showChange: Boolean = true,
+    val boldTotals: Boolean = true,
     val showFooter: Boolean = true,
     // Second currency (dual-currency shops): when a non-blank code + positive rate
     // are set, the receipt also prints the total (and cash change) converted to it.
@@ -119,6 +123,7 @@ object EscPos {
         val dateStr = SimpleDateFormat("dd/MM/yy HH:mm", Locale.UK).format(Date(sale.soldAt))
         line(twoCol("Ref: $ref", dateStr, w))
         line("Customer: ${sale.customerName?.takeIf { it.isNotBlank() } ?: "Walk-in"}")
+        if (style.showCashier) sale.createdByName?.takeIf { it.isNotBlank() }?.let { line("Served by: $it") }
         if (isQuote) {
             val vu = sale.validUntil?.let { SimpleDateFormat("dd/MM/yy", Locale.UK).format(Date(it)) } ?: "-"
             line("Valid until: $vu")
@@ -143,9 +148,9 @@ object EscPos {
             val vatLabel = if (business.vatEnabled) "VAT ${trimQty(business.vatPercent)}%" else "VAT"
             line(twoCol(vatLabel, fmt(sale.taxTotal, cur), w))
         }
-        cmd(ESC, 0x45, 0x01)
+        if (style.boldTotals) cmd(ESC, 0x45, 0x01)
         line(twoCol("TOTAL", fmt(sale.total, cur), w))
-        cmd(ESC, 0x45, 0x00)
+        if (style.boldTotals) cmd(ESC, 0x45, 0x00)
 
         // Dual-currency: show the grand total converted to the second currency.
         val cur2On = secondCurrencyActive(style.secondCode, style.secondRate)
@@ -154,8 +159,8 @@ object EscPos {
         }
 
         // Payment — credit, cash + change, or another tender with its reference.
-        // A quote takes no payment, so the whole block is skipped.
-        if (!isQuote) when (sale.paymentMethod) {
+        // A quote takes no payment, and the payment block can be hidden per settings.
+        if (!isQuote && style.showPayment) when (sale.paymentMethod) {
             "credit" -> {
                 cmd(ESC, 0x45, 0x01)
                 line(twoCol("ON CREDIT", fmt(sale.total, cur), w))
@@ -163,7 +168,7 @@ object EscPos {
             }
             "cash" -> {
                 line(twoCol("Cash", fmt(sale.tendered ?: sale.total, cur), w))
-                sale.changeDue?.takeIf { it > 0 }?.let { chg ->
+                if (style.showChange) sale.changeDue?.takeIf { it > 0 }?.let { chg ->
                     line(twoCol("Change", fmt(chg, cur), w))
                     if (cur2On) {
                         line(twoCol("  @ ${trimQty(style.secondRate)}", fmt(baseToSecond(chg, style.secondRate), style.secondCode), w))

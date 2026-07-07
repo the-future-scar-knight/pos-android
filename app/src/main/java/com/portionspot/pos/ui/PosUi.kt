@@ -126,6 +126,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -308,6 +309,10 @@ private class PrinterUi(
             showTagline = flags.showTagline,
             showAddress = flags.showAddress,
             showVat = p.receiptShowVat,
+            showCashier = p.receiptShowCashier,
+            showPayment = p.receiptShowPayment,
+            showChange = p.receiptShowChange,
+            boldTotals = p.receiptBoldTotals,
             showFooter = flags.showFooter,
             secondCode = p.secondCurrencyCode,
             secondRate = p.secondCurrencyRate
@@ -1779,6 +1784,10 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
     var showPayment by remember { mutableStateOf(false) }
     var quoteMode by remember { mutableStateOf(false) }
     var showQuote by remember { mutableStateOf(false) }
+    // Discount-approval gate (§1.2): a cashier's over-threshold discount is parked here
+    // until a manager PIN approves it, then the sale/quote goes through.
+    var pendingSale by remember { mutableStateOf<PendingSale?>(null) }
+    var pendingQuote by remember { mutableStateOf<Pair<Double, Customer?>?>(null) }
     var priceModalItem by remember { mutableStateOf<Item?>(null) }
     var scanning by remember { mutableStateOf(false) }
     val context = LocalContext.current
@@ -1945,8 +1954,12 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
             onPaynowPoll = { reference, onResult -> vm.paynowPoll(reference, onResult) },
             onDismiss = { showPayment = false }
         ) { payments, discount, customer, onCredit, changeAsCredit ->
-            vm.checkout(payments, discount, customer, onCredit, changeAsCredit)
             showPayment = false
+            if (vm.discountNeedsApproval(discount, cart.sumOf { it.lineSubtotal })) {
+                pendingSale = PendingSale(payments, discount, customer, onCredit, changeAsCredit)
+            } else {
+                vm.checkout(payments, discount, customer, onCredit, changeAsCredit)
+            }
         }
     }
     if (showQuote) {
@@ -1957,10 +1970,33 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
             validityDays = prefs.defaultQuoteValidityDays,
             onDismiss = { showQuote = false }
         ) { discount, customer ->
-            vm.generateQuote(discount, customer)
             showQuote = false
-            quoteMode = false
+            if (vm.discountNeedsApproval(discount, cart.sumOf { it.lineSubtotal })) {
+                pendingQuote = discount to customer
+            } else {
+                vm.generateQuote(discount, customer)
+                quoteMode = false
+            }
         }
+    }
+    pendingSale?.let { pending ->
+        ApprovalPinDialog(
+            reason = "A discount of ${money(pending.discount, currency)} needs manager approval.",
+            onVerify = { pin -> vm.verifyAdminPin(pin) },
+            onApproved = {
+                vm.checkout(pending.payments, pending.discount, pending.customer, pending.onCredit, pending.changeAsCredit)
+                pendingSale = null
+            },
+            onDismiss = { pendingSale = null }
+        )
+    }
+    pendingQuote?.let { (discount, cust) ->
+        ApprovalPinDialog(
+            reason = "A discount of ${money(discount, currency)} needs manager approval.",
+            onVerify = { pin -> vm.verifyAdminPin(pin) },
+            onApproved = { vm.generateQuote(discount, cust); quoteMode = false; pendingQuote = null },
+            onDismiss = { pendingQuote = null }
+        )
     }
     lastReceipt?.let { receipt ->
         ReceiptDialog(
@@ -2357,6 +2393,71 @@ private fun BoxScope.FloatingCart(
             }
         }
     }
+}
+
+/** A checkout parked pending manager approval of an over-threshold discount (§1.2). */
+private data class PendingSale(
+    val payments: List<Tender>,
+    val discount: Double,
+    val customer: Customer?,
+    val onCredit: Boolean,
+    val changeAsCredit: Boolean
+)
+
+/**
+ * Manager-approval PIN gate (§1.2 parity): a cashier applying a discount above the
+ * shop threshold must have an admin authorise it with their PIN. Verified against any
+ * admin account on the device via [onVerify]; [onApproved] fires only on a match.
+ */
+@Composable
+private fun ApprovalPinDialog(
+    reason: String,
+    onVerify: suspend (String) -> Boolean,
+    onApproved: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val scope = rememberCoroutineScope()
+    var pin by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    AlertDialog(
+        onDismissRequest = { if (!busy) onDismiss() },
+        confirmButton = {
+            Button(
+                enabled = pin.length >= 4 && !busy,
+                onClick = {
+                    busy = true; error = null
+                    scope.launch {
+                        val ok = onVerify(pin)
+                        busy = false
+                        if (ok) onApproved() else { error = "Wrong PIN — ask an admin"; pin = "" }
+                    }
+                }
+            ) { Text("Approve") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss, enabled = !busy) { Text("Cancel") } },
+        title = { Text("Manager approval") },
+        text = {
+            Column {
+                Text(reason, style = MaterialTheme.typography.bodySmall)
+                Spacer(Modifier.height(10.dp))
+                OutlinedTextField(
+                    value = pin,
+                    onValueChange = { if (it.length <= 6 && it.all(Char::isDigit)) pin = it },
+                    label = { Text("Admin PIN") },
+                    singleLine = true,
+                    enabled = !busy,
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                error?.let {
+                    Spacer(Modifier.height(6.dp))
+                    Text(it, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+                }
+            }
+        }
+    )
 }
 
 /** Held sales: tap one to load it back into the cart (replacing the current cart). */
@@ -3511,6 +3612,10 @@ private fun ReceiptTemplateSection(prefs: ShopPrefs, onChange: (ShopPrefs) -> Un
     SettingsSwitch("Show tagline", prefs.receiptShowTagline) { onChange(prefs.copy(receiptShowTagline = it)) }
     SettingsSwitch("Show address", prefs.receiptShowAddress) { onChange(prefs.copy(receiptShowAddress = it)) }
     SettingsSwitch("Show VAT line", prefs.receiptShowVat) { onChange(prefs.copy(receiptShowVat = it)) }
+    SettingsSwitch("Show cashier", prefs.receiptShowCashier) { onChange(prefs.copy(receiptShowCashier = it)) }
+    SettingsSwitch("Show payment", prefs.receiptShowPayment) { onChange(prefs.copy(receiptShowPayment = it)) }
+    SettingsSwitch("Show change", prefs.receiptShowChange) { onChange(prefs.copy(receiptShowChange = it)) }
+    SettingsSwitch("Bold totals", prefs.receiptBoldTotals) { onChange(prefs.copy(receiptBoldTotals = it)) }
     SettingsSwitch("Show footer", prefs.receiptShowFooter) { onChange(prefs.copy(receiptShowFooter = it)) }
 }
 
@@ -6875,6 +6980,21 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
             SettingsField("Quote validity (days)", prefs.defaultQuoteValidityDays.toString()) {
                 it.toIntOrNull()?.coerceIn(0, 365)?.let { d ->
                     vm.savePrefs(prefs.copy(defaultQuoteValidityDays = d))
+                }
+            }
+
+            // ---- Discounts (saves live, device-local) ----
+            Spacer(Modifier.height(20.dp))
+            SettingsSectionHeader("Discounts")
+            Text(
+                "A cashier giving a discount above this percentage needs an admin PIN to " +
+                    "approve it. Admins are never asked. Set 0 to never require approval.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            SettingsField("Approval threshold (%)", trimPct(prefs.discountThresholdPct)) {
+                it.toDoubleOrNull()?.coerceIn(0.0, 100.0)?.let { p ->
+                    vm.savePrefs(prefs.copy(discountThresholdPct = p))
                 }
             }
 

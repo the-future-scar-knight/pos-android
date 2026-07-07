@@ -93,10 +93,28 @@ class PosViewModel(
     // refunds now, and onto the other financial writes as Phase-2 wiring continues.
     private var currentCashierId: String? = null
     private var currentCashierName: String? = null
-    fun setCurrentCashier(id: String?, name: String?) {
+    private var currentIsAdmin: Boolean = false
+    fun setCurrentCashier(id: String?, name: String?, isAdmin: Boolean = false) {
         currentCashierId = id
         currentCashierName = name
+        currentIsAdmin = isAdmin
     }
+
+    /**
+     * Does a [discount] (currency units) on goods worth [subtotal] need manager
+     * approval before it can be applied? True only for a cashier whose discount
+     * exceeds the shop's [ShopPrefs.discountThresholdPct]. Admins are never gated,
+     * and a threshold of 0 disables the gate. See [verifyAdminPin].
+     */
+    fun discountNeedsApproval(discount: Double, subtotal: Double): Boolean {
+        if (currentIsAdmin || discount <= 0.0 || subtotal <= 0.0) return false
+        val threshold = _shopPrefs.value.discountThresholdPct
+        if (threshold <= 0.0) return false
+        return (discount / subtotal) * 100.0 > threshold
+    }
+
+    /** Verify a manager/admin PIN to authorise an over-threshold discount. */
+    suspend fun verifyAdminPin(pin: String): Boolean = authManager.verifyAdminPin(pin)
 
     val business: StateFlow<Business?> =
         repo.businessFlow.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
@@ -325,10 +343,15 @@ class PosViewModel(
             receiptShowTagline = repo.getSetting(KEY_RC_TAGLINE)?.toBooleanStrictOrNull() ?: d.receiptShowTagline,
             receiptShowAddress = repo.getSetting(KEY_RC_ADDRESS)?.toBooleanStrictOrNull() ?: d.receiptShowAddress,
             receiptShowVat = repo.getSetting(KEY_RC_VAT)?.toBooleanStrictOrNull() ?: d.receiptShowVat,
+            receiptShowCashier = repo.getSetting(KEY_RC_CASHIER)?.toBooleanStrictOrNull() ?: d.receiptShowCashier,
+            receiptShowPayment = repo.getSetting(KEY_RC_PAYMENT)?.toBooleanStrictOrNull() ?: d.receiptShowPayment,
+            receiptShowChange = repo.getSetting(KEY_RC_CHANGE)?.toBooleanStrictOrNull() ?: d.receiptShowChange,
+            receiptBoldTotals = repo.getSetting(KEY_RC_BOLD_TOTALS)?.toBooleanStrictOrNull() ?: d.receiptBoldTotals,
             receiptShowFooter = repo.getSetting(KEY_RC_FOOTER)?.toBooleanStrictOrNull() ?: d.receiptShowFooter,
             wholesaleRounding = repo.getSetting(KEY_ROUND_WS)?.toDoubleOrNull() ?: d.wholesaleRounding,
             checkoutRounding = repo.getSetting(KEY_ROUND_CO)?.toDoubleOrNull() ?: d.checkoutRounding,
             defaultQuoteValidityDays = repo.getSetting(KEY_QUOTE_DAYS)?.toIntOrNull() ?: d.defaultQuoteValidityDays,
+            discountThresholdPct = repo.getSetting(KEY_DISCOUNT_THRESHOLD)?.toDoubleOrNull() ?: d.discountThresholdPct,
             marginFormula = repo.getSetting(KEY_MARGIN_FORMULA) ?: d.marginFormula,
             autoConvertUnitsToBoxes = repo.getSetting(KEY_AUTO_BOXES)?.toBooleanStrictOrNull() ?: d.autoConvertUnitsToBoxes,
             printerType = repo.getSetting(KEY_PRINTER_TYPE) ?: d.printerType,
@@ -352,10 +375,15 @@ class PosViewModel(
             repo.putSetting(KEY_RC_TAGLINE, prefs.receiptShowTagline.toString())
             repo.putSetting(KEY_RC_ADDRESS, prefs.receiptShowAddress.toString())
             repo.putSetting(KEY_RC_VAT, prefs.receiptShowVat.toString())
+            repo.putSetting(KEY_RC_CASHIER, prefs.receiptShowCashier.toString())
+            repo.putSetting(KEY_RC_PAYMENT, prefs.receiptShowPayment.toString())
+            repo.putSetting(KEY_RC_CHANGE, prefs.receiptShowChange.toString())
+            repo.putSetting(KEY_RC_BOLD_TOTALS, prefs.receiptBoldTotals.toString())
             repo.putSetting(KEY_RC_FOOTER, prefs.receiptShowFooter.toString())
             repo.putSetting(KEY_ROUND_WS, prefs.wholesaleRounding.toString())
             repo.putSetting(KEY_ROUND_CO, prefs.checkoutRounding.toString())
             repo.putSetting(KEY_QUOTE_DAYS, prefs.defaultQuoteValidityDays.toString())
+            repo.putSetting(KEY_DISCOUNT_THRESHOLD, prefs.discountThresholdPct.toString())
             repo.putSetting(KEY_MARGIN_FORMULA, prefs.marginFormula)
             repo.putSetting(KEY_AUTO_BOXES, prefs.autoConvertUnitsToBoxes.toString())
             repo.putSetting(KEY_PRINTER_TYPE, prefs.printerType)
@@ -1284,10 +1312,15 @@ class PosViewModel(
         private const val KEY_RC_TAGLINE = "rc_show_tagline"
         private const val KEY_RC_ADDRESS = "rc_show_address"
         private const val KEY_RC_VAT = "rc_show_vat"
+        private const val KEY_RC_CASHIER = "rc_show_cashier"
+        private const val KEY_RC_PAYMENT = "rc_show_payment"
+        private const val KEY_RC_CHANGE = "rc_show_change"
+        private const val KEY_RC_BOLD_TOTALS = "rc_bold_totals"
         private const val KEY_RC_FOOTER = "rc_show_footer"
         private const val KEY_ROUND_WS = "round_wholesale"
         private const val KEY_ROUND_CO = "round_checkout"
         private const val KEY_QUOTE_DAYS = "quote_validity_days"
+        private const val KEY_DISCOUNT_THRESHOLD = "discount_threshold_pct"
         private const val KEY_MARGIN_FORMULA = "margin_formula"
         private const val KEY_AUTO_BOXES = "auto_units_to_boxes"
         private const val KEY_PRINTER_TYPE = "printer_type"

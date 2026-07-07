@@ -235,6 +235,11 @@ class AuthManager(
             ?: vault.activeSession()?.toUser()
     }
 
+    /** Authorise a manager-gated action (e.g. an over-threshold discount) by checking
+     *  the entered PIN against any admin account provisioned on this device. */
+    suspend fun verifyAdminPin(pin: String): Boolean =
+        withContext(Dispatchers.IO) { vault.verifyAnyAdminPin(pin) }
+
     // ── tokens for the sync layer ─────────────────────────────────────────
 
     /** Snapshot for request headers; may be stale, see [refreshIfNeeded]. */
