@@ -259,6 +259,12 @@ class PosViewModel(
     private val _lastSyncAt = MutableStateFlow<Long?>(null)
     val lastSyncAt: StateFlow<Long?> = _lastSyncAt.asStateFlow()
 
+    /** Stage-2 master switch: whether local data is pushed UP to the cloud. Default
+     *  off so the repoint is pull-only until the owner opts in (after clearing test
+     *  data). See [setCloudPushEnabled]. */
+    private val _cloudPushEnabled = MutableStateFlow(false)
+    val cloudPushEnabled: StateFlow<Boolean> = _cloudPushEnabled.asStateFlow()
+
     // ---- Appearance theme (themeable accent/background/sidebar; device-local) ----
     private val _themeChoice = MutableStateFlow(DEFAULT_THEME)
     val themeChoice: StateFlow<ThemeChoice> = _themeChoice.asStateFlow()
@@ -1016,6 +1022,16 @@ class PosViewModel(
         viewModelScope.launch {
             _connection.value = sync.connection()
             _lastSyncAt.value = sync.lastSyncAt()
+            _cloudPushEnabled.value = sync.config.pushEnabled()
+        }
+    }
+
+    /** Turn cloud PUSH on/off (Stage 2). Off by default; only enable after the pull
+     *  is verified and any local test data has been cleared. */
+    fun setCloudPushEnabled(on: Boolean) {
+        viewModelScope.launch {
+            sync.config.setPushEnabled(on)
+            _cloudPushEnabled.value = on
         }
     }
 

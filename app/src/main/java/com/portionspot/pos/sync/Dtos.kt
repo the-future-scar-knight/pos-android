@@ -2,8 +2,11 @@ package com.portionspot.pos.sync
 
 import com.portionspot.pos.data.Customer
 import com.portionspot.pos.data.Item
+import com.portionspot.pos.data.Refund
+import com.portionspot.pos.data.RefundLine
 import com.portionspot.pos.data.SaleEntity
 import com.portionspot.pos.data.SaleLine
+import com.portionspot.pos.data.SalePayment
 import com.portionspot.pos.data.newId
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -248,3 +251,160 @@ fun SaleDto.toSaleLines(businessId: String, resolveItemId: (String?) -> String?)
             unitsPerLine = if (li.unitsPerLine < 1) 1 else li.unitsPerLine,
         )
     }
+
+// ── push DTOs (Stage 2) ───────────────────────────────────────────────────────
+// The exact row shape the web writes (src/lib/sync.js pushSales). Stage 2 push is
+// SALES + REFUNDS only — both are append-only / insert-once, so they can never
+// clobber existing shared rows. Products push (overwrite-on-sku) and customers/
+// credit push (the derived `balance` column is a corruption risk until credit is
+// pulled) are deliberately left for later sub-stages.
+
+@Serializable
+data class ProductPushDto(
+    val sku: String,
+    val name: String,
+    val category: String? = null,
+    @SerialName("product_type") val productType: String = "box",
+    @SerialName("box_price") val boxPrice: Double = 0.0,
+    @SerialName("box_size") val boxSize: Int = 1,
+    @SerialName("wholesale_price") val wholesalePrice: Double = 0.0,
+    @SerialName("retail_price") val retailPrice: Double = 0.0,
+    @SerialName("cost_price") val costPrice: Double = 0.0,
+    @SerialName("stock_boxes") val stockBoxes: Int = 0,
+    @SerialName("stock_units") val stockUnits: Int = 0,
+    @SerialName("low_stock_threshold") val lowStockThreshold: Int = 5,
+    val active: Boolean = true,
+    @SerialName("updated_at") val updatedAt: String,
+)
+
+/** Local [Item] → the web `products` row (upsert on sku). Total on-hand units are
+ *  split back into boxes + loose the way the web stores them. Caller must ensure a
+ *  non-blank sku (products.sku is NOT NULL and is the conflict key). */
+fun Item.toProductPush(): ProductPushDto {
+    val bs = if (boxSize < 1) 1 else boxSize
+    val totalUnits = stockQty.toInt()
+    return ProductPushDto(
+        sku = sku.orEmpty(),
+        name = name,
+        category = category,
+        productType = if (bs > 1) "box" else "unit",
+        boxPrice = boxPrice,
+        boxSize = bs,
+        wholesalePrice = wholesalePrice,
+        retailPrice = price,
+        costPrice = cost ?: 0.0,
+        stockBoxes = if (bs > 1) totalUnits / bs else 0,
+        stockUnits = if (bs > 1) totalUnits % bs else totalUnits,
+        lowStockThreshold = reorderLevel.toInt(),
+        active = isActive,
+        updatedAt = IsoTime.toIso(updatedAt),
+    )
+}
+
+@Serializable
+data class SalePushDto(
+    val id: String,                       // web keys sales by the ref string
+    val ref: String,
+    val type: String = "sale",            // sale | return
+    val status: String = "completed",
+    @SerialName("customer_id") val customerId: String = "",
+    @SerialName("customer_name") val customerName: String = "",
+    val items: List<SaleItemJson> = emptyList(),
+    val subtotal: Double = 0.0,
+    @SerialName("total_discount") val totalDiscount: Double = 0.0,
+    @SerialName("vat_amount") val vatAmount: Double = 0.0,
+    @SerialName("grand_total") val grandTotal: Double = 0.0,
+    val payments: List<SalePaymentJson> = emptyList(),
+    @SerialName("amount_paid") val amountPaid: Double = 0.0,
+    @SerialName("change_given") val changeGiven: Double = 0.0,
+    @SerialName("amount_owing") val amountOwing: Double = 0.0,
+    @SerialName("pay_method") val payMethod: String = "cash",
+    val cashier: String = "",
+    @SerialName("cashier_id") val cashierId: String = "",
+    val notes: String = "",
+    @SerialName("created_at") val createdAt: String,
+    @SerialName("updated_at") val updatedAt: String,
+)
+
+private fun SaleLine.toItemJson(sku: String?): SaleItemJson = SaleItemJson(
+    qty = qty,
+    sku = sku,
+    mode = mode,
+    name = name,
+    label = when (mode) {
+        "box" -> "Box of $unitsPerLine"
+        "wholesale" -> "Wholesale"
+        else -> "Retail"
+    },
+    subMode = if (mode == "box") "boxes" else "",
+    unitPrice = unitPrice,
+    lineDiscount = lineDiscount,
+    unitsPerLine = unitsPerLine,
+    boxSize = if (mode == "box") unitsPerLine else null,
+)
+
+/** A completed sale + its lines/tenders → the web `sales` row shape (type='sale'). */
+fun buildSalePush(
+    sale: SaleEntity,
+    lines: List<SaleLine>,
+    payments: List<SalePayment>,
+    skuOf: (String?) -> String?,
+): SalePushDto {
+    val ref = sale.receiptNo ?: sale.id
+    return SalePushDto(
+        id = ref,
+        ref = ref,
+        type = "sale",
+        status = sale.status,
+        customerId = sale.customerId ?: "",
+        customerName = sale.customerName ?: "",
+        items = lines.map { it.toItemJson(skuOf(it.itemId)) },
+        subtotal = sale.subtotal,
+        totalDiscount = sale.discountTotal,
+        vatAmount = sale.taxTotal,
+        grandTotal = sale.total,
+        payments = payments.map { SalePaymentJson(amount = it.amount, method = it.method) },
+        amountPaid = sale.amountPaid,
+        changeGiven = sale.changeDue ?: 0.0,
+        payMethod = sale.paymentMethod,
+        cashier = sale.createdByName ?: "",
+        cashierId = sale.createdBy ?: "",
+        notes = sale.note ?: "",
+        createdAt = IsoTime.toIso(sale.soldAt),
+        updatedAt = IsoTime.toIso(sale.updatedAt),
+    )
+}
+
+/** A refund + its returned lines → a `type='return'` sales row with NEGATIVE totals
+ *  (the web's convention: "negative = cash going back out", nets revenue automatically). */
+fun buildRefundPush(
+    refund: Refund,
+    lines: List<RefundLine>,
+    skuOf: (String?) -> String?,
+): SalePushDto = SalePushDto(
+    id = refund.id,
+    ref = "RTN-${refund.saleReceiptNo ?: refund.id.take(8)}",
+    type = "return",
+    status = "completed",
+    customerId = refund.customerId ?: "",
+    customerName = refund.customerName ?: "",
+    items = lines.map { rl ->
+        SaleItemJson(
+            qty = rl.qty,
+            sku = skuOf(rl.itemId),
+            mode = rl.mode,
+            name = rl.name,
+            unitPrice = rl.unitPrice,
+            unitsPerLine = rl.unitsPerLine,
+            boxSize = if (rl.mode == "box") rl.unitsPerLine else null,
+        )
+    },
+    subtotal = -refund.refundTotal,
+    grandTotal = -refund.refundTotal,
+    payMethod = "cash",
+    cashier = refund.createdByName ?: "",
+    cashierId = refund.createdBy ?: "",
+    notes = refund.reason ?: "",
+    createdAt = IsoTime.toIso(refund.createdAt),
+    updatedAt = IsoTime.toIso(refund.updatedAt),
+)

@@ -82,16 +82,21 @@ class SupabaseRest(
         }
     }
 
-    /** Upsert a JSON array of rows, conflict-resolving on [onConflict] (the PK). */
-    fun upsert(table: String, jsonArray: String, onConflict: String) {
+    /**
+     * Upsert a JSON array of rows, conflict-resolving on [onConflict] (the PK).
+     * [ignoreDuplicates] = true skips existing rows entirely (matches the web's
+     * `ignoreDuplicates` on the append-only `sales` table) instead of overwriting.
+     */
+    fun upsert(table: String, jsonArray: String, onConflict: String, ignoreDuplicates: Boolean = false) {
         val url = (rest(table).toHttpUrlOrNull() ?: throw IOException("Bad URL"))
             .newBuilder()
             .addQueryParameter("on_conflict", onConflict)
             .build()
+        val resolution = if (ignoreDuplicates) "ignore-duplicates" else "merge-duplicates"
         val req = Request.Builder().url(url)
             .post(jsonArray.toRequestBody(jsonMedia))
             .authed()
-            .header("Prefer", "resolution=merge-duplicates,return=minimal")
+            .header("Prefer", "resolution=$resolution,return=minimal")
             .build()
         client.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) {
