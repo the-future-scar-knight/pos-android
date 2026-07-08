@@ -187,9 +187,11 @@ class AuthManager(
 
     // ── PIN ───────────────────────────────────────────────────────────────
 
-    fun setPin(pin: String) {
+    /** Suspends on IO: PBKDF2 (120k iterations) is too heavy for the main thread on
+     *  low-end hardware like the Sunmi, and hashing there would freeze PIN setup. */
+    suspend fun setPin(pin: String) {
         val user = (state.value as? AuthState.PinSetup)?.user ?: return
-        vault.setPin(user.id, pin)
+        withContext(Dispatchers.IO) { vault.setPin(user.id, pin) }
         _state.value = AuthState.Active(user)
     }
 

@@ -305,14 +305,16 @@ private fun PinField(
 
 @Composable
 private fun PinSetupScreen(auth: AuthManager) {
+    val scope = rememberCoroutineScope()
     var pin by remember { mutableStateOf("") }
     var confirm by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
 
     AuthScaffold("Set a PIN", "Unlock quickly on this device, even offline") {
-        PinField(pin, { pin = it }, "PIN (4-6 digits)")
+        PinField(pin, { pin = it }, "PIN (4-6 digits)", enabled = !busy)
         Spacer(Modifier.height(12.dp))
-        PinField(confirm, { confirm = it }, "Confirm PIN")
+        PinField(confirm, { confirm = it }, "Confirm PIN", enabled = !busy)
         ErrorText(error)
         Spacer(Modifier.height(20.dp))
         Button(
@@ -320,13 +322,18 @@ private fun PinSetupScreen(auth: AuthManager) {
                 when {
                     pin.length < 4 -> error = "PIN must be at least 4 digits"
                     pin != confirm -> error = "PINs don't match"
-                    else -> auth.setPin(pin)
+                    else -> {
+                        busy = true; error = null
+                        // Hashing runs on Dispatchers.IO inside setPin, so the UI
+                        // stays responsive while the PIN is derived.
+                        scope.launch { auth.setPin(pin) }
+                    }
                 }
             },
-            enabled = pin.isNotEmpty() && confirm.isNotEmpty(),
+            enabled = !busy && pin.isNotEmpty() && confirm.isNotEmpty(),
             modifier = Modifier.fillMaxWidth().height(48.dp)
-        ) { Text("Save PIN") }
-        TextButton(onClick = { auth.skipPin() }) { Text("Skip for now") }
+        ) { Text(if (busy) "Saving…" else "Save PIN") }
+        TextButton(onClick = { auth.skipPin() }, enabled = !busy) { Text("Skip for now") }
     }
 }
 

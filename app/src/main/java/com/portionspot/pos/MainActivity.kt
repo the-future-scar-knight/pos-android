@@ -1,6 +1,8 @@
 package com.portionspot.pos
 
+import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -28,6 +30,20 @@ class MainActivity : ComponentActivity() {
     // onCreate and updated by onNewIntent so a tap on the mobile-money notification
     // deep-links to the Mobile Money screen whether the app was cold or already open.
     private val openTarget = mutableStateOf<String?>(null)
+
+    /**
+     * Pin the app's font scale to 1.0 regardless of the device's system Font-size
+     * setting. A POS must look identical on every till; on the Sunmi (Android 6 / API
+     * 23, where only Font size — not Display size — can be enlarged) an operator's
+     * "Large" font blew the search bar, chips and cards up so only a couple of products
+     * were visible (prompt §2). Ignoring the device font setting keeps the layout tight
+     * and consistent with the phone it was designed on.
+     */
+    override fun attachBaseContext(newBase: Context) {
+        val config = Configuration(newBase.resources.configuration)
+        config.fontScale = 1.0f
+        super.attachBaseContext(newBase.createConfigurationContext(config))
+    }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)

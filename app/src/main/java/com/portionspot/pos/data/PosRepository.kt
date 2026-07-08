@@ -62,6 +62,11 @@ class PosRepository(private val db: PosDatabase) {
     fun methodBreakdownFlow(businessId: String, from: Long, to: Long): Flow<List<MethodBreakdown>> =
         saleDao.observeMethodBreakdown(businessId, from, to)
 
+    /** How many sales in the window are fully refunded — subtract from the sale count
+     *  for a net "live sales" figure (prompt §5). */
+    fun fullyRefundedCountFlow(businessId: String, from: Long, to: Long): Flow<Int> =
+        saleDao.observeFullyRefundedCount(businessId, from, to)
+
     // ---- dashboard --------------------------------------------------------
 
     fun topProductsFlow(businessId: String, from: Long, to: Long, limit: Int = 5): Flow<List<TopProduct>> =
@@ -144,8 +149,22 @@ class PosRepository(private val db: PosDatabase) {
     suspend fun saveBusiness(business: Business) =
         businessDao.upsert(business.copy(updatedAt = now(), pendingSync = true))
 
-    suspend fun saveItem(item: Item) =
-        itemDao.upsert(item.copy(updatedAt = now(), pendingSync = true))
+    /**
+     * Save a catalogue item, guaranteeing SKU uniqueness at the source so duplicates
+     * can't be created in the first place (prompt §1). If another row already owns this
+     * SKU (case/space-folded), we write onto THAT row's id instead of inserting a second
+     * copy — whether this is a brand-new add or an edit that collides with an existing
+     * code. SKU-less items are unaffected (they can legitimately repeat).
+     */
+    suspend fun saveItem(item: Item) {
+        val sku = item.sku?.trim()?.ifBlank { null }
+        val canonicalId = sku
+            ?.let { itemDao.getBySku(item.businessId, it) }
+            ?.takeIf { it.id != item.id }
+            ?.id
+        val target = if (canonicalId != null) item.copy(id = canonicalId) else item
+        itemDao.upsert(target.copy(sku = sku, updatedAt = now(), pendingSync = true))
+    }
 
     suspend fun itemByBarcode(businessId: String, barcode: String): Item? =
         itemDao.getByBarcode(businessId, barcode.trim())

@@ -268,6 +268,14 @@ fun PosTheme(
         outline = tokens.surfaceBorder,
         error = tokens.danger,
         onError = Color.White,
+        // Material 3 tints every ELEVATED surface (dialogs, menus, elevated cards)
+        // with `surfaceTint` — which defaults to `primary` (the brand red). At a
+        // dialog's 6dp tonal elevation that paints a muddy pink wash behind the
+        // white content, so the accent, the wash, and the fixed blue/greys clash.
+        // Killing the tint (transparent) keeps elevated surfaces clean white across
+        // EVERY theme; the brand still shows on buttons, chips and accents where we
+        // set it explicitly. (prompt §2 — popup colours don't fit together.)
+        surfaceTint = Color.Transparent,
     )
 
     val view = LocalView.current

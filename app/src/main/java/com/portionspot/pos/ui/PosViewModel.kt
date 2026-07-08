@@ -207,6 +207,16 @@ class PosViewModel(
             }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0.0)
 
+    /** Count of fully-refunded sales in the window — subtract from the sale count so a
+     *  refunded sale stops counting as live (prompt §5). */
+    val reportFullyRefunded: StateFlow<Int> =
+        combine(businessId.filterNotNull(), _reportRange) { bid, range -> bid to range }
+            .flatMapLatest { (bid, range) ->
+                val (from, to) = rangeBounds(range)
+                repo.fullyRefundedCountFlow(bid, from, to)
+            }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0)
+
     fun setReportRange(range: ReportRange) { _reportRange.value = range }
 
     // ---- Dashboard (its own date window, independent of the Reports screen) ----
@@ -303,6 +313,10 @@ class PosViewModel(
     init {
         viewModelScope.launch {
             businessId.value = repo.ensureSeeded()
+            // Sweep any pre-existing catalogue duplicates on startup so the fix is
+            // self-healing and the manual "Remove duplicates" button is never needed
+            // (prompt §1). New duplicates are prevented at the source in saveItem/pull.
+            repo.dedupeItems()
         }
         viewModelScope.launch { _themeChoice.value = loadTheme() }
         viewModelScope.launch { _shopPrefs.value = loadPrefs() }
@@ -1141,6 +1155,9 @@ class PosViewModel(
     fun syncNow() {
         viewModelScope.launch {
             sync.runNow()
+            // A pull can surface a cloud copy of a hand-added item; collapse any such
+            // duplicate immediately so the catalogue self-cleans without user action.
+            repo.dedupeItems()
             refreshSyncState()
         }
     }

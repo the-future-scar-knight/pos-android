@@ -12,10 +12,10 @@ import java.security.MessageDigest
 import java.security.SecureRandom
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
+import javax.crypto.Mac
 import javax.crypto.SecretKey
-import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.GCMParameterSpec
-import javax.crypto.spec.PBEKeySpec
+import javax.crypto.spec.SecretKeySpec
 
 /** Everything needed to work offline after the first online login. */
 @Serializable
@@ -262,10 +262,43 @@ class SessionVault(context: Context) {
         return gen.generateKey()
     }
 
-    private fun pbkdf2(pin: String, salt: ByteArray): ByteArray =
-        SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
-            .generateSecret(PBEKeySpec(pin.toCharArray(), salt, 120_000, 256))
-            .encoded
+    /**
+     * PBKDF2-HMAC-SHA256 (RFC 8018), implemented over [Mac] rather than
+     * `SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")`. That factory algorithm
+     * only exists on API 26+ — on the Sunmi V1s (Android 6.0 / API 23, our minSdk) it
+     * throws `NoSuchAlgorithmException` and crashes PIN setup. `Mac("HmacSHA256")`
+     * ships on every API level, and this produces byte-identical output to the
+     * standard KDF, so PIN hashes created on newer devices still verify. 120k
+     * iterations, 256-bit derived key — unchanged from before.
+     */
+    private fun pbkdf2(pin: String, salt: ByteArray): ByteArray {
+        val iterations = 120_000
+        val dkLen = 32 // 256 bits
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(pin.toByteArray(Charsets.UTF_8), "HmacSHA256"))
+        val hLen = mac.macLength
+        val blocks = (dkLen + hLen - 1) / hLen
+        val out = ByteArray(blocks * hLen)
+        for (i in 1..blocks) {
+            // U_1 = PRF(salt || INT_32_BE(i)); doFinal() resets the Mac to its
+            // post-init state, so the same key is reused for every subsequent PRF.
+            mac.update(salt)
+            mac.update(
+                byteArrayOf(
+                    (i ushr 24).toByte(), (i ushr 16).toByte(),
+                    (i ushr 8).toByte(), i.toByte()
+                )
+            )
+            var u = mac.doFinal()
+            val block = u.copyOf()
+            for (c in 1 until iterations) {
+                u = mac.doFinal(u)
+                for (j in block.indices) block[j] = (block[j].toInt() xor u[j].toInt()).toByte()
+            }
+            System.arraycopy(block, 0, out, (i - 1) * hLen, hLen)
+        }
+        return out.copyOf(dkLen)
+    }
 
     private companion object {
         const val ANDROID_KEYSTORE = "AndroidKeyStore"

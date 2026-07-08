@@ -51,6 +51,14 @@ interface ItemDao {
     @Query("SELECT * FROM items WHERE businessId = :businessId AND barcode = :barcode AND deleted = 0 LIMIT 1")
     suspend fun getByBarcode(businessId: String, barcode: String): Item?
 
+    /** Existing catalogue row that already owns this SKU (case/space-folded), if any.
+     *  Used to write onto the canonical row instead of inserting a duplicate. */
+    @Query(
+        "SELECT * FROM items WHERE businessId = :businessId AND deleted = 0 " +
+            "AND sku IS NOT NULL AND TRIM(LOWER(sku)) = TRIM(LOWER(:sku)) LIMIT 1"
+    )
+    suspend fun getBySku(businessId: String, sku: String): Item?
+
     @Upsert
     suspend fun upsert(item: Item)
 
@@ -169,6 +177,25 @@ interface SaleDao {
             "GROUP BY paymentMethod ORDER BY total DESC"
     )
     fun observeMethodBreakdown(businessId: String, from: Long, to: Long): Flow<List<MethodBreakdown>>
+
+    /**
+     * Count of completed sales in the window whose goods have been FULLY returned —
+     * the booked refund value (refundTotal, VAT+discount inclusive) reaches the sale
+     * total. The report subtracts this from the sale count so a fully-refunded sale
+     * stops counting as a live sale (prompt §5). Refunds are windowed on the same
+     * period so the count and the "refunds paid" money line tell one consistent story.
+     */
+    @Query(
+        "SELECT COUNT(*) FROM sales s " +
+            "WHERE s.businessId = :businessId AND s.deleted = 0 " +
+            "AND s.status = 'completed' AND s.soldAt >= :from AND s.soldAt < :to " +
+            "AND s.total > 0 AND (" +
+            "SELECT COALESCE(SUM(r.refundTotal), 0) FROM refunds r " +
+            "WHERE r.saleId = s.id AND r.deleted = 0 " +
+            "AND r.createdAt >= :from AND r.createdAt < :to" +
+            ") >= s.total - 0.01"
+    )
+    fun observeFullyRefundedCount(businessId: String, from: Long, to: Long): Flow<Int>
 
     // ---- dashboard ----
     /** Best-selling lines in a window (grouped by snapshot name, so ad-hoc lines count too). */

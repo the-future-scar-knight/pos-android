@@ -128,6 +128,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.LineHeightStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -154,6 +155,7 @@ import androidx.compose.material.icons.filled.WifiOff
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import com.portionspot.pos.data.Business
@@ -531,7 +533,8 @@ fun AppRoot(
                 onSelect = { screen = it; drawerOpen = false },
                 onDismiss = { drawerOpen = false },
                 onSwitchUser = { drawerOpen = false; vm.switchUser() },
-                onSignOut = { drawerOpen = false; vm.signOut() }
+                onSignOut = { drawerOpen = false; vm.signOut() },
+                logoUri = business?.logoUri
             )
         }
     }
@@ -909,7 +912,7 @@ fun AdminRoot(
     Box(Modifier.fillMaxSize()) {
         Scaffold(
             containerColor = t.canvas,
-            topBar = { AdminTopBar(business?.name ?: "Admin", onExitToCashier) },
+            topBar = { AdminTopBar(business?.name ?: "Admin", onExitToCashier, business?.logoUri) },
             bottomBar = { AdminBottomNav(current = tab, alertsBadge = unread, onSelect = { tab = it }) }
         ) { padding ->
             Box(Modifier.fillMaxSize().padding(padding).background(t.canvasBrush)) {
@@ -932,7 +935,7 @@ fun AdminRoot(
 
 /** Admin top bar: an ADMIN badge + shop name + a switch into the cashier POS. */
 @Composable
-private fun AdminTopBar(shopName: String, onExitToCashier: () -> Unit) {
+private fun AdminTopBar(shopName: String, onExitToCashier: () -> Unit, logoUri: String? = null) {
     val t = LocalPosTokens.current
     Column(Modifier.fillMaxWidth().background(t.surface1)) {
         Row(
@@ -940,7 +943,7 @@ private fun AdminTopBar(shopName: String, onExitToCashier: () -> Unit) {
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            LogoMark(shopName, 30.dp)
+            LogoMark(shopName, 30.dp, logoUri)
             Column(Modifier.weight(1f)) {
                 Text(
                     shopName, color = t.inkPrimary, fontWeight = FontWeight.Black,
@@ -1577,21 +1580,79 @@ private fun todayStartMs(): Long {
     return c.timeInMillis
 }
 
-/** Logo square (PSM mark or shop initials) used in the topbar + drawer. */
+/**
+ * A count rendered inside a small circular badge. Compose's default text layout
+ * adds font padding and lays the glyph in a line box taller than the digit, so a
+ * lone number sits visibly BELOW the circle's centre. Stripping the font padding
+ * and centring the line height plants the number dead-centre in the bubble
+ * (prompt §1 — badge numbers off-centre).
+ */
 @Composable
-private fun LogoMark(shopName: String, size: androidx.compose.ui.unit.Dp = 32.dp) {
+private fun BadgeNumber(
+    text: String,
+    color: Color,
+    fontSize: androidx.compose.ui.unit.TextUnit,
+    fontWeight: FontWeight = FontWeight.Black
+) {
+    Text(
+        text,
+        color = color,
+        fontSize = fontSize,
+        fontWeight = fontWeight,
+        lineHeight = fontSize,
+        textAlign = TextAlign.Center,
+        maxLines = 1,
+        style = TextStyle(
+            platformStyle = PlatformTextStyle(includeFontPadding = false),
+            lineHeightStyle = LineHeightStyle(
+                alignment = LineHeightStyle.Alignment.Center,
+                trim = LineHeightStyle.Trim.Both
+            )
+        )
+    )
+}
+
+/** Logo square: the shop's uploaded logo when set, else its initials. Used in the
+ *  topbar + drawer (prompt §3 — show the logo, not just letters). */
+@Composable
+private fun LogoMark(
+    shopName: String,
+    size: androidx.compose.ui.unit.Dp = 32.dp,
+    logoUri: String? = null
+) {
     val t = LocalPosTokens.current
+    val context = LocalContext.current
+    var bitmap by remember(logoUri) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    LaunchedEffect(logoUri) {
+        bitmap = logoUri?.takeIf { it.isNotBlank() }?.let { s ->
+            runCatching {
+                context.contentResolver.openInputStream(Uri.parse(s)).use { input ->
+                    android.graphics.BitmapFactory.decodeStream(input)?.asImageBitmap()
+                }
+            }.getOrNull()
+        }
+    }
     Box(
         Modifier.size(size).clip(RoundedCornerShape(size / 3.2f)).background(t.brand.s600),
         contentAlignment = Alignment.Center
     ) {
-        Text(
-            shopName.take(3).uppercase(),
-            color = t.inkOnBrand,
-            fontWeight = FontWeight.Black,
-            fontSize = (size.value * 0.30f).sp,
-            letterSpacing = (-0.5).sp
-        )
+        val bmp = bitmap
+        if (bmp != null) {
+            Image(
+                bmp,
+                contentDescription = "$shopName logo",
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop
+            )
+        } else {
+            Text(
+                shopName.take(3).uppercase(),
+                color = t.inkOnBrand,
+                fontWeight = FontWeight.Black,
+                fontSize = (size.value * 0.30f).sp,
+                letterSpacing = (-0.5).sp
+            )
+        }
     }
 }
 
@@ -1615,7 +1676,7 @@ private fun MobileTopBar(
             IconButton(onClick = onMenu, modifier = Modifier.size(36.dp)) {
                 Icon(Icons.Filled.Menu, contentDescription = "Menu", tint = t.inkSecondary)
             }
-            LogoMark(shopName, 30.dp)
+            LogoMark(shopName, 30.dp, logoUri)
             Text(
                 shopName,
                 color = t.inkPrimary,
@@ -1708,7 +1769,7 @@ private fun BottomNavItem(
                             .size(15.dp).clip(CircleShape).background(t.warning),
                         contentAlignment = Alignment.Center
                     ) {
-                        Text("$badge", color = Color(0xFF1A1A1A), fontSize = 9.sp, fontWeight = FontWeight.Black)
+                        BadgeNumber("$badge", color = Color(0xFF1A1A1A), fontSize = 9.sp)
                     }
                 }
             }
@@ -1783,7 +1844,8 @@ private fun SideDrawer(
     onSelect: (Screen) -> Unit,
     onDismiss: () -> Unit,
     onSwitchUser: () -> Unit,
-    onSignOut: () -> Unit
+    onSignOut: () -> Unit,
+    logoUri: String? = null
 ) {
     val t = LocalPosTokens.current
     Row(
@@ -1799,7 +1861,7 @@ private fun SideDrawer(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                LogoMark(shopName, 36.dp)
+                LogoMark(shopName, 36.dp, logoUri)
                 Column(Modifier.weight(1f)) {
                     Text(shopName, color = t.navInk, fontWeight = FontWeight.Black, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Text("Point of Sale", color = t.navInk.copy(alpha = 0.6f), fontSize = 10.sp)
@@ -1841,7 +1903,12 @@ private fun SideDrawer(
                 }
             }
             HorizontalDivider(color = t.navInk.copy(alpha = 0.12f))
-            Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            // navigationBarsPadding keeps "Sign out" clear of the phone's gesture/recents
+            // bar, which was overlapping it at the very bottom (prompt §3).
+            Column(
+                Modifier.navigationBarsPadding().padding(10.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
                 DrawerAction(Icons.Filled.SwitchAccount, "Switch user", onSwitchUser)
                 DrawerAction(Icons.AutoMirrored.Filled.Logout, "Sign out", onSignOut)
             }
@@ -2147,7 +2214,7 @@ private fun ProductCard(item: Item, currency: String, inCart: Int, onClick: () -
                 Modifier.align(Alignment.TopStart).size(20.dp).clip(CircleShape).background(t.brand.s600),
                 contentAlignment = Alignment.Center
             ) {
-                Text(inCart.toString(), color = t.inkOnBrand, fontSize = 10.sp, fontWeight = FontWeight.Black)
+                BadgeNumber(inCart.toString(), color = t.inkOnBrand, fontSize = 10.sp)
             }
         }
         Column(Modifier.fillMaxSize()) {
@@ -6445,6 +6512,11 @@ private fun ReportsScreen(vm: PosViewModel, business: Business) {
     val summary by vm.reportSummary.collectAsState()
     val breakdown by vm.reportBreakdown.collectAsState()
     val refunds by vm.reportRefunds.collectAsState()
+    val fullyRefunded by vm.reportFullyRefunded.collectAsState()
+    // Net takings: refunded money comes off gross, and a fully-refunded sale stops
+    // counting as a live sale (prompt §5). Gross stays visible in the breakdown.
+    val netSales = (summary.gross - refunds).coerceAtLeast(0.0)
+    val netCount = (summary.count - fullyRefunded).coerceAtLeast(0)
 
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp)
@@ -6472,15 +6544,18 @@ private fun ReportsScreen(vm: PosViewModel, business: Business) {
             )
         ) {
             Column(Modifier.fillMaxWidth().padding(20.dp)) {
-                Text("Total sales", color = MaterialTheme.colorScheme.onPrimaryContainer)
                 Text(
-                    money(summary.gross, currency),
+                    if (refunds > 0.0) "Total sales (net)" else "Total sales",
+                    color = MaterialTheme.colorScheme.onPrimaryContainer
+                )
+                Text(
+                    money(netSales, currency),
                     fontWeight = FontWeight.Bold,
                     fontSize = 30.sp,
                     color = MaterialTheme.colorScheme.onPrimaryContainer
                 )
                 Text(
-                    "${summary.count} sale${if (summary.count == 1) "" else "s"}",
+                    "$netCount sale${if (netCount == 1) "" else "s"}",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onPrimaryContainer
                 )
@@ -6502,12 +6577,13 @@ private fun ReportsScreen(vm: PosViewModel, business: Business) {
                 }
                 ReportStatRow("Discounts given", money(summary.discount, currency))
                 if (refunds > 0.0) {
+                    ReportStatRow("Gross sales", money(summary.gross, currency))
                     ReportStatRow("Refunds paid", "-${money(refunds, currency)}")
                     HorizontalDivider(Modifier.padding(vertical = 6.dp))
-                    ReportStatRow("Net sales", money(summary.gross - refunds, currency))
+                    ReportStatRow("Net sales", money(netSales, currency))
                 }
-                if (summary.count > 0) {
-                    ReportStatRow("Average sale", money(summary.gross / summary.count, currency))
+                if (netCount > 0) {
+                    ReportStatRow("Average sale", money(netSales / netCount, currency))
                 }
             }
         }

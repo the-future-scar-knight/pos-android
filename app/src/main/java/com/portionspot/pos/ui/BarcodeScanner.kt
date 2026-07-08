@@ -12,10 +12,13 @@ import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -28,11 +31,14 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import com.google.zxing.BarcodeFormat
 import com.google.zxing.BinaryBitmap
 import com.google.zxing.DecodeHintType
 import com.google.zxing.MultiFormatReader
@@ -103,14 +109,48 @@ private fun CameraPreview(
     val decoded = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
     val reader = remember {
         MultiFormatReader().apply {
-            setHints(mapOf(DecodeHintType.TRY_HARDER to true))
+            // Zimbabwe retail runs on 1D product barcodes, not QR. Naming the exact
+            // formats we expect makes zxing decode faster and far more reliably than
+            // a blind "try every symbology" pass (which is why QR seemed to be all it
+            // caught). QR/Data Matrix stay in the list so a QR still scans if present.
+            setHints(
+                mapOf(
+                    DecodeHintType.TRY_HARDER to true,
+                    DecodeHintType.POSSIBLE_FORMATS to listOf(
+                        BarcodeFormat.EAN_13,
+                        BarcodeFormat.EAN_8,
+                        BarcodeFormat.UPC_A,
+                        BarcodeFormat.UPC_E,
+                        BarcodeFormat.CODE_128,
+                        BarcodeFormat.CODE_39,
+                        BarcodeFormat.CODE_93,
+                        BarcodeFormat.ITF,
+                        BarcodeFormat.CODABAR,
+                        BarcodeFormat.QR_CODE,
+                        BarcodeFormat.DATA_MATRIX,
+                    ),
+                )
+            )
         }
     }
 
+    // Clip the camera surface to a rounded card so it sits inside the dialog instead
+    // of bleeding to square corners over the dialog's rounded edge (prompt §4).
+    Box(
+        modifier
+            .clip(RoundedCornerShape(14.dp))
+            .background(Color.Black)
+    ) {
     AndroidView(
-        modifier = modifier,
+        modifier = Modifier.fillMaxSize(),
         factory = { ctx ->
-            val previewView = PreviewView(ctx)
+            val previewView = PreviewView(ctx).apply {
+                // COMPATIBLE (TextureView) avoids the SurfaceView punch-through that
+                // can leave the preview mis-seated in a dialog; FILL_CENTER fills the
+                // rounded box without letterbox gaps while keeping the frame upright.
+                implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+                scaleType = PreviewView.ScaleType.FILL_CENTER
+            }
             val providerFuture = ProcessCameraProvider.getInstance(ctx)
             providerFuture.addListener({
                 val provider = providerFuture.get()
@@ -136,6 +176,7 @@ private fun CameraPreview(
             previewView
         }
     )
+    }
 
     DisposableEffect(Unit) {
         onDispose {
