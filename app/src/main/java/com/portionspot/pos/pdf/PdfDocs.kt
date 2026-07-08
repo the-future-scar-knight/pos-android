@@ -160,6 +160,59 @@ object PdfDocs {
         return write(context, doc, "Statement-${customerName.replace(Regex("[^A-Za-z0-9]"), "_").take(20)}")
     }
 
+    /** One priced entry on a price list: a product name, an optional note (e.g. the
+     *  box size "(x12)"), and its price in the chosen basis. */
+    data class PriceListLine(val name: String, val note: String?, val price: Double)
+
+    /**
+     * A price list (§1.2 parity + improvement): products grouped by category, each with
+     * one price (retail or wholesale, box-first — decided by the caller). Paginates over
+     * as many pages as needed. [heading] distinguishes "Retail"/"Wholesale".
+     */
+    fun priceList(
+        context: Context,
+        business: Business,
+        heading: String,
+        currency: String,
+        groups: List<Pair<String, List<PriceListLine>>>
+    ): File {
+        val doc = PdfDocument()
+        var pageNo = 1
+        var page = doc.startPage(PdfDocument.PageInfo.Builder(PAGE_W, PAGE_H, pageNo).create())
+        var c = page.canvas
+        var y = header(c, business)
+        y = title(c, heading.uppercase(), y)
+        y = kv(c, "Generated", dateTime(System.currentTimeMillis()), y)
+        y = rule(c, y)
+
+        fun newPage() {
+            footer(c, business, "Page $pageNo")
+            doc.finishPage(page)
+            pageNo += 1
+            page = doc.startPage(PdfDocument.PageInfo.Builder(PAGE_W, PAGE_H, pageNo).create())
+            c = page.canvas
+            y = MARGIN + 10f
+        }
+
+        for ((cat, items) in groups) {
+            if (y > PAGE_H - MARGIN - 50f) newPage()
+            c.drawText(cat.uppercase(), MARGIN, y, h2Paint)
+            y += 18f
+            for (it in items) {
+                if (y > PAGE_H - MARGIN - 30f) newPage()
+                val label = it.name + (it.note?.let { " $it" } ?: "")
+                c.drawText(clip(label, 380), MARGIN, y, bodyPaint)
+                val priceStr = money(it.price, currency)
+                c.drawText(priceStr, colAmt - bodyPaint.measureText(priceStr), y, boldPaint)
+                y += 15f
+            }
+            y += 8f
+        }
+        footer(c, business, "Page $pageNo")
+        doc.finishPage(page)
+        return write(context, doc, "PriceList")
+    }
+
     // ---- drawing helpers -------------------------------------------------
 
     private val titlePaint = Paint().apply { color = 0xFF111827.toInt(); textSize = 20f; typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD); isAntiAlias = true }

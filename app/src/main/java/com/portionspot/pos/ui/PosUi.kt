@@ -83,6 +83,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Surface
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
@@ -3742,7 +3743,9 @@ private fun shareReceipt(
 private fun ItemsScreen(vm: PosViewModel, currency: String) {
     val t = LocalPosTokens.current
     val items by vm.items.collectAsState()
+    val business by vm.business.collectAsState()
     var showAdd by remember { mutableStateOf(false) }
+    var showPriceList by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<Item?>(null) }
     var search by remember { mutableStateOf("") }
 
@@ -3760,7 +3763,17 @@ private fun ItemsScreen(vm: PosViewModel, currency: String) {
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
             Column(Modifier.fillMaxWidth().background(t.surface1).padding(horizontal = 12.dp, vertical = 8.dp)) {
-                SearchField(value = search, onValue = { search = it }, onClear = { search = "" })
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(Modifier.weight(1f)) {
+                        SearchField(value = search, onValue = { search = it }, onClear = { search = "" })
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    FilledTonalButton(onClick = { showPriceList = true }, enabled = items.isNotEmpty()) {
+                        Icon(Icons.AutoMirrored.Filled.ReceiptLong, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Price list")
+                    }
+                }
             }
             HorizontalDivider(color = t.surfaceBorder)
             if (shown.isEmpty()) {
@@ -3814,9 +3827,168 @@ private fun ItemsScreen(vm: PosViewModel, currency: String) {
     if (showAdd) {
         ItemDialog(vm = vm, existing = null, onClose = { showAdd = false })
     }
+    if (showPriceList) {
+        PriceListDialog(items = items, business = business, currency = currency, onDismiss = { showPriceList = false })
+    }
     editing?.let { current ->
         ItemDialog(vm = vm, existing = current, onClose = { editing = null })
     }
+}
+
+/** A price-list line resolved for one basis (retail or wholesale, box-first). */
+private data class PricedItem(val name: String, val category: String, val note: String?, val price: Double)
+
+/**
+ * Resolve the catalogue into priced lines for the chosen [basis] ("retail" or
+ * "wholesale"). Wholesale is box-first (a real box quotes the box price with an
+ * "(x N)" note; otherwise the per-unit wholesale price); retail uses the retail
+ * price. Items with no price in the basis are dropped. Inventory order is kept.
+ */
+private fun priceCatalogue(items: List<Item>, basis: String): List<PricedItem> =
+    items.filter { it.isActive && !it.deleted }.mapNotNull { p ->
+        val cat = p.category?.takeIf { it.isNotBlank() } ?: "Uncategorised"
+        if (basis == "retail") {
+            if (p.price > 0.0) PricedItem(p.name, cat, null, p.price) else null
+        } else {
+            val hasBox = p.boxSize > 1 && p.boxPrice > 0.0
+            when {
+                hasBox -> PricedItem(p.name, cat, "(x${p.boxSize})", p.boxPrice)
+                p.wholesalePrice > 0.0 -> PricedItem(p.name, cat, null, p.wholesalePrice)
+                else -> null
+            }
+        }
+    }
+
+/**
+ * Price-list generator (web Inventory "Wholesale Price List" parity + improvement).
+ * Improvement over the web: a Retail vs Wholesale basis toggle (web was wholesale-only)
+ * and a proper saved/shared PDF via [PdfDocs.priceList]. Pick categories, then share
+ * the list as WhatsApp text or a PDF. Prices are box-first for wholesale.
+ */
+@Composable
+private fun PriceListDialog(
+    items: List<Item>,
+    business: Business?,
+    currency: String,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    var basis by remember { mutableStateOf("wholesale") }        // "wholesale" | "retail"
+    val priced = remember(items, basis) { priceCatalogue(items, basis) }
+    val orderedCategories = remember(priced) {
+        val seen = LinkedHashSet<String>()
+        priced.forEach { seen.add(it.category) }
+        seen.toList()
+    }
+    // Selected categories; re-seeded to "all" whenever the category set changes.
+    var selected by remember(orderedCategories) { mutableStateOf(orderedCategories.toSet()) }
+    val groups = remember(priced, selected, orderedCategories) {
+        orderedCategories.filter { it in selected }
+            .map { cat -> cat to priced.filter { it.category == cat } }
+            .filter { it.second.isNotEmpty() }
+    }
+    val itemCount = groups.sumOf { it.second.size }
+    val heading = if (basis == "retail") "Retail Price List" else "Wholesale Price List"
+
+    fun buildText(): String {
+        val sb = StringBuilder()
+        sb.appendLine("*${business?.name?.takeIf { it.isNotBlank() } ?: "PortionSpot"} — $heading*")
+        business?.phone?.takeIf { it.isNotBlank() }?.let { sb.appendLine(it) }
+        sb.appendLine("Updated: ${SimpleDateFormat("dd MMM yyyy", Locale.getDefault()).format(Date())}")
+        groups.forEach { (cat, list) ->
+            sb.appendLine()
+            sb.appendLine("*${cat.uppercase()}*")
+            list.forEach { p ->
+                sb.appendLine("  ${p.name}${p.note?.let { " $it" } ?: ""} — ${money(p.price, currency)}")
+            }
+        }
+        return sb.toString().trim()
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+        title = { Text("Price list") },
+        text = {
+            Column {
+                // Basis toggle (the improvement over the web's wholesale-only list).
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(selected = basis == "wholesale", onClick = { basis = "wholesale" }, label = { Text("Wholesale") })
+                    FilterChip(selected = basis == "retail", onClick = { basis = "retail" }, label = { Text("Retail") })
+                }
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    if (basis == "wholesale") "Box-first: a boxed item shows its box price."
+                    else "Retail (per-unit) prices for a customer-facing list.",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(10.dp))
+                if (orderedCategories.isEmpty()) {
+                    Text("No priced items for this basis.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                } else {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Categories", modifier = Modifier.weight(1f), fontWeight = FontWeight.SemiBold)
+                        TextButton(onClick = { selected = orderedCategories.toSet() }) { Text("All") }
+                        TextButton(onClick = { selected = emptySet() }) { Text("None") }
+                    }
+                    Column(
+                        Modifier.heightIn(max = 220.dp).verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        orderedCategories.forEach { cat ->
+                            val on = cat in selected
+                            Row(
+                                Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
+                                    .clickable { selected = if (on) selected - cat else selected + cat }
+                                    .padding(horizontal = 8.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Checkbox(checked = on, onCheckedChange = { selected = if (on) selected - cat else selected + cat })
+                                Spacer(Modifier.width(6.dp))
+                                Text(cat, modifier = Modifier.weight(1f))
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Text("$itemCount item${if (itemCount == 1) "" else "s"} · ${groups.size}/${orderedCategories.size} categories",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.height(12.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = {
+                                val send = Intent(Intent.ACTION_SEND).apply {
+                                    type = "text/plain"; putExtra(Intent.EXTRA_TEXT, buildText())
+                                }
+                                runCatching { context.startActivity(Intent(send).setPackage("com.whatsapp")) }
+                                    .getOrElse { context.startActivity(Intent.createChooser(send, "Share price list")) }
+                            },
+                            enabled = itemCount > 0,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(Icons.Filled.Share, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp)); Text("Text")
+                        }
+                        Button(
+                            onClick = {
+                                val biz = business ?: return@Button
+                                val file = PdfDocs.priceList(
+                                    context, biz, heading, currency,
+                                    groups.map { (c, list) -> c to list.map { PdfDocs.PriceListLine(it.name, it.note, it.price) } }
+                                )
+                                PdfFiles.share(context, file, heading)
+                            },
+                            enabled = itemCount > 0 && business != null,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(Icons.Filled.Print, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp)); Text("PDF")
+                        }
+                    }
+                }
+            }
+        }
+    )
 }
 
 /**
