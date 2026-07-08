@@ -1105,6 +1105,7 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
     var showAddCashier by remember { mutableStateOf(false) }
     var resetConfirm by remember { mutableStateOf(false) }
     var dedupeConfirm by remember { mutableStateOf(false) }
+    var resetPwFor by remember { mutableStateOf<com.portionspot.pos.auth.StaffRow?>(null) }
     val staff by vm.staff.collectAsState()
     val syncConnection by vm.connection.collectAsState()
     LaunchedEffect(syncConnection) { if (syncConnection != null) vm.refreshStaff() }
@@ -1310,6 +1311,7 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
                                 color = if (s.active) t.inkTertiary else t.danger, fontSize = 11.sp
                             )
                         }
+                        TextButton(onClick = { resetPwFor = s }) { Text("Reset PW") }
                         // Admins aren't toggled here; only cashiers are (de)activated.
                         if (s.role != "admin") {
                             Switch(checked = s.active, onCheckedChange = { on -> vm.setCashierActive(s.id, on) })
@@ -1362,6 +1364,13 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
         AddCashierDialog(
             onDismiss = { showAddCashier = false },
             onCreate = { email, pass, name, cb -> vm.createCashier(email, pass, name, "cashier", cb) }
+        )
+    }
+    resetPwFor?.let { s ->
+        ResetPasswordDialog(
+            staffName = s.displayName.ifBlank { "this account" },
+            onDismiss = { resetPwFor = null },
+            onReset = { pass, cb -> vm.resetCashierPassword(s.id, pass, cb) }
         )
     }
     if (dedupeConfirm) {
@@ -1489,6 +1498,70 @@ private fun AddCashierDialog(
                 OutlinedTextField(email, { email = it }, label = { Text("Email") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                 Spacer(Modifier.height(6.dp))
                 OutlinedTextField(password, { password = it }, label = { Text("Password (6+ characters)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                error?.let {
+                    Spacer(Modifier.height(6.dp))
+                    Text(it, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+                }
+            }
+        }
+    )
+}
+
+/** Admin dialog to reset a staff member's password via the create-cashier Edge Function. */
+@Composable
+private fun ResetPasswordDialog(
+    staffName: String,
+    onDismiss: () -> Unit,
+    onReset: (String, (com.portionspot.pos.auth.StaffResult) -> Unit) -> Unit,
+) {
+    val context = LocalContext.current
+    var password by remember { mutableStateOf("") }
+    var confirm by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    val valid = password.length >= 6 && password == confirm
+    AlertDialog(
+        onDismissRequest = { if (!busy) onDismiss() },
+        confirmButton = {
+            Button(
+                enabled = valid && !busy,
+                onClick = {
+                    busy = true; error = null
+                    onReset(password) { res ->
+                        busy = false
+                        when (res) {
+                            is com.portionspot.pos.auth.StaffResult.Ok -> {
+                                Toast.makeText(context, "Password reset for $staffName", Toast.LENGTH_SHORT).show()
+                                onDismiss()
+                            }
+                            is com.portionspot.pos.auth.StaffResult.Err -> error = res.message
+                        }
+                    }
+                }
+            ) { Text(if (busy) "Resetting…" else "Reset password") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss, enabled = !busy) { Text("Cancel") } },
+        title = { Text("Reset password") },
+        text = {
+            Column {
+                Text(
+                    "Set a new password for $staffName. They'll sign in with it on their device (and re-add the account if their old session was cleared).",
+                    fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    password, { password = it },
+                    label = { Text("New password (6+ characters)") }, singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(6.dp))
+                OutlinedTextField(
+                    confirm, { confirm = it },
+                    label = { Text("Confirm password") }, singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth()
+                )
                 error?.let {
                     Spacer(Modifier.height(6.dp))
                     Text(it, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)

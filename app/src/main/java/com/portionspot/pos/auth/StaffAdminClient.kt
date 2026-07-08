@@ -77,6 +77,9 @@ class StaffAdminClient(
     fun setActive(staffId: String, active: Boolean): StaffResult =
         callFn("{\"action\":\"set_active\",\"staffId\":${q(staffId)},\"active\":$active}")
 
+    fun resetPassword(staffId: String, password: String): StaffResult =
+        callFn("{\"action\":\"reset_password\",\"staffId\":${q(staffId)},\"password\":${q(password)}}")
+
     private fun callFn(body: String): StaffResult = try {
         val req = Request.Builder()
             .url("${connection.url}/functions/v1/create-cashier")

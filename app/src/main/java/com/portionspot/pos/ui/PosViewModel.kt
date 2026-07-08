@@ -1189,6 +1189,19 @@ class PosViewModel(
         }
     }
 
+    /** Reset a staff member's password (admin-only, via the Edge Function). */
+    fun resetCashierPassword(
+        staffId: String, password: String,
+        onResult: (com.portionspot.pos.auth.StaffResult) -> Unit = {},
+    ) {
+        viewModelScope.launch {
+            val client = staffClient()
+                ?: return@launch onResult(com.portionspot.pos.auth.StaffResult.Err("Connect cloud sync first"))
+            val r = withContext(Dispatchers.IO) { client.resetPassword(staffId, password) }
+            onResult(r)
+        }
+    }
+
     /** Activate/deactivate a staff member (admin-only delete = deactivate). */
     fun setCashierActive(
         staffId: String, active: Boolean,
