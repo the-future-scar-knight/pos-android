@@ -75,6 +75,10 @@ interface ItemDao {
     @Query("UPDATE items SET stockQty = 0, updatedAt = :at, pendingSync = 1 WHERE businessId = :businessId")
     suspend fun resetAllStock(businessId: String, at: Long)
 
+    /** Hard-delete one item (used to merge a duplicate catalogue row; never synced). */
+    @Query("DELETE FROM items WHERE id = :id")
+    suspend fun hardDelete(id: String)
+
     // ---- sync ----
     @Query("SELECT * FROM items WHERE pendingSync = 1")
     suspend fun pending(): List<Item>

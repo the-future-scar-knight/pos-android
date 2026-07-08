@@ -203,18 +203,40 @@ class PosSyncEngine(
         return applied
     }
 
-    /** products → items, bridged by sku (the cloud has no per-row local id here). */
+    /**
+     * products → items, bridged by sku (the cloud has no per-row local id here).
+     *
+     * Matching is deliberately forgiving to avoid DUPLICATES: a cloud product is joined
+     * to an existing local item by trimmed/case-folded sku; failing that (an item added
+     * on-device with no sku, or from an older build), by trimmed/case-folded NAME among
+     * the sku-less local items — so it's absorbed and adopts the cloud sku instead of
+     * inserting a second copy. Each sku-less local item can be claimed only once. Cloud
+     * rows sharing a sku are also collapsed to the newest, so a data glitch upstream
+     * can't fan out into two local rows. Only genuinely new products insert a fresh row.
+     */
     private suspend fun pullProducts(api: SupabaseRest, bid: String): Int {
         val rows = syncJson.decodeFromString<List<ProductDto>>(
             api.selectSince("products", config.cursor("products"), PAGE)
         )
         if (rows.isEmpty()) return 0
-        val bySku = itemDao.allForBusinessOnce(bid)
-            .filter { !it.sku.isNullOrBlank() }
-            .associateBy { it.sku!!.lowercase() }
+        val localAll = itemDao.allForBusinessOnce(bid)
+        val bySku = localAll.filter { !it.sku.isNullOrBlank() }
+            .associateBy { it.sku!!.trim().lowercase() }
+        // Mutable so a sku-less local item is claimed by at most one cloud product.
+        val byNameNoSku = localAll.filter { it.sku.isNullOrBlank() }
+            .associateBy { it.name.trim().lowercase() }
+            .toMutableMap()
+        // Collapse duplicate-sku cloud rows to the newest (blank skus are NOT grouped —
+        // that would wrongly merge every un-skued product into one).
+        val (skued, blank) = rows.partition { it.sku.isNotBlank() }
+        val toApply = skued.groupBy { it.sku.trim().lowercase() }
+            .map { (_, g) -> g.maxByOrNull { IsoTime.toMillis(it.updatedAt) }!! } + blank
+
         var applied = 0
-        for (dto in rows) {
-            val local = bySku[dto.sku.lowercase()]
+        for (dto in toApply) {
+            val skuKey = dto.sku.trim().lowercase()
+            val local = (if (skuKey.isNotEmpty()) bySku[skuKey] else null)
+                ?: byNameNoSku.remove(dto.name.trim().lowercase())
             if (local == null || IsoTime.toMillis(dto.updatedAt) > local.updatedAt) {
                 itemDao.upsert(dto.toItem(bid, local))
                 applied++

@@ -84,6 +84,39 @@ class PosRepository(private val db: PosDatabase) {
      * to clear local TEST data before enabling push. Keeps the business profile,
      * device settings (printer/theme) and the cloud connection.
      */
+    /**
+     * Merge duplicate catalogue items in place — WITHOUT touching sales/customers, so it
+     * is safe to run on a live device (unlike [resetLocalData]). Two safe rules:
+     *  1. items sharing a sku (case/space-folded) are the same product → keep the newest,
+     *     hard-delete the rest.
+     *  2. a sku-less item whose name uniquely matches ONE sku'd item is a hand-added
+     *     duplicate of that cloud product → hard-delete it (the sku'd row is canonical).
+     * Ambiguous name matches (0 or >1) are left alone. Returns how many rows were removed.
+     */
+    suspend fun dedupeItems(): Int {
+        val bid = businessDao.getOnce()?.id ?: return 0
+        var removed = 0
+        db.withTransaction {
+            val items = itemDao.allForBusinessOnce(bid).filter { !it.deleted }
+            // 1) exact-sku duplicates
+            val keptBySku = mutableListOf<Item>()
+            items.filter { !it.sku.isNullOrBlank() }
+                .groupBy { it.sku!!.trim().lowercase() }
+                .forEach { (_, group) ->
+                    val keep = group.maxByOrNull { it.updatedAt }!!
+                    keptBySku += keep
+                    group.filter { it.id != keep.id }.forEach { itemDao.hardDelete(it.id); removed++ }
+                }
+            // 2) sku-less item absorbed into a UNIQUE same-name sku'd item
+            val skuedByName = keptBySku.groupBy { it.name.trim().lowercase() }
+            items.filter { it.sku.isNullOrBlank() }.forEach { item ->
+                val match = skuedByName[item.name.trim().lowercase()]
+                if (match != null && match.size == 1) { itemDao.hardDelete(item.id); removed++ }
+            }
+        }
+        return removed
+    }
+
     suspend fun resetLocalData() {
         val bid = businessDao.getOnce()?.id ?: return
         db.withTransaction {
@@ -619,8 +652,22 @@ class PosRepository(private val db: PosDatabase) {
      * twice. Ad-hoc lines without an item id are dropped (they can't re-price).
      */
     suspend fun resumeParked(saleId: String): List<CartLine> {
-        val lines = saleDao.linesForSale(saleId)
-        val cart = lines.mapNotNull { l ->
+        val cart = saleLinesToCart(saleId)
+        db.withTransaction {
+            saleDao.hardDeletePayments(saleId)
+            saleDao.hardDeleteLines(saleId)
+            saleDao.hardDeleteSale(saleId)
+        }
+        return cart
+    }
+
+    /**
+     * Rebuild an in-memory cart from a saved sale/quote's lines WITHOUT deleting it —
+     * used to turn an accepted quote into a live sale (the quote record is kept).
+     * Ad-hoc lines with no item id are dropped (they can't be re-priced).
+     */
+    suspend fun saleLinesToCart(saleId: String): List<CartLine> =
+        saleDao.linesForSale(saleId).mapNotNull { l ->
             val itemId = l.itemId ?: return@mapNotNull null
             CartLine(
                 itemId = itemId,
@@ -632,13 +679,6 @@ class PosRepository(private val db: PosDatabase) {
                 unitsPerLine = l.unitsPerLine
             )
         }
-        db.withTransaction {
-            saleDao.hardDeletePayments(saleId)
-            saleDao.hardDeleteLines(saleId)
-            saleDao.hardDeleteSale(saleId)
-        }
-        return cart
-    }
 
     // ---- inventory: stock movements & adjustments -------------------------
 

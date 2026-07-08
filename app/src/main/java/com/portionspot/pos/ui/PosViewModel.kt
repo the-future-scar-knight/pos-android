@@ -555,6 +555,15 @@ class PosViewModel(
             .flatMapLatest { repo.quotesFlow(it) }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
+    /** Load an accepted quote's items into the cart (the quote record is kept) so the
+     *  cashier can ring it up as a normal sale. Replaces the current cart. */
+    fun loadQuoteToCart(quoteId: String, onDone: () -> Unit = {}) {
+        viewModelScope.launch {
+            _cart.value = repo.saleLinesToCart(quoteId)
+            onDone()
+        }
+    }
+
     /** Create a customer on the fly from a typed name, then hand it back. */
     fun createCustomer(name: String, phone: String? = null, onCreated: (Customer) -> Unit) {
         val bid = businessId.value ?: return
@@ -1191,6 +1200,15 @@ class PosViewModel(
             val r = withContext(Dispatchers.IO) { client.setActive(staffId, active) }
             if (r is com.portionspot.pos.auth.StaffResult.Ok) refreshStaff()
             onResult(r)
+        }
+    }
+
+    /** Merge duplicate catalogue items (safe — leaves sales/customers alone). Reports
+     *  how many rows were removed. See [PosRepository.dedupeItems]. */
+    fun dedupeItems(onDone: (Int) -> Unit = {}) {
+        viewModelScope.launch {
+            val removed = repo.dedupeItems()
+            onDone(removed)
         }
     }
 
