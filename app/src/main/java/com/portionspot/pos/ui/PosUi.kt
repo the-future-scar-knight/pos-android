@@ -1104,6 +1104,7 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
     var countedCash by remember { mutableStateOf("") }
     var showAddCashier by remember { mutableStateOf(false) }
     var resetConfirm by remember { mutableStateOf(false) }
+    var dedupeConfirm by remember { mutableStateOf(false) }
     val staff by vm.staff.collectAsState()
     val syncConnection by vm.connection.collectAsState()
     LaunchedEffect(syncConnection) { if (syncConnection != null) vm.refreshStaff() }
@@ -1327,6 +1328,18 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
             }
         }
 
+        // ---- Catalogue maintenance (safe — leaves sales/customers alone) ----
+        item { AdminSectionHeader("Catalogue") }
+        item {
+            Text(
+                "If a cloud sync left duplicate products (e.g. a hand-added item plus its cloud copy), merge them here. Your sales and customers are not touched.",
+                color = t.inkTertiary, fontSize = 12.sp
+            )
+        }
+        item {
+            OutlinedButton(onClick = { dedupeConfirm = true }) { Text("Remove duplicate items") }
+        }
+
         // ---- Danger zone ----
         item { AdminSectionHeader("Danger zone") }
         item {
@@ -1349,6 +1362,25 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
         AddCashierDialog(
             onDismiss = { showAddCashier = false },
             onCreate = { email, pass, name, cb -> vm.createCashier(email, pass, name, "cashier", cb) }
+        )
+    }
+    if (dedupeConfirm) {
+        val ctx = LocalContext.current
+        ConfirmDialog(
+            title = "Remove duplicate items?",
+            message = "Merges catalogue duplicates: items sharing a code (SKU), and a hand-added item whose name uniquely matches a cloud product. The cloud copy is kept. Your sales and customers are not touched.",
+            confirmLabel = "Merge duplicates",
+            onConfirm = {
+                dedupeConfirm = false
+                vm.dedupeItems { n ->
+                    Toast.makeText(
+                        ctx,
+                        if (n > 0) "Merged $n duplicate item${if (n == 1) "" else "s"}" else "No duplicate items found",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            },
+            onDismiss = { dedupeConfirm = false }
         )
     }
     if (resetConfirm) {
@@ -3844,7 +3876,7 @@ private data class PricedItem(val name: String, val category: String, val note: 
  * "(x N)" note; otherwise the per-unit wholesale price); retail uses the retail
  * price. Items with no price in the basis are dropped. Inventory order is kept.
  */
-private fun priceCatalogue(items: List<Item>, basis: String): List<PricedItem> =
+private fun priceCatalogue(items: List<Item>, basis: String, showUnit: Boolean, currency: String): List<PricedItem> =
     items.filter { it.isActive && !it.deleted }.mapNotNull { p ->
         val cat = p.category?.takeIf { it.isNotBlank() } ?: "Uncategorised"
         if (basis == "retail") {
@@ -3852,7 +3884,13 @@ private fun priceCatalogue(items: List<Item>, basis: String): List<PricedItem> =
         } else {
             val hasBox = p.boxSize > 1 && p.boxPrice > 0.0
             when {
-                hasBox -> PricedItem(p.name, cat, "(x${p.boxSize})", p.boxPrice)
+                hasBox -> {
+                    val note = buildString {
+                        append("(x${p.boxSize})")
+                        if (showUnit && p.wholesalePrice > 0.0) append(" · ${money(p.wholesalePrice, currency)}/unit")
+                    }
+                    PricedItem(p.name, cat, note, p.boxPrice)
+                }
                 p.wholesalePrice > 0.0 -> PricedItem(p.name, cat, null, p.wholesalePrice)
                 else -> null
             }
@@ -3874,7 +3912,8 @@ private fun PriceListDialog(
 ) {
     val context = LocalContext.current
     var basis by remember { mutableStateOf("wholesale") }        // "wholesale" | "retail"
-    val priced = remember(items, basis) { priceCatalogue(items, basis) }
+    var showUnit by remember { mutableStateOf(false) }           // add "$X/unit" on box lines
+    val priced = remember(items, basis, showUnit, currency) { priceCatalogue(items, basis, showUnit, currency) }
     val orderedCategories = remember(priced) {
         val seen = LinkedHashSet<String>()
         priced.forEach { seen.add(it.category) }
@@ -3923,6 +3962,12 @@ private fun PriceListDialog(
                     else "Retail (per-unit) prices for a customer-facing list.",
                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+                if (basis == "wholesale") {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Show unit price on boxes", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                        Switch(checked = showUnit, onCheckedChange = { showUnit = it })
+                    }
+                }
                 Spacer(Modifier.height(10.dp))
                 if (orderedCategories.isEmpty()) {
                     Text("No priced items for this basis.", color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -4764,6 +4809,41 @@ private fun CustomerDetailDialog(
                     Icon(Icons.Filled.Share, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(6.dp))
                     Text("Share debt statement PDF")
+                }
+                // Change/refund statement (§5) — money the shop owes THIS customer.
+                // Only shown when there's change/refund ledger activity to report.
+                val changeTypes = remember { setOf("change_owed", "refund_owed", "change_paid", "refund_paid") }
+                if (history.any { it.type in changeTypes }) {
+                    TextButton(
+                        onClick = {
+                            val biz = bizForPdf ?: return@TextButton
+                            val entries = history.sortedBy { it.createdAt }
+                                .filter { it.type in changeTypes }
+                                .map {
+                                    val owed = it.type == "change_owed" || it.type == "refund_owed"
+                                    PdfDocs.StatementEntry(
+                                        date = it.createdAt,
+                                        label = when (it.type) {
+                                            "change_owed" -> "Change owed"
+                                            "refund_owed" -> "Refund owed"
+                                            "change_paid" -> "Change paid"
+                                            else -> "Refund paid"
+                                        },
+                                        amount = if (owed) it.amount else -it.amount
+                                    )
+                                }
+                            pdfScope.launch {
+                                val file = withContext(Dispatchers.IO) {
+                                    PdfDocs.customerStatement(pdfCtx, biz, "Change & Refund Statement", customer.name, entries)
+                                }
+                                PdfFiles.share(pdfCtx, file, "Change statement — ${customer.name}")
+                            }
+                        }
+                    ) {
+                        Icon(Icons.Filled.Share, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Share change/refund statement PDF")
+                    }
                 }
                 Spacer(Modifier.height(4.dp))
                 HorizontalDivider()
@@ -6514,6 +6594,7 @@ private fun QuotesList(
         }
         return
     }
+    val ctx = LocalContext.current
     val now = System.currentTimeMillis()
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(12.dp)) {
         items(quotes, key = { it.id }) { q ->
@@ -6533,6 +6614,13 @@ private fun QuotesList(
                     )
                 }
                 Text(money(q.total, currency), fontWeight = FontWeight.Bold)
+                IconButton(onClick = {
+                    vm.loadQuoteToCart(q.id) {
+                        Toast.makeText(ctx, "Loaded into cart — open Sell to check out", Toast.LENGTH_SHORT).show()
+                    }
+                }) {
+                    Icon(Icons.Filled.ShoppingCart, contentDescription = "Load quote into cart")
+                }
                 IconButton(onClick = { printer.printReceipt(business, q) { vm.loadLines(q.id) } }) {
                     Icon(Icons.Filled.Print, contentDescription = "Reprint quote")
                 }
