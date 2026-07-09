@@ -8,6 +8,7 @@ import com.portionspot.pos.data.MobileMoneyDao
 import com.portionspot.pos.data.RefundDao
 import com.portionspot.pos.data.SaleDao
 import com.portionspot.pos.data.SalePaymentDao
+import com.portionspot.pos.media.ProductImages
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.decodeFromString
@@ -82,7 +83,35 @@ class PosSyncEngine(
         var n = 0
 
         // products — only locally-edited items that carry a sku (the cloud conflict key).
-        val products = itemDao.pending().filter { !it.sku.isNullOrBlank() && !it.deleted }
+        // First resolve any pending product image: upload the local copy to Storage and
+        // swap in the resulting public URL. An item whose upload fails is dropped from
+        // THIS push (its row stays pending) so it retries next pass instead of shipping
+        // a device-local path as image_url.
+        val pendingProducts = itemDao.pending().filter { !it.sku.isNullOrBlank() && !it.deleted }
+        val products = pendingProducts.mapNotNull { item ->
+            if (!item.imagePending) return@mapNotNull item
+            val bytes = ProductImages.readBytes(item.imageLocalPath)
+            if (bytes == null) {
+                // Removed image, or the local file vanished: clear the flag and push the
+                // (possibly null) image_url as-is so the cleared state reaches the cloud.
+                val cleared = item.copy(imagePending = false)
+                itemDao.upsert(cleared)
+                cleared
+            } else {
+                try {
+                    val path = ProductImages.objectPath(bid, item.id)
+                    api.uploadObject("product-images", path, bytes, ProductImages.CONTENT_TYPE)
+                    val uploaded = item.copy(
+                        imageUrl = api.publicUrl("product-images", path),
+                        imagePending = false,
+                    )
+                    itemDao.upsert(uploaded)
+                    uploaded
+                } catch (_: Exception) {
+                    null   // leave pending; skip this cycle and retry on the next sync
+                }
+            }
+        }
         if (products.isNotEmpty()) {
             api.upsert("products", syncJson.encodeToString(products.map { it.toProductPush() }), "sku")
             itemDao.markSynced(products.map { it.id })

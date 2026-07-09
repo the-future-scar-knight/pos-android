@@ -119,6 +119,48 @@ class SupabaseRest(
         }
     }
 
+    // ── Storage (product images) ──────────────────────────────────────────────
+    private fun storage(bucket: String, objectPath: String) =
+        "$baseUrl/storage/v1/object/$bucket/$objectPath"
+
+    /**
+     * Upload [bytes] to `<bucket>/<objectPath>`, overwriting any existing object
+     * (`x-upsert: true`). Returns true on success. RLS on storage.objects must allow
+     * the signed-in staff user to write the bucket. Throws on transport failure so the
+     * caller can decide whether to retry (the sync engine catches + leaves it pending).
+     */
+    fun uploadObject(bucket: String, objectPath: String, bytes: ByteArray, contentType: String): Boolean {
+        val url = storage(bucket, objectPath).toHttpUrlOrNull() ?: throw IOException("Bad URL")
+        val req = Request.Builder().url(url)
+            .post(bytes.toRequestBody(contentType.toMediaType()))
+            .authed()
+            .header("x-upsert", "true")
+            .header("Content-Type", contentType)
+            .build()
+        client.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) {
+                val body = resp.body?.string().orEmpty()
+                throw IOException("upload $bucket/$objectPath: HTTP ${resp.code} $body")
+            }
+            return true
+        }
+    }
+
+    /** Best-effort delete of a storage object; false on any non-success (never throws). */
+    fun deleteObject(bucket: String, objectPath: String): Boolean {
+        val url = storage(bucket, objectPath).toHttpUrlOrNull() ?: return false
+        return try {
+            client.newCall(Request.Builder().url(url).delete().authed().build()).execute()
+                .use { it.isSuccessful }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /** Public URL for an object in a PUBLIC bucket (no auth needed to read). */
+    fun publicUrl(bucket: String, objectPath: String): String =
+        "$baseUrl/storage/v1/object/public/$bucket/$objectPath"
+
     private fun Request.Builder.authed() = this
         .header("apikey", anonKey)
         .header("Authorization", "Bearer ${accessToken() ?: anonKey}")

@@ -12,7 +12,9 @@ import android.os.Build
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.ManagedActivityResultLauncher
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import coil.compose.AsyncImage
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -49,6 +51,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.AddPhotoAlternate
 import androidx.compose.material.icons.filled.AdminPanelSettings
 import androidx.compose.material.icons.automirrored.filled.Assignment
 import androidx.compose.material.icons.automirrored.filled.Logout
@@ -154,6 +157,7 @@ import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material.icons.filled.WifiOff
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.TextStyle
@@ -168,6 +172,7 @@ import com.portionspot.pos.data.Customer
 import com.portionspot.pos.data.CustomerWithBalance
 import com.portionspot.pos.data.DebtAgingRow
 import com.portionspot.pos.device.CallLogAccess
+import com.portionspot.pos.media.ProductImages
 import com.portionspot.pos.device.PickedContact
 import com.portionspot.pos.device.RecentCall
 import com.portionspot.pos.device.phoneKey
@@ -2184,6 +2189,30 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
 }
 
 /**
+ * A product image loaded from the on-device copy first (offline-first, instant),
+ * falling back to the remote Supabase Storage URL (Coil memory/disk caches it).
+ * Renders nothing when [model] is blank, so products with no image are unaffected.
+ */
+@Composable
+private fun ProductImage(
+    model: String?,
+    contentDescription: String?,
+    modifier: Modifier = Modifier,
+    shape: Shape = RoundedCornerShape(10.dp),
+) {
+    if (model.isNullOrBlank()) return
+    AsyncImage(
+        model = model,
+        contentDescription = contentDescription,
+        contentScale = ContentScale.Crop,
+        modifier = modifier.clip(shape),
+    )
+}
+
+/** The display model for an item's image: local copy first, else the remote URL. */
+private val Item.imageModel: String? get() = imageLocalPath ?: imageUrl
+
+/**
  * Web-faithful product card: white tile, retail price dominant in brand-600,
  * name, then Box / WS secondary prices, SKU at the foot. A cart-count bubble
  * (top-left) and stock badge (top-right) float over a reserved top band.
@@ -2196,6 +2225,7 @@ private fun ProductCard(item: Item, currency: String, inCart: Int, onClick: () -
     val isOut = tracked && units <= 0.0
     val hasBox = item.boxSize > 1 && item.boxPrice > 0.0
     val hasWs = item.wholesalePrice > 0.0
+    val heroImage = item.imageModel?.takeIf { item.showImage }
 
     Box(
         Modifier
@@ -2218,7 +2248,18 @@ private fun ProductCard(item: Item, currency: String, inCart: Int, onClick: () -
             }
         }
         Column(Modifier.fillMaxSize()) {
-            Spacer(Modifier.height(20.dp)) // reserved band for bubble + stock badge
+            if (heroImage != null) {
+                // Photo hero. Badges float over its top corners; text sits below.
+                ProductImage(
+                    model = heroImage,
+                    contentDescription = item.name,
+                    modifier = Modifier.fillMaxWidth().height(56.dp),
+                    shape = RoundedCornerShape(10.dp),
+                )
+                Spacer(Modifier.height(6.dp))
+            } else {
+                Spacer(Modifier.height(20.dp)) // reserved band for bubble + stock badge
+            }
             Text(
                 money(item.price, currency),
                 color = t.brand.s600, fontWeight = FontWeight.Black, fontSize = 16.sp, maxLines = 1
@@ -3963,6 +4004,17 @@ private fun ItemsScreen(vm: PosViewModel, currency: String) {
                             modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
                         ) {
                             Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                                // Leading thumbnail when the product has an image (shown
+                                // here regardless of "show on card" — this is the manage view).
+                                item.imageModel?.let { model ->
+                                    ProductImage(
+                                        model = model,
+                                        contentDescription = item.name,
+                                        modifier = Modifier.size(44.dp),
+                                        shape = RoundedCornerShape(8.dp),
+                                    )
+                                    Spacer(Modifier.width(12.dp))
+                                }
                                 Column(Modifier.weight(1f)) {
                                     Text(item.name, fontWeight = FontWeight.Medium)
                                     if (item.trackStock) {
@@ -4220,6 +4272,31 @@ private fun ItemDialog(
     }
     var showHistory by remember { mutableStateOf(false) }
 
+    // ── Product image ──
+    // [imageLocalPath] is the on-device copy to display/save; [imageChanged] tracks
+    // whether the user picked or removed an image this session (so an edit marks the
+    // image pending re-upload / clears the cloud URL). [showImage] mirrors show_image.
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var imageLocalPath by remember { mutableStateOf(existing?.imageLocalPath) }
+    var imageChanged by remember { mutableStateOf(false) }
+    var showImage by remember { mutableStateOf(existing?.showImage ?: true) }
+    val imagePreviewModel = imageLocalPath ?: existing?.imageUrl?.takeIf { !imageChanged }
+    val photoPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickVisualMedia()
+    ) { uri: Uri? ->
+        if (uri != null) scope.launch {
+            val saved = withContext(Dispatchers.IO) { ProductImages.saveLocalCopy(context, uri) }
+            if (saved != null) {
+                // Drop the previous session-staged copy to avoid orphan files.
+                imageLocalPath?.takeIf { it != existing?.imageLocalPath }
+                    ?.let { ProductImages.deleteLocal(it) }
+                imageLocalPath = saved
+                imageChanged = true
+            }
+        }
+    }
+
     val priceVal = price.toDoubleOrNull()
     val taxVal = tax.toDoubleOrNull() ?: 0.0
     val costVal = cost.toDoubleOrNull()
@@ -4248,9 +4325,22 @@ private fun ItemDialog(
                             barcode = barcode.trim().ifBlank { null },
                             taxRate = taxVal, trackStock = track, stockQty = stockVal,
                             reorderLevel = reorder.toDoubleOrNull() ?: 0.0,
-                            cost = costVal, unit = unitText
+                            cost = costVal, unit = unitText,
+                            imageLocalPath = imageLocalPath, showImage = showImage
                         )
                     } else {
+                        // Resolve the image fields. Untouched → keep as-is; removed →
+                        // clear url+path and mark pending (so the clear reaches the cloud);
+                        // added/replaced → new local path, mark pending for Storage upload.
+                        val (finalPath, finalUrl, finalPending) = when {
+                            !imageChanged -> Triple(existing.imageLocalPath, existing.imageUrl, existing.imagePending)
+                            imageLocalPath == null -> Triple(null, null, true)
+                            else -> Triple(imageLocalPath, existing.imageUrl, true)
+                        }
+                        // Free the previous committed local copy when it was replaced/removed.
+                        if (imageChanged && existing.imageLocalPath != null && existing.imageLocalPath != finalPath) {
+                            ProductImages.deleteLocal(existing.imageLocalPath)
+                        }
                         vm.updateItem(
                             existing.copy(
                                 name = name.trim(),
@@ -4266,7 +4356,11 @@ private fun ItemDialog(
                                 stockQty = if (track) stockVal else 0.0,
                                 reorderLevel = if (track) (reorder.toDoubleOrNull() ?: 0.0) else 0.0,
                                 cost = costVal,
-                                unit = unitText
+                                unit = unitText,
+                                imageLocalPath = finalPath,
+                                imageUrl = finalUrl,
+                                imagePending = finalPending,
+                                showImage = showImage
                             )
                         )
                     }
@@ -4278,6 +4372,56 @@ private fun ItemDialog(
         title = { Text(if (existing == null) "New item" else "Edit item") },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState())) {
+                // ── Product image ──
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    val t = LocalPosTokens.current
+                    Box(
+                        Modifier.size(64.dp).clip(RoundedCornerShape(12.dp))
+                            .background(t.surface2),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (imagePreviewModel != null) {
+                            ProductImage(
+                                model = imagePreviewModel,
+                                contentDescription = "Product image",
+                                modifier = Modifier.size(64.dp),
+                                shape = RoundedCornerShape(12.dp),
+                            )
+                        } else {
+                            Icon(
+                                Icons.Filled.AddPhotoAlternate, contentDescription = null,
+                                tint = t.inkTertiary, modifier = Modifier.size(28.dp)
+                            )
+                        }
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(onClick = {
+                                photoPicker.launch(
+                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                )
+                            }) { Text(if (imagePreviewModel != null) "Change" else "Add photo") }
+                            if (imagePreviewModel != null) {
+                                TextButton(onClick = {
+                                    imageLocalPath?.takeIf { it != existing?.imageLocalPath }
+                                        ?.let { ProductImages.deleteLocal(it) }
+                                    imageLocalPath = null
+                                    imageChanged = true
+                                }) { Text("Remove") }
+                            }
+                        }
+                        if (imagePreviewModel != null) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("Show on card", style = MaterialTheme.typography.bodySmall,
+                                    color = t.inkSecondary)
+                                Spacer(Modifier.weight(1f))
+                                Switch(checked = showImage, onCheckedChange = { showImage = it })
+                            }
+                        }
+                    }
+                }
+                Spacer(Modifier.height(12.dp))
                 OutlinedTextField(
                     value = name, onValueChange = { name = it },
                     label = { Text("Name") }, singleLine = true, modifier = Modifier.fillMaxWidth()

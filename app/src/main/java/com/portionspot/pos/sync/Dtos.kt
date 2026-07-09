@@ -96,6 +96,8 @@ data class ProductDto(
     val active: Boolean = true,
     @SerialName("product_type") val productType: String = "box",
     @SerialName("box_only") val boxOnly: Boolean = false,
+    @SerialName("image_url") val imageUrl: String? = null,
+    @SerialName("show_image") val showImage: Boolean = true,
     @SerialName("updated_at") val updatedAt: String? = null,
 )
 
@@ -104,6 +106,10 @@ data class ProductDto(
 fun ProductDto.toItem(businessId: String, local: Item?): Item {
     val boxSz = if (boxSize < 1) 1 else boxSize
     val base = local ?: Item(businessId = businessId, name = name, sku = sku)
+    // Remote is the source of truth for the image. Keep the local cached copy only
+    // when the remote URL is unchanged; otherwise drop it (and any pending flag) so
+    // display falls back to the new remote image (Coil fetches + caches it).
+    val remoteImageUnchanged = imageUrl == base.imageUrl
     return base.copy(
         businessId = businessId,
         name = name,
@@ -118,6 +124,10 @@ fun ProductDto.toItem(businessId: String, local: Item?): Item {
         trackStock = true,
         stockQty = (stockBoxes * boxSz + stockUnits).toDouble(),
         reorderLevel = lowStockThreshold.toDouble(),
+        imageUrl = imageUrl,
+        imageLocalPath = if (remoteImageUnchanged) base.imageLocalPath else null,
+        imagePending = if (remoteImageUnchanged) base.imagePending else false,
+        showImage = showImage,
         isActive = active,
         updatedAt = IsoTime.toMillis(updatedAt),
         deleted = false,
@@ -379,12 +389,18 @@ data class ProductPushDto(
     @SerialName("stock_units") val stockUnits: Int = 0,
     @SerialName("low_stock_threshold") val lowStockThreshold: Int = 5,
     val active: Boolean = true,
+    @SerialName("image_url") val imageUrl: String? = null,
+    @SerialName("show_image") val showImage: Boolean = true,
     @SerialName("updated_at") val updatedAt: String,
 )
 
 /** Local [Item] → the web `products` row (upsert on sku). Total on-hand units are
  *  split back into boxes + loose the way the web stores them. Caller must ensure a
- *  non-blank sku (products.sku is NOT NULL and is the conflict key). */
+ *  non-blank sku (products.sku is NOT NULL and is the conflict key).
+ *
+ *  Only a REMOTE image URL is pushed: a still-pending local file path is never a
+ *  valid cloud value, so the sync engine uploads it to Storage (which sets [imageUrl]
+ *  to the public URL and clears [imagePending]) BEFORE calling this. */
 fun Item.toProductPush(): ProductPushDto {
     val bs = if (boxSize < 1) 1 else boxSize
     val totalUnits = stockQty.toInt()
@@ -402,6 +418,8 @@ fun Item.toProductPush(): ProductPushDto {
         stockUnits = if (bs > 1) totalUnits % bs else totalUnits,
         lowStockThreshold = reorderLevel.toInt(),
         active = isActive,
+        imageUrl = if (imagePending) null else imageUrl,
+        showImage = showImage,
         updatedAt = IsoTime.toIso(updatedAt),
     )
 }

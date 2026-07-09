@@ -324,6 +324,21 @@ val MIGRATION_15_16 = object : Migration(15, 16) {
     }
 }
 
+/**
+ * v16 → v17: product images. Adds the remote image URL (mirrors the cloud
+ * `products.image_url`), a local cached-copy path + pending-upload flag (both
+ * local-only), and the `show_image` toggle to `items`. Additive + nullable/defaulted,
+ * so existing items keep NULL image / show=on and their cards are unchanged.
+ */
+val MIGRATION_16_17 = object : Migration(16, 17) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE items ADD COLUMN imageUrl TEXT")
+        db.execSQL("ALTER TABLE items ADD COLUMN imageLocalPath TEXT")
+        db.execSQL("ALTER TABLE items ADD COLUMN imagePending INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE items ADD COLUMN showImage INTEGER NOT NULL DEFAULT 1")
+    }
+}
+
 @Database(
     entities = [
         Business::class,
@@ -346,7 +361,7 @@ val MIGRATION_15_16 = object : Migration(15, 16) {
         AppNotification::class,
         AuditEntry::class
     ],
-    version = 16,
+    version = 17,
     exportSchema = false
 )
 abstract class PosDatabase : RoomDatabase() {
@@ -387,7 +402,7 @@ abstract class PosDatabase : RoomDatabase() {
                     .addMigrations(
                         MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9,
                         MIGRATION_9_10, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14,
-                        MIGRATION_14_15, MIGRATION_15_16
+                        MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17
                     )
                     .fallbackToDestructiveMigration()
                     .build()

@@ -113,6 +113,16 @@ data class Item(
     @ColumnInfo(defaultValue = "0") val reorderLevel: Double = 0.0,  // low-stock threshold
     val unit: String = "pc",
     val colorHex: String? = null,        // tile colour when no image
+    // ──── Product image (mirrors the cloud `products.image_url` + `show_image`) ────
+    // [imageUrl] is the REMOTE Supabase Storage public URL — this is what syncs to the
+    // cloud. [imageLocalPath] is a downscaled on-device copy for offline/instant display
+    // AND the source bytes uploaded to Storage on push; it is LOCAL-ONLY. [imagePending]
+    // flags a locally picked/removed image not yet pushed to Storage (LOCAL-ONLY).
+    // Display prefers imageLocalPath, falling back to imageUrl.
+    val imageUrl: String? = null,
+    val imageLocalPath: String? = null,
+    @ColumnInfo(defaultValue = "0") val imagePending: Boolean = false,
+    @ColumnInfo(defaultValue = "1") val showImage: Boolean = true,
     val isActive: Boolean = true,
     val updatedAt: Long = now(),
     val deleted: Boolean = false,

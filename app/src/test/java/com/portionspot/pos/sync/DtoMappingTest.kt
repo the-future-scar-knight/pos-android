@@ -55,6 +55,45 @@ class DtoMappingTest {
     }
 
     @Test
+    fun product_imageUrlAndShowImage_roundTrip() {
+        // Pull: cloud image_url + show_image land on the Item.
+        val dto = ProductDto(
+            sku = "OIL-DELO-5L", name = "Delo 5L", retailPrice = "23",
+            imageUrl = "https://x.supabase.co/storage/v1/object/public/product-images/biz1/i1.jpg",
+            showImage = false, updatedAt = "2026-07-06T09:00:00.000Z",
+        )
+        val item = dto.toItem("biz1", null)
+        assertEquals(dto.imageUrl, item.imageUrl)
+        assertTrue(!item.showImage)
+
+        // Push: a REMOTE url is sent; a still-pending local path is NOT (sent as null).
+        val remote = item.copy(imagePending = false).toProductPush()
+        assertEquals(dto.imageUrl, remote.imageUrl)
+        assertTrue(!remote.showImage)
+        val pendingLocal = item.copy(
+            imageLocalPath = "/data/.../local.jpg", imagePending = true,
+        ).toProductPush()
+        assertNull(pendingLocal.imageUrl)              // never push a device-local path
+    }
+
+    @Test
+    fun product_pullKeepsLocalCache_whenImageUrlUnchanged() {
+        val url = "https://x/obj/public/product-images/biz1/i1.jpg"
+        val existing = com.portionspot.pos.data.Item(
+            id = "local-1", businessId = "biz1", name = "Delo", sku = "OIL-DELO-5L",
+            imageUrl = url, imageLocalPath = "/data/cache/i1.jpg",
+        )
+        // Same remote url ⇒ keep the on-device cached copy.
+        val same = ProductDto(sku = "OIL-DELO-5L", name = "Delo", retailPrice = "9", imageUrl = url)
+            .toItem("biz1", existing)
+        assertEquals("/data/cache/i1.jpg", same.imageLocalPath)
+        // Changed remote url ⇒ drop the stale local copy (display falls back to remote).
+        val changed = ProductDto(sku = "OIL-DELO-5L", name = "Delo", retailPrice = "9", imageUrl = "$url?v=2")
+            .toItem("biz1", existing)
+        assertNull(changed.imageLocalPath)
+    }
+
+    @Test
     fun sale_parsesJsonbItemsAndStringTotals() {
         val json = """
           {"id":"PSM-1","ref":"PSM-1","type":"sale","status":"completed",

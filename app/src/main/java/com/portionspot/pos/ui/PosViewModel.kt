@@ -639,7 +639,9 @@ class PosViewModel(
         stockQty: Double = 0.0,
         reorderLevel: Double = 0.0,
         cost: Double? = null,
-        unit: String = "pc"
+        unit: String = "pc",
+        imageLocalPath: String? = null,
+        showImage: Boolean = true
     ) {
         val bid = businessId.value ?: return
         if (name.isBlank()) return
@@ -660,7 +662,11 @@ class PosViewModel(
                     stockQty = if (trackStock) stockQty else 0.0,
                     reorderLevel = if (trackStock) reorderLevel else 0.0,
                     cost = cost,
-                    unit = unit.trim().ifBlank { "pc" }
+                    unit = unit.trim().ifBlank { "pc" },
+                    // A freshly-picked local image starts pending upload to Storage.
+                    imageLocalPath = imageLocalPath,
+                    imagePending = imageLocalPath != null,
+                    showImage = showImage
                 )
             )
         }

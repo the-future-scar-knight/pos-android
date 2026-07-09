@@ -123,4 +123,8 @@ dependencies {
     implementation(libs.androidx.camera.camera2)
     implementation(libs.androidx.camera.lifecycle)
     implementation(libs.androidx.camera.view)
+
+    // ---- Product images: Compose image loader with memory/disk cache. Loads
+    // local files (freshly-picked, offline) and remote Supabase Storage URLs. ----
+    implementation(libs.coil.compose)
 }
