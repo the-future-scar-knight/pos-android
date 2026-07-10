@@ -7,13 +7,19 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.TextUnit
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 
 /**
@@ -230,6 +236,73 @@ fun buildTokens(choice: ThemeChoice): PosTokens {
 
 val LocalPosTokens = staticCompositionLocalOf { buildTokens(DEFAULT_THEME) }
 
+// ── Responsive sizing ────────────────────────────────────────────────────────
+// The layout used to be frozen: a fixed 2-column grid and hard-coded card/text
+// sizes, so a big tablet till showed two giant cards while a small handheld
+// crammed the same two. This is genuine *screen-size* responsiveness (driven by
+// the window's width in dp) and is orthogonal to the fontScale=1f pin in
+// MainActivity — that pin only stops the device's ACCESSIBILITY font setting from
+// blowing the UI up; it does not adapt to the actual screen. Here we do.
+//
+// Buckets (screenWidthDp): Compact <360 (small phones / the Sunmi V1s-G handheld),
+// Medium 360–599 (typical phones), Expanded 600–839 (large phones landscape /
+// small tablets), Large ≥840 (tablet tills). The Sunmi stays at 2 columns and
+// slightly tightened sizes so the tight low-DPI screen never clips.
+
+enum class PosWidthClass { Compact, Medium, Expanded, Large }
+
+/** Screen-size–derived dimensions read across the POS surfaces via [LocalPosDimens]. */
+data class PosDimens(
+    val widthClass: PosWidthClass,
+    val productColumns: Int,
+    val gridPadding: Dp,
+    val gridSpacing: Dp,
+    val cardHeight: Dp,
+    val cardPadding: Dp,
+    val cardCorner: Dp,
+    val cardImageHeight: Dp,
+    val cardPriceSize: TextUnit,
+    val cardNameSize: TextUnit,
+    val cardMetaSize: TextUnit,
+)
+
+fun posDimensFor(widthDp: Int): PosDimens {
+    val cls = when {
+        widthDp < 360 -> PosWidthClass.Compact
+        widthDp < 600 -> PosWidthClass.Medium
+        widthDp < 840 -> PosWidthClass.Expanded
+        else -> PosWidthClass.Large
+    }
+    return when (cls) {
+        PosWidthClass.Compact -> PosDimens(
+            widthClass = cls, productColumns = 2,
+            gridPadding = 10.dp, gridSpacing = 8.dp,
+            cardHeight = 140.dp, cardPadding = 10.dp, cardCorner = 14.dp, cardImageHeight = 50.dp,
+            cardPriceSize = 15.sp, cardNameSize = 11.sp, cardMetaSize = 9.sp,
+        )
+        PosWidthClass.Medium -> PosDimens(
+            widthClass = cls, productColumns = 2,
+            gridPadding = 12.dp, gridSpacing = 10.dp,
+            cardHeight = 152.dp, cardPadding = 12.dp, cardCorner = 16.dp, cardImageHeight = 56.dp,
+            cardPriceSize = 16.sp, cardNameSize = 12.sp, cardMetaSize = 10.sp,
+        )
+        PosWidthClass.Expanded -> PosDimens(
+            widthClass = cls, productColumns = 3,
+            gridPadding = 16.dp, gridSpacing = 12.dp,
+            cardHeight = 168.dp, cardPadding = 14.dp, cardCorner = 18.dp, cardImageHeight = 66.dp,
+            cardPriceSize = 18.sp, cardNameSize = 13.sp, cardMetaSize = 11.sp,
+        )
+        PosWidthClass.Large -> PosDimens(
+            widthClass = cls, productColumns = 4,
+            gridPadding = 20.dp, gridSpacing = 14.dp,
+            cardHeight = 184.dp, cardPadding = 16.dp, cardCorner = 20.dp, cardImageHeight = 78.dp,
+            cardPriceSize = 20.sp, cardNameSize = 14.sp, cardMetaSize = 11.sp,
+        )
+    }
+}
+
+val LocalPosDimens = staticCompositionLocalOf { posDimensFor(400) }
+
 // ── App font ─────────────────────────────────────────────────────────────────
 // The web app uses Poppins, which we previously pulled via *downloadable* Google
 // Fonts. That path needs Google Play Services (the `com.google.android.gms` font
@@ -304,7 +377,13 @@ fun PosTheme(
         }
     }
 
-    CompositionLocalProvider(LocalPosTokens provides tokens) {
+    val widthDp = LocalConfiguration.current.screenWidthDp
+    val dimens = remember(widthDp) { posDimensFor(widthDp) }
+
+    CompositionLocalProvider(
+        LocalPosTokens provides tokens,
+        LocalPosDimens provides dimens,
+    ) {
         MaterialTheme(
             colorScheme = colors,
             typography = posTypography(Poppins),

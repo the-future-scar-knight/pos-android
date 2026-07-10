@@ -2053,12 +2053,13 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
                 }
             }
         } else {
+            val gridDimens = LocalPosDimens.current
             LazyVerticalGrid(
-                columns = GridCells.Fixed(2),
+                columns = GridCells.Fixed(gridDimens.productColumns),
                 modifier = Modifier.weight(1f).fillMaxWidth(),
-                contentPadding = PaddingValues(12.dp),
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
+                contentPadding = PaddingValues(gridDimens.gridPadding),
+                horizontalArrangement = Arrangement.spacedBy(gridDimens.gridSpacing),
+                verticalArrangement = Arrangement.spacedBy(gridDimens.gridSpacing)
             ) {
                 items(filtered, key = { it.id }) { item ->
                     val inCart = cart.filter { it.itemId == item.id }.sumOf { it.qty }.toInt()
@@ -2228,6 +2229,7 @@ private val Item.imageModel: String? get() = imageLocalPath ?: imageUrl
 @Composable
 private fun ProductCard(item: Item, currency: String, inCart: Int, onClick: () -> Unit) {
     val t = LocalPosTokens.current
+    val d = LocalPosDimens.current
     val tracked = item.trackStock
     val units = item.stockQty
     val isOut = tracked && units <= 0.0
@@ -2238,13 +2240,13 @@ private fun ProductCard(item: Item, currency: String, inCart: Int, onClick: () -
     Box(
         Modifier
             .fillMaxWidth()
-            .height(152.dp)
-            .clip(RoundedCornerShape(16.dp))
+            .height(d.cardHeight)
+            .clip(RoundedCornerShape(d.cardCorner))
             .background(t.surface1)
-            .border(1.dp, t.surfaceBorder, RoundedCornerShape(16.dp))
+            .border(1.dp, t.surfaceBorder, RoundedCornerShape(d.cardCorner))
             .alpha(if (isOut) 0.45f else 1f)
             .clickable(enabled = !isOut, onClick = onClick)
-            .padding(12.dp)
+            .padding(d.cardPadding)
     ) {
         Box(Modifier.align(Alignment.TopEnd)) { StockBadge(item) }
         if (inCart > 0) {
@@ -2261,7 +2263,7 @@ private fun ProductCard(item: Item, currency: String, inCart: Int, onClick: () -
                 ProductImage(
                     model = heroImage,
                     contentDescription = item.name,
-                    modifier = Modifier.fillMaxWidth().height(56.dp),
+                    modifier = Modifier.fillMaxWidth().height(d.cardImageHeight),
                     shape = RoundedCornerShape(10.dp),
                 )
                 Spacer(Modifier.height(6.dp))
@@ -2270,31 +2272,31 @@ private fun ProductCard(item: Item, currency: String, inCart: Int, onClick: () -
             }
             Text(
                 money(item.price, currency),
-                color = t.brand.s600, fontWeight = FontWeight.Black, fontSize = 16.sp, maxLines = 1
+                color = t.brand.s600, fontWeight = FontWeight.Black, fontSize = d.cardPriceSize, maxLines = 1
             )
             Spacer(Modifier.height(4.dp))
             Text(
                 item.name,
-                color = t.inkPrimary, fontWeight = FontWeight.SemiBold, fontSize = 12.sp,
-                lineHeight = 15.sp, maxLines = 2, overflow = TextOverflow.Ellipsis
+                color = t.inkPrimary, fontWeight = FontWeight.SemiBold, fontSize = d.cardNameSize,
+                lineHeight = (d.cardNameSize.value * 1.25f).sp, maxLines = 2, overflow = TextOverflow.Ellipsis
             )
             Spacer(Modifier.weight(1f))
             if (hasBox) {
                 Row {
-                    Text("Box ", color = t.inkTertiary, fontSize = 10.sp)
-                    Text(money(item.boxPrice, currency), color = t.inkSecondary, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
+                    Text("Box ", color = t.inkTertiary, fontSize = d.cardMetaSize)
+                    Text(money(item.boxPrice, currency), color = t.inkSecondary, fontSize = d.cardMetaSize, fontWeight = FontWeight.SemiBold)
                 }
             }
             if (hasWs) {
                 Row {
-                    Text("WS ", color = t.accentBlue, fontSize = 10.sp)
-                    Text(money(item.wholesalePrice, currency), color = t.accentBlue, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
+                    Text("WS ", color = t.accentBlue, fontSize = d.cardMetaSize)
+                    Text(money(item.wholesalePrice, currency), color = t.accentBlue, fontSize = d.cardMetaSize, fontWeight = FontWeight.SemiBold)
                 }
             }
             item.sku?.takeIf { it.isNotBlank() }?.let {
                 Spacer(Modifier.height(2.dp))
                 Text(
-                    it, color = t.inkTertiary.copy(alpha = 0.7f), fontSize = 9.sp,
+                    it, color = t.inkTertiary.copy(alpha = 0.7f), fontSize = (d.cardMetaSize.value * 0.9f).sp,
                     fontFamily = FontFamily.Monospace, maxLines = 1, overflow = TextOverflow.Ellipsis
                 )
             }
@@ -3369,7 +3371,10 @@ private fun PaymentDialog(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Text("Put ${money(remaining, currency)} on ${selected!!.name}'s account")
+                        Text(
+                            "Put ${money(remaining, currency)} on ${selected!!.name}'s account",
+                            modifier = Modifier.weight(1f).padding(end = 12.dp)
+                        )
                         Switch(checked = onCredit, onCheckedChange = { onCredit = it })
                     }
                 }
@@ -3380,7 +3385,10 @@ private fun PaymentDialog(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Text("Owe ${money(overpay, currency)} change to account")
+                        Text(
+                            "Owe ${money(overpay, currency)} change to account",
+                            modifier = Modifier.weight(1f).padding(end = 12.dp)
+                        )
                         Switch(checked = changeAsCredit, onCheckedChange = { changeAsCredit = it })
                     }
                 }
