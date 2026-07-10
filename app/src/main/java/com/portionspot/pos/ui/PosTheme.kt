@@ -87,19 +87,27 @@ fun buildRamp(hex: String): BrandRamp = BrandRamp(
 
 data class AccentPreset(val id: String, val name: String, val hex: String)
 
+// A coordinated wheel of accents. Every hex is a mid-tone "500" (roughly equal
+// perceived lightness/chroma) so the generated 50→800 ramp lands in the same
+// tonal family across themes — the picker reads as one designed set, not a
+// random rainbow. Ordered around the colour wheel (green → blue → violet →
+// red → orange) with the new default (Pine) first. Every original id is kept so
+// a persisted selection never breaks; a few hexes were re-tuned for harmony and
+// to sit clearly apart from the FIXED wholesale blue (#1E5BFF) and danger red.
 val ACCENT_PRESETS = listOf(
-    AccentPreset("red",     "Signature Red", "#ff3830"),
-    AccentPreset("crimson", "Crimson",       "#e11d48"),
-    AccentPreset("rose",    "Rose",          "#db2777"),
-    AccentPreset("orange",  "Sunset",        "#ea580c"),
-    AccentPreset("amber",   "Amber",         "#d97706"),
-    AccentPreset("gold",    "Gold",          "#b8860b"),
+    AccentPreset("pine",    "Pine",          "#0F766E"), // NEW default — deep teal-green
     AccentPreset("emerald", "Emerald",       "#059669"),
-    AccentPreset("teal",    "Teal",          "#0d9488"),
-    AccentPreset("blue",    "Ocean",         "#2563eb"),
-    AccentPreset("navy",    "Navy",          "#1e3a8a"),
-    AccentPreset("indigo",  "Indigo",        "#4f46e5"),
-    AccentPreset("violet",  "Violet",        "#7c3aed"),
+    AccentPreset("teal",    "Teal",          "#0D9488"),
+    AccentPreset("blue",    "Ocean",         "#0E7490"), // cyan-teal — distinct from the fixed wholesale blue
+    AccentPreset("navy",    "Navy",          "#1E3A8A"),
+    AccentPreset("indigo",  "Indigo",        "#4F46E5"),
+    AccentPreset("violet",  "Violet",        "#7C3AED"),
+    AccentPreset("rose",    "Rose",          "#E11D48"),
+    AccentPreset("crimson", "Crimson",       "#DC2626"),
+    AccentPreset("red",     "Signature Red", "#FF3830"), // web-parity anchor — kept exact
+    AccentPreset("orange",  "Sunset",        "#EA580C"),
+    AccentPreset("amber",   "Amber",         "#D97706"),
+    AccentPreset("gold",    "Gold",          "#B8860B"),
     AccentPreset("slate",   "Graphite",      "#475569"),
 )
 
@@ -110,15 +118,20 @@ data class BackgroundPreset(
     val gradient: List<Color>? = null, // when set, the canvas is this gradient
 )
 
+// Canvases are kept high-key (the POS is read in bright workshops) but softened:
+// pure-grey/pure-white were fatiguing and made the white cards vanish into the
+// background. Each now carries a whisper of warmth or hue so cards read as raised
+// surfaces, and the gradients use gentle same-family stops (never muddy). Default
+// is "Cloud" — a soft cool off-white that lets the Pine accent do the talking.
 val BACKGROUND_PRESETS = listOf(
-    BackgroundPreset("cloud", "Cloud", Color(0xFFF3F4F6)),
-    BackgroundPreset("paper", "Paper", Color(0xFFFFFFFF)),
-    BackgroundPreset("sand",  "Sand",  Color(0xFFF5F1EA)),
-    BackgroundPreset("mist",  "Mist",  Color(0xFFEEF1F6)),
-    BackgroundPreset("sky",   "Sky",   Color(0xFFEEF4FB), listOf(Color(0xFFF3F8FF), Color(0xFFE6EEFB))),
-    BackgroundPreset("mint",  "Mint",  Color(0xFFEEF6F1), listOf(Color(0xFFF1FAF4), Color(0xFFE4F1E9))),
-    BackgroundPreset("dawn",  "Dawn",  Color(0xFFFBF1EF), listOf(Color(0xFFFDF3F0), Color(0xFFF7E8EF))),
-    BackgroundPreset("dusk",  "Dusk",  Color(0xFFF0F0F7), listOf(Color(0xFFF4F3FB), Color(0xFFEAE8F5))),
+    BackgroundPreset("cloud", "Cloud", Color(0xFFF2F4F7)),                       // soft cool off-white (default)
+    BackgroundPreset("paper", "Paper", Color(0xFFFBFAF7)),                       // warm near-white
+    BackgroundPreset("sand",  "Sand",  Color(0xFFF3EEE4)),                       // warm neutral
+    BackgroundPreset("mist",  "Mist",  Color(0xFFEBEFF4)),                       // cool grey-blue
+    BackgroundPreset("sky",   "Sky",   Color(0xFFEAF2FB), listOf(Color(0xFFF1F7FF), Color(0xFFDFEAF8))),
+    BackgroundPreset("mint",  "Mint",  Color(0xFFE9F4EE), listOf(Color(0xFFF0F9F3), Color(0xFFDCEDE4))), // pairs with Pine
+    BackgroundPreset("dawn",  "Dawn",  Color(0xFFFBF0EC), listOf(Color(0xFFFDF4F0), Color(0xFFF6E6EA))),
+    BackgroundPreset("dusk",  "Dusk",  Color(0xFFEFEFF7), listOf(Color(0xFFF4F3FB), Color(0xFFE6E5F2))),
 )
 
 data class SidebarPreset(val id: String, val name: String, val desc: String)
@@ -128,11 +141,15 @@ val SIDEBAR_PRESETS = listOf(
     SidebarPreset("accent", "Accent",   "Tinted with your color"),
 )
 
-/** The user's persisted theme selection. Default is Signature Red — matches
- *  the web's DEFAULT_THEME ({ accent: 'red', accentHex: '#ff3830' }). */
+/** The user's persisted theme selection. The out-of-box default is now "Pine"
+ *  (a deep teal-green) — calmer over long retail shifts than the old fire-engine
+ *  red, and cleanly distinct from the fixed wholesale blue and the danger red so
+ *  the three never blur together. Signature Red (#ff3830, the web's old default)
+ *  is still one tap away under Settings → Appearance. A cashier who had already
+ *  chosen a theme keeps it; only fresh installs get Pine. */
 data class ThemeChoice(
-    val accent: String = "red",
-    val accentHex: String = "#ff3830",
+    val accent: String = "pine",
+    val accentHex: String = "#0F766E",
     val background: String = "cloud",
     val sidebar: String = "dark",
 )
