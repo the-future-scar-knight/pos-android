@@ -33,6 +33,10 @@ data class ShopPrefs(
     // A cashier applying a discount above this % of the goods value needs a manager/
     // admin PIN to approve it. Admins are never gated. 0 = no approval ever required.
     val discountThresholdPct: Double = 5.0,
+    // Hard cap (in base-currency units) on the discount a cashier may take off a
+    // single cart line. This is a ceiling the till physically enforces — unlike
+    // [discountThresholdPct] (a PIN gate), it can never be exceeded. 0 = no limit.
+    val maxItemDiscount: Double = 0.0,
     // ── Margins ──
     val marginFormula: String = "markup",    // "markup" (over cost) or "gross" (of price)
     val autoConvertUnitsToBoxes: Boolean = false, // show stock as N boxes + loose units

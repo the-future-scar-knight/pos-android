@@ -193,7 +193,13 @@ class PosRepository(private val db: PosDatabase) {
     /** One customer by id (e.g. to resolve the owed-refund target from a sale). */
     suspend fun customerById(id: String): Customer? = customerDao.getById(id)
 
-    /** Record a repayment against a customer's account (writes a credit_paid row). */
+    /**
+     * Record a repayment against a customer's account. Settles the debt with a
+     * `credit_paid` row up to what's owed; any OVERPAYMENT is booked as a `change_owed`
+     * row, so the excess flows into the shop-owes-customer balance (payable back later
+     * via [recordChangePayment]) instead of driving the debt negative. Both rows commit
+     * together.
+     */
     suspend fun recordRepayment(
         businessId: String,
         customerId: String,
@@ -203,18 +209,47 @@ class PosRepository(private val db: PosDatabase) {
         cashierName: String? = null
     ) {
         if (amount <= 0) return
-        creditDao.insert(
-            CreditTxn(
-                businessId = businessId,
-                customerId = customerId,
-                type = "credit_paid",
-                amount = amount,
-                note = note,
-                createdBy = cashierId,
-                createdByName = cashierName
-            )
-        )
+        val debt = creditDao.balanceOnce(customerId).coerceAtLeast(0.0)
+        val paid = minOf(amount, debt)      // never past zero: debt won't go negative
+        val excess = amount - paid          // overpayment → shop now owes the customer
+        val stamp = now()
+        db.withTransaction {
+            if (paid > 0.0) {
+                creditDao.insert(
+                    CreditTxn(
+                        businessId = businessId,
+                        customerId = customerId,
+                        type = "credit_paid",
+                        amount = paid,
+                        note = note,
+                        createdBy = cashierId,
+                        createdByName = cashierName,
+                        createdAt = stamp,
+                        updatedAt = stamp
+                    )
+                )
+            }
+            if (excess > 0.0) {
+                creditDao.insert(
+                    CreditTxn(
+                        businessId = businessId,
+                        customerId = customerId,
+                        type = "change_owed",
+                        amount = excess,
+                        note = if (paid > 0.0) "Overpayment" else note ?: "Overpayment",
+                        createdBy = cashierId,
+                        createdByName = cashierName,
+                        createdAt = stamp,
+                        updatedAt = stamp
+                    )
+                )
+            }
+        }
     }
+
+    /** Shop-wide money owed back to customers (change + unpaid refunds). */
+    fun totalChangeOwedFlow(businessId: String): Flow<Double> =
+        creditDao.observeTotalChangeOwed(businessId)
 
     // ---- expenses (local-only; never synced) ------------------------------
 
@@ -372,8 +407,11 @@ class PosRepository(private val db: PosDatabase) {
     ): SaleWithLines {
         // Money math (pure + unit-tested in SaleMathTest): discount clamped to the
         // goods value, VAT charged on the DISCOUNTED base, total is tax-inclusive.
-        val subtotal = cart.sumOf { it.lineSubtotal }       // pre-tax goods value
-        val totals = computeSaleTotals(subtotal, discount, vatEnabled, vatPercent)
+        val subtotal = cart.sumOf { it.lineSubtotal }       // pre-tax goods value (gross)
+        // Per-item discounts fold into the sale's discount total, so VAT is charged on
+        // the fully discounted base and reports count them as discounts given.
+        val perItemDiscount = cart.sumOf { it.lineDiscountApplied }
+        val totals = computeSaleTotals(subtotal, discount + perItemDiscount, vatEnabled, vatPercent)
         val saleDiscount = totals.discount
         val taxTotal = totals.taxTotal
         // Optional checkout rounding (e.g. nearest 5c for cash floats). Adjusts only
@@ -438,6 +476,9 @@ class PosRepository(private val db: PosDatabase) {
                 unitPrice = c.unitPrice,
                 // Per-line tax is superseded by business-level VAT; keep lines tax-free.
                 lineTax = 0.0,
+                lineDiscount = c.lineDiscountApplied,
+                // lineTotal stays the GROSS goods value; the discount prints on its own
+                // line and is already reflected in the sale's discount total.
                 lineTotal = c.lineSubtotal,
                 mode = c.mode,
                 unitsPerLine = c.unitsPerLine,
@@ -551,7 +592,8 @@ class PosRepository(private val db: PosDatabase) {
         cashierName: String? = null
     ): SaleWithLines {
         val subtotal = cart.sumOf { it.lineSubtotal }
-        val totals = computeSaleTotals(subtotal, discount, vatEnabled, vatPercent)
+        val perItemDiscount = cart.sumOf { it.lineDiscountApplied }
+        val totals = computeSaleTotals(subtotal, discount + perItemDiscount, vatEnabled, vatPercent)
         val saleId = newId()
         val stamp = now()
         val validUntil = stamp + validityDays.coerceAtLeast(0) * 24L * 60 * 60 * 1000
@@ -585,6 +627,7 @@ class PosRepository(private val db: PosDatabase) {
                 name = if (c.mode == "box") "${c.name} (Box of ${c.unitsPerLine})" else c.name,
                 qty = c.qty,
                 unitPrice = c.unitPrice,
+                lineDiscount = c.lineDiscountApplied,
                 lineTotal = c.lineSubtotal,
                 mode = c.mode,
                 unitsPerLine = c.unitsPerLine,
@@ -627,13 +670,15 @@ class PosRepository(private val db: PosDatabase) {
         val saleId = newId()
         val stamp = now()
         val subtotal = cart.sumOf { it.lineSubtotal }
+        val perItemDiscount = cart.sumOf { it.lineDiscountApplied }
+        val parkedDiscount = (discount + perItemDiscount).coerceIn(0.0, subtotal)
         val sale = SaleEntity(
             id = saleId,
             businessId = businessId,
             status = "parked",
             subtotal = subtotal,
-            discountTotal = discount.coerceIn(0.0, subtotal),
-            total = subtotal,
+            discountTotal = parkedDiscount,
+            total = subtotal - parkedDiscount,
             paymentStatus = "unpaid",
             note = note,
             customerId = customer?.id,
@@ -652,6 +697,7 @@ class PosRepository(private val db: PosDatabase) {
                 name = c.name,                      // raw name; mode is stored separately
                 qty = c.qty,
                 unitPrice = c.unitPrice,
+                lineDiscount = c.lineDiscountApplied,
                 lineTotal = c.lineSubtotal,
                 mode = c.mode,
                 unitsPerLine = c.unitsPerLine,
@@ -695,7 +741,8 @@ class PosRepository(private val db: PosDatabase) {
                 taxRate = 0.0,                      // VAT is business-level now
                 qty = l.qty,
                 mode = l.mode,
-                unitsPerLine = l.unitsPerLine
+                unitsPerLine = l.unitsPerLine,
+                lineDiscount = l.lineDiscount
             )
         }
 
@@ -1490,11 +1537,23 @@ data class CartLine(
     val taxRate: Double,
     val qty: Double,
     val mode: String = "retail",
-    val unitsPerLine: Int = 1
+    val unitsPerLine: Int = 1,
+    /** Fixed currency amount knocked off this whole line (0 = none). Clamped to the
+     *  line's gross value below, so it can never make a line go negative. */
+    val lineDiscount: Double = 0.0
 ) {
-    val lineSubtotal: Double get() = unitPrice * qty
-    val lineTax: Double get() = lineSubtotal * (taxRate / 100.0)
-    val lineTotal: Double get() = lineSubtotal + lineTax
+    /** Pre-discount goods value of the line. */
+    val lineGross: Double get() = unitPrice * qty
+    /** The per-item discount actually applied, never more than the goods are worth. */
+    val lineDiscountApplied: Double get() = lineDiscount.coerceIn(0.0, lineGross)
+    /** Gross goods value — feeds the sale subtotal and the discount-approval base
+     *  (per-item discounts are folded into the sale's discount total at checkout). */
+    val lineSubtotal: Double get() = lineGross
+    /** Goods value after the per-item discount. */
+    val lineNet: Double get() = lineGross - lineDiscountApplied
+    val lineTax: Double get() = lineNet * (taxRate / 100.0)
+    /** What the customer pays for this line (net of the per-item discount, plus tax). */
+    val lineTotal: Double get() = lineNet + lineTax
     /** Total stock units this line removes from the shelf. */
     val stockUnits: Double get() = qty * unitsPerLine
     /** Identity for cart merge/update: the same item at a different price mode is a separate line. */

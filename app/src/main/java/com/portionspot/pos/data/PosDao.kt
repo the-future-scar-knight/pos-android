@@ -140,6 +140,11 @@ interface SaleDao {
     @Query("DELETE FROM sale_items WHERE saleId = :saleId")
     suspend fun hardDeleteLines(saleId: String)
 
+    /** Repoint sale lines from a merged-away duplicate item onto the survivor, so
+     *  historical sales still join to a live catalogue row after a de-dup. */
+    @Query("UPDATE sale_items SET itemId = :survivor WHERE itemId = :dup")
+    suspend fun repointLineItem(dup: String, survivor: String)
+
     @Query("DELETE FROM sale_payments WHERE saleId = :saleId")
     suspend fun hardDeletePayments(saleId: String)
 
@@ -409,6 +414,24 @@ interface CreditDao {
             "FROM credit_transactions WHERE customerId = :customerId AND deleted = 0"
     )
     fun observeChangeBalance(customerId: String): Flow<Double>
+
+    /** One-shot DEBT balance (credit_owed − credit_paid). Used to split an overpayment:
+     *  a repayment bigger than the debt settles it and books the rest as change owed. */
+    @Query(
+        "SELECT COALESCE(SUM(CASE WHEN type = 'credit_owed' THEN amount " +
+            "WHEN type = 'credit_paid' THEN -amount ELSE 0 END), 0) " +
+            "FROM credit_transactions WHERE customerId = :customerId AND deleted = 0"
+    )
+    suspend fun balanceOnce(customerId: String): Double
+
+    /** Shop-wide money owed BACK to customers (change + unpaid refunds), net of payouts.
+     *  Powers the "You owe customers" summary on the Change & Credit screen. */
+    @Query(
+        "SELECT COALESCE(SUM(CASE WHEN type IN ('change_owed', 'refund_owed') THEN amount " +
+            "WHEN type IN ('change_paid', 'refund_paid') THEN -amount ELSE 0 END), 0) " +
+            "FROM credit_transactions WHERE businessId = :businessId AND deleted = 0"
+    )
+    fun observeTotalChangeOwed(businessId: String): Flow<Double>
 
     @Query("DELETE FROM credit_transactions WHERE businessId = :businessId")
     suspend fun wipe(businessId: String)

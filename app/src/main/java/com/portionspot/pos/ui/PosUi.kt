@@ -48,6 +48,8 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
@@ -77,7 +79,10 @@ import androidx.compose.material.icons.filled.Receipt
 import androidx.compose.material.icons.automirrored.filled.ReceiptLong
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.OpenInNew
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.ShoppingCart
 import androidx.compose.material.icons.filled.SwitchAccount
 import androidx.compose.material.icons.filled.Sync
@@ -211,6 +216,7 @@ import com.portionspot.pos.pdf.PdfFiles
 import com.portionspot.pos.print.ReceiptPrinter
 import com.portionspot.pos.print.ReceiptStyle
 import com.portionspot.pos.sync.ConnectionTest
+import com.portionspot.pos.sync.SUPABASE_SETUP_SQL
 import com.portionspot.pos.sync.SyncOutcome
 import com.portionspot.pos.sync.SyncStatus
 import kotlinx.coroutines.CoroutineScope
@@ -2122,6 +2128,7 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
         PaymentDialog(
             business = business,
             subtotal = cart.sumOf { it.lineSubtotal },
+            itemDiscount = cart.sumOf { it.lineDiscountApplied },
             currency = currency,
             secondCode = prefs.secondCurrencyCode,
             secondRate = prefs.secondCurrencyRate,
@@ -2143,6 +2150,7 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
     if (showQuote) {
         QuoteDialog(
             subtotal = cart.sumOf { it.lineSubtotal },
+            itemDiscount = cart.sumOf { it.lineDiscountApplied },
             currency = currency,
             customers = customers,
             validityDays = prefs.defaultQuoteValidityDays,
@@ -2425,6 +2433,7 @@ private fun CartBar(
 @Composable
 private fun QuoteDialog(
     subtotal: Double,
+    itemDiscount: Double = 0.0,
     currency: String,
     customers: List<CustomerWithBalance>,
     validityDays: Int,
@@ -2433,8 +2442,9 @@ private fun QuoteDialog(
 ) {
     var customer by remember { mutableStateOf<Customer?>(null) }
     var discountText by remember { mutableStateOf("") }
-    val discount = (discountText.toDoubleOrNull() ?: 0.0).coerceIn(0.0, subtotal)
-    val total = (subtotal - discount).coerceAtLeast(0.0)
+    val netGoods = (subtotal - itemDiscount).coerceAtLeast(0.0)
+    val discount = (discountText.toDoubleOrNull() ?: 0.0).coerceIn(0.0, netGoods)
+    val total = (netGoods - discount).coerceAtLeast(0.0)
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = {
@@ -2791,6 +2801,7 @@ private fun PriceOption(title: String, subtitle: String, price: String, accent: 
 private fun CartDialog(cart: List<CartLine>, currency: String, vm: PosViewModel, onDismiss: () -> Unit) {
     val t = LocalPosTokens.current
     var editingQtyLine by remember { mutableStateOf<CartLine?>(null) }
+    var editingDiscountLine by remember { mutableStateOf<CartLine?>(null) }
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } },
@@ -2812,6 +2823,20 @@ private fun CartDialog(cart: List<CartLine>, currency: String, vm: PosViewModel,
                                     "${modeLabel(line.mode)} · ${money(line.unitPrice, currency)}/ea",
                                     color = t.inkTertiary, fontSize = 11.sp
                                 )
+                                // Per-item discount affordance (tap to set/edit).
+                                Text(
+                                    if (line.lineDiscountApplied > 0)
+                                        "Less ${money(line.lineDiscountApplied, currency)} — edit"
+                                    else "Add discount",
+                                    color = if (line.lineDiscountApplied > 0) t.danger else t.inkTertiary,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    modifier = Modifier
+                                        .padding(top = 2.dp)
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .clickable { editingDiscountLine = line }
+                                        .padding(vertical = 2.dp, horizontal = 2.dp)
+                                )
                             }
                             QtyStepper(
                                 qty = line.qty.toInt(),
@@ -2820,7 +2845,16 @@ private fun CartDialog(cart: List<CartLine>, currency: String, vm: PosViewModel,
                                 onQtyClick = { editingQtyLine = line }
                             )
                             Spacer(Modifier.width(8.dp))
-                            Text(money(line.lineTotal, currency), fontWeight = FontWeight.Black, color = t.inkPrimary, fontSize = 13.sp)
+                            Column(horizontalAlignment = Alignment.End) {
+                                if (line.lineDiscountApplied > 0) {
+                                    Text(
+                                        money(line.lineGross, currency),
+                                        color = t.inkTertiary, fontSize = 10.sp,
+                                        textDecoration = TextDecoration.LineThrough
+                                    )
+                                }
+                                Text(money(line.lineTotal, currency), fontWeight = FontWeight.Black, color = t.inkPrimary, fontSize = 13.sp)
+                            }
                             IconButton(onClick = { vm.removeLine(line.lineKey) }) {
                                 Icon(Icons.Filled.Delete, "Remove", tint = t.inkTertiary)
                             }
@@ -2838,6 +2872,78 @@ private fun CartDialog(cart: List<CartLine>, currency: String, vm: PosViewModel,
             onConfirm = { qty -> vm.setQty(line.lineKey, qty); editingQtyLine = null }
         )
     }
+
+    editingDiscountLine?.let { line ->
+        // Re-read the live line so the dialog reflects the latest qty/price.
+        val current = cart.firstOrNull { it.lineKey == line.lineKey } ?: line
+        SetLineDiscountDialog(
+            line = current,
+            currency = currency,
+            maxDiscount = vm.maxItemDiscount,
+            onDismiss = { editingDiscountLine = null },
+            onConfirm = { amount -> vm.setLineDiscount(line.lineKey, amount); editingDiscountLine = null }
+        )
+    }
+}
+
+/**
+ * Per-item discount entry (§ per-line fixed discount). The cashier types a currency
+ * amount off this one line; it's clamped to the line's own value and to the admin's
+ * [maxDiscount] ceiling (0 = no ceiling). Confirm with 0 to clear the discount.
+ */
+@Composable
+private fun SetLineDiscountDialog(
+    line: CartLine,
+    currency: String,
+    maxDiscount: Double,
+    onDismiss: () -> Unit,
+    onConfirm: (Double) -> Unit
+) {
+    val t = LocalPosTokens.current
+    var text by remember { mutableStateOf(if (line.lineDiscount > 0) trimQty(line.lineDiscount) else "") }
+    val typed = text.replace(',', '.').toDoubleOrNull() ?: 0.0
+    // The hard ceiling: the smaller of the line's value and any admin cap.
+    val ceiling = if (maxDiscount > 0.0) minOf(line.lineGross, maxDiscount) else line.lineGross
+    val amount = typed.coerceIn(0.0, ceiling)
+    val overCeiling = typed > ceiling + 0.0001
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = { Button(onClick = { onConfirm(amount) }) { Text("Apply") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+        title = { Text("Line discount", fontWeight = FontWeight.Bold, color = t.inkPrimary) },
+        text = {
+            Column {
+                Text(line.name, color = t.inkSecondary, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(
+                    "${trimQty(line.qty)} × ${money(line.unitPrice, currency)} = ${money(line.lineGross, currency)}",
+                    color = t.inkTertiary, fontSize = 12.sp
+                )
+                Spacer(Modifier.height(10.dp))
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it.filter { ch -> ch.isDigit() || ch == '.' || ch == ',' } },
+                    label = { Text("Discount ($currency off this line)") },
+                    singleLine = true,
+                    isError = overCeiling,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                if (maxDiscount > 0.0) {
+                    Text(
+                        "Max ${money(maxDiscount, currency)} per item (set by admin).",
+                        color = if (overCeiling) t.danger else t.inkTertiary,
+                        fontSize = 11.sp,
+                        modifier = Modifier.padding(top = 4.dp)
+                    )
+                }
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "Line total: ${money(line.lineGross - amount, currency)}",
+                    color = t.inkPrimary, fontWeight = FontWeight.SemiBold, fontSize = 13.sp
+                )
+            }
+        }
+    )
 }
 
 /** Tap-the-number fast quantity entry for a cart line (type an exact amount). */
@@ -2925,6 +3031,7 @@ private fun SyncScreen(vm: PosViewModel) {
 private fun PaymentDialog(
     business: Business,
     subtotal: Double,
+    itemDiscount: Double = 0.0,
     currency: String,
     secondCode: String = "",
     secondRate: Double = 0.0,
@@ -2957,8 +3064,11 @@ private fun PaymentDialog(
     var entryCur2 by remember { mutableStateOf(false) }
 
     // Business-level VAT mirrors PosRepository.checkout(): tax on the discounted base.
-    val discount = (discountText.toDoubleOrNull() ?: 0.0).coerceIn(0.0, subtotal)
-    val taxableBase = subtotal - discount
+    // Per-item discounts ([itemDiscount]) already came off before this whole-sale
+    // discount; the taxable base is the goods value net of both.
+    val netGoods = (subtotal - itemDiscount).coerceAtLeast(0.0)
+    val discount = (discountText.toDoubleOrNull() ?: 0.0).coerceIn(0.0, netGoods)
+    val taxableBase = netGoods - discount
     val vat = if (business.vatEnabled) taxableBase * business.vatPercent / 100.0 else 0.0
     val total = taxableBase + vat
 
@@ -3025,6 +3135,10 @@ private fun PaymentDialog(
         text = {
             Column(Modifier.verticalScroll(rememberScrollState())) {
                 TotalRow("Subtotal", money(subtotal, currency))
+                if (itemDiscount > 0) {
+                    Spacer(Modifier.height(4.dp))
+                    TotalRow("Item discounts", "-${money(itemDiscount, currency)}")
+                }
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(
                     value = discountText,
@@ -5025,19 +5139,23 @@ private fun CustomerDetailDialog(
     onDismiss: () -> Unit
 ) {
     val balance by vm.balanceFlow(customer.id).collectAsState(initial = 0.0)
+    // Money the SHOP owes THIS customer — change booked to their account + unpaid refunds.
+    val changeOwed by vm.changeBalanceFlow(customer.id).collectAsState(initial = 0.0)
     val history by vm.creditHistory(customer.id).collectAsState(initial = emptyList())
     val bizForPdf by vm.business.collectAsState()
     val pdfCtx = LocalContext.current
     val pdfScope = rememberCoroutineScope()
     var showPay by remember { mutableStateOf(false) }
+    var showPayout by remember { mutableStateOf(false) }
     var wholesale by remember { mutableStateOf(customer.wholesale) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
         dismissButton = {
-            if (balance > 0) {
-                Button(onClick = { showPay = true }) { Text("Record payment") }
+            when {
+                balance > 0 -> Button(onClick = { showPay = true }) { Text("Record payment") }
+                changeOwed > 0 -> Button(onClick = { showPayout = true }) { Text("Pay out") }
             }
         },
         title = { Text(customer.name) },
@@ -5062,12 +5180,30 @@ private fun CustomerDetailDialog(
                 }
                 Spacer(Modifier.height(4.dp))
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text("Balance owed", fontWeight = FontWeight.Bold)
-                    Text(
-                        money(balance, currency), fontWeight = FontWeight.Bold,
-                        color = if (balance > 0) MaterialTheme.colorScheme.error
-                        else MaterialTheme.colorScheme.primary
-                    )
+                    when {
+                        balance > 0 -> {
+                            Text("Balance owed", fontWeight = FontWeight.Bold)
+                            Text(
+                                money(balance, currency), fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
+                        changeOwed > 0 -> {
+                            // Overpaid credit or change booked to account — the shop owes them.
+                            Text("You owe (change)", fontWeight = FontWeight.Bold)
+                            Text(
+                                money(changeOwed, currency), fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                        else -> {
+                            Text("Settled", fontWeight = FontWeight.Bold)
+                            Text(
+                                money(0.0, currency), fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                    }
                 }
                 Spacer(Modifier.height(8.dp))
                 TextButton(
@@ -5137,22 +5273,23 @@ private fun CustomerDetailDialog(
                 } else {
                     Column(Modifier.heightIn(max = 240.dp).verticalScroll(rememberScrollState())) {
                         history.forEach { txn ->
-                            val owed = txn.type == "credit_owed"
+                            val meta = creditRowMeta(txn.type)
                             Row(
                                 Modifier.fillMaxWidth().padding(vertical = 4.dp),
                                 horizontalArrangement = Arrangement.SpaceBetween
                             ) {
                                 Column(Modifier.weight(1f)) {
-                                    Text(if (owed) "Charged" else "Payment",
-                                        style = MaterialTheme.typography.bodyMedium)
+                                    Text(meta.label, style = MaterialTheme.typography.bodyMedium)
                                     Text(syncTimeLabel(txn.createdAt),
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
                                 Text(
-                                    (if (owed) "+" else "-") + money(txn.amount, currency),
-                                    color = if (owed) MaterialTheme.colorScheme.error
-                                    else MaterialTheme.colorScheme.primary
+                                    (if (meta.positive) "+" else "-") + money(txn.amount, currency),
+                                    color = when {
+                                        meta.positive && !meta.weOwe -> MaterialTheme.colorScheme.error
+                                        else -> MaterialTheme.colorScheme.primary
+                                    }
                                 )
                             }
                         }
@@ -5172,12 +5309,43 @@ private fun CustomerDetailDialog(
             showPay = false
         }
     }
+    if (showPayout) {
+        RecordPaymentDialog(
+            maxAmount = changeOwed,
+            currency = currency,
+            title = "Pay out change",
+            owedLabel = "We owe",
+            actionLabel = "Pay out",
+            onDismiss = { showPayout = false }
+        ) { amount, note ->
+            // Never pay out more than we owe (that would flip the balance negative).
+            vm.recordChangePayment(customer.id, amount.coerceAtMost(changeOwed), note.ifBlank { null })
+            showPayout = false
+        }
+    }
+}
+
+/** Display metadata for a credit-ledger row: label, whether it ADDS to its balance
+ *  (shows "+"), and whether it belongs to the shop-owes-customer ledger (vs debt). */
+private data class CreditRowMeta(val label: String, val positive: Boolean, val weOwe: Boolean)
+
+private fun creditRowMeta(type: String): CreditRowMeta = when (type) {
+    "credit_owed" -> CreditRowMeta("Charged", positive = true, weOwe = false)
+    "credit_paid" -> CreditRowMeta("Payment", positive = false, weOwe = false)
+    "change_owed" -> CreditRowMeta("Change owed", positive = true, weOwe = true)
+    "refund_owed" -> CreditRowMeta("Refund owed", positive = true, weOwe = true)
+    "change_paid" -> CreditRowMeta("Change paid", positive = false, weOwe = true)
+    "refund_paid" -> CreditRowMeta("Refund paid", positive = false, weOwe = true)
+    else -> CreditRowMeta("Payment", positive = false, weOwe = false)
 }
 
 @Composable
 private fun RecordPaymentDialog(
     maxAmount: Double,
     currency: String,
+    title: String = "Record payment",
+    owedLabel: String = "Owed",
+    actionLabel: String = "Record",
     onDismiss: () -> Unit,
     onConfirm: (Double, String) -> Unit
 ) {
@@ -5188,13 +5356,13 @@ private fun RecordPaymentDialog(
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = {
-            Button(enabled = valid, onClick = { onConfirm(amount ?: 0.0, note) }) { Text("Record") }
+            Button(enabled = valid, onClick = { onConfirm(amount ?: 0.0, note) }) { Text(actionLabel) }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-        title = { Text("Record payment") },
+        title = { Text(title) },
         text = {
             Column {
-                Text("Owed: ${money(maxAmount, currency)}",
+                Text("$owedLabel: ${money(maxAmount, currency)}",
                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(
@@ -6128,23 +6296,26 @@ private fun PoReceiveDialog(
 // ───────────────────────── CHANGE & CREDIT ─────────────────────────
 
 /**
- * Whole-shop credit ledger — a faithful port of the web Change & Credit page,
- * adapted to the Android data model. The web tracks per-transaction `settled`
- * flags and "change owed" rows; here balances are DERIVED (credit_owed −
- * credit_paid) and only those two ledger types exist, so this screen focuses on
- * customer credit: outstanding-credit summary cards, type + search filters, and
- * a flat newest-first ledger. Tapping a customer who still owes opens Record
- * payment (which pays down their whole balance, reusing the Customers flow).
+ * Whole-shop credit ledger — a port of the web Change & Credit page. Balances are
+ * DERIVED (never stored) over TWO ledgers: what customers owe the shop (credit_owed −
+ * credit_paid) and what the shop owes customers (change_owed/refund_owed − change_paid/
+ * refund_paid). Two summary cards surface both totals. The ledger renders every row
+ * with the right label/sign/colour: tapping a debt charge opens Record payment; tapping
+ * a change/refund the shop owes opens Pay out. (Overpaying a debt is booked as change
+ * owed by the repository, so it lands here too.)
  */
 @Composable
 private fun ChangeCreditScreen(vm: PosViewModel, currency: String) {
     val t = LocalPosTokens.current
     val ledger by vm.creditLedger.collectAsState()
     val customers by vm.customers.collectAsState()
+    // Money the shop owes back to customers (change booked to account + unpaid refunds).
+    val totalOwedToCustomers by vm.totalChangeOwedFlow().collectAsState(initial = 0.0)
 
     var search by remember { mutableStateOf("") }
     var typeFilter by remember { mutableStateOf("all") }      // all | credit_owed | credit_paid
-    var payFor by remember { mutableStateOf<String?>(null) }  // customerId being settled
+    var payFor by remember { mutableStateOf<String?>(null) }  // customerId settling a DEBT
+    var payoutFor by remember { mutableStateOf<String?>(null) } // customerId being PAID OUT change
 
     val totalOwed = customers.sumOf { it.balance.coerceAtLeast(0.0) }
     val activeAccounts = customers.count { it.balance > 0.0 }
@@ -6174,8 +6345,8 @@ private fun ChangeCreditScreen(vm: PosViewModel, currency: String) {
                     t.danger, t.surface1, t.inkTertiary
                 )
                 CreditSummaryCard(
-                    Modifier.weight(1f), "Active accounts",
-                    activeAccounts.toString(), "with a balance",
+                    Modifier.weight(1f), "You owe customers",
+                    money(totalOwedToCustomers, currency), "change + refunds",
                     t.brand.s600, t.surface1, t.inkTertiary
                 )
             }
@@ -6222,27 +6393,36 @@ private fun ChangeCreditScreen(vm: PosViewModel, currency: String) {
                 contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
             ) {
                 items(filtered, key = { it.txn.id }) { row ->
-                    val owed = row.txn.type == "credit_owed"
-                    val stillOwes =
+                    val meta = creditRowMeta(row.txn.type)
+                    val stillOwesDebt =
                         (customers.firstOrNull { it.customer.id == row.txn.customerId }?.balance ?: 0.0) > 0.0
-                    val canPay = owed && stillOwes
+                    // A debt charge is payable while the customer still owes; a "we owe"
+                    // charge (change/refund owed) opens the pay-out flow instead.
+                    val onClick: (() -> Unit)? = when {
+                        row.txn.type == "credit_owed" && stillOwesDebt -> ({ payFor = row.txn.customerId })
+                        meta.positive && meta.weOwe -> ({ payoutFor = row.txn.customerId })
+                        else -> null
+                    }
+                    val accent = when {
+                        meta.positive && !meta.weOwe -> t.danger        // customer owes us
+                        meta.positive && meta.weOwe -> t.brand.s600      // we owe the customer
+                        else -> t.success                                // a payment / pay-out
+                    }
                     val rowMod = Modifier.fillMaxWidth().padding(vertical = 4.dp)
-                    Card(if (canPay) rowMod.clickable { payFor = row.txn.customerId } else rowMod) {
+                    Card(if (onClick != null) rowMod.clickable(onClick = onClick) else rowMod) {
                         Row(
                             Modifier.fillMaxWidth().padding(14.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Box(
                                 Modifier.size(34.dp).clip(RoundedCornerShape(10.dp))
-                                    .background(
-                                        (if (owed) t.danger else t.success).copy(alpha = 0.12f)
-                                    ),
+                                    .background(accent.copy(alpha = 0.12f)),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Icon(
-                                    if (owed) Icons.Filled.Add else Icons.Filled.Check,
+                                    if (meta.positive) Icons.Filled.Add else Icons.Filled.Check,
                                     contentDescription = null,
-                                    tint = if (owed) t.danger else t.success,
+                                    tint = accent,
                                     modifier = Modifier.size(16.dp)
                                 )
                             }
@@ -6250,7 +6430,7 @@ private fun ChangeCreditScreen(vm: PosViewModel, currency: String) {
                             Column(Modifier.weight(1f)) {
                                 Text(row.customerName, fontWeight = FontWeight.Bold, color = t.inkPrimary)
                                 Text(
-                                    (if (owed) "Charged" else "Payment") + " · " + dashTime(row.txn.createdAt),
+                                    meta.label + " · " + dashTime(row.txn.createdAt),
                                     style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
                                 )
                                 row.txn.note?.takeIf { it.isNotBlank() }?.let {
@@ -6261,9 +6441,9 @@ private fun ChangeCreditScreen(vm: PosViewModel, currency: String) {
                                 }
                             }
                             Text(
-                                (if (owed) "+" else "−") + money(row.txn.amount, currency),
+                                (if (meta.positive) "+" else "−") + money(row.txn.amount, currency),
                                 fontWeight = FontWeight.Black,
-                                color = if (owed) t.danger else t.success
+                                color = accent
                             )
                         }
                     }
@@ -6277,6 +6457,18 @@ private fun ChangeCreditScreen(vm: PosViewModel, currency: String) {
         RecordPaymentDialog(maxAmount = balance, currency = currency, onDismiss = { payFor = null }) { amount, note ->
             vm.recordRepayment(cid, amount, note.ifBlank { null })
             payFor = null
+        }
+    }
+
+    payoutFor?.let { cid ->
+        val changeBal by vm.changeBalanceFlow(cid).collectAsState(initial = 0.0)
+        RecordPaymentDialog(
+            maxAmount = changeBal, currency = currency,
+            title = "Pay out change", owedLabel = "We owe", actionLabel = "Pay out",
+            onDismiss = { payoutFor = null }
+        ) { amount, note ->
+            vm.recordChangePayment(cid, amount.coerceAtMost(changeBal), note.ifBlank { null })
+            payoutFor = null
         }
     }
 }
@@ -7307,12 +7499,27 @@ private fun RefundPayoutDialog(
 
 // ───────────────────────── SETTINGS ─────────────────────────
 
+/** Setting groups shown one at a time in [SettingsScreen] (mobile-first: no endless scroll). */
+private enum class SettingsCat(val label: String, val editsBusiness: Boolean) {
+    Business("Business", true),
+    Appearance("Appearance", false),
+    Payments("Payments", true),
+    TaxPricing("Tax & pricing", true),
+    Discounts("Discounts", false),
+    Receipt("Receipt & printer", true),
+    Data("Data & sync", false),
+}
+
 @Composable
 private fun SettingsScreen(vm: PosViewModel, business: Business, printer: PrinterUi) {
     val theme by vm.themeChoice.collectAsState()
     val prefs by vm.shopPrefs.collectAsState()
     var showResetStock by remember { mutableStateOf(false) }
     var showWipeSales by remember { mutableStateOf(false) }
+    // Settings are grouped into categories so it isn't one endless scroll; the picker
+    // below swaps which group is shown. All the editable state lives in this one
+    // composable, so switching categories never loses an unsaved edit.
+    var settingsCat by remember { mutableStateOf(SettingsCat.Business) }
 
     var name by remember(business.id) { mutableStateOf(business.name) }
     var tagline by remember(business.id) { mutableStateOf(business.tagline ?: "") }
@@ -7433,6 +7640,10 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
 
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp)) {
         item {
+            SettingsCategoryBar(selected = settingsCat, onSelect = { settingsCat = it })
+            Spacer(Modifier.height(16.dp))
+
+          if (settingsCat == SettingsCat.Business) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 LogoPreview(logoUri)
                 Spacer(Modifier.width(16.dp))
@@ -7447,14 +7658,16 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
             SettingsField("Website", website) { website = it }
             SettingsField("Address", address) { address = it }
             SettingsField("Receipt footer", footer) { footer = it }
+          }
 
+          if (settingsCat == SettingsCat.Appearance) {
             // ---- Appearance (theme; saves live, device-local) ----
-            Spacer(Modifier.height(20.dp))
             SettingsSectionHeader("Appearance")
             AppearanceSection(theme = theme, onChange = { vm.saveTheme(it) })
+          }
 
+          if (settingsCat == SettingsCat.TaxPricing) {
             // ---- VAT / ZIMRA ----
-            Spacer(Modifier.height(20.dp))
             SettingsSectionHeader("VAT / ZIMRA")
             SettingsSwitch("Charge VAT", vatEnabled) { vatEnabled = it }
             if (vatEnabled) {
@@ -7463,9 +7676,10 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
                     vatPercentText = it.filter { ch -> ch.isDigit() || ch == '.' }
                 }
             }
+          }
 
+          if (settingsCat == SettingsCat.Payments) {
             // ---- Payment methods ----
-            Spacer(Modifier.height(20.dp))
             SettingsSectionHeader("Payment methods")
             Text(
                 "Choose which methods cashiers can use at checkout. Money goes directly " +
@@ -7521,14 +7735,16 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
                 SettingsField("Omari account name", omariAccountName) { omariAccountName = it }
                 SettingsField("Omari phone", omariPhone) { omariPhone = it }
             }
+          }
 
+          if (settingsCat == SettingsCat.TaxPricing) {
             // ---- Tax & price rounding + Margins (saves live, device-local) ----
-            Spacer(Modifier.height(20.dp))
             SettingsSectionHeader("Tax & margins")
             TaxMarginsSection(prefs = prefs, onChange = { vm.savePrefs(it) })
+          }
 
+          if (settingsCat == SettingsCat.Discounts) {
             // ---- Quotes (saves live, device-local) ----
-            Spacer(Modifier.height(20.dp))
             SettingsSectionHeader("Quotes")
             SettingsField("Quote validity (days)", prefs.defaultQuoteValidityDays.toString()) {
                 it.toIntOrNull()?.coerceIn(0, 365)?.let { d ->
@@ -7540,8 +7756,8 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
             Spacer(Modifier.height(20.dp))
             SettingsSectionHeader("Discounts")
             Text(
-                "A cashier giving a discount above this percentage needs an admin PIN to " +
-                    "approve it. Admins are never asked. Set 0 to never require approval.",
+                "A cashier giving a whole-sale discount above this percentage needs an admin " +
+                    "PIN to approve it. Admins are never asked. Set 0 to never require approval.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -7551,6 +7767,26 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
                 }
             }
 
+            // Per-item discount ceiling: a hard cap the till enforces at the cart, so a
+            // cashier can knock money off a single line but never past this amount.
+            Spacer(Modifier.height(12.dp))
+            Text(
+                "The most a cashier may take off a single cart line. This is a hard limit — " +
+                    "they can't go past it, no PIN overrides it. Set 0 for no limit.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            SettingsField(
+                "Max discount per item (${currency.ifBlank { "USD" }})",
+                trimPct(prefs.maxItemDiscount)
+            ) {
+                it.toDoubleOrNull()?.coerceAtLeast(0.0)?.let { m ->
+                    vm.savePrefs(prefs.copy(maxItemDiscount = m))
+                }
+            }
+          }
+
+          if (settingsCat == SettingsCat.TaxPricing) {
             // ---- Second currency (dual-currency tender, saves live, device-local) ----
             Spacer(Modifier.height(20.dp))
             SettingsSectionHeader("Second currency")
@@ -7595,9 +7831,10 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
                     color = MaterialTheme.colorScheme.primary
                 )
             }
+          }
 
+          if (settingsCat == SettingsCat.Receipt) {
             // ---- Printer ----
-            Spacer(Modifier.height(20.dp))
             Text("Receipt printer", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(6.dp))
             Text("Printer type", style = MaterialTheme.typography.bodyMedium)
@@ -7705,15 +7942,20 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
             Spacer(Modifier.height(20.dp))
             SettingsSectionHeader("Receipt template")
             ReceiptTemplateSection(prefs = prefs, onChange = { vm.savePrefs(it) })
+          }
 
+          // Save writes the business record (name, VAT, payment methods, printer). The
+          // prefs-only groups (Appearance, Discounts) save live, so no button there.
+          if (settingsCat.editsBusiness) {
             Spacer(Modifier.height(20.dp))
             Button(
                 onClick = { vm.saveBusiness(edited()) },
                 modifier = Modifier.fillMaxWidth()
             ) { Text("Save settings") }
+          }
 
+          if (settingsCat == SettingsCat.Data) {
             // ---- Danger zone ----
-            Spacer(Modifier.height(24.dp))
             SettingsSectionHeader("Danger zone")
             Text(
                 "These actions cannot be undone.",
@@ -7734,6 +7976,7 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
             ) { Text("Wipe all sales history") }
 
             CloudSyncSection(vm)
+          }
         }
     }
 
@@ -7788,6 +8031,10 @@ private fun CloudSyncSection(vm: PosViewModel) {
     var busy by remember { mutableStateOf(false) }
     var message by remember(connection) { mutableStateOf<String?>(null) }
     var isError by remember(connection) { mutableStateOf(false) }
+    // Set when a Test reveals the project is reachable but empty → surfaces the guided
+    // "Set up your database" flow (the app can't create tables itself — see the sheet).
+    var tablesMissing by remember(connection) { mutableStateOf(false) }
+    var showSetup by remember { mutableStateOf(false) }
 
     Spacer(Modifier.height(28.dp))
     HorizontalDivider()
@@ -7837,6 +8084,7 @@ private fun CloudSyncSection(vm: PosViewModel) {
                     vm.testConnection(url, key) { result ->
                         testing = false
                         isError = result !is ConnectionTest.Ok
+                        tablesMissing = result is ConnectionTest.TablesMissing
                         message = result.label()
                     }
                 }
@@ -7867,6 +8115,29 @@ private fun CloudSyncSection(vm: PosViewModel) {
                 }
                 Text("Connect & sync")
             }
+        }
+        if (tablesMissing) {
+            Spacer(Modifier.height(8.dp))
+            Button(
+                onClick = { showSetup = true },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Filled.Storage, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("Set up your database")
+            }
+        }
+        if (showSetup) {
+            DatabaseSetupSheet(
+                url = url,
+                recheck = { cb -> vm.testConnection(url, key, cb) },
+                onReady = {
+                    tablesMissing = false
+                    isError = false
+                    message = "Tables found. Tap \"Connect & sync\"."
+                },
+                onDismiss = { showSetup = false }
+            )
         }
     } else {
         Text(
@@ -7938,11 +8209,134 @@ private fun SyncMessage(text: String, isError: Boolean) {
     Spacer(Modifier.height(8.dp))
 }
 
+/**
+ * Guided one-time database setup, shown when a Test finds the project reachable but
+ * EMPTY. The app cannot create tables itself (PostgREST runs no DDL from the anon key),
+ * so this hands the user the exact SQL to run once in their Supabase SQL editor, then
+ * re-checks. Only ever opened for an empty DB, so it never touches a configured one.
+ */
+@Composable
+private fun DatabaseSetupSheet(
+    url: String,
+    recheck: ((ConnectionTest) -> Unit) -> Unit,
+    onReady: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    var checking by remember { mutableStateOf(false) }
+    var checkMsg by remember { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = {
+            Button(
+                enabled = !checking,
+                onClick = {
+                    checking = true; checkMsg = null
+                    recheck { res ->
+                        checking = false
+                        if (res is ConnectionTest.Ok) { onReady(); onDismiss() }
+                        else checkMsg = res.label()
+                    }
+                }
+            ) {
+                if (checking) {
+                    CircularProgressIndicator(
+                        Modifier.size(16.dp), strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.onPrimary
+                    )
+                    Spacer(Modifier.width(8.dp))
+                }
+                Text("I've run it — re-check")
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+        title = { Text("Set up your database") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                Text(
+                    "Your database is empty. It needs a one-time setup — about 30 seconds. " +
+                        "Copy the setup script, run it once in your Supabase SQL editor, then re-check. " +
+                        "Running it again later is harmless — it never deletes your data.",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                Spacer(Modifier.height(12.dp))
+                OutlinedButton(
+                    onClick = {
+                        clipboard.setText(AnnotatedString(SUPABASE_SETUP_SQL))
+                        Toast.makeText(context, "Setup SQL copied", Toast.LENGTH_SHORT).show()
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.Filled.ContentCopy, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Copy setup SQL")
+                }
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = {
+                        runCatching {
+                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(sqlEditorUrl(url))))
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.Filled.OpenInNew, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Open Supabase SQL editor")
+                }
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = {
+                        val send = Intent(Intent.ACTION_SEND).apply {
+                            type = "text/plain"
+                            putExtra(Intent.EXTRA_SUBJECT, "ON-SPOT POS — Supabase setup SQL")
+                            putExtra(Intent.EXTRA_TEXT, SUPABASE_SETUP_SQL)
+                        }
+                        runCatching { context.startActivity(Intent.createChooser(send, "Share setup SQL")) }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.Filled.Share, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Share SQL (send to a PC)")
+                }
+                Spacer(Modifier.height(16.dp))
+                Text("Steps", fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "1. Open your Supabase SQL editor (button above).\n" +
+                        "2. Paste the copied SQL into a new query.\n" +
+                        "3. Press Run.\n" +
+                        "4. Come back and tap \"I've run it — re-check\".",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                checkMsg?.let {
+                    Spacer(Modifier.height(12.dp))
+                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                }
+            }
+        }
+    )
+}
+
+/** Deep-link to the SQL editor of the project in [url] (`https://<ref>.supabase.co`),
+ *  falling back to the dashboard root when the ref can't be parsed. */
+private fun sqlEditorUrl(url: String): String {
+    val host = runCatching { Uri.parse(url.trim()).host }.getOrNull()
+    val ref = host?.takeIf { it.contains(".supabase.") }
+        ?.substringBefore('.')?.takeIf { it.isNotBlank() }
+    return if (ref != null) "https://supabase.com/dashboard/project/$ref/sql/new"
+    else "https://supabase.com/dashboard"
+}
+
 private fun ConnectionTest.label(): String = when (this) {
     ConnectionTest.Ok -> "Connection works — tables found. You're good to connect."
     ConnectionTest.TablesMissing ->
-        "Reached the database, but the tables aren't set up yet. Run the setup SQL " +
-            "(see SUPABASE_SETUP.md) in your project, then try again."
+        "Reached the database, but it's empty — the tables aren't set up yet. " +
+            "Tap \"Set up your database\" below to finish in about 30 seconds."
     ConnectionTest.Unauthorized ->
         "Key rejected. Make sure you pasted the anon (public) key and the URL is correct."
     is ConnectionTest.Failed -> "Couldn't connect: $message"
@@ -8002,6 +8396,23 @@ private fun SettingsField(label: String, value: String, onChange: (String) -> Un
 private fun SettingsSectionHeader(title: String) {
     Text(title, style = MaterialTheme.typography.titleMedium)
     Spacer(Modifier.height(4.dp))
+}
+
+/** Horizontal, scrollable category picker at the top of Settings (mobile-first). */
+@Composable
+private fun SettingsCategoryBar(selected: SettingsCat, onSelect: (SettingsCat) -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        SettingsCat.values().forEach { cat ->
+            FilterChip(
+                selected = selected == cat,
+                onClick = { onSelect(cat) },
+                label = { Text(cat.label) }
+            )
+        }
+    }
 }
 
 @Composable

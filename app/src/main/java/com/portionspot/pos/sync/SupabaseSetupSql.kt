@@ -1,18 +1,24 @@
--- ============================================================================
+package com.portionspot.pos.sync
+
+/**
+ * The one-time Supabase setup script the app hands the user when their project is
+ * empty (see the "Set up your database" flow in CloudSyncSection). It creates the FIVE
+ * tables this app syncs to — matching the shared web-POS contract the engine reads/writes
+ * (see [SyncConfig.TABLES] and the DTOs in Dtos.kt), NOT the older items/sale_items shape.
+ *
+ * Bundled in-app (not an asset) so it is available offline on the device. Fully
+ * idempotent — every statement is `if not exists` / `drop … if exists` then recreate —
+ * so pasting it into an ALREADY-configured project is a harmless no-op that never drops
+ * or overwrites data.
+ *
+ * Keep this in lockstep with the repo `supabase-setup.sql` (the two are one source of
+ * truth) and with the column names in Dtos.kt.
+ */
+const val SUPABASE_SETUP_SQL: String = """-- ============================================================================
 -- ON-SPOT POS — Supabase setup (bring-your-own-database)
--- ----------------------------------------------------------------------------
--- Run this ONCE in your own Supabase project: Dashboard -> SQL Editor -> New
--- query -> paste -> Run. It creates the FIVE tables the app syncs to.
---
--- Safe to run more than once and safe on an existing project: every statement
--- uses "if not exists" / "drop … if exists" then recreate, so it never drops or
--- overwrites your data.
---
--- The app connects with your project's anon (public) key. This schema mirrors the
--- shared web-POS contract the app reads/writes (products by sku, customers by
--- local_id, sales keyed by ref with JSONB line items, credit_transactions by
--- local_id, mobile_money_receipts by txn_code). It is kept in lockstep with the
--- in-app copy at app/.../sync/SupabaseSetupSql.kt.
+-- Run ONCE: Supabase Dashboard -> SQL Editor -> New query -> paste -> Run.
+-- Safe to re-run: every statement is "if not exists", so it never drops your data.
+-- The app connects with your project's anon (public) key.
 -- ============================================================================
 
 -- 1) Tables ------------------------------------------------------------------
@@ -162,3 +168,4 @@ to anon, authenticated;
 -- Done. Copy your Project URL and anon (public) key from
 -- Dashboard -> Project Settings -> API, then paste them into the app under
 -- Settings -> Cloud sync, and tap "Connect & sync".
+"""

@@ -366,6 +366,7 @@ class PosViewModel(
             checkoutRounding = repo.getSetting(KEY_ROUND_CO)?.toDoubleOrNull() ?: d.checkoutRounding,
             defaultQuoteValidityDays = repo.getSetting(KEY_QUOTE_DAYS)?.toIntOrNull() ?: d.defaultQuoteValidityDays,
             discountThresholdPct = repo.getSetting(KEY_DISCOUNT_THRESHOLD)?.toDoubleOrNull() ?: d.discountThresholdPct,
+            maxItemDiscount = repo.getSetting(KEY_MAX_ITEM_DISCOUNT)?.toDoubleOrNull() ?: d.maxItemDiscount,
             marginFormula = repo.getSetting(KEY_MARGIN_FORMULA) ?: d.marginFormula,
             autoConvertUnitsToBoxes = repo.getSetting(KEY_AUTO_BOXES)?.toBooleanStrictOrNull() ?: d.autoConvertUnitsToBoxes,
             printerType = repo.getSetting(KEY_PRINTER_TYPE) ?: d.printerType,
@@ -398,6 +399,7 @@ class PosViewModel(
             repo.putSetting(KEY_ROUND_CO, prefs.checkoutRounding.toString())
             repo.putSetting(KEY_QUOTE_DAYS, prefs.defaultQuoteValidityDays.toString())
             repo.putSetting(KEY_DISCOUNT_THRESHOLD, prefs.discountThresholdPct.toString())
+            repo.putSetting(KEY_MAX_ITEM_DISCOUNT, prefs.maxItemDiscount.toString())
             repo.putSetting(KEY_MARGIN_FORMULA, prefs.marginFormula)
             repo.putSetting(KEY_AUTO_BOXES, prefs.autoConvertUnitsToBoxes.toString())
             repo.putSetting(KEY_PRINTER_TYPE, prefs.printerType)
@@ -484,6 +486,26 @@ class PosViewModel(
             if (line.lineKey == lineKey) line.copy(qty = qty) else line
         }
     }
+
+    /**
+     * Set a fixed-amount discount on a cart line. The [amount] is clamped to the
+     * line's own goods value AND to the admin's [ShopPrefs.maxItemDiscount] ceiling
+     * (0 = no ceiling), so a cashier can never discount past either limit.
+     */
+    fun setLineDiscount(lineKey: String, amount: Double) {
+        val cap = _shopPrefs.value.maxItemDiscount
+        _cart.value = _cart.value.map { line ->
+            if (line.lineKey != lineKey) line
+            else {
+                var d = amount.coerceIn(0.0, line.lineGross)
+                if (cap > 0.0) d = d.coerceAtMost(cap)
+                line.copy(lineDiscount = d)
+            }
+        }
+    }
+
+    /** The admin-set ceiling on a single line's discount (0 = unlimited). */
+    val maxItemDiscount: Double get() = _shopPrefs.value.maxItemDiscount
 
     fun removeLine(lineKey: String) {
         _cart.value = _cart.value.filterNot { it.lineKey == lineKey }
@@ -759,6 +781,10 @@ class PosViewModel(
 
     /** Change the shop still owes this customer (change_owed − change_paid). */
     fun changeBalanceFlow(customerId: String): Flow<Double> = repo.changeBalanceFlow(customerId)
+
+    /** Shop-wide money owed back to customers (change + unpaid refunds) — summary card. */
+    fun totalChangeOwedFlow(): Flow<Double> =
+        businessId.filterNotNull().flatMapLatest { repo.totalChangeOwedFlow(it) }
 
     /** Hand over change the shop previously owed a customer. */
     fun recordChangePayment(customerId: String, amount: Double, note: String? = null) {
@@ -1375,6 +1401,7 @@ class PosViewModel(
         private const val KEY_ROUND_CO = "round_checkout"
         private const val KEY_QUOTE_DAYS = "quote_validity_days"
         private const val KEY_DISCOUNT_THRESHOLD = "discount_threshold_pct"
+        private const val KEY_MAX_ITEM_DISCOUNT = "max_item_discount"
         private const val KEY_MARGIN_FORMULA = "margin_formula"
         private const val KEY_AUTO_BOXES = "auto_units_to_boxes"
         private const val KEY_PRINTER_TYPE = "printer_type"

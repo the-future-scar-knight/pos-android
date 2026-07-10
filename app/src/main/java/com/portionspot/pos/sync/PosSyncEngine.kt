@@ -3,6 +3,7 @@ package com.portionspot.pos.sync
 import com.portionspot.pos.data.BusinessDao
 import com.portionspot.pos.data.CreditDao
 import com.portionspot.pos.data.CustomerDao
+import com.portionspot.pos.data.Item
 import com.portionspot.pos.data.ItemDao
 import com.portionspot.pos.data.MobileMoneyDao
 import com.portionspot.pos.data.RefundDao
@@ -236,12 +237,16 @@ class PosSyncEngine(
      * products → items, bridged by sku (the cloud has no per-row local id here).
      *
      * Matching is deliberately forgiving to avoid DUPLICATES: a cloud product is joined
-     * to an existing local item by trimmed/case-folded sku; failing that (an item added
-     * on-device with no sku, or from an older build), by trimmed/case-folded NAME among
-     * the sku-less local items — so it's absorbed and adopts the cloud sku instead of
-     * inserting a second copy. Each sku-less local item can be claimed only once. Cloud
-     * rows sharing a sku are also collapsed to the newest, so a data glitch upstream
-     * can't fan out into two local rows. Only genuinely new products insert a fresh row.
+     * to an existing local item by trimmed/case-folded sku; failing that, by trimmed/
+     * case-folded NAME against ANY local item (not just sku-less ones) — so a catalogue
+     * the shop typed in first (whose items may carry a different/auto sku, or none) is
+     * absorbed and adopts the cloud sku instead of the pull inserting a second copy. Each
+     * local item can be claimed only once. Cloud rows sharing a sku are collapsed to the
+     * newest. Only genuinely new products insert a fresh row. See [bridgeProducts].
+     *
+     * After applying, [healDuplicateItems] collapses any local rows that were ALREADY
+     * duplicated (from earlier connects, before this broader bridge) so the shop doesn't
+     * keep seeing two of everything.
      */
     private suspend fun pullProducts(api: SupabaseRest, bid: String): Int {
         val rows = syncJson.decodeFromString<List<ProductDto>>(
@@ -249,30 +254,44 @@ class PosSyncEngine(
         )
         if (rows.isEmpty()) return 0
         val localAll = itemDao.allForBusinessOnce(bid)
-        val bySku = localAll.filter { !it.sku.isNullOrBlank() }
-            .associateBy { it.sku!!.trim().lowercase() }
-        // Mutable so a sku-less local item is claimed by at most one cloud product.
-        val byNameNoSku = localAll.filter { it.sku.isNullOrBlank() }
-            .associateBy { it.name.trim().lowercase() }
-            .toMutableMap()
-        // Collapse duplicate-sku cloud rows to the newest (blank skus are NOT grouped —
-        // that would wrongly merge every un-skued product into one).
-        val (skued, blank) = rows.partition { it.sku.isNotBlank() }
-        val toApply = skued.groupBy { it.sku.trim().lowercase() }
-            .map { (_, g) -> g.maxByOrNull { IsoTime.toMillis(it.updatedAt) }!! } + blank
 
         var applied = 0
-        for (dto in toApply) {
-            val skuKey = dto.sku.trim().lowercase()
-            val local = (if (skuKey.isNotEmpty()) bySku[skuKey] else null)
-                ?: byNameNoSku.remove(dto.name.trim().lowercase())
+        for ((dto, local) in bridgeProducts(localAll, rows)) {
             if (local == null || IsoTime.toMillis(dto.updatedAt) > local.updatedAt) {
                 itemDao.upsert(dto.toItem(bid, local))
                 applied++
             }
         }
+        healDuplicateItems(bid)
         config.setCursor("products", rows.maxOf { it.updatedAt ?: IsoTime.EPOCH })
         return applied
+    }
+
+    /**
+     * Collapse local catalogue rows that are duplicates of the SAME product — same
+     * case/space-folded NAME, with skus that are equal or one-side-blank (two genuinely
+     * different products that merely share a name, each with its own sku, are left
+     * alone). The survivor is the sku-bearing, already-synced, newest row; each other
+     * copy has its sale history repointed onto the survivor and is then hard-deleted
+     * (local only — never synced). Idempotent: a no-op once there are no duplicates.
+     */
+    private suspend fun healDuplicateItems(bid: String) {
+        val groups = itemDao.allForBusinessOnce(bid).groupBy { it.name.trim().lowercase() }
+        for ((_, group) in groups) {
+            if (group.size < 2) continue
+            val survivor = group.maxWithOrNull(
+                compareBy({ !it.sku.isNullOrBlank() }, { !it.pendingSync }, { it.updatedAt })
+            ) ?: continue
+            for (dup in group) {
+                if (dup.id == survivor.id) continue
+                val a = dup.sku?.trim()?.lowercase().orEmpty()
+                val b = survivor.sku?.trim()?.lowercase().orEmpty()
+                // Same product only: skus match, or at least one is blank.
+                if (a.isNotEmpty() && b.isNotEmpty() && a != b) continue
+                saleDao.repointLineItem(dup.id, survivor.id)
+                itemDao.hardDelete(dup.id)
+            }
+        }
     }
 
     /** customers → customers, bridged by local_id (= the Android UUID). */
@@ -324,5 +343,41 @@ class PosSyncEngine(
     companion object {
         /** Rows per pull. A single till changes far fewer than this between syncs. */
         private const val PAGE = 1000
+    }
+}
+
+/**
+ * Pure product-merge bridge (extracted from [PosSyncEngine.pullProducts] so it can be
+ * unit-tested). Matches each cloud [ProductDto] to at most one local [Item] — by
+ * case/space-folded sku first, then by folded name against ANY local item — claim-once,
+ * so a locally-typed catalogue merges onto its cloud twin instead of duplicating. Cloud
+ * rows sharing a sku are collapsed to the newest before matching. Returns each cloud row
+ * paired with its matched local item (or null = a genuinely new product).
+ */
+internal fun bridgeProducts(local: List<Item>, cloud: List<ProductDto>): List<Pair<ProductDto, Item?>> {
+    val bySku = HashMap<String, Item>()
+    val byName = HashMap<String, Item>()
+    for (it in local) {
+        val s = it.sku?.trim()?.lowercase()
+        if (!s.isNullOrEmpty()) bySku.putIfAbsent(s, it)
+        byName.putIfAbsent(it.name.trim().lowercase(), it)
+    }
+    // Collapse duplicate-sku cloud rows to the newest; blank-sku rows stay individual
+    // (grouping them would wrongly fuse every un-skued product into one).
+    val (skued, blank) = cloud.partition { it.sku.isNotBlank() }
+    val ordered = skued.groupBy { it.sku.trim().lowercase() }
+        .map { (_, g) -> g.maxByOrNull { IsoTime.toMillis(it.updatedAt) }!! } + blank
+
+    val claimed = HashSet<String>()   // local ids already taken (claim-once)
+    return ordered.map { dto ->
+        val skuKey = dto.sku.trim().lowercase()
+        var match = if (skuKey.isNotEmpty()) bySku[skuKey] else null
+        if (match != null && match.id in claimed) match = null
+        if (match == null) {
+            val cand = byName[dto.name.trim().lowercase()]
+            if (cand != null && cand.id !in claimed) match = cand
+        }
+        if (match != null) claimed.add(match.id)
+        dto to match
     }
 }

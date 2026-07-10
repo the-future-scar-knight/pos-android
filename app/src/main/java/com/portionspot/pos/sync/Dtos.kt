@@ -113,7 +113,8 @@ fun ProductDto.toItem(businessId: String, local: Item?): Item {
     return base.copy(
         businessId = businessId,
         name = name,
-        sku = sku,
+        // Never let a blank cloud sku wipe a real local sku (keeps the merge bridge stable).
+        sku = sku.ifBlank { base.sku?.ifBlank { null } ?: sku },
         category = category,
         price = retailPrice.toMoney(),
         wholesalePrice = wholesalePrice.toMoney(),
