@@ -81,6 +81,14 @@ data class CreditLedgerRow(val txn: CreditTxn, val customerName: String)
 private const val DAY_MS = 24L * 60 * 60 * 1000
 
 @OptIn(ExperimentalCoroutinesApi::class)
+/**
+ * How the till is being run. [Local] (default) is a phone-only shop: full app
+ * features + admin panel, no cloud account, an optional device PIN. [Cloud] is the
+ * opt-in team mode: Supabase login, per-cashier PINs, staff management, attribution
+ * and sync — the original behaviour, now behind a choice.
+ */
+enum class AppMode { Local, Cloud }
+
 class PosViewModel(
     private val repo: PosRepository,
     private val sync: SyncManager,
@@ -88,6 +96,25 @@ class PosViewModel(
 ) : ViewModel() {
 
     private val businessId = MutableStateFlow<String?>(null)
+
+    // ── App mode / first-run onboarding / local device PIN ────────────────
+    // Default Local so a fresh install is usable immediately (no login wall).
+    private val _appMode = MutableStateFlow(AppMode.Local)
+    val appMode: StateFlow<AppMode> = _appMode.asStateFlow()
+
+    /** False until the first-run "Set a PIN / Keep it open" choice has been made. */
+    private val _onboarded = MutableStateFlow(false)
+    val onboarded: StateFlow<Boolean> = _onboarded.asStateFlow()
+
+    /** Whether a local device PIN is set (drives the lock screen + Settings toggle). */
+    private val _hasLocalPin = MutableStateFlow(false)
+    val hasLocalPin: StateFlow<Boolean> = _hasLocalPin.asStateFlow()
+
+    /** False until app-mode/onboarding/PIN flags have been read from storage. The gate
+     *  shows nothing until this is true, so a returning user never sees the welcome
+     *  screen flash before the persisted choice loads. */
+    private val _bootLoaded = MutableStateFlow(false)
+    val bootLoaded: StateFlow<Boolean> = _bootLoaded.asStateFlow()
 
     // The signed-in cashier, pushed in from AuthGate (see MainActivity). Stamped onto
     // refunds now, and onto the other financial writes as Phase-2 wiring continues.
@@ -320,8 +347,56 @@ class PosViewModel(
         }
         viewModelScope.launch { _themeChoice.value = loadTheme() }
         viewModelScope.launch { _shopPrefs.value = loadPrefs() }
+        viewModelScope.launch {
+            _appMode.value = if (repo.getSetting(KEY_APP_MODE) == "cloud") AppMode.Cloud else AppMode.Local
+            _onboarded.value = repo.getSetting(KEY_ONBOARDED) == "1"
+            _hasLocalPin.value = authManager.hasLocalPin()
+            _bootLoaded.value = true
+        }
         refreshSyncState()
     }
+
+    // ── App mode / onboarding / local PIN actions ─────────────────────────
+
+    /** Record that the first-run choice has been made; the welcome screen won't return. */
+    fun completeOnboarding() {
+        _onboarded.value = true
+        viewModelScope.launch { repo.putSetting(KEY_ONBOARDED, "1") }
+    }
+
+    /** Set (or replace) the local device PIN. Hashing runs off the main thread. */
+    fun setLocalPin(pin: String, onDone: () -> Unit = {}) {
+        viewModelScope.launch {
+            authManager.setLocalPin(pin)
+            _hasLocalPin.value = true
+            onDone()
+        }
+    }
+
+    /** Remove the local device PIN (till opens without a lock). */
+    fun clearLocalPin() {
+        viewModelScope.launch {
+            authManager.clearLocalPin()
+            _hasLocalPin.value = false
+        }
+    }
+
+    suspend fun verifyLocalPin(pin: String): Boolean = authManager.verifyLocalPin(pin)
+
+    /** Switch to cloud (team) mode; the AuthGate login flow takes over from here. */
+    fun connectCloud() {
+        _appMode.value = AppMode.Cloud
+        viewModelScope.launch { repo.putSetting(KEY_APP_MODE, "cloud") }
+    }
+
+    /** Return to local (phone-only) mode, e.g. backing out of cloud login. */
+    fun useLocalMode() {
+        _appMode.value = AppMode.Local
+        viewModelScope.launch { repo.putSetting(KEY_APP_MODE, "local") }
+    }
+
+    /** True once at least one cloud account has been provisioned on this device. */
+    fun hasCloudAccount(): Boolean = authManager.hasCloudAccount()
 
     // ---- Appearance theme ------------------------------------------------
 
@@ -1385,6 +1460,8 @@ class PosViewModel(
         private const val KEY_THEME_ACCENT_HEX = "theme_accent_hex"
         private const val KEY_THEME_BG = "theme_background"
         private const val KEY_THEME_SIDEBAR = "theme_sidebar"
+        private const val KEY_APP_MODE = "app_mode"        // "local" | "cloud"
+        private const val KEY_ONBOARDED = "onboarded"      // "1" once first-run choice made
         private const val KEY_RC_FONT = "rc_font_scale"
         private const val KEY_RC_FEED = "rc_feed_lines"
         private const val KEY_RC_BOLD = "rc_bold_name"

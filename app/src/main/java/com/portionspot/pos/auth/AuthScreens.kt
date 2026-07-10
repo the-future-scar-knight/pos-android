@@ -58,13 +58,19 @@ import kotlinx.coroutines.launch
  * the "session expired" banner when a refresh is rejected server-side.
  */
 @Composable
-fun AuthGate(auth: AuthManager, content: @Composable (PosUser) -> Unit) {
+fun AuthGate(
+    auth: AuthManager,
+    onExitToLocal: (() -> Unit)? = null,
+    content: @Composable (PosUser) -> Unit,
+) {
     val state by auth.state.collectAsState()
     val reloginRequired by auth.reloginRequired.collectAsState()
 
     when (val s = state) {
         is AuthState.Loading -> Box(Modifier.fillMaxSize()) {}
-        is AuthState.LoggedOut -> LoginScreen(auth, onBack = null)
+        // With no account yet, [onExitToLocal] (when cloud mode was just opted into)
+        // becomes the back arrow so the user can return to using the till locally.
+        is AuthState.LoggedOut -> LoginScreen(auth, onBack = onExitToLocal)
         is AuthState.AddAccount -> LoginScreen(auth, onBack = { auth.backToPicker() })
         is AuthState.Picker -> AccountPickerScreen(auth, s.accounts)
         is AuthState.Locked -> PinUnlockScreen(auth, s.account)
@@ -95,7 +101,7 @@ fun AuthGate(auth: AuthManager, content: @Composable (PosUser) -> Unit) {
 }
 
 @Composable
-private fun AuthScaffold(
+internal fun AuthScaffold(
     title: String,
     subtitle: String,
     onBack: (() -> Unit)? = null,
@@ -285,7 +291,7 @@ private fun LoginScreen(auth: AuthManager, onBack: (() -> Unit)?) {
 }
 
 @Composable
-private fun PinField(
+internal fun PinField(
     value: String,
     onChange: (String) -> Unit,
     label: String,

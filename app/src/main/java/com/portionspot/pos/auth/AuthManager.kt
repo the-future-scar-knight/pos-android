@@ -242,6 +242,22 @@ class AuthManager(
     suspend fun verifyAdminPin(pin: String): Boolean =
         withContext(Dispatchers.IO) { vault.verifyAnyAdminPin(pin) }
 
+    // ── local device PIN (no-cloud mode) ──────────────────────────────────
+    // The optional single PIN that locks a phone-only till. Separate from cloud
+    // accounts entirely; all hashing runs on IO (PBKDF2 is heavy on the Sunmi).
+
+    /** True if a cloud account has ever been provisioned on this device. */
+    fun hasCloudAccount(): Boolean = vault.hasAnyAccount()
+
+    suspend fun hasLocalPin(): Boolean = withContext(Dispatchers.IO) { vault.hasLocalPin() }
+
+    suspend fun setLocalPin(pin: String) = withContext(Dispatchers.IO) { vault.setLocalPin(pin) }
+
+    suspend fun verifyLocalPin(pin: String): Boolean =
+        withContext(Dispatchers.IO) { vault.verifyLocalPin(pin) }
+
+    suspend fun clearLocalPin() = withContext(Dispatchers.IO) { vault.clearLocalPin() }
+
     // ── tokens for the sync layer ─────────────────────────────────────────
 
     /** Snapshot for request headers; may be stale, see [refreshIfNeeded]. */

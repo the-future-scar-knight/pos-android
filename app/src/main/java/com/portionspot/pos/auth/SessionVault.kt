@@ -40,11 +40,16 @@ data class AccountRecord(
     val hasPin: Boolean get() = pinHash != null && pinSalt != null
 }
 
-/** The whole device vault: every provisioned account plus which one is active. */
+/** The whole device vault: every provisioned account plus which one is active.
+ *  [localPinSalt]/[localPinHash] are the OPTIONAL device PIN for local (no-cloud)
+ *  mode — independent of any cloud account, so a phone-only shop can lock the till
+ *  without ever signing in. Both null = the device is unlocked/open. */
 @Serializable
 private data class VaultData(
     val accounts: List<AccountRecord> = emptyList(),
     val activeUserId: String? = null,
+    val localPinSalt: String? = null,
+    val localPinHash: String? = null,
 )
 
 /** A provisioned account as the lock-screen picker sees it (no tokens/secrets). */
@@ -241,6 +246,40 @@ class SessionVault(context: Context) {
         if (data.accounts.none { it.auth.userId == userId }) return
         val accounts = data.accounts.map { if (it.auth.userId == userId) block(it) else it }
         persist(data.copy(accounts = accounts))
+    }
+
+    // ── local device PIN (no-cloud mode) ──────────────────────────────────
+    // A single optional PIN gating the whole device when the shop runs without any
+    // cloud account. Same PBKDF2-HMAC-SHA256 + Keystore-sealed storage as the
+    // per-account PINs above (so it's API-23 safe on the Sunmi), just keyed off the
+    // vault itself rather than an account.
+
+    fun hasLocalPin(): Boolean {
+        val d = load()
+        return d.localPinHash != null && d.localPinSalt != null
+    }
+
+    fun setLocalPin(pin: String) {
+        val salt = ByteArray(16).also { SecureRandom().nextBytes(it) }
+        val data = load()
+        persist(
+            data.copy(
+                localPinSalt = Base64.encodeToString(salt, Base64.NO_WRAP),
+                localPinHash = Base64.encodeToString(pbkdf2(pin, salt), Base64.NO_WRAP),
+            )
+        )
+    }
+
+    fun verifyLocalPin(pin: String): Boolean {
+        val d = load()
+        val salt = Base64.decode(d.localPinSalt ?: return false, Base64.NO_WRAP)
+        val expected = Base64.decode(d.localPinHash ?: return false, Base64.NO_WRAP)
+        return MessageDigest.isEqual(expected, pbkdf2(pin, salt))
+    }
+
+    fun clearLocalPin() {
+        val data = load()
+        persist(data.copy(localPinSalt = null, localPinHash = null))
     }
 
     // ── internals ─────────────────────────────────────────────────────────

@@ -3019,13 +3019,21 @@ private fun StepBtn(icon: androidx.compose.ui.graphics.vector.ImageVector, cd: S
     }
 }
 
-/** Sync page (its own bottom-nav destination, like the web). Wraps the cloud panel. */
+/** Sync page (its own bottom-nav destination, like the web). In local (no-cloud)
+ *  mode it becomes the discoverable entry point to turn cloud on; once connected it
+ *  shows the bring-your-own-database sync panel. */
 @Composable
 private fun SyncScreen(vm: PosViewModel) {
+    val appMode by vm.appMode.collectAsState()
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)
     ) {
-        CloudSyncSection(vm)
+        if (appMode == AppMode.Cloud) {
+            CloudSyncSection(vm)
+        } else {
+            SettingsSectionHeader("Cloud & staff accounts")
+            ConnectCloudCard(vm)
+        }
     }
 }
 
@@ -7963,6 +7971,20 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
           }
 
           if (settingsCat == SettingsCat.Data) {
+            val dataAppMode by vm.appMode.collectAsState()
+
+            // In local (phone-only) mode: manage the optional device PIN here, and
+            // offer the opt-in to cloud. The login / per-cashier PIN / staff
+            // management all live behind that opt-in (cloud mode).
+            if (dataAppMode == AppMode.Local) {
+                SettingsSectionHeader("Security (this device)")
+                DevicePinSettings(vm)
+                Spacer(Modifier.height(16.dp))
+                SettingsSectionHeader("Cloud & staff accounts")
+                ConnectCloudCard(vm)
+                Spacer(Modifier.height(16.dp))
+            }
+
             // ---- Danger zone ----
             SettingsSectionHeader("Danger zone")
             Text(
@@ -7983,7 +8005,10 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
                 colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
             ) { Text("Wipe all sales history") }
 
-            CloudSyncSection(vm)
+            // The bring-your-own-database sync panel is a cloud-mode feature.
+            if (dataAppMode == AppMode.Cloud) {
+                CloudSyncSection(vm)
+            }
           }
         }
     }
@@ -8017,6 +8042,122 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
             },
             onDismiss = { showPicker = false }
         )
+    }
+}
+
+// ─────────────────── LOCAL SECURITY / CLOUD OPT-IN ───────────────────
+
+/** Set / change / remove the optional local device PIN (no-cloud mode). */
+@Composable
+private fun DevicePinSettings(vm: PosViewModel) {
+    val hasPin by vm.hasLocalPin.collectAsState()
+    var showSet by remember { mutableStateOf(false) }
+    var showRemove by remember { mutableStateOf(false) }
+
+    Text(
+        if (hasPin) "A PIN is required each time the app opens."
+        else "The till opens without a lock. Add a PIN to require it every time the app opens.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+    Spacer(Modifier.height(8.dp))
+    if (!hasPin) {
+        Button(onClick = { showSet = true }, modifier = Modifier.fillMaxWidth()) {
+            Text("Set device PIN")
+        }
+    } else {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(onClick = { showSet = true }, modifier = Modifier.weight(1f)) {
+                Text("Change PIN")
+            }
+            OutlinedButton(
+                onClick = { showRemove = true },
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
+            ) { Text("Remove PIN") }
+        }
+    }
+
+    if (showSet) {
+        LocalPinDialog(
+            title = if (hasPin) "Change device PIN" else "Set device PIN",
+            onDismiss = { showSet = false },
+            onSave = { pin -> vm.setLocalPin(pin); showSet = false }
+        )
+    }
+    if (showRemove) {
+        ConfirmDialog(
+            title = "Remove device PIN?",
+            message = "The till will open without a lock. Anyone with the phone can use it.",
+            confirmLabel = "Remove PIN",
+            onConfirm = { vm.clearLocalPin(); showRemove = false },
+            onDismiss = { showRemove = false }
+        )
+    }
+}
+
+/** Enter + confirm a 4-6 digit PIN in a dialog. Used for set/change in Settings. */
+@Composable
+private fun LocalPinDialog(title: String, onDismiss: () -> Unit, onSave: (String) -> Unit) {
+    var pin by remember { mutableStateOf("") }
+    var confirm by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = {
+            TextButton(onClick = {
+                when {
+                    pin.length < 4 -> error = "PIN must be at least 4 digits"
+                    pin != confirm -> error = "PINs don't match"
+                    else -> onSave(pin)
+                }
+            }) { Text("Save") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+        title = { Text(title) },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = pin,
+                    onValueChange = { new -> if (new.length <= 6 && new.all { it.isDigit() }) { pin = new; error = null } },
+                    label = { Text("PIN (4-6 digits)") },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = confirm,
+                    onValueChange = { new -> if (new.length <= 6 && new.all { it.isDigit() }) { confirm = new; error = null } },
+                    label = { Text("Confirm PIN") },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                if (error != null) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(error!!, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        }
+    )
+}
+
+/** The opt-in that turns on cloud (team) mode: login, staff accounts, attribution, sync. */
+@Composable
+private fun ConnectCloudCard(vm: PosViewModel) {
+    Text(
+        "Cloud mode adds staff logins, per-cashier PINs, sales attribution and backup/sync " +
+            "across devices. Everything already on this device stays put.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+    Spacer(Modifier.height(8.dp))
+    Button(onClick = { vm.connectCloud() }, modifier = Modifier.fillMaxWidth()) {
+        Text("Connect cloud")
     }
 }
 
