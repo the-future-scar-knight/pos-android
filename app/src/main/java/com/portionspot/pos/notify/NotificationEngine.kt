@@ -62,18 +62,23 @@ object NotificationEngine {
         val out = ArrayList<NotifCandidate>()
 
         // ---- Inventory: out of stock, then low stock ----
+        // Wording is product-type aware (§ Box/Set/Piece): a set reads "2 sets left",
+        // a piece "4 pieces left", a box item just "5 left" (the count carries it).
         for (it in s.trackedItems) {
             if (it.stockQty <= 0.0) {
+                val noun = stockNoun(it, 0.0)
                 out += NotifCandidate(
-                    "inventory", "danger", "Out of stock", "${it.name} has run out.",
+                    "inventory", "danger", "Out of stock",
+                    if (noun != null) "${it.name}: no $noun in stock." else "${it.name} has run out.",
                     "outstock:${it.id}", "item", it.id, s.nowMs, pushWorthy = true
                 )
             } else {
                 val level = if (it.reorderLevel > 0.0) it.reorderLevel else t.lowStockDefault
                 if (it.stockQty <= level) {
+                    val noun = stockNoun(it, it.stockQty)
                     out += NotifCandidate(
                         "inventory", "warn", "Low stock",
-                        "${it.name}: ${trimQty(it.stockQty)} left.",
+                        "${it.name}: ${trimQty(it.stockQty)}${noun?.let { n -> " $n" } ?: ""} left.",
                         "lowstock:${it.id}", "item", it.id, s.nowMs, pushWorthy = true
                     )
                 }
@@ -150,4 +155,12 @@ object NotificationEngine {
 
     private fun trimQty(q: Double): String =
         if (q == q.toLong().toDouble()) q.toLong().toString() else q.toString()
+
+    /** Stock noun for the item's product type, singular/plural by [qty]; null for box/
+     *  unit items where the bare count already reads naturally ("5 left"). */
+    private fun stockNoun(item: Item, qty: Double): String? = when (item.productType) {
+        "set" -> if (qty == 1.0) "set" else "sets"
+        "piece" -> if (qty == 1.0) "piece" else "pieces"
+        else -> null
+    }
 }

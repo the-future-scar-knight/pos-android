@@ -76,7 +76,12 @@ enum class ReportRange(val label: String) {
 data class DayBar(val label: String, val total: Double)
 
 /** One credit-ledger entry joined with its customer's display name (read model). */
-data class CreditLedgerRow(val txn: CreditTxn, val customerName: String)
+data class CreditLedgerRow(
+    val txn: CreditTxn,
+    val customerName: String,
+    /** Receipt ref of the sale that created this row (for "which transaction"); null if none. */
+    val saleRef: String? = null
+)
 
 private const val DAY_MS = 24L * 60 * 60 * 1000
 
@@ -180,9 +185,20 @@ class PosViewModel(
     val creditLedger: StateFlow<List<CreditLedgerRow>> =
         businessId.filterNotNull()
             .flatMapLatest { bid ->
-                combine(repo.creditLedgerFlow(bid), repo.customersFlow(bid)) { txns, custs ->
+                combine(
+                    repo.creditLedgerFlow(bid),
+                    repo.customersFlow(bid),
+                    repo.saleRefsFlow(bid)
+                ) { txns, custs, refs ->
                     val nameById = custs.associate { it.id to it.name }
-                    txns.map { CreditLedgerRow(it, nameById[it.customerId] ?: "Unknown") }
+                    val refById = refs.associate { it.id to (it.receiptNo ?: it.id.takeLast(6).uppercase()) }
+                    txns.map { txn ->
+                        CreditLedgerRow(
+                            txn = txn,
+                            customerName = nameById[txn.customerId] ?: "Unknown",
+                            saleRef = txn.saleId?.let { refById[it] ?: it.takeLast(6).uppercase() }
+                        )
+                    }
                 }
             }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
@@ -728,6 +744,7 @@ class PosViewModel(
         wholesalePrice: Double = 0.0,
         boxPrice: Double = 0.0,
         boxSize: Int = 1,
+        productType: String = "box",
         category: String? = null,
         sku: String? = null,
         barcode: String? = null,
@@ -754,6 +771,7 @@ class PosViewModel(
                     wholesalePrice = wholesalePrice,
                     boxPrice = boxPrice,
                     boxSize = boxSize.coerceAtLeast(1),
+                    productType = productType,
                     taxRate = taxRate,
                     trackStock = trackStock,
                     stockQty = if (trackStock) stockQty else 0.0,

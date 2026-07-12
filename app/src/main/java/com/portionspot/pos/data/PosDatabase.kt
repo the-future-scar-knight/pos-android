@@ -339,6 +339,20 @@ val MIGRATION_16_17 = object : Migration(16, 17) {
     }
 }
 
+/**
+ * v17 → v18: product type (Box / Set / Piece). Adds `productType` to `items` so the
+ * catalog carries the web's three-way product model instead of inferring box-vs-unit
+ * from box size. Existing rows are backfilled by their box size — a real box item
+ * (boxSize > 1) becomes "box"; a single-unit item becomes "piece" (sold individually).
+ * Additive + defaulted, so nothing is dropped and every existing card is unchanged.
+ */
+val MIGRATION_17_18 = object : Migration(17, 18) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE items ADD COLUMN productType TEXT NOT NULL DEFAULT 'box'")
+        db.execSQL("UPDATE items SET productType = CASE WHEN boxSize > 1 THEN 'box' ELSE 'piece' END")
+    }
+}
+
 @Database(
     entities = [
         Business::class,
@@ -361,7 +375,7 @@ val MIGRATION_16_17 = object : Migration(16, 17) {
         AppNotification::class,
         AuditEntry::class
     ],
-    version = 17,
+    version = 18,
     exportSchema = false
 )
 abstract class PosDatabase : RoomDatabase() {
@@ -402,7 +416,8 @@ abstract class PosDatabase : RoomDatabase() {
                     .addMigrations(
                         MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9,
                         MIGRATION_9_10, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14,
-                        MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17
+                        MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17,
+                        MIGRATION_17_18
                     )
                     .fallbackToDestructiveMigration()
                     .build()

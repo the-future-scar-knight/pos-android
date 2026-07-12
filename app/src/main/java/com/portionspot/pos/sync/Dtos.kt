@@ -101,6 +101,16 @@ data class ProductDto(
     @SerialName("updated_at") val updatedAt: String? = null,
 )
 
+/** Coerce a cloud/legacy product_type to the three values the app understands. Older
+ *  rows (and the app's own earlier push) used "unit" for a single-unit item; map that —
+ *  and anything unrecognised — to box vs piece by box size. */
+fun normalizeProductType(raw: String?, boxSize: Int): String = when (raw?.trim()?.lowercase()) {
+    "box" -> "box"
+    "set" -> "set"
+    "piece" -> "piece"
+    else -> if (boxSize > 1) "box" else "piece"
+}
+
 /** Merge a pulled product onto the local [Item] (bridged by sku), preserving the
  *  Android-only fields the cloud doesn't carry (barcode, colour, unit, tax rate). */
 fun ProductDto.toItem(businessId: String, local: Item?): Item {
@@ -120,6 +130,7 @@ fun ProductDto.toItem(businessId: String, local: Item?): Item {
         wholesalePrice = wholesalePrice.toMoney(),
         boxPrice = boxPrice.toMoney(),
         boxSize = boxSz,
+        productType = normalizeProductType(productType, boxSz),
         // cloud cost_price defaults to 0 = "unknown"; keep Android's null-means-unknown
         cost = costPrice?.toDoubleOrNull()?.takeIf { it > 0.0 },
         trackStock = true,
@@ -409,7 +420,7 @@ fun Item.toProductPush(): ProductPushDto {
         sku = sku.orEmpty(),
         name = name,
         category = category,
-        productType = if (bs > 1) "box" else "unit",
+        productType = normalizeProductType(productType, bs),
         boxPrice = boxPrice,
         boxSize = bs,
         wholesalePrice = wholesalePrice,

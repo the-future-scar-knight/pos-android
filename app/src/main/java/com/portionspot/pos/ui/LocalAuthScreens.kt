@@ -5,8 +5,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.size
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -20,6 +20,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.portionspot.pos.auth.AuthScaffold
 import com.portionspot.pos.auth.PinField
 import kotlinx.coroutines.launch
@@ -50,6 +51,7 @@ fun LocalGate(vm: PosViewModel, content: @Composable () -> Unit) {
 /** First-run: choose whether to protect the till with a PIN or leave it open. */
 @Composable
 private fun WelcomeScreen(vm: PosViewModel, onProceed: () -> Unit) {
+    val t = LocalPosTokens.current
     // false = the choice screen; true = the "set a PIN" form.
     var settingPin by remember { mutableStateOf(false) }
 
@@ -57,19 +59,22 @@ private fun WelcomeScreen(vm: PosViewModel, onProceed: () -> Unit) {
         AuthScaffold("Welcome", "How do you want to secure this till?") {
             Button(
                 onClick = { settingPin = true },
-                modifier = Modifier.fillMaxWidth().height(48.dp)
+                modifier = Modifier.fillMaxWidth().height(48.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = t.brand.s600, contentColor = t.inkOnBrand,
+                ),
             ) { Text("Set up a PIN") }
             Spacer(Modifier.height(12.dp))
             OutlinedButton(
                 onClick = { vm.completeOnboarding(); onProceed() },
-                modifier = Modifier.fillMaxWidth().height(48.dp)
+                modifier = Modifier.fillMaxWidth().height(48.dp),
             ) { Text("Keep it open") }
             Spacer(Modifier.height(12.dp))
             Text(
                 "A PIN is asked each time you open the app. You can add, change or remove it " +
                     "later under Settings. This device works fully offline — no account needed.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+                fontSize = 12.sp,
+                color = t.inkTertiary,
             )
         }
     } else {
@@ -86,6 +91,7 @@ private fun WelcomeScreen(vm: PosViewModel, onProceed: () -> Unit) {
 /** The lock screen shown on every cold start when a local PIN is set. */
 @Composable
 private fun LocalLockScreen(vm: PosViewModel, onUnlock: () -> Unit) {
+    val t = LocalPosTokens.current
     val scope = rememberCoroutineScope()
     var pin by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
@@ -109,18 +115,21 @@ private fun LocalLockScreen(vm: PosViewModel, onUnlock: () -> Unit) {
         PinField(pin, { pin = it }, "PIN", enabled = !busy)
         if (error != null) {
             Spacer(Modifier.height(8.dp))
-            Text(error!!, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
+            Text(error!!, color = t.danger, fontSize = 14.sp)
         }
         Spacer(Modifier.height(20.dp))
         Button(
             onClick = { submit() },
             enabled = !busy && pin.length >= 4,
-            modifier = Modifier.fillMaxWidth().height(48.dp)
+            modifier = Modifier.fillMaxWidth().height(48.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = t.brand.s600, contentColor = t.inkOnBrand,
+            ),
         ) {
             if (busy) CircularProgressIndicator(
                 Modifier.size(22.dp),
-                color = MaterialTheme.colorScheme.onPrimary,
-                strokeWidth = 2.dp
+                color = t.inkOnBrand,
+                strokeWidth = 2.dp,
             ) else Text("Unlock")
         }
     }
@@ -138,6 +147,7 @@ private fun PinSetupForm(
     onBack: () -> Unit,
     onSave: (String) -> Unit,
 ) {
+    val t = LocalPosTokens.current
     var pin by remember { mutableStateOf("") }
     var confirm by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
@@ -149,7 +159,7 @@ private fun PinSetupForm(
         PinField(confirm, { confirm = it }, "Confirm PIN", enabled = !busy)
         if (error != null) {
             Spacer(Modifier.height(8.dp))
-            Text(error!!, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
+            Text(error!!, color = t.danger, fontSize = 14.sp)
         }
         Spacer(Modifier.height(20.dp))
         Button(
@@ -161,8 +171,13 @@ private fun PinSetupForm(
                 }
             },
             enabled = !busy && pin.isNotEmpty() && confirm.isNotEmpty(),
-            modifier = Modifier.fillMaxWidth().height(48.dp)
+            modifier = Modifier.fillMaxWidth().height(48.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = t.brand.s600, contentColor = t.inkOnBrand,
+            ),
         ) { Text(if (busy) "Saving…" else saveLabel) }
-        TextButton(onClick = onBack, enabled = !busy) { Text("Cancel") }
+        TextButton(onClick = onBack, enabled = !busy) {
+            Text("Cancel", color = t.inkSecondary)
+        }
     }
 }

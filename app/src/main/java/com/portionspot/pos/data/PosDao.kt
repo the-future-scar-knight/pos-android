@@ -113,6 +113,11 @@ interface SaleDao {
     )
     fun observeRecent(businessId: String, limit: Int = 100): Flow<List<SaleEntity>>
 
+    /** (id, receiptNo) for every live sale — cheap lookup to label ledger rows with the
+     *  originating transaction's reference. */
+    @Query("SELECT id, receiptNo FROM sales WHERE businessId = :businessId AND deleted = 0")
+    fun observeSaleRefs(businessId: String): Flow<List<SaleRef>>
+
     @Query("SELECT * FROM sale_items WHERE saleId = :saleId AND deleted = 0")
     suspend fun linesForSale(saleId: String): List<SaleLine>
 

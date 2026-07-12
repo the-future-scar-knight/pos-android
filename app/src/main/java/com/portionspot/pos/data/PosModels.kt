@@ -106,6 +106,12 @@ data class Item(
     @ColumnInfo(defaultValue = "0") val wholesalePrice: Double = 0.0,
     @ColumnInfo(defaultValue = "0") val boxPrice: Double = 0.0,
     @ColumnInfo(defaultValue = "1") val boxSize: Int = 1,
+    // How the product is sold (mirrors the web catalog's product_type):
+    //   "box"   — sold by the box AND/OR as loose units (uses boxSize/boxPrice).
+    //   "set"   — sold only as a complete set (no box split; stock counts sets).
+    //   "piece" — sold individually, no box (stock counts pieces).
+    // Drives the product form's field set and the type-aware stock wording.
+    @ColumnInfo(defaultValue = "box") val productType: String = "box",
     val cost: Double? = null,
     val taxRate: Double = 0.0,            // percent, e.g. 16.0
     val trackStock: Boolean = false,
@@ -462,6 +468,10 @@ data class CreditTxn(
     /** Local-only: true => has unsynced local edits to push. Never sent to cloud. */
     val pendingSync: Boolean = true
 )
+
+/** Lightweight (saleId → receipt reference) projection used to label a ledger row with
+ *  the sale that created it, without loading whole [SaleEntity] rows. */
+data class SaleRef(val id: String, val receiptNo: String?)
 
 /** A customer paired with their derived outstanding balance (read model). */
 data class CustomerWithBalance(

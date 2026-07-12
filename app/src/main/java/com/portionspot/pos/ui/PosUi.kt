@@ -18,6 +18,7 @@ import coil.compose.AsyncImage
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -719,11 +720,15 @@ private fun MmReceiptCard(
 ) {
     val t = LocalPosTokens.current
     val who = r.matchedCustomerName ?: r.senderName ?: r.senderPhone ?: "Unknown sender"
-    Card(
-        Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = t.surface1)
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(t.surface1)
+            .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
+            .padding(14.dp)
     ) {
-        Column(Modifier.fillMaxWidth().padding(14.dp)) {
+        Column(Modifier.fillMaxWidth()) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Box(
                     Modifier.size(38.dp).clip(CircleShape).background(t.brand.s500.copy(alpha = 0.14f)),
@@ -807,42 +812,29 @@ private fun MmVerifyDialog(
     }
     val canConfirm = purpose == "sale" || selected != null
 
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = {
-            Button(
-                onClick = { onConfirm(if (purpose == "debt") selected else selected, purpose, note.ifBlank { null }) },
-                enabled = canConfirm
-            ) { Text("Confirm") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-        title = { Text("Verify ${money(r.amount, r.currency)}") },
-        text = {
-            Column {
-                Text(
-                    "From ${r.senderName ?: r.senderPhone ?: "unknown"} · Ref ${r.txnCode}",
-                    color = t.inkTertiary, fontSize = 11.sp
-                )
-                Spacer(Modifier.height(10.dp))
-                Text("What was this for?", color = t.inkSecondary, fontSize = 12.sp)
-                Spacer(Modifier.height(6.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(selected = purpose == "debt", onClick = { purpose = "debt" }, label = { Text("Settle debt") })
-                    FilterChip(selected = purpose == "sale", onClick = { purpose = "sale" }, label = { Text("Walk-in sale") })
-                }
-                if (purpose == "debt") {
-                    Spacer(Modifier.height(10.dp))
-                    Text("Customer", color = t.inkSecondary, fontSize = 12.sp)
-                    OutlinedTextField(
-                        value = query,
-                        onValueChange = { query = it },
-                        placeholder = { Text("Search name or number") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Spacer(Modifier.height(6.dp))
-                    LazyColumn(Modifier.fillMaxWidth().height(180.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        items(filtered, key = { it.customer.id }) { cw ->
+    PosContainedForm(
+        title = "Verify ${money(r.amount, r.currency)}",
+        onDismiss = onDismiss,
+        confirmLabel = "Confirm",
+        confirmEnabled = canConfirm,
+        onConfirm = { onConfirm(if (purpose == "debt") selected else selected, purpose, note.ifBlank { null }) }
+    ) {
+        Text(
+            "From ${r.senderName ?: r.senderPhone ?: "unknown"} · Ref ${r.txnCode}",
+            color = t.inkTertiary, fontSize = 11.sp
+        )
+        Text("What was this for?", color = t.inkSecondary, fontSize = 12.sp)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilterChip(selected = purpose == "debt", onClick = { purpose = "debt" }, label = { Text("Settle debt") })
+            FilterChip(selected = purpose == "sale", onClick = { purpose = "sale" }, label = { Text("Walk-in sale") })
+        }
+        if (purpose == "debt") {
+            PosField(
+                value = query, onValueChange = { query = it },
+                label = "Customer", placeholder = "Search name or number", modifier = Modifier.fillMaxWidth()
+            )
+            LazyColumn(Modifier.fillMaxWidth().height(180.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                items(filtered, key = { it.customer.id }) { cw ->
                             val on = selected?.customer?.id == cw.customer.id
                             Row(
                                 Modifier.fillMaxWidth()
@@ -867,17 +859,11 @@ private fun MmVerifyDialog(
                         }
                     }
                 }
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = note,
-                    onValueChange = { note = it },
-                    placeholder = { Text("Note (optional)") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-            }
-        }
-    )
+        PosField(
+            value = note, onValueChange = { note = it },
+            label = "Note (optional)", modifier = Modifier.fillMaxWidth()
+        )
+    }
 }
 
 // ─────────────────────────── ADMIN SHELL (Phase 8) ───────────────────────────
@@ -1068,29 +1054,33 @@ private fun NotificationCard(n: com.portionspot.pos.data.AppNotification, onClic
         else -> Icons.Filled.Sync
     }
     val unread = n.readAt == null
-    Card(
-        Modifier.fillMaxWidth().clickable(onClick = onClick),
-        colors = CardDefaults.cardColors(containerColor = if (unread) t.surface2 else t.surface1)
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(if (unread) t.surface2 else t.surface1)
+            .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick)
+            .padding(14.dp),
+        verticalAlignment = Alignment.CenterVertically
     ) {
-        Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(
-                Modifier.size(38.dp).clip(CircleShape).background(tint.copy(alpha = 0.14f)),
-                contentAlignment = Alignment.Center
-            ) { Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(20.dp)) }
-            Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-                Text(
-                    n.title, color = t.inkPrimary,
-                    fontWeight = if (unread) FontWeight.Black else FontWeight.SemiBold, fontSize = 14.sp
-                )
-                Text(n.body, color = t.inkSecondary, fontSize = 12.sp)
-            }
-            Spacer(Modifier.width(8.dp))
-            Column(horizontalAlignment = Alignment.End) {
-                if (unread) Box(Modifier.size(8.dp).clip(CircleShape).background(tint))
-                Spacer(Modifier.height(2.dp))
-                Text(relativeAgo(n.eventAt), color = t.inkTertiary, fontSize = 10.sp)
-            }
+        Box(
+            Modifier.size(38.dp).clip(CircleShape).background(tint.copy(alpha = 0.14f)),
+            contentAlignment = Alignment.Center
+        ) { Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(20.dp)) }
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                n.title, color = t.inkPrimary,
+                fontWeight = if (unread) FontWeight.Black else FontWeight.SemiBold, fontSize = 14.sp
+            )
+            Text(n.body, color = t.inkSecondary, fontSize = 12.sp)
+        }
+        Spacer(Modifier.width(8.dp))
+        Column(horizontalAlignment = Alignment.End) {
+            if (unread) Box(Modifier.size(8.dp).clip(CircleShape).background(tint))
+            Spacer(Modifier.height(2.dp))
+            Text(relativeAgo(n.eventAt), color = t.inkTertiary, fontSize = 10.sp)
         }
     }
 }
@@ -1165,8 +1155,14 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
             }
         }
         item {
-            Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = t.surface1)) {
-                Column(Modifier.padding(14.dp)) {
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(t.surface1)
+                    .border(1.dp, t.surfaceBorder, RoundedCornerShape(14.dp))
+                    .padding(14.dp)
+            ) {
                     if (cashiers.isEmpty()) {
                         Text("No sales this day.", color = t.inkTertiary, fontSize = 13.sp)
                     } else {
@@ -1205,7 +1201,6 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
                             )
                         }
                     }
-                }
             }
         }
 
@@ -1215,21 +1210,26 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
             item { Text("No outstanding debts.", color = t.inkTertiary, fontSize = 13.sp) }
         } else {
             items(aging, key = { it.customerId }) { row ->
-                Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = t.surface1)) {
-                    Column(Modifier.padding(14.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(row.customerName, color = t.inkPrimary, fontWeight = FontWeight.SemiBold, fontSize = 14.sp, modifier = Modifier.weight(1f))
-                            Text(money(row.total, currency), color = t.danger, fontWeight = FontWeight.Black, fontSize = 14.sp)
-                        }
-                        Spacer(Modifier.height(4.dp))
-                        Text(
-                            "0–30: ${money(row.bucket0to30, currency)} · 30–60: ${money(row.bucket30to60, currency)} · " +
-                                "60–90: ${money(row.bucket60to90, currency)} · 90+: ${money(row.bucket90plus, currency)}",
-                            color = t.inkTertiary, fontSize = 11.sp
-                        )
-                        Spacer(Modifier.height(6.dp))
-                        OutlinedButton(onClick = { writeOffFor = row }) { Text("Write off") }
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(t.surface1)
+                        .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
+                        .padding(14.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(row.customerName, color = t.inkPrimary, fontWeight = FontWeight.SemiBold, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                        Text(money(row.total, currency), color = t.danger, fontWeight = FontWeight.Black, fontSize = 14.sp)
                     }
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "0–30: ${money(row.bucket0to30, currency)} · 30–60: ${money(row.bucket30to60, currency)} · " +
+                            "60–90: ${money(row.bucket60to90, currency)} · 90+: ${money(row.bucket90plus, currency)}",
+                        color = t.inkTertiary, fontSize = 11.sp
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    OutlinedButton(onClick = { writeOffFor = row }) { Text("Write off") }
                 }
             }
         }
@@ -1251,13 +1251,18 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
                 Triple("paynow", "Paynow", biz.paynowEnabled),
             )
             item {
-                Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = t.surface1)) {
-                    Column(Modifier.padding(horizontal = 14.dp, vertical = 4.dp)) {
-                        methodFlags.forEach { (id, label, enabled) ->
-                            Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                                Text(label, color = t.inkPrimary, fontSize = 14.sp, modifier = Modifier.weight(1f))
-                                Switch(checked = enabled, onCheckedChange = { vm.setPaymentMethodEnabled(id, it) })
-                            }
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(t.surface1)
+                        .border(1.dp, t.surfaceBorder, RoundedCornerShape(14.dp))
+                        .padding(horizontal = 14.dp, vertical = 4.dp)
+                ) {
+                    methodFlags.forEach { (id, label, enabled) ->
+                        Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text(label, color = t.inkPrimary, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                            Switch(checked = enabled, onCheckedChange = { vm.setPaymentMethodEnabled(id, it) })
                         }
                     }
                 }
@@ -1449,24 +1454,22 @@ private fun WriteOffDialog(
     onConfirm: (Double) -> Unit
 ) {
     var amount by remember { mutableStateOf(String.format(Locale.US, "%.2f", row.total)) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = {
-            Button(
-                onClick = { amount.toDoubleOrNull()?.let { if (it > 0) onConfirm(it) } },
-                enabled = (amount.toDoubleOrNull() ?: 0.0) > 0.0
-            ) { Text("Write off") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-        title = { Text("Write off ${row.customerName}'s debt") },
-        text = {
-            Column {
-                Text("Owes ${money(row.total, currency)}. Writing off records a payment that clears the balance (audit-logged).", fontSize = 12.sp)
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(value = amount, onValueChange = { amount = it }, label = { Text("Amount") }, singleLine = true)
-            }
+    PosContainedForm(
+        title = "Write off ${row.customerName}'s debt",
+        onDismiss = onDismiss,
+        confirmLabel = "Write off",
+        confirmEnabled = (amount.toDoubleOrNull() ?: 0.0) > 0.0,
+        onConfirm = { amount.toDoubleOrNull()?.let { if (it > 0) onConfirm(it) } }
+    ) {
+        val t = LocalPosTokens.current
+        Text(
+            "Owes ${money(row.total, currency)}. Writing off records a payment that clears the balance (audit-logged).",
+            fontSize = 12.sp, color = t.inkSecondary
+        )
+        PosFormCard {
+            PosField(value = amount, onValueChange = { amount = it }, label = "Amount", keyboardType = KeyboardType.Decimal, modifier = Modifier.fillMaxWidth())
         }
-    )
+    }
 }
 
 /** Admin dialog to create a cashier login via the create-cashier Edge Function. */
@@ -1481,44 +1484,34 @@ private fun AddCashierDialog(
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     val valid = name.isNotBlank() && email.contains("@") && password.length >= 6
-    AlertDialog(
-        onDismissRequest = { if (!busy) onDismiss() },
-        confirmButton = {
-            Button(
-                enabled = valid && !busy,
-                onClick = {
-                    busy = true; error = null
-                    onCreate(email.trim(), password, name.trim()) { res ->
-                        busy = false
-                        when (res) {
-                            is com.portionspot.pos.auth.StaffResult.Ok -> onDismiss()
-                            is com.portionspot.pos.auth.StaffResult.Err -> error = res.message
-                        }
-                    }
-                }
-            ) { Text(if (busy) "Creating…" else "Create") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss, enabled = !busy) { Text("Cancel") } },
-        title = { Text("Add cashier") },
-        text = {
-            Column {
-                Text(
-                    "Creates a login. The cashier signs in with it — on their own device, or on this one via 'Add another account' on the lock screen. They're attributed on every sale; only an admin can deactivate them.",
-                    fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(name, { name = it }, label = { Text("Name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                Spacer(Modifier.height(6.dp))
-                OutlinedTextField(email, { email = it }, label = { Text("Email") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                Spacer(Modifier.height(6.dp))
-                OutlinedTextField(password, { password = it }, label = { Text("Password (6+ characters)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                error?.let {
-                    Spacer(Modifier.height(6.dp))
-                    Text(it, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+    PosContainedForm(
+        title = "Add cashier",
+        onDismiss = { if (!busy) onDismiss() },
+        confirmLabel = if (busy) "Creating…" else "Create",
+        confirmEnabled = valid && !busy,
+        onConfirm = {
+            busy = true; error = null
+            onCreate(email.trim(), password, name.trim()) { res ->
+                busy = false
+                when (res) {
+                    is com.portionspot.pos.auth.StaffResult.Ok -> onDismiss()
+                    is com.portionspot.pos.auth.StaffResult.Err -> error = res.message
                 }
             }
         }
-    )
+    ) {
+        val t = LocalPosTokens.current
+        Text(
+            "Creates a login. The cashier signs in with it — on their own device, or on this one via 'Add another account' on the lock screen. They're attributed on every sale; only an admin can deactivate them.",
+            fontSize = 12.sp, color = t.inkSecondary
+        )
+        PosFormCard {
+            PosField(name, { name = it }, "Name", modifier = Modifier.fillMaxWidth())
+            PosField(email, { email = it }, "Email", keyboardType = KeyboardType.Email, modifier = Modifier.fillMaxWidth())
+            PosField(password, { password = it }, "Password (6+ characters)", visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
+        }
+        error?.let { Text(it, color = t.danger, fontSize = 12.sp) }
+    }
 }
 
 /** Admin dialog to reset a staff member's password via the create-cashier Edge Function. */
@@ -1534,55 +1527,36 @@ private fun ResetPasswordDialog(
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     val valid = password.length >= 6 && password == confirm
-    AlertDialog(
-        onDismissRequest = { if (!busy) onDismiss() },
-        confirmButton = {
-            Button(
-                enabled = valid && !busy,
-                onClick = {
-                    busy = true; error = null
-                    onReset(password) { res ->
-                        busy = false
-                        when (res) {
-                            is com.portionspot.pos.auth.StaffResult.Ok -> {
-                                Toast.makeText(context, "Password reset for $staffName", Toast.LENGTH_SHORT).show()
-                                onDismiss()
-                            }
-                            is com.portionspot.pos.auth.StaffResult.Err -> error = res.message
-                        }
+    PosContainedForm(
+        title = "Reset password",
+        onDismiss = { if (!busy) onDismiss() },
+        confirmLabel = if (busy) "Resetting…" else "Reset password",
+        confirmEnabled = valid && !busy,
+        onConfirm = {
+            busy = true; error = null
+            onReset(password) { res ->
+                busy = false
+                when (res) {
+                    is com.portionspot.pos.auth.StaffResult.Ok -> {
+                        Toast.makeText(context, "Password reset for $staffName", Toast.LENGTH_SHORT).show()
+                        onDismiss()
                     }
-                }
-            ) { Text(if (busy) "Resetting…" else "Reset password") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss, enabled = !busy) { Text("Cancel") } },
-        title = { Text("Reset password") },
-        text = {
-            Column {
-                Text(
-                    "Set a new password for $staffName. They'll sign in with it on their device (and re-add the account if their old session was cleared).",
-                    fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    password, { password = it },
-                    label = { Text("New password (6+ characters)") }, singleLine = true,
-                    visualTransformation = PasswordVisualTransformation(),
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(6.dp))
-                OutlinedTextField(
-                    confirm, { confirm = it },
-                    label = { Text("Confirm password") }, singleLine = true,
-                    visualTransformation = PasswordVisualTransformation(),
-                    modifier = Modifier.fillMaxWidth()
-                )
-                error?.let {
-                    Spacer(Modifier.height(6.dp))
-                    Text(it, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+                    is com.portionspot.pos.auth.StaffResult.Err -> error = res.message
                 }
             }
         }
-    )
+    ) {
+        val t = LocalPosTokens.current
+        Text(
+            "Set a new password for $staffName. They'll sign in with it on their device (and re-add the account if their old session was cleared).",
+            fontSize = 12.sp, color = t.inkSecondary
+        )
+        PosFormCard {
+            PosField(password, { password = it }, "New password (6+ characters)", visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
+            PosField(confirm, { confirm = it }, "Confirm password", visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
+        }
+        error?.let { Text(it, color = t.danger, fontSize = 12.sp) }
+    }
 }
 
 private fun todayStartMs(): Long {
@@ -2281,6 +2255,10 @@ private fun ProductCard(item: Item, currency: String, inCart: Int, onClick: () -
                 lineHeight = (d.cardNameSize.value * 1.25f).sp, maxLines = 2, overflow = TextOverflow.Ellipsis
             )
             Spacer(Modifier.weight(1f))
+            if (item.productType == "set" || item.productType == "piece") {
+                TypeBadge(item)
+                Spacer(Modifier.height(3.dp))
+            }
             if (hasBox) {
                 Row {
                     Text("Box ", color = t.inkTertiary, fontSize = d.cardMetaSize)
@@ -2320,6 +2298,24 @@ private fun StockBadge(item: Item) {
                 .padding(horizontal = 6.dp, vertical = 2.dp)
         ) { Text(trimQty(units), color = t.warning, fontSize = 9.sp, fontWeight = FontWeight.Bold) }
         else -> Text(trimQty(units), color = t.inkTertiary, fontSize = 9.sp)
+    }
+}
+
+/** Product-type pill. A Set (brand tint) or Piece (green) gets a small colour-coded
+ *  badge so it's distinguishable at a glance; a Box is the default and shows nothing. */
+@Composable
+private fun TypeBadge(item: Item) {
+    val t = LocalPosTokens.current
+    val (label, color) = when (item.productType) {
+        "set" -> "Set" to t.brand.s600
+        "piece" -> "Piece" to t.success
+        else -> return
+    }
+    Box(
+        Modifier.clip(RoundedCornerShape(6.dp)).background(color.copy(alpha = 0.13f))
+            .padding(horizontal = 6.dp, vertical = 2.dp)
+    ) {
+        Text(label, color = color, fontSize = 9.sp, fontWeight = FontWeight.Bold, maxLines = 1)
     }
 }
 
@@ -2447,39 +2443,30 @@ private fun QuoteDialog(
     val netGoods = (subtotal - itemDiscount).coerceAtLeast(0.0)
     val discount = (discountText.toDoubleOrNull() ?: 0.0).coerceIn(0.0, netGoods)
     val total = (netGoods - discount).coerceAtLeast(0.0)
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = {
-            Button(onClick = { onConfirm(discount, customer) }) { Text("Generate quote") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-        title = { Text("New quote") },
-        text = {
-            Column {
-                CustomerPicker(customers = customers, selected = customer, onSelect = { customer = it })
-                Spacer(Modifier.height(10.dp))
-                OutlinedTextField(
-                    value = discountText,
-                    onValueChange = { discountText = it },
-                    label = { Text("Discount ($currency)") },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(12.dp))
-                Row(Modifier.fillMaxWidth()) {
-                    Text("Quote total", modifier = Modifier.weight(1f), fontWeight = FontWeight.SemiBold)
-                    Text(money(total, currency), fontWeight = FontWeight.Black)
-                }
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    "Valid for $validityDays day${if (validityDays == 1) "" else "s"}. No payment is taken.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+    PosContainedForm(
+        title = "New quote",
+        onDismiss = onDismiss,
+        confirmLabel = "Generate quote",
+        onConfirm = { onConfirm(discount, customer) }
+    ) {
+        val t = LocalPosTokens.current
+        CustomerPicker(customers = customers, selected = customer, onSelect = { customer = it })
+        PosFormCard {
+            PosField(
+                value = discountText,
+                onValueChange = { discountText = it },
+                label = "Discount ($currency)", keyboardType = KeyboardType.Decimal, modifier = Modifier.fillMaxWidth()
+            )
+            Row(Modifier.fillMaxWidth()) {
+                Text("Quote total", modifier = Modifier.weight(1f), fontWeight = FontWeight.SemiBold, color = t.inkPrimary)
+                Text(money(total, currency), fontWeight = FontWeight.Black, color = t.inkPrimary)
             }
         }
-    )
+        Text(
+            "Valid for $validityDays day${if (validityDays == 1) "" else "s"}. No payment is taken.",
+            style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
+        )
+    }
 }
 
 /**
@@ -2646,44 +2633,34 @@ private fun ApprovalPinDialog(
     var pin by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
-    AlertDialog(
-        onDismissRequest = { if (!busy) onDismiss() },
-        confirmButton = {
-            Button(
-                enabled = pin.length >= 4 && !busy,
-                onClick = {
-                    busy = true; error = null
-                    scope.launch {
-                        val ok = onVerify(pin)
-                        busy = false
-                        if (ok) onApproved() else { error = "Wrong PIN — ask an admin"; pin = "" }
-                    }
-                }
-            ) { Text("Approve") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss, enabled = !busy) { Text("Cancel") } },
-        title = { Text("Manager approval") },
-        text = {
-            Column {
-                Text(reason, style = MaterialTheme.typography.bodySmall)
-                Spacer(Modifier.height(10.dp))
-                OutlinedTextField(
-                    value = pin,
-                    onValueChange = { if (it.length <= 6 && it.all(Char::isDigit)) pin = it },
-                    label = { Text("Admin PIN") },
-                    singleLine = true,
-                    enabled = !busy,
-                    visualTransformation = PasswordVisualTransformation(),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                    modifier = Modifier.fillMaxWidth()
-                )
-                error?.let {
-                    Spacer(Modifier.height(6.dp))
-                    Text(it, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
-                }
+    PosContainedForm(
+        title = "Manager approval",
+        onDismiss = { if (!busy) onDismiss() },
+        confirmLabel = "Approve",
+        confirmEnabled = pin.length >= 4 && !busy,
+        onConfirm = {
+            busy = true; error = null
+            scope.launch {
+                val ok = onVerify(pin)
+                busy = false
+                if (ok) onApproved() else { error = "Wrong PIN — ask an admin"; pin = "" }
             }
         }
-    )
+    ) {
+        val t = LocalPosTokens.current
+        Text(reason, style = MaterialTheme.typography.bodySmall, color = t.inkSecondary)
+        PosFormCard {
+            PosField(
+                value = pin,
+                onValueChange = { if (it.length <= 6 && it.all(Char::isDigit)) pin = it },
+                label = "Admin PIN",
+                keyboardType = KeyboardType.NumberPassword,
+                visualTransformation = PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
+        error?.let { Text(it, color = t.danger, fontSize = 12.sp) }
+    }
 }
 
 /** Held sales: tap one to load it back into the cart (replacing the current cart). */
@@ -2695,42 +2672,35 @@ private fun ParkedSalesDialog(
     onDismiss: () -> Unit
 ) {
     val t = LocalPosTokens.current
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
-        title = { Text("Held sales") },
-        text = {
-            if (parked.isEmpty()) {
-                Text("No held sales.", color = t.inkTertiary)
-            } else {
-                LazyColumn(Modifier.fillMaxWidth()) {
-                    items(parked, key = { it.id }) { sale ->
-                        Card(
-                            onClick = { onResume(sale.id) },
-                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
-                        ) {
-                            Row(
-                                Modifier.fillMaxWidth().padding(14.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column(Modifier.weight(1f)) {
-                                    Text(
-                                        sale.customerName?.takeIf { it.isNotBlank() }
-                                            ?: "Held #${sale.id.takeLast(6).uppercase()}",
-                                        fontWeight = FontWeight.Medium
-                                    )
-                                    sale.note?.takeIf { it.isNotBlank() }?.let {
-                                        Text(it, style = MaterialTheme.typography.bodySmall, color = t.inkTertiary)
-                                    }
-                                }
-                                Text(money(sale.total, currency), fontWeight = FontWeight.Bold)
-                            }
+    PosDialog(title = "Held sales", onDismiss = onDismiss) {
+        if (parked.isEmpty()) {
+            Text("No held sales.", color = t.inkTertiary)
+        } else {
+            parked.forEach { sale ->
+                Row(
+                    Modifier.fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(t.surface1)
+                        .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
+                        .clickable { onResume(sale.id) }
+                        .padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            sale.customerName?.takeIf { it.isNotBlank() }
+                                ?: "Held #${sale.id.takeLast(6).uppercase()}",
+                            fontWeight = FontWeight.Bold, color = t.inkPrimary
+                        )
+                        sale.note?.takeIf { it.isNotBlank() }?.let {
+                            Text(it, style = MaterialTheme.typography.bodySmall, color = t.inkTertiary)
                         }
                     }
+                    Text(money(sale.total, currency), fontWeight = FontWeight.Bold, color = t.inkPrimary)
                 }
             }
         }
-    )
+    }
 }
 
 /** Box / Wholesale / Retail picker — mirrors the web price modal. */
@@ -2739,46 +2709,34 @@ private fun PriceModeDialog(item: Item, currency: String, onPick: (String) -> Un
     val t = LocalPosTokens.current
     val hasBox = item.boxSize > 1 && item.boxPrice > 0.0
     val hasWs = item.wholesalePrice > 0.0
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = {},
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-        title = {
-            Column {
-                Text(item.name, fontWeight = FontWeight.Bold, color = t.inkPrimary)
-                item.sku?.takeIf { it.isNotBlank() }?.let {
-                    Text(it, color = t.inkTertiary, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
-                }
-            }
-        },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("Select price type:", color = t.inkSecondary, fontSize = 12.sp, fontWeight = FontWeight.Medium)
-                if (hasBox) {
-                    PriceOption(
-                        title = "Box of ${item.boxSize}",
-                        subtitle = "Per unit: ${money(item.boxPrice / item.boxSize, currency)}",
-                        price = money(item.boxPrice, currency),
-                        accent = t.brand.s600
-                    ) { onPick("box") }
-                }
-                if (hasWs) {
-                    PriceOption(
-                        title = "Wholesale",
-                        subtitle = "Trade price",
-                        price = money(item.wholesalePrice, currency),
-                        accent = t.accentBlue
-                    ) { onPick("wholesale") }
-                }
-                PriceOption(
-                    title = "Retail",
-                    subtitle = "Walk-in price",
-                    price = money(item.price, currency),
-                    accent = t.success
-                ) { onPick("retail") }
-            }
+    PosDialog(title = item.name, onDismiss = onDismiss) {
+        item.sku?.takeIf { it.isNotBlank() }?.let {
+            Text(it, color = t.inkTertiary, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
         }
-    )
+        Text("Select price type", color = t.inkSecondary, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+        if (hasBox) {
+            PriceOption(
+                title = "Box of ${item.boxSize}",
+                subtitle = "Per unit: ${money(item.boxPrice / item.boxSize, currency)}",
+                price = money(item.boxPrice, currency),
+                accent = t.brand.s600
+            ) { onPick("box") }
+        }
+        if (hasWs) {
+            PriceOption(
+                title = "Wholesale",
+                subtitle = "Trade price",
+                price = money(item.wholesalePrice, currency),
+                accent = t.accentBlue
+            ) { onPick("wholesale") }
+        }
+        PriceOption(
+            title = "Retail",
+            subtitle = "Walk-in price",
+            price = money(item.price, currency),
+            accent = t.success
+        ) { onPick("retail") }
+    }
 }
 
 @Composable
@@ -2804,68 +2762,76 @@ private fun CartDialog(cart: List<CartLine>, currency: String, vm: PosViewModel,
     val t = LocalPosTokens.current
     var editingQtyLine by remember { mutableStateOf<CartLine?>(null) }
     var editingDiscountLine by remember { mutableStateOf<CartLine?>(null) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } },
-        dismissButton = { TextButton(onClick = { vm.clearCart(); onDismiss() }) { Text("Clear all", color = t.danger) } },
-        title = { Text("Cart", fontWeight = FontWeight.Bold, color = t.inkPrimary) },
-        text = {
-            if (cart.isEmpty()) {
-                Text("Cart is empty", color = t.inkTertiary)
-            } else {
-                LazyColumn {
-                    items(cart, key = { it.lineKey }) { line ->
-                        Row(
-                            Modifier.fillMaxWidth().padding(vertical = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(Modifier.weight(1f)) {
-                                Text(line.name, fontWeight = FontWeight.SemiBold, color = t.inkPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                Text(
-                                    "${modeLabel(line.mode)} · ${money(line.unitPrice, currency)}/ea",
-                                    color = t.inkTertiary, fontSize = 11.sp
-                                )
-                                // Per-item discount affordance (tap to set/edit).
-                                Text(
-                                    if (line.lineDiscountApplied > 0)
-                                        "Less ${money(line.lineDiscountApplied, currency)} — edit"
-                                    else "Add discount",
-                                    color = if (line.lineDiscountApplied > 0) t.danger else t.inkTertiary,
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    modifier = Modifier
-                                        .padding(top = 2.dp)
-                                        .clip(RoundedCornerShape(6.dp))
-                                        .clickable { editingDiscountLine = line }
-                                        .padding(vertical = 2.dp, horizontal = 2.dp)
-                                )
-                            }
-                            QtyStepper(
-                                qty = line.qty.toInt(),
-                                onMinus = { vm.changeQty(line.lineKey, -1.0) },
-                                onPlus = { vm.changeQty(line.lineKey, +1.0) },
-                                onQtyClick = { editingQtyLine = line }
+    PosDialog(title = "Cart", onDismiss = onDismiss) {
+        if (cart.isEmpty()) {
+            Text("Cart is empty", color = t.inkTertiary)
+        } else {
+            cart.forEach { line ->
+                Row(
+                    Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(line.name, fontWeight = FontWeight.SemiBold, color = t.inkPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            "${modeLabel(line.mode)} · ${money(line.unitPrice, currency)}/ea",
+                            color = t.inkTertiary, fontSize = 11.sp
+                        )
+                        // Per-item discount affordance (tap to set/edit).
+                        Text(
+                            if (line.lineDiscountApplied > 0)
+                                "Less ${money(line.lineDiscountApplied, currency)} — edit"
+                            else "Add discount",
+                            color = if (line.lineDiscountApplied > 0) t.danger else t.inkTertiary,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier
+                                .padding(top = 2.dp)
+                                .clip(RoundedCornerShape(6.dp))
+                                .clickable { editingDiscountLine = line }
+                                .padding(vertical = 2.dp, horizontal = 2.dp)
+                        )
+                    }
+                    QtyStepper(
+                        qty = line.qty.toInt(),
+                        onMinus = { vm.changeQty(line.lineKey, -1.0) },
+                        onPlus = { vm.changeQty(line.lineKey, +1.0) },
+                        onQtyClick = { editingQtyLine = line }
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Column(horizontalAlignment = Alignment.End) {
+                        if (line.lineDiscountApplied > 0) {
+                            Text(
+                                money(line.lineGross, currency),
+                                color = t.inkTertiary, fontSize = 10.sp,
+                                textDecoration = TextDecoration.LineThrough
                             )
-                            Spacer(Modifier.width(8.dp))
-                            Column(horizontalAlignment = Alignment.End) {
-                                if (line.lineDiscountApplied > 0) {
-                                    Text(
-                                        money(line.lineGross, currency),
-                                        color = t.inkTertiary, fontSize = 10.sp,
-                                        textDecoration = TextDecoration.LineThrough
-                                    )
-                                }
-                                Text(money(line.lineTotal, currency), fontWeight = FontWeight.Black, color = t.inkPrimary, fontSize = 13.sp)
-                            }
-                            IconButton(onClick = { vm.removeLine(line.lineKey) }) {
-                                Icon(Icons.Filled.Delete, "Remove", tint = t.inkTertiary)
-                            }
                         }
+                        Text(money(line.lineTotal, currency), fontWeight = FontWeight.Black, color = t.inkPrimary, fontSize = 13.sp)
+                    }
+                    IconButton(onClick = { vm.removeLine(line.lineKey) }) {
+                        Icon(Icons.Filled.Delete, "Remove", tint = t.inkTertiary)
                     }
                 }
             }
+            HorizontalDivider(color = t.surfaceBorder)
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                OutlinedButton(
+                    onClick = { vm.clearCart(); onDismiss() },
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = t.danger)
+                ) { Text("Clear all") }
+                Button(
+                    onClick = onDismiss,
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(containerColor = t.brand.s600, contentColor = t.inkOnBrand)
+                ) { Text("Done") }
+            }
         }
-    )
+    }
 
     editingQtyLine?.let { line ->
         SetQtyDialog(
@@ -2908,44 +2874,37 @@ private fun SetLineDiscountDialog(
     val ceiling = if (maxDiscount > 0.0) minOf(line.lineGross, maxDiscount) else line.lineGross
     val amount = typed.coerceIn(0.0, ceiling)
     val overCeiling = typed > ceiling + 0.0001
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = { Button(onClick = { onConfirm(amount) }) { Text("Apply") } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-        title = { Text("Line discount", fontWeight = FontWeight.Bold, color = t.inkPrimary) },
-        text = {
-            Column {
-                Text(line.name, color = t.inkSecondary, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    PosContainedForm(
+        title = "Line discount",
+        onDismiss = onDismiss,
+        confirmLabel = "Apply",
+        onConfirm = { onConfirm(amount) }
+    ) {
+        Text(line.name, color = t.inkSecondary, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(
+            "${trimQty(line.qty)} × ${money(line.unitPrice, currency)} = ${money(line.lineGross, currency)}",
+            color = t.inkTertiary, fontSize = 12.sp
+        )
+        PosFormCard {
+            PosField(
+                value = text,
+                onValueChange = { text = it.filter { ch -> ch.isDigit() || ch == '.' || ch == ',' } },
+                label = "Discount ($currency off this line)",
+                keyboardType = KeyboardType.Decimal,
+                modifier = Modifier.fillMaxWidth()
+            )
+            if (maxDiscount > 0.0) {
                 Text(
-                    "${trimQty(line.qty)} × ${money(line.unitPrice, currency)} = ${money(line.lineGross, currency)}",
-                    color = t.inkTertiary, fontSize = 12.sp
-                )
-                Spacer(Modifier.height(10.dp))
-                OutlinedTextField(
-                    value = text,
-                    onValueChange = { text = it.filter { ch -> ch.isDigit() || ch == '.' || ch == ',' } },
-                    label = { Text("Discount ($currency off this line)") },
-                    singleLine = true,
-                    isError = overCeiling,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                    modifier = Modifier.fillMaxWidth()
-                )
-                if (maxDiscount > 0.0) {
-                    Text(
-                        "Max ${money(maxDiscount, currency)} per item (set by admin).",
-                        color = if (overCeiling) t.danger else t.inkTertiary,
-                        fontSize = 11.sp,
-                        modifier = Modifier.padding(top = 4.dp)
-                    )
-                }
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    "Line total: ${money(line.lineGross - amount, currency)}",
-                    color = t.inkPrimary, fontWeight = FontWeight.SemiBold, fontSize = 13.sp
+                    "Max ${money(maxDiscount, currency)} per item (set by admin).",
+                    color = if (overCeiling) t.danger else t.inkTertiary, fontSize = 11.sp
                 )
             }
+            Text(
+                "Line total: ${money(line.lineGross - amount, currency)}",
+                color = t.inkPrimary, fontWeight = FontWeight.SemiBold, fontSize = 13.sp
+            )
         }
-    )
+    }
 }
 
 /** Tap-the-number fast quantity entry for a cart line (type an exact amount). */
@@ -2955,26 +2914,22 @@ private fun SetQtyDialog(line: CartLine, onDismiss: () -> Unit, onConfirm: (Doub
     var text by remember { mutableStateOf(trimQty(line.qty)) }
     val qty = text.replace(',', '.').toDoubleOrNull()
     val valid = qty != null && qty > 0
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = { Button(enabled = valid, onClick = { onConfirm(qty ?: 0.0) }) { Text("Set") } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-        title = { Text("Quantity", fontWeight = FontWeight.Bold, color = t.inkPrimary) },
-        text = {
-            Column {
-                Text(line.name, color = t.inkSecondary, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Spacer(Modifier.height(10.dp))
-                OutlinedTextField(
-                    value = text,
-                    onValueChange = { text = it.filter { ch -> ch.isDigit() || ch == '.' || ch == ',' } },
-                    label = { Text("Quantity") },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                    modifier = Modifier.fillMaxWidth()
-                )
-            }
+    PosContainedForm(
+        title = "Quantity",
+        onDismiss = onDismiss,
+        confirmLabel = "Set",
+        confirmEnabled = valid,
+        onConfirm = { onConfirm(qty ?: 0.0) }
+    ) {
+        Text(line.name, color = t.inkSecondary, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        PosFormCard {
+            PosField(
+                value = text,
+                onValueChange = { text = it.filter { ch -> ch.isDigit() || ch == '.' || ch == ',' } },
+                label = "Quantity", keyboardType = KeyboardType.Decimal, modifier = Modifier.fillMaxWidth()
+            )
         }
-    )
+    }
 }
 
 private fun modeLabel(mode: String): String = when (mode) {
@@ -3124,293 +3079,229 @@ private fun PaymentDialog(
         referenceText = ""
     }
 
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = {
-            Button(
-                enabled = valid,
-                onClick = {
-                    onConfirm(
-                        tenders.toList(),
-                        discount,
-                        selected,
-                        onCredit && remaining > 0.0,
-                        changeAsCredit && overpay > 0.0 && selected != null
-                    )
-                }
-            ) { Text(if (!fullyPaid && creditValid) "Charge to credit" else "Complete sale") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-        title = { Text("Take payment") },
-        text = {
-            Column(Modifier.verticalScroll(rememberScrollState())) {
-                TotalRow("Subtotal", money(subtotal, currency))
-                if (itemDiscount > 0) {
-                    Spacer(Modifier.height(4.dp))
-                    TotalRow("Item discounts", "-${money(itemDiscount, currency)}")
-                }
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = discountText,
-                    onValueChange = { discountText = it.filter { ch -> ch.isDigit() || ch == '.' } },
-                    label = { Text("Discount (optional)") },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                    modifier = Modifier.fillMaxWidth()
+    PosContainedForm(
+        title = "Take payment",
+        onDismiss = onDismiss,
+        confirmLabel = if (!fullyPaid && creditValid) "Charge to credit" else "Complete sale",
+        confirmEnabled = valid,
+        onConfirm = {
+            onConfirm(
+                tenders.toList(),
+                discount,
+                selected,
+                onCredit && remaining > 0.0,
+                changeAsCredit && overpay > 0.0 && selected != null
+            )
+        }
+    ) {
+        val t = LocalPosTokens.current
+        TotalRow("Subtotal", money(subtotal, currency))
+        if (itemDiscount > 0) {
+            TotalRow("Item discounts", "-${money(itemDiscount, currency)}")
+        }
+        PosField(
+            value = discountText,
+            onValueChange = { discountText = it.filter { ch -> ch.isDigit() || ch == '.' } },
+            label = "Discount (optional)",
+            keyboardType = KeyboardType.Decimal,
+            modifier = Modifier.fillMaxWidth()
+        )
+        if (discount > 0) {
+            TotalRow("Discount", "-${money(discount, currency)}")
+        }
+        if (business.vatEnabled) {
+            TotalRow("VAT (${trimPct(business.vatPercent)}%)", money(vat, currency))
+        }
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("Total due", fontWeight = FontWeight.Bold, color = t.inkPrimary)
+            Text(money(total, currency), fontWeight = FontWeight.Black, fontSize = 22.sp, color = t.inkPrimary)
+        }
+        if (cur2On) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                Text(
+                    "≈ ${money(baseToSecond(total, secondRate), secondCode)} @ ${trimPct(secondRate)}",
+                    fontSize = 12.sp, color = t.inkTertiary
                 )
-                if (discount > 0) {
-                    Spacer(Modifier.height(4.dp))
-                    TotalRow("Discount", "-${money(discount, currency)}")
+            }
+        }
+
+        // Customer — searchable, with create-on-the-fly from a typed name.
+        CustomerSearchField(
+            customers = customers,
+            selected = selected,
+            onSelect = { selected = it },
+            onCreate = { name -> onCreateCustomer(name) { selected = it } }
+        )
+
+        // ── Tenders collected so far ──
+        if (tenders.isNotEmpty()) {
+            tenders.forEachIndexed { idx, tn ->
+                Row(
+                    Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        PaymentMethod.fromCode(tn.method)?.label ?: tn.method,
+                        modifier = Modifier.weight(1f), color = t.inkPrimary
+                    )
+                    val tc = tn.currency
+                    val ta = tn.tenderAmount
+                    if (tc != null && ta != null) {
+                        // Taken in the second currency: show what was handed over,
+                        // with the base-currency equivalent (the booked value) beneath.
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text(money(ta, tc), fontWeight = FontWeight.SemiBold, color = t.inkPrimary)
+                            Text("= ${money(tn.amount, currency)}", fontSize = 12.sp, color = t.inkTertiary)
+                        }
+                    } else {
+                        Text(money(tn.amount, currency), fontWeight = FontWeight.SemiBold, color = t.inkPrimary)
+                    }
+                    IconButton(onClick = { tenders.removeAt(idx) }) {
+                        Icon(Icons.Filled.Close, contentDescription = "Remove payment", tint = t.inkTertiary)
+                    }
                 }
-                if (business.vatEnabled) {
-                    Spacer(Modifier.height(4.dp))
-                    TotalRow("VAT (${trimPct(business.vatPercent)}%)", money(vat, currency))
-                }
-                Spacer(Modifier.height(12.dp))
+            }
+            HorizontalDivider(color = t.surfaceBorder)
+            TotalRow("Paid", money(paid, currency))
+            if (remaining > 0) {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text("Total due", fontWeight = FontWeight.Bold)
-                    Text(money(total, currency), fontWeight = FontWeight.Bold, fontSize = 22.sp)
+                    Text("Remaining", fontWeight = FontWeight.SemiBold, color = t.inkPrimary)
+                    Text(money(remaining, currency), fontWeight = FontWeight.SemiBold, color = t.danger)
                 }
                 if (cur2On) {
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                        Text(
-                            "≈ ${money(baseToSecond(total, secondRate), secondCode)} @ ${trimPct(secondRate)}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                        Text("or ${money(baseToSecond(remaining, secondRate), secondCode)}", fontSize = 12.sp, color = t.inkTertiary)
                     }
                 }
-                Spacer(Modifier.height(12.dp))
-
-                // Customer — searchable, with create-on-the-fly from a typed name.
-                CustomerSearchField(
-                    customers = customers,
-                    selected = selected,
-                    onSelect = { selected = it },
-                    onCreate = { name -> onCreateCustomer(name) { selected = it } }
-                )
-                Spacer(Modifier.height(12.dp))
-
-                // ── Tenders collected so far ──
-                if (tenders.isNotEmpty()) {
-                    tenders.forEachIndexed { idx, t ->
-                        Row(
-                            Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                PaymentMethod.fromCode(t.method)?.label ?: t.method,
-                                modifier = Modifier.weight(1f)
-                            )
-                            val tc = t.currency
-                            val ta = t.tenderAmount
-                            if (tc != null && ta != null) {
-                                // Taken in the second currency: show what was handed over,
-                                // with the base-currency equivalent (the booked value) beneath.
-                                Column(horizontalAlignment = Alignment.End) {
-                                    Text(money(ta, tc), fontWeight = FontWeight.SemiBold)
-                                    Text(
-                                        "= ${money(t.amount, currency)}",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                            } else {
-                                Text(money(t.amount, currency), fontWeight = FontWeight.SemiBold)
-                            }
-                            IconButton(onClick = { tenders.removeAt(idx) }) {
-                                Icon(Icons.Filled.Close, contentDescription = "Remove payment")
-                            }
-                        }
+            } else if (overpay > 0) {
+                TotalRow("Change", money(overpay, currency))
+                if (cur2On) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                        Text("or ${money(baseToSecond(overpay, secondRate), secondCode)}", fontSize = 12.sp, color = t.inkTertiary)
                     }
-                    HorizontalDivider()
-                    Spacer(Modifier.height(6.dp))
-                    TotalRow("Paid", money(paid, currency))
-                    if (remaining > 0) {
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text("Remaining", fontWeight = FontWeight.SemiBold)
-                            Text(
-                                money(remaining, currency),
-                                fontWeight = FontWeight.SemiBold,
-                                color = MaterialTheme.colorScheme.error
-                            )
-                        }
-                        if (cur2On) {
-                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                                Text(
-                                    "or ${money(baseToSecond(remaining, secondRate), secondCode)}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                        }
-                    } else if (overpay > 0) {
-                        TotalRow("Change", money(overpay, currency))
-                        if (cur2On) {
-                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                                Text(
-                                    "or ${money(baseToSecond(overpay, secondRate), secondCode)}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                        }
-                    }
-                    Spacer(Modifier.height(12.dp))
-                }
-
-                // ── Add a tender (hidden once the total is fully covered) ──
-                if (remaining > 0 || tenders.isEmpty()) {
-                    Text(
-                        if (tenders.isEmpty()) "Payment" else "Add another payment",
-                        fontWeight = FontWeight.SemiBold,
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                    Spacer(Modifier.height(6.dp))
-                    if (methods.size > 1) {
-                        PaymentMethodPicker(methods, method) { method = it; referenceText = "" }
-                        Spacer(Modifier.height(8.dp))
-                    }
-                    // Pay-into account details for manual methods (bank / mobile money).
-                    business.payInstructions(method)?.let { instr ->
-                        PayInstructionsCard(instr)
-                        Spacer(Modifier.height(8.dp))
-                    }
-                    // Currency toggle — which currency the cashier is keying this tender in.
-                    if (canPickCur2) {
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            FilterChip(
-                                selected = !entryCur2,
-                                onClick = { entryCur2 = false },
-                                label = { Text(currency) }
-                            )
-                            FilterChip(
-                                selected = entryCur2,
-                                onClick = { entryCur2 = true },
-                                label = { Text(secondCode) }
-                            )
-                        }
-                        Spacer(Modifier.height(8.dp))
-                    }
-                    OutlinedTextField(
-                        value = amountText,
-                        onValueChange = { amountText = it.filter { ch -> ch.isDigit() || ch == '.' } },
-                        label = {
-                            Text(if (useCur2) "${method.label} amount ($secondCode)" else "${method.label} amount")
-                        },
-                        singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    // When keying the second currency, echo the base value that gets booked.
-                    val baseEquiv = enteredAmount?.let { secondToBase(it, secondRate) }
-                    if (useCur2 && baseEquiv != null && baseEquiv > 0.0) {
-                        Text(
-                            "= ${money(baseEquiv, currency)}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(top = 2.dp)
-                        )
-                    }
-                    // Quick-fill: exact remaining + rounded notes, in the entry currency.
-                    val quickBasis = if (useCur2) baseToSecond(remaining, secondRate) else remaining
-                    val quickCur = if (useCur2) secondCode else currency
-                    val quick = remember(quickBasis) { quickAmounts(quickBasis) }
-                    if (quick.isNotEmpty()) {
-                        Spacer(Modifier.height(6.dp))
-                        Row(
-                            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            quick.forEachIndexed { i, amt ->
-                                AssistChip(
-                                    onClick = { amountText = trimAmount(amt) },
-                                    label = {
-                                        Text(if (i == 0) "Exact ${money(amt, quickCur)}" else money(amt, quickCur))
-                                    }
-                                )
-                            }
-                        }
-                    }
-                    // Paynow online: generate a QR and watch for payment live.
-                    if (method == PaymentMethod.PAYNOW && paynowAvailable) {
-                        Spacer(Modifier.height(10.dp))
-                        PaynowPanel(
-                            amount = if (remaining > 0) remaining else total,
-                            currency = currency,
-                            onInitiate = onPaynowInitiate,
-                            onPoll = onPaynowPoll,
-                            onPaid = { ref ->
-                                referenceText = ref
-                                if (amountText.isBlank()) {
-                                    amountText = trimAmount(if (remaining > 0) remaining else total)
-                                }
-                            }
-                        )
-                    }
-                    if (needsRef) {
-                        Spacer(Modifier.height(8.dp))
-                        OutlinedTextField(
-                            value = referenceText,
-                            onValueChange = { referenceText = it },
-                            label = { Text("${method.label} reference") },
-                            singleLine = true,
-                            isError = referenceText.isBlank(),
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    OutlinedButton(
-                        onClick = { addTender() },
-                        enabled = canAdd,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Icon(Icons.Filled.Add, contentDescription = null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("Add payment")
-                    }
-                }
-
-                // ── Settling the gap (credit) or the overpayment (change owed) ──
-                if (selected != null && remaining > 0) {
-                    Spacer(Modifier.height(8.dp))
-                    Row(
-                        Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(
-                            "Put ${money(remaining, currency)} on ${selected!!.name}'s account",
-                            modifier = Modifier.weight(1f).padding(end = 12.dp)
-                        )
-                        Switch(checked = onCredit, onCheckedChange = { onCredit = it })
-                    }
-                }
-                if (selected != null && overpay > 0) {
-                    Spacer(Modifier.height(8.dp))
-                    Row(
-                        Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(
-                            "Owe ${money(overpay, currency)} change to account",
-                            modifier = Modifier.weight(1f).padding(end = 12.dp)
-                        )
-                        Switch(checked = changeAsCredit, onCheckedChange = { changeAsCredit = it })
-                    }
-                }
-                if (remaining > 0 && selected == null) {
-                    Spacer(Modifier.height(6.dp))
-                    Text(
-                        "Add payment to cover the total, or pick a customer to sell on credit.",
-                        color = MaterialTheme.colorScheme.error,
-                        style = MaterialTheme.typography.bodySmall
-                    )
                 }
             }
         }
-    )
+
+        // ── Add a tender (hidden once the total is fully covered) ──
+        if (remaining > 0 || tenders.isEmpty()) {
+            PosSectionLabel(if (tenders.isEmpty()) "Payment" else "Add another payment")
+            if (methods.size > 1) {
+                PaymentMethodPicker(methods, method) { method = it; referenceText = "" }
+            }
+            // Pay-into account details for manual methods (bank / mobile money).
+            business.payInstructions(method)?.let { instr ->
+                PayInstructionsCard(instr)
+            }
+            // Currency toggle — which currency the cashier is keying this tender in.
+            if (canPickCur2) {
+                PosSegmented(
+                    options = listOf(currency to currency, secondCode to secondCode),
+                    selected = if (entryCur2) secondCode else currency,
+                    onSelect = { entryCur2 = it == secondCode }
+                )
+            }
+            PosField(
+                value = amountText,
+                onValueChange = { amountText = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                label = if (useCur2) "${method.label} amount ($secondCode)" else "${method.label} amount",
+                keyboardType = KeyboardType.Decimal,
+                modifier = Modifier.fillMaxWidth()
+            )
+            // When keying the second currency, echo the base value that gets booked.
+            val baseEquiv = enteredAmount?.let { secondToBase(it, secondRate) }
+            if (useCur2 && baseEquiv != null && baseEquiv > 0.0) {
+                Text("= ${money(baseEquiv, currency)}", fontSize = 12.sp, color = t.inkTertiary)
+            }
+            // Quick-fill: exact remaining + rounded notes, in the entry currency.
+            val quickBasis = if (useCur2) baseToSecond(remaining, secondRate) else remaining
+            val quickCur = if (useCur2) secondCode else currency
+            val quick = remember(quickBasis) { quickAmounts(quickBasis) }
+            if (quick.isNotEmpty()) {
+                Row(
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    quick.forEachIndexed { i, amt ->
+                        QuickAmountPill(
+                            label = if (i == 0) "Exact ${money(amt, quickCur)}" else money(amt, quickCur),
+                            onClick = { amountText = trimAmount(amt) }
+                        )
+                    }
+                }
+            }
+            // Paynow online: generate a QR and watch for payment live.
+            if (method == PaymentMethod.PAYNOW && paynowAvailable) {
+                PaynowPanel(
+                    amount = if (remaining > 0) remaining else total,
+                    currency = currency,
+                    onInitiate = onPaynowInitiate,
+                    onPoll = onPaynowPoll,
+                    onPaid = { ref ->
+                        referenceText = ref
+                        if (amountText.isBlank()) {
+                            amountText = trimAmount(if (remaining > 0) remaining else total)
+                        }
+                    }
+                )
+            }
+            if (needsRef) {
+                PosField(
+                    value = referenceText,
+                    onValueChange = { referenceText = it },
+                    label = "${method.label} reference",
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+            OutlinedButton(
+                onClick = { addTender() },
+                enabled = canAdd,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Filled.Add, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("Add payment")
+            }
+        }
+
+        // ── Settling the gap (credit) or the overpayment (change owed) ──
+        if (selected != null && remaining > 0) {
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    "Put ${money(remaining, currency)} on ${selected!!.name}'s account",
+                    modifier = Modifier.weight(1f).padding(end = 12.dp), color = t.inkPrimary
+                )
+                Switch(checked = onCredit, onCheckedChange = { onCredit = it })
+            }
+        }
+        if (selected != null && overpay > 0) {
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    "Owe ${money(overpay, currency)} change to account",
+                    modifier = Modifier.weight(1f).padding(end = 12.dp), color = t.inkPrimary
+                )
+                Switch(checked = changeAsCredit, onCheckedChange = { changeAsCredit = it })
+            }
+        }
+        if (remaining > 0 && selected == null) {
+            Text(
+                "Add payment to cover the total, or pick a customer to sell on credit.",
+                color = t.danger, fontSize = 12.sp
+            )
+        }
+    }
 }
 
 /** Exact-remaining + a couple of rounded notes for the cash quick-fill chips. */
@@ -3461,6 +3352,7 @@ private fun PaynowPanel(
     var statusText by remember { mutableStateOf<String?>(null) }
     var errorText by remember { mutableStateOf<String?>(null) }
 
+    val t = LocalPosTokens.current
     val qr = remember(browserUrl) { browserUrl?.let { QrCodes.bitmap(it) } }
 
     // Poll for status while we have a started payment that isn't paid yet. The
@@ -3485,92 +3377,87 @@ private fun PaynowPanel(
         }
     }
 
-    Card(
-        Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceVariant
-        )
+    Column(
+        Modifier.fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(t.surface2)
+            .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
+            .padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Column(
-            Modifier.fillMaxWidth().padding(16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            when {
-                paid -> {
-                    Icon(
-                        Icons.Filled.CloudDone,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(40.dp)
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    Text("Payment received", fontWeight = FontWeight.Bold)
-                    Text(
-                        "Press \"Mark paid\" to finish the sale.",
-                        style = MaterialTheme.typography.bodySmall,
-                        textAlign = TextAlign.Center
-                    )
-                }
-                reference != null -> {
-                    val bmp = qr
-                    if (bmp != null) {
-                        Image(
-                            bitmap = bmp.asImageBitmap(),
-                            contentDescription = "Paynow QR code",
-                            modifier = Modifier.size(220.dp)
-                        )
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    Text("Scan to pay ${money(amount, currency)}", fontWeight = FontWeight.SemiBold)
-                    Spacer(Modifier.height(6.dp))
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                        Spacer(Modifier.width(8.dp))
-                        Text(
-                            paynowStatusLabel(statusText),
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    }
-                }
-                else -> {
-                    Text(
-                        "Show a Paynow QR the customer can scan with their phone.",
-                        style = MaterialTheme.typography.bodySmall,
-                        textAlign = TextAlign.Center
-                    )
-                    Spacer(Modifier.height(10.dp))
-                    Button(
-                        enabled = !starting,
-                        onClick = {
-                            starting = true
-                            errorText = null
-                            onInitiate(amount) { init ->
-                                starting = false
-                                when (init) {
-                                    is PaynowInit.Ok -> {
-                                        reference = init.reference
-                                        browserUrl = init.browserUrl
-                                    }
-                                    is PaynowInit.Err -> errorText = init.message
-                                }
-                            }
-                        }
-                    ) {
-                        Icon(Icons.Filled.Payments, contentDescription = null)
-                        Spacer(Modifier.width(8.dp))
-                        Text(if (starting) "Starting…" else "Generate Paynow QR")
-                    }
-                }
-            }
-            errorText?.let {
+        when {
+            paid -> {
+                Icon(
+                    Icons.Filled.CloudDone,
+                    contentDescription = null,
+                    tint = t.success,
+                    modifier = Modifier.size(40.dp)
+                )
                 Spacer(Modifier.height(8.dp))
+                Text("Payment received", fontWeight = FontWeight.Bold, color = t.inkPrimary)
                 Text(
-                    it,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodySmall,
+                    "Press \"Mark paid\" to finish the sale.",
+                    fontSize = 12.sp, color = t.inkTertiary,
                     textAlign = TextAlign.Center
                 )
             }
+            reference != null -> {
+                val bmp = qr
+                if (bmp != null) {
+                    Image(
+                        bitmap = bmp.asImageBitmap(),
+                        contentDescription = "Paynow QR code",
+                        modifier = Modifier.size(220.dp)
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
+                Text("Scan to pay ${money(amount, currency)}", fontWeight = FontWeight.SemiBold, color = t.inkPrimary)
+                Spacer(Modifier.height(6.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = t.brand.s600)
+                    Spacer(Modifier.width(8.dp))
+                    Text(paynowStatusLabel(statusText), fontSize = 12.sp, color = t.inkSecondary)
+                }
+            }
+            else -> {
+                Text(
+                    "Show a Paynow QR the customer can scan with their phone.",
+                    fontSize = 12.sp, color = t.inkTertiary,
+                    textAlign = TextAlign.Center
+                )
+                Spacer(Modifier.height(10.dp))
+                Button(
+                    enabled = !starting,
+                    onClick = {
+                        starting = true
+                        errorText = null
+                        onInitiate(amount) { init ->
+                            starting = false
+                            when (init) {
+                                is PaynowInit.Ok -> {
+                                    reference = init.reference
+                                    browserUrl = init.browserUrl
+                                }
+                                is PaynowInit.Err -> errorText = init.message
+                            }
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = t.brand.s600, contentColor = t.inkOnBrand)
+                ) {
+                    Icon(Icons.Filled.Payments, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text(if (starting) "Starting…" else "Generate Paynow QR")
+                }
+            }
+        }
+        errorText?.let {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                it,
+                color = t.danger,
+                fontSize = 12.sp,
+                textAlign = TextAlign.Center
+            )
         }
     }
 }
@@ -3614,15 +3501,17 @@ private fun PaymentMethodPicker(
 @Composable
 private fun PayInstructionsCard(instr: PayInstructions) {
     if (instr.lines.isEmpty()) return
-    Card(
-        Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+    val t = LocalPosTokens.current
+    Column(
+        Modifier.fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(t.surface2)
+            .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
+            .padding(12.dp)
     ) {
-        Column(Modifier.fillMaxWidth().padding(12.dp)) {
-            Text(instr.title, fontWeight = FontWeight.SemiBold)
-            Spacer(Modifier.height(4.dp))
-            instr.lines.forEach { (label, value) -> TotalRow(label, value) }
-        }
+        Text(instr.title, fontWeight = FontWeight.SemiBold, color = t.inkPrimary)
+        Spacer(Modifier.height(4.dp))
+        instr.lines.forEach { (label, value) -> TotalRow(label, value) }
     }
 }
 
@@ -3671,21 +3560,22 @@ private fun CustomerSearchField(
     onSelect: (Customer?) -> Unit,
     onCreate: (name: String) -> Unit
 ) {
+    val t = LocalPosTokens.current
     if (selected != null) {
         Row(
             Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Icon(Icons.Filled.Person, contentDescription = null)
+            Icon(Icons.Filled.Person, contentDescription = null, tint = t.inkSecondary)
             Spacer(Modifier.width(8.dp))
             Column(Modifier.weight(1f)) {
-                Text(selected.name, fontWeight = FontWeight.SemiBold)
+                Text(selected.name, fontWeight = FontWeight.SemiBold, color = t.inkPrimary)
                 if (selected.wholesale) {
-                    Text("Wholesale", style = MaterialTheme.typography.labelSmall)
+                    Text("Wholesale", fontSize = 11.sp, color = t.accentBlue)
                 }
             }
             IconButton(onClick = { onSelect(null) }) {
-                Icon(Icons.Filled.Close, contentDescription = "Clear customer")
+                Icon(Icons.Filled.Close, contentDescription = "Clear customer", tint = t.inkTertiary)
             }
         }
         return
@@ -3700,50 +3590,46 @@ private fun CustomerSearchField(
     val exact = customers.any { it.customer.name.equals(trimmed, ignoreCase = true) }
 
     Column(Modifier.fillMaxWidth()) {
-        OutlinedTextField(
+        PosField(
             value = query,
             onValueChange = { query = it },
-            label = { Text("Customer (optional)") },
-            placeholder = { Text("Search or type a new name") },
-            singleLine = true,
-            leadingIcon = { Icon(Icons.Filled.Person, contentDescription = null) },
+            label = "Customer (optional)",
+            placeholder = "Search or type a new name",
             modifier = Modifier.fillMaxWidth()
         )
         if (trimmed.isNotBlank()) {
             Spacer(Modifier.height(4.dp))
-            Card(
-                Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant
-                )
+            Column(
+                Modifier.fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(t.surface2)
+                    .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
             ) {
-                Column(Modifier.fillMaxWidth()) {
-                    matches.forEach { cb ->
-                        Row(
-                            Modifier
-                                .fillMaxWidth()
-                                .clickable { onSelect(cb.customer); query = "" }
-                                .padding(horizontal = 12.dp, vertical = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(cb.customer.name, modifier = Modifier.weight(1f))
-                            cb.customer.phone?.takeIf { it.isNotBlank() }?.let {
-                                Text(it, style = MaterialTheme.typography.labelSmall)
-                            }
+                matches.forEach { cb ->
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clickable { onSelect(cb.customer); query = "" }
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(cb.customer.name, modifier = Modifier.weight(1f), color = t.inkPrimary)
+                        cb.customer.phone?.takeIf { it.isNotBlank() }?.let {
+                            Text(it, fontSize = 11.sp, color = t.inkTertiary)
                         }
                     }
-                    if (!exact) {
-                        Row(
-                            Modifier
-                                .fillMaxWidth()
-                                .clickable { onCreate(trimmed); query = "" }
-                                .padding(horizontal = 12.dp, vertical = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(Icons.Filled.Add, contentDescription = null)
-                            Spacer(Modifier.width(8.dp))
-                            Text("Create \"$trimmed\"", fontWeight = FontWeight.SemiBold)
-                        }
+                }
+                if (!exact) {
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clickable { onCreate(trimmed); query = "" }
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Filled.Add, contentDescription = null, tint = t.brand.s600)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Create \"$trimmed\"", fontWeight = FontWeight.SemiBold, color = t.brand.s600)
                     }
                 }
             }
@@ -3753,9 +3639,27 @@ private fun CustomerSearchField(
 
 @Composable
 private fun TotalRow(label: String, value: String) {
+    val t = LocalPosTokens.current
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-        Text(label, style = MaterialTheme.typography.bodyMedium)
-        Text(value, style = MaterialTheme.typography.bodyMedium)
+        Text(label, fontSize = 14.sp, color = t.inkSecondary)
+        Text(value, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = t.inkPrimary)
+    }
+}
+
+/** Small brand-tinted tap pill for the payment quick-fill amounts (replaces AssistChip). */
+@Composable
+private fun QuickAmountPill(label: String, onClick: () -> Unit) {
+    val t = LocalPosTokens.current
+    Box(
+        Modifier
+            .clip(RoundedCornerShape(9.dp))
+            .background(t.brand.s600.copy(alpha = 0.10f))
+            .border(1.dp, t.brand.s600.copy(alpha = 0.35f), RoundedCornerShape(9.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(label, color = t.brand.s600, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
     }
 }
 
@@ -3974,64 +3878,62 @@ private fun ReceiptDialog(
 ) {
     val context = LocalContext.current
     val isQuote = sale.status == "quote"
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = { Button(onClick = onDismiss) { Text(if (isQuote) "Done" else "New sale") } },
-        title = { Text(if (isQuote) "Quote ready" else "Sale complete") },
-        text = {
-            Column {
-                Text("${if (isQuote) "Quote" else "Receipt"} #${sale.receiptNo ?: sale.id.takeLast(6).uppercase()}")
-                sale.customerName?.takeIf { it.isNotBlank() }?.let {
-                    Text("Customer: $it", style = MaterialTheme.typography.bodySmall)
+    PosContainedForm(
+        title = if (isQuote) "Quote ready" else "Sale complete",
+        onDismiss = onDismiss,
+        confirmLabel = if (isQuote) "Done" else "New sale",
+        onConfirm = onDismiss
+    ) {
+        val t = LocalPosTokens.current
+        Text(
+            "${if (isQuote) "Quote" else "Receipt"} #${sale.receiptNo ?: sale.id.takeLast(6).uppercase()}",
+            color = t.inkPrimary, fontWeight = FontWeight.Bold
+        )
+        sale.customerName?.takeIf { it.isNotBlank() }?.let {
+            Text("Customer: $it", style = MaterialTheme.typography.bodySmall, color = t.inkSecondary)
+        }
+        if (isQuote) sale.validUntil?.let {
+            val vu = remember(it) { SimpleDateFormat("dd MMM yyyy", Locale.getDefault()).format(Date(it)) }
+            Text("Valid until: $vu", style = MaterialTheme.typography.bodySmall, color = t.inkSecondary)
+        }
+        PosFormCard {
+            TotalRow("Subtotal", money(sale.subtotal, currency))
+            if (sale.discountTotal > 0) TotalRow("Discount", "-${money(sale.discountTotal, currency)}")
+            if (sale.taxTotal > 0) TotalRow("VAT", money(sale.taxTotal, currency))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text(
+                    when {
+                        isQuote -> "Quote total"
+                        sale.paymentMethod == "credit" -> "Charged to account"
+                        else -> "Total paid"
+                    },
+                    fontWeight = FontWeight.Bold, color = t.inkPrimary
+                )
+                Text(money(sale.total, currency), fontWeight = FontWeight.Bold, color = t.inkPrimary)
+            }
+            // Payment/change lines are meaningless on a quote — sale only.
+            if (!isQuote) {
+                if (sale.paymentMethod != "cash" && sale.paymentMethod != "credit") {
+                    TotalRow("Paid via", PaymentMethod.fromCode(sale.paymentMethod)?.label ?: sale.paymentMethod)
                 }
-                if (isQuote) sale.validUntil?.let {
-                    val vu = remember(it) {
-                        SimpleDateFormat("dd MMM yyyy", Locale.getDefault()).format(Date(it))
-                    }
-                    Text("Valid until: $vu", style = MaterialTheme.typography.bodySmall)
-                }
-                Spacer(Modifier.height(8.dp))
-                TotalRow("Subtotal", money(sale.subtotal, currency))
-                if (sale.discountTotal > 0) TotalRow("Discount", "-${money(sale.discountTotal, currency)}")
-                if (sale.taxTotal > 0) TotalRow("VAT", money(sale.taxTotal, currency))
-                Spacer(Modifier.height(4.dp))
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text(
-                        when {
-                            isQuote -> "Quote total"
-                            sale.paymentMethod == "credit" -> "Charged to account"
-                            else -> "Total paid"
-                        },
-                        fontWeight = FontWeight.Bold
-                    )
-                    Text(money(sale.total, currency), fontWeight = FontWeight.Bold)
-                }
-                // Payment/change lines are meaningless on a quote — sale only.
-                if (!isQuote) {
-                    if (sale.paymentMethod != "cash" && sale.paymentMethod != "credit") {
-                        TotalRow("Paid via", PaymentMethod.fromCode(sale.paymentMethod)?.label ?: sale.paymentMethod)
-                    }
-                    sale.paymentRef?.takeIf { it.isNotBlank() }?.let { TotalRow("Reference", it) }
-                    sale.changeDue?.takeIf { it > 0 }?.let { TotalRow("Change given", money(it, currency)) }
-                }
-                Spacer(Modifier.height(12.dp))
-                OutlinedButton(onClick = onPrint, modifier = Modifier.fillMaxWidth()) {
-                    Icon(Icons.Filled.Print, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text(if (isQuote) "Print quote" else "Print receipt")
-                }
-                Spacer(Modifier.height(8.dp))
-                OutlinedButton(
-                    onClick = { shareReceipt(context, business, sale, lines, currency) },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Icon(Icons.Filled.Share, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text("Share via WhatsApp")
-                }
+                sale.paymentRef?.takeIf { it.isNotBlank() }?.let { TotalRow("Reference", it) }
+                sale.changeDue?.takeIf { it > 0 }?.let { TotalRow("Change given", money(it, currency)) }
             }
         }
-    )
+        OutlinedButton(onClick = onPrint, modifier = Modifier.fillMaxWidth()) {
+            Icon(Icons.Filled.Print, contentDescription = null)
+            Spacer(Modifier.width(8.dp))
+            Text(if (isQuote) "Print quote" else "Print receipt")
+        }
+        OutlinedButton(
+            onClick = { shareReceipt(context, business, sale, lines, currency) },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Icon(Icons.Filled.Share, contentDescription = null)
+            Spacer(Modifier.width(8.dp))
+            Text("Share via WhatsApp")
+        }
+    }
 }
 
 /** Build a plain-text receipt and hand it to WhatsApp (falling back to the
@@ -4146,7 +4048,17 @@ private fun ItemsScreen(vm: PosViewModel, currency: String) {
                                     Spacer(Modifier.width(12.dp))
                                 }
                                 Column(Modifier.weight(1f)) {
-                                    Text(item.name, fontWeight = FontWeight.Medium)
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            item.name, fontWeight = FontWeight.Medium,
+                                            maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f, fill = false)
+                                        )
+                                        if (item.productType == "set" || item.productType == "piece") {
+                                            Spacer(Modifier.width(6.dp))
+                                            TypeBadge(item)
+                                        }
+                                    }
                                     if (item.trackStock) {
                                         val out = item.stockQty <= 0.0
                                         // Per-item reorder level wins; fall back to the global default.
@@ -4266,96 +4178,84 @@ private fun PriceListDialog(
         return sb.toString().trim()
     }
 
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = {},
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
-        title = { Text("Price list") },
-        text = {
-            Column {
-                // Basis toggle (the improvement over the web's wholesale-only list).
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(selected = basis == "wholesale", onClick = { basis = "wholesale" }, label = { Text("Wholesale") })
-                    FilterChip(selected = basis == "retail", onClick = { basis = "retail" }, label = { Text("Retail") })
-                }
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    if (basis == "wholesale") "Box-first: a boxed item shows its box price."
-                    else "Retail (per-unit) prices for a customer-facing list.",
-                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                if (basis == "wholesale") {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("Show unit price on boxes", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
-                        Switch(checked = showUnit, onCheckedChange = { showUnit = it })
-                    }
-                }
-                Spacer(Modifier.height(10.dp))
-                if (orderedCategories.isEmpty()) {
-                    Text("No priced items for this basis.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                } else {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("Categories", modifier = Modifier.weight(1f), fontWeight = FontWeight.SemiBold)
-                        TextButton(onClick = { selected = orderedCategories.toSet() }) { Text("All") }
-                        TextButton(onClick = { selected = emptySet() }) { Text("None") }
-                    }
-                    Column(
-                        Modifier.heightIn(max = 220.dp).verticalScroll(rememberScrollState()),
-                        verticalArrangement = Arrangement.spacedBy(2.dp)
+    PosDialog(title = "Price list", onDismiss = onDismiss) {
+        val t = LocalPosTokens.current
+        // Basis toggle (the improvement over the web's wholesale-only list).
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilterChip(selected = basis == "wholesale", onClick = { basis = "wholesale" }, label = { Text("Wholesale") })
+            FilterChip(selected = basis == "retail", onClick = { basis = "retail" }, label = { Text("Retail") })
+        }
+        Text(
+            if (basis == "wholesale") "Box-first: a boxed item shows its box price."
+            else "Retail (per-unit) prices for a customer-facing list.",
+            style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
+        )
+        if (basis == "wholesale") {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Show unit price on boxes", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, color = t.inkPrimary)
+                Switch(checked = showUnit, onCheckedChange = { showUnit = it })
+            }
+        }
+        if (orderedCategories.isEmpty()) {
+            Text("No priced items for this basis.", color = t.inkTertiary)
+        } else {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Categories", modifier = Modifier.weight(1f), fontWeight = FontWeight.SemiBold, color = t.inkPrimary)
+                TextButton(onClick = { selected = orderedCategories.toSet() }) { Text("All") }
+                TextButton(onClick = { selected = emptySet() }) { Text("None") }
+            }
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                orderedCategories.forEach { cat ->
+                    val on = cat in selected
+                    Row(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
+                            .clickable { selected = if (on) selected - cat else selected + cat }
+                            .padding(horizontal = 8.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        orderedCategories.forEach { cat ->
-                            val on = cat in selected
-                            Row(
-                                Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
-                                    .clickable { selected = if (on) selected - cat else selected + cat }
-                                    .padding(horizontal = 8.dp, vertical = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Checkbox(checked = on, onCheckedChange = { selected = if (on) selected - cat else selected + cat })
-                                Spacer(Modifier.width(6.dp))
-                                Text(cat, modifier = Modifier.weight(1f))
-                            }
-                        }
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    Text("$itemCount item${if (itemCount == 1) "" else "s"} · ${groups.size}/${orderedCategories.size} categories",
-                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Spacer(Modifier.height(12.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(
-                            onClick = {
-                                val send = Intent(Intent.ACTION_SEND).apply {
-                                    type = "text/plain"; putExtra(Intent.EXTRA_TEXT, buildText())
-                                }
-                                runCatching { context.startActivity(Intent(send).setPackage("com.whatsapp")) }
-                                    .getOrElse { context.startActivity(Intent.createChooser(send, "Share price list")) }
-                            },
-                            enabled = itemCount > 0,
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Icon(Icons.Filled.Share, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(6.dp)); Text("Text")
-                        }
-                        Button(
-                            onClick = {
-                                val biz = business ?: return@Button
-                                val file = PdfDocs.priceList(
-                                    context, biz, heading, currency,
-                                    groups.map { (c, list) -> c to list.map { PdfDocs.PriceListLine(it.name, it.note, it.price) } }
-                                )
-                                PdfFiles.share(context, file, heading)
-                            },
-                            enabled = itemCount > 0 && business != null,
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Icon(Icons.Filled.Print, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(6.dp)); Text("PDF")
-                        }
+                        Checkbox(checked = on, onCheckedChange = { selected = if (on) selected - cat else selected + cat })
+                        Spacer(Modifier.width(6.dp))
+                        Text(cat, modifier = Modifier.weight(1f), color = t.inkPrimary)
                     }
                 }
             }
+            Text(
+                "$itemCount item${if (itemCount == 1) "" else "s"} · ${groups.size}/${orderedCategories.size} categories",
+                style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    onClick = {
+                        val send = Intent(Intent.ACTION_SEND).apply {
+                            type = "text/plain"; putExtra(Intent.EXTRA_TEXT, buildText())
+                        }
+                        runCatching { context.startActivity(Intent(send).setPackage("com.whatsapp")) }
+                            .getOrElse { context.startActivity(Intent.createChooser(send, "Share price list")) }
+                    },
+                    enabled = itemCount > 0,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(Icons.Filled.Share, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp)); Text("Text")
+                }
+                Button(
+                    onClick = {
+                        val biz = business ?: return@Button
+                        val file = PdfDocs.priceList(
+                            context, biz, heading, currency,
+                            groups.map { (c, list) -> c to list.map { PdfDocs.PriceListLine(it.name, it.note, it.price) } }
+                        )
+                        PdfFiles.share(context, file, heading)
+                    },
+                    enabled = itemCount > 0 && business != null,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(Icons.Filled.Print, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp)); Text("PDF")
+                }
+            }
         }
-    )
+    }
 }
 
 /**
@@ -4376,7 +4276,19 @@ private fun ItemDialog(
     var wholesale by remember { mutableStateOf(existing?.wholesalePrice?.takeIf { it > 0 }?.let { trimQty(it) } ?: "") }
     var boxPrice by remember { mutableStateOf(existing?.boxPrice?.takeIf { it > 0 }?.let { trimQty(it) } ?: "") }
     var boxSize by remember { mutableStateOf(existing?.boxSize?.takeIf { it > 1 }?.toString() ?: "") }
+    // How the product is sold: box | set | piece (mirrors the web catalog).
+    var productType by remember { mutableStateOf(existing?.productType ?: "box") }
+    // Per-unit cost (used for set/piece, and the stored value for every type).
     var cost by remember { mutableStateOf(existing?.cost?.let { trimQty(it) } ?: "") }
+    // Cost entered PER BOX for box items; the per-unit cost is derived from it on save.
+    // Seed it from an existing box item's stored per-unit cost × its box size.
+    var boxCost by remember {
+        val e = existing
+        mutableStateOf(
+            if (e != null && e.productType == "box" && e.cost != null && e.cost > 0.0)
+                trimQty(e.cost * e.boxSize.coerceAtLeast(1)) else ""
+        )
+    }
     var tax by remember { mutableStateOf(existing?.taxRate?.takeIf { it > 0 }?.let { trimPct(it) } ?: "") }
     var category by remember { mutableStateOf(existing?.category ?: "") }
     var sku by remember { mutableStateOf(existing?.sku ?: "") }
@@ -4429,311 +4341,318 @@ private fun ItemDialog(
 
     val priceVal = price.toDoubleOrNull()
     val taxVal = tax.toDoubleOrNull() ?: 0.0
-    val costVal = cost.toDoubleOrNull()
     val wholesaleVal = wholesale.toDoubleOrNull() ?: 0.0
     val boxPriceVal = boxPrice.toDoubleOrNull() ?: 0.0
     val boxSizeVal = boxSize.toIntOrNull()?.coerceAtLeast(1) ?: 1
+    // Product type drives which fields apply. Only a "box" item uses the box price /
+    // units-per-box and the boxes+loose stock split; a set or piece is a single count.
+    val isBox = productType == "box"
+    val typeSuffix = when (productType) { "set" -> "  (per set)"; "piece" -> "  (each)"; else -> "" }
+    val useBoxStock = isBox && boxSizeVal > 1
+    // Cost basis is type-aware: a box's cost is entered PER BOX and the per-unit cost is
+    // derived (box cost ÷ units per box); a set/piece cost is already per sellable unit.
+    val unitCostVal = if (isBox) boxCost.toDoubleOrNull()?.let { it / boxSizeVal }
+    else cost.toDoubleOrNull()
+    // Values actually persisted: a set/piece never keeps a box size or box price.
+    val savedBoxSize = if (isBox) boxSizeVal else 1
+    val savedBoxPrice = if (isBox) boxPriceVal else 0.0
     // Total on-hand units. For a box item it's dynamically summed from boxes + loose;
-    // otherwise it's the single unit count.
+    // otherwise it's the single unit/set/piece count.
     val boxesVal = stockBoxes.toIntOrNull() ?: 0
     val looseVal = stockLoose.toDoubleOrNull() ?: 0.0
-    val stockVal = if (boxSizeVal > 1) boxesVal * boxSizeVal + looseVal
+    val stockVal = if (useBoxStock) boxesVal * boxSizeVal + looseVal
     else (stock.toDoubleOrNull() ?: 0.0)
     val unitText = unit.trim().ifBlank { "pc" }
 
-    AlertDialog(
-        onDismissRequest = onClose,
-        confirmButton = {
-            Button(
-                enabled = name.isNotBlank() && priceVal != null,
-                onClick = {
-                    if (existing == null) {
-                        vm.addItem(
-                            name = name, price = priceVal ?: 0.0,
-                            wholesalePrice = wholesaleVal, boxPrice = boxPriceVal, boxSize = boxSizeVal,
-                            category = category.trim().ifBlank { null }, sku = sku.trim().ifBlank { null },
-                            barcode = barcode.trim().ifBlank { null },
-                            taxRate = taxVal, trackStock = track, stockQty = stockVal,
-                            reorderLevel = reorder.toDoubleOrNull() ?: 0.0,
-                            cost = costVal, unit = unitText,
-                            imageLocalPath = imageLocalPath, showImage = showImage
-                        )
-                    } else {
-                        // Resolve the image fields. Untouched → keep as-is; removed →
-                        // clear url+path and mark pending (so the clear reaches the cloud);
-                        // added/replaced → new local path, mark pending for Storage upload.
-                        val (finalPath, finalUrl, finalPending) = when {
-                            !imageChanged -> Triple(existing.imageLocalPath, existing.imageUrl, existing.imagePending)
-                            imageLocalPath == null -> Triple(null, null, true)
-                            else -> Triple(imageLocalPath, existing.imageUrl, true)
-                        }
-                        // Free the previous committed local copy when it was replaced/removed.
-                        if (imageChanged && existing.imageLocalPath != null && existing.imageLocalPath != finalPath) {
-                            ProductImages.deleteLocal(existing.imageLocalPath)
-                        }
-                        vm.updateItem(
-                            existing.copy(
-                                name = name.trim(),
-                                price = priceVal ?: 0.0,
-                                wholesalePrice = wholesaleVal,
-                                boxPrice = boxPriceVal,
-                                boxSize = boxSizeVal,
-                                category = category.trim().ifBlank { null },
-                                sku = sku.trim().ifBlank { null },
-                                barcode = barcode.trim().ifBlank { null },
-                                taxRate = taxVal,
-                                trackStock = track,
-                                stockQty = if (track) stockVal else 0.0,
-                                reorderLevel = if (track) (reorder.toDoubleOrNull() ?: 0.0) else 0.0,
-                                cost = costVal,
-                                unit = unitText,
-                                imageLocalPath = finalPath,
-                                imageUrl = finalUrl,
-                                imagePending = finalPending,
-                                showImage = showImage
-                            )
-                        )
-                    }
-                    onClose()
+    PosContainedForm(
+        title = if (existing == null) "New item" else "Edit item",
+        onDismiss = onClose,
+        confirmLabel = "Save item",
+        confirmEnabled = name.isNotBlank() && priceVal != null,
+        onConfirm = {
+            if (existing == null) {
+                vm.addItem(
+                    name = name, price = priceVal ?: 0.0,
+                    wholesalePrice = wholesaleVal, boxPrice = savedBoxPrice, boxSize = savedBoxSize,
+                    productType = productType,
+                    category = category.trim().ifBlank { null }, sku = sku.trim().ifBlank { null },
+                    barcode = barcode.trim().ifBlank { null },
+                    taxRate = taxVal, trackStock = track, stockQty = stockVal,
+                    reorderLevel = reorder.toDoubleOrNull() ?: 0.0,
+                    cost = unitCostVal, unit = unitText,
+                    imageLocalPath = imageLocalPath, showImage = showImage
+                )
+            } else {
+                // Resolve the image fields. Untouched → keep as-is; removed → clear
+                // url+path and mark pending (so the clear reaches the cloud); added/
+                // replaced → new local path, mark pending for Storage upload.
+                val (finalPath, finalUrl, finalPending) = when {
+                    !imageChanged -> Triple(existing.imageLocalPath, existing.imageUrl, existing.imagePending)
+                    imageLocalPath == null -> Triple(null, null, true)
+                    else -> Triple(imageLocalPath, existing.imageUrl, true)
                 }
-            ) { Text("Save") }
-        },
-        dismissButton = { TextButton(onClick = onClose) { Text("Cancel") } },
-        title = { Text(if (existing == null) "New item" else "Edit item") },
-        text = {
-            Column(Modifier.verticalScroll(rememberScrollState())) {
-                // ── Product image ──
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    val t = LocalPosTokens.current
-                    Box(
-                        Modifier.size(64.dp).clip(RoundedCornerShape(12.dp))
-                            .background(t.surface2),
-                        contentAlignment = Alignment.Center
+                if (imageChanged && existing.imageLocalPath != null && existing.imageLocalPath != finalPath) {
+                    ProductImages.deleteLocal(existing.imageLocalPath)
+                }
+                vm.updateItem(
+                    existing.copy(
+                        name = name.trim(),
+                        price = priceVal ?: 0.0,
+                        wholesalePrice = wholesaleVal,
+                        boxPrice = savedBoxPrice,
+                        boxSize = savedBoxSize,
+                        productType = productType,
+                        category = category.trim().ifBlank { null },
+                        sku = sku.trim().ifBlank { null },
+                        barcode = barcode.trim().ifBlank { null },
+                        taxRate = taxVal,
+                        trackStock = track,
+                        stockQty = if (track) stockVal else 0.0,
+                        reorderLevel = if (track) (reorder.toDoubleOrNull() ?: 0.0) else 0.0,
+                        cost = unitCostVal,
+                        unit = unitText,
+                        imageLocalPath = finalPath,
+                        imageUrl = finalUrl,
+                        imagePending = finalPending,
+                        showImage = showImage
+                    )
+                )
+            }
+            onClose()
+        }
+    ) {
+        val t = LocalPosTokens.current
+        val currency = vm.business.value?.currency ?: "USD"
+
+        // ── Product image ──
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                Modifier.size(64.dp).clip(RoundedCornerShape(12.dp)).background(t.surface2),
+                contentAlignment = Alignment.Center
+            ) {
+                if (imagePreviewModel != null) {
+                    ProductImage(
+                        model = imagePreviewModel,
+                        contentDescription = "Product image",
+                        modifier = Modifier.size(64.dp),
+                        shape = RoundedCornerShape(12.dp),
+                    )
+                } else {
+                    Icon(
+                        Icons.Filled.AddPhotoAlternate, contentDescription = null,
+                        tint = t.inkTertiary, modifier = Modifier.size(28.dp)
+                    )
+                }
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = {
+                        photoPicker.launch(
+                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                        )
+                    }) { Text(if (imagePreviewModel != null) "Change" else "Add photo") }
+                    if (imagePreviewModel != null) {
+                        TextButton(onClick = {
+                            imageLocalPath?.takeIf { it != existing?.imageLocalPath }
+                                ?.let { ProductImages.deleteLocal(it) }
+                            imageLocalPath = null
+                            imageChanged = true
+                        }) { Text("Remove") }
+                    }
+                }
+                if (imagePreviewModel != null) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Show on card", style = MaterialTheme.typography.bodySmall, color = t.inkSecondary)
+                        Spacer(Modifier.weight(1f))
+                        Switch(checked = showImage, onCheckedChange = { showImage = it })
+                    }
+                }
+            }
+        }
+
+        // ── Product type (Box / Set / Piece) — drives the fields below ──
+        Column {
+            PosSectionLabel("Product type")
+            Spacer(Modifier.height(6.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf(
+                    Triple("box", "Box", "Box or loose unit"),
+                    Triple("set", "Set", "Complete set only"),
+                    Triple("piece", "Piece", "Sold individually")
+                ).forEach { (value, title, desc) ->
+                    val selected = productType == value
+                    Column(
+                        Modifier
+                            .weight(1f)
+                            .heightIn(min = 64.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(if (selected) t.brand.s50 else t.surface2)
+                            .border(
+                                width = if (selected) 1.5.dp else 1.dp,
+                                color = if (selected) t.brand.s500 else t.surfaceBorder,
+                                shape = RoundedCornerShape(12.dp)
+                            )
+                            .clickable { productType = value }
+                            .padding(horizontal = 10.dp, vertical = 8.dp)
                     ) {
-                        if (imagePreviewModel != null) {
-                            ProductImage(
-                                model = imagePreviewModel,
-                                contentDescription = "Product image",
-                                modifier = Modifier.size(64.dp),
-                                shape = RoundedCornerShape(12.dp),
-                            )
-                        } else {
-                            Icon(
-                                Icons.Filled.AddPhotoAlternate, contentDescription = null,
-                                tint = t.inkTertiary, modifier = Modifier.size(28.dp)
-                            )
-                        }
-                    }
-                    Spacer(Modifier.width(12.dp))
-                    Column(Modifier.weight(1f)) {
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            OutlinedButton(onClick = {
-                                photoPicker.launch(
-                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                                )
-                            }) { Text(if (imagePreviewModel != null) "Change" else "Add photo") }
-                            if (imagePreviewModel != null) {
-                                TextButton(onClick = {
-                                    imageLocalPath?.takeIf { it != existing?.imageLocalPath }
-                                        ?.let { ProductImages.deleteLocal(it) }
-                                    imageLocalPath = null
-                                    imageChanged = true
-                                }) { Text("Remove") }
-                            }
-                        }
-                        if (imagePreviewModel != null) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text("Show on card", style = MaterialTheme.typography.bodySmall,
-                                    color = t.inkSecondary)
-                                Spacer(Modifier.weight(1f))
-                                Switch(checked = showImage, onCheckedChange = { showImage = it })
-                            }
-                        }
+                        Text(
+                            title, fontSize = 14.sp,
+                            fontWeight = if (selected) FontWeight.Bold else FontWeight.SemiBold,
+                            color = if (selected) t.brand.s700 else t.inkPrimary, maxLines = 1
+                        )
+                        Spacer(Modifier.height(3.dp))
+                        Text(desc, fontSize = 10.sp, lineHeight = 12.sp, color = t.inkTertiary, maxLines = 2)
                     }
                 }
-                Spacer(Modifier.height(12.dp))
-                OutlinedTextField(
-                    value = name, onValueChange = { name = it },
-                    label = { Text("Name") }, singleLine = true, modifier = Modifier.fillMaxWidth()
+            }
+        }
+
+        // ── Pricing ──
+        PosFormCard {
+            PosField(value = name, onValueChange = { name = it }, label = "Name", modifier = Modifier.fillMaxWidth())
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                PosField(
+                    value = price,
+                    onValueChange = { price = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                    label = "Retail price$typeSuffix", keyboardType = KeyboardType.Decimal,
+                    modifier = Modifier.weight(1f)
                 )
-                Spacer(Modifier.height(8.dp))
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedTextField(
-                        value = price,
-                        onValueChange = { price = it.filter { ch -> ch.isDigit() || ch == '.' } },
-                        label = { Text("Retail price") }, singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                        modifier = Modifier.weight(1f)
-                    )
-                    OutlinedTextField(
-                        value = cost,
-                        onValueChange = { cost = it.filter { ch -> ch.isDigit() || ch == '.' } },
-                        label = { Text("Cost  (opt)") }, singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                        modifier = Modifier.weight(1f)
-                    )
-                }
-                // Live margin readout. The Settings → Tax "Margin formula" choice
-                // picks markup-on-cost vs gross-of-price so the number matches how
-                // the shop owner thinks about their margins.
-                if (priceVal != null && costVal != null && costVal > 0.0 && priceVal > 0.0) {
-                    val profit = priceVal - costVal
-                    val pct = if (prefs.marginFormula == "gross") profit / priceVal * 100
-                    else profit / costVal * 100
-                    val label = if (prefs.marginFormula == "gross") "Gross margin" else "Markup"
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        "$label: ${trimPct(pct)}%  (${money(profit, vm.business.value?.currency ?: "USD")} profit)",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = if (profit >= 0) LocalPosTokens.current.success
-                        else MaterialTheme.colorScheme.error
-                    )
-                }
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = wholesale,
-                    onValueChange = { wholesale = it.filter { ch -> ch.isDigit() || ch == '.' } },
-                    label = { Text("Wholesale price  (opt)") }, singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                    modifier = Modifier.fillMaxWidth()
+                PosField(
+                    value = if (isBox) boxCost else cost,
+                    onValueChange = { v ->
+                        val f = v.filter { ch -> ch.isDigit() || ch == '.' }
+                        if (isBox) boxCost = f else cost = f
+                    },
+                    label = when (productType) {
+                        "box" -> "Cost / box"
+                        "set" -> "Cost / set"
+                        else -> "Cost / piece"
+                    },
+                    keyboardType = KeyboardType.Decimal, modifier = Modifier.weight(1f)
                 )
-                Spacer(Modifier.height(8.dp))
+            }
+            if (isBox && boxSizeVal > 1 && unitCostVal != null) {
+                Text(
+                    "Per unit ≈ ${money(unitCostVal, currency)}",
+                    style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
+                )
+            }
+            if (priceVal != null && unitCostVal != null && unitCostVal > 0.0 && priceVal > 0.0) {
+                val profit = priceVal - unitCostVal
+                val pct = if (prefs.marginFormula == "gross") profit / priceVal * 100
+                else profit / unitCostVal * 100
+                val marginLabel = if (prefs.marginFormula == "gross") "Gross margin" else "Markup"
+                Text(
+                    "$marginLabel: ${trimPct(pct)}%  (${money(profit, currency)} profit)",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (profit >= 0) t.success else MaterialTheme.colorScheme.error
+                )
+            }
+            PosField(
+                value = wholesale,
+                onValueChange = { wholesale = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                label = "Wholesale price  (opt)", keyboardType = KeyboardType.Decimal,
+                modifier = Modifier.fillMaxWidth()
+            )
+            if (isBox) {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedTextField(
+                    PosField(
                         value = boxPrice,
                         onValueChange = { boxPrice = it.filter { ch -> ch.isDigit() || ch == '.' } },
-                        label = { Text("Box price  (opt)") }, singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        label = "Box price  (opt)", keyboardType = KeyboardType.Decimal,
                         modifier = Modifier.weight(1f)
                     )
-                    OutlinedTextField(
+                    PosField(
                         value = boxSize,
                         onValueChange = { boxSize = it.filter { ch -> ch.isDigit() } },
-                        label = { Text("Units / box") }, singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        label = "Units / box", keyboardType = KeyboardType.Number,
                         modifier = Modifier.weight(1f)
                     )
                 }
-                // With "auto-convert units to boxes" on (Settings → Tax), the box
-                // price is derived from the retail price × units-per-box so the owner
-                // only maintains one number. Editing the box field by hand still wins.
                 if (prefs.autoConvertUnitsToBoxes && boxSizeVal > 1 && priceVal != null) {
                     LaunchedEffect(priceVal, boxSizeVal, prefs.autoConvertUnitsToBoxes) {
                         boxPrice = trimQty(priceVal * boxSizeVal)
                     }
                 }
-                Spacer(Modifier.height(8.dp))
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedTextField(
-                        value = category, onValueChange = { category = it },
-                        label = { Text("Category  (opt)") }, singleLine = true,
-                        modifier = Modifier.weight(1f)
-                    )
-                    OutlinedTextField(
-                        value = sku, onValueChange = { sku = it },
-                        label = { Text("SKU  (opt)") }, singleLine = true,
-                        modifier = Modifier.weight(1f)
-                    )
-                }
-                Spacer(Modifier.height(8.dp))
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    OutlinedTextField(
-                        value = barcode,
-                        onValueChange = { barcode = it.trim() },
-                        label = { Text("Barcode  (opt)") }, singleLine = true,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    FilledTonalIconButton(onClick = { scanning = true }) {
-                        Icon(Icons.Filled.QrCodeScanner, contentDescription = "Scan barcode")
-                    }
-                }
-                Spacer(Modifier.height(8.dp))
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedTextField(
-                        value = tax,
-                        onValueChange = { tax = it.filter { ch -> ch.isDigit() || ch == '.' } },
-                        label = { Text("Tax %  (opt)") }, singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                        modifier = Modifier.weight(1f)
-                    )
-                    OutlinedTextField(
-                        value = unit, onValueChange = { unit = it },
-                        label = { Text("Unit") }, singleLine = true,
-                        modifier = Modifier.weight(1f)
+            }
+        }
+
+        // ── Details ──
+        PosFormCard {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                PosField(value = category, onValueChange = { category = it }, label = "Category  (opt)", modifier = Modifier.weight(1f))
+                PosField(value = sku, onValueChange = { sku = it }, label = "SKU  (opt)", modifier = Modifier.weight(1f))
+            }
+            PosField(
+                value = barcode, onValueChange = { barcode = it.trim() },
+                label = "Barcode  (opt)", modifier = Modifier.fillMaxWidth(),
+                trailing = {
+                    Icon(
+                        Icons.Filled.QrCodeScanner, contentDescription = "Scan barcode",
+                        tint = t.brand.s600, modifier = Modifier.size(20.dp).clickable { scanning = true }
                     )
                 }
-                Spacer(Modifier.height(4.dp))
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Text("Track stock", Modifier.weight(1f))
-                    Switch(checked = track, onCheckedChange = { track = it })
-                }
-                if (track) {
-                    if (boxSizeVal > 1) {
-                        // Box item: enter boxes + loose units; total is computed live.
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            OutlinedTextField(
-                                value = stockBoxes,
-                                onValueChange = { stockBoxes = it.filter { ch -> ch.isDigit() } },
-                                label = { Text("Boxes") },
-                                singleLine = true,
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                                modifier = Modifier.weight(1f)
-                            )
-                            OutlinedTextField(
-                                value = stockLoose,
-                                onValueChange = { stockLoose = it.filter { ch -> ch.isDigit() || ch == '.' } },
-                                label = { Text("Loose $unitText") },
-                                singleLine = true,
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                                modifier = Modifier.weight(1f)
-                            )
-                        }
-                        Spacer(Modifier.height(4.dp))
-                        Text(
-                            "Total: ${trimQty(stockVal)} $unitText  ($boxesVal box${if (boxesVal == 1) "" else "es"} × $boxSizeVal + $looseVal loose)",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                PosField(
+                    value = tax, onValueChange = { tax = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                    label = "Tax %  (opt)", keyboardType = KeyboardType.Decimal, modifier = Modifier.weight(1f)
+                )
+                PosField(value = unit, onValueChange = { unit = it }, label = "Unit", modifier = Modifier.weight(1f))
+            }
+        }
+
+        // ── Stock ──
+        PosFormCard {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text("Track stock", Modifier.weight(1f), color = t.inkPrimary, fontWeight = FontWeight.Medium)
+                Switch(checked = track, onCheckedChange = { track = it })
+            }
+            if (track) {
+                if (useBoxStock) {
+                    // Box item: enter boxes + loose units; total is computed live.
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        PosField(
+                            value = stockBoxes, onValueChange = { stockBoxes = it.filter { ch -> ch.isDigit() } },
+                            label = "Boxes", keyboardType = KeyboardType.Number, modifier = Modifier.weight(1f)
                         )
-                        Spacer(Modifier.height(8.dp))
-                        OutlinedTextField(
-                            value = reorder,
-                            onValueChange = { reorder = it.filter { ch -> ch.isDigit() || ch == '.' } },
-                            label = { Text("Reorder at ($unitText)") },
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                            modifier = Modifier.fillMaxWidth()
+                        PosField(
+                            value = stockLoose, onValueChange = { stockLoose = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                            label = "Loose $unitText", keyboardType = KeyboardType.Decimal, modifier = Modifier.weight(1f)
                         )
-                    } else {
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            OutlinedTextField(
-                                value = stock,
-                                onValueChange = { stock = it.filter { ch -> ch.isDigit() || ch == '.' } },
-                                label = { Text(if (existing == null) "Opening stock" else "Stock on hand") },
-                                singleLine = true,
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                                modifier = Modifier.weight(1f)
-                            )
-                            OutlinedTextField(
-                                value = reorder,
-                                onValueChange = { reorder = it.filter { ch -> ch.isDigit() || ch == '.' } },
-                                label = { Text("Reorder at") },
-                                singleLine = true,
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                                modifier = Modifier.weight(1f)
-                            )
-                        }
                     }
-                    if (existing != null) {
-                        Spacer(Modifier.height(4.dp))
-                        TextButton(onClick = { showHistory = true }) {
-                            Text("View stock history")
-                        }
+                    Text(
+                        "Total: ${trimQty(stockVal)} $unitText  ($boxesVal box${if (boxesVal == 1) "" else "es"} × $boxSizeVal + $looseVal loose)",
+                        style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
+                    )
+                    PosField(
+                        value = reorder, onValueChange = { reorder = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                        label = "Reorder at ($unitText)", keyboardType = KeyboardType.Decimal, modifier = Modifier.fillMaxWidth()
+                    )
+                } else {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        PosField(
+                            value = stock, onValueChange = { stock = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                            label = when (productType) {
+                                "set" -> if (existing == null) "Sets in stock" else "Sets on hand"
+                                "piece" -> if (existing == null) "Pieces in stock" else "Pieces on hand"
+                                else -> if (existing == null) "Opening stock" else "Stock on hand"
+                            },
+                            keyboardType = KeyboardType.Decimal, modifier = Modifier.weight(1f)
+                        )
+                        PosField(
+                            value = reorder, onValueChange = { reorder = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                            label = "Reorder at", keyboardType = KeyboardType.Decimal, modifier = Modifier.weight(1f)
+                        )
                     }
+                }
+                if (existing != null) {
+                    TextButton(onClick = { showHistory = true }) { Text("View stock history") }
                 }
             }
         }
-    )
+    }
 
     if (showHistory && existing != null) {
         StockHistoryDialog(vm = vm, item = existing, onDismiss = { showHistory = false })
@@ -4752,121 +4671,134 @@ private fun ItemDialog(
 private fun StockHistoryDialog(vm: PosViewModel, item: Item, onDismiss: () -> Unit) {
     val t = LocalPosTokens.current
     val movements by vm.itemMovements(item.id).collectAsState(initial = emptyList())
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
-        title = { Text("Stock history · ${item.name}") },
-        text = {
-            if (movements.isEmpty()) {
-                Text("No stock movements yet.", color = t.inkTertiary)
-            } else {
-                LazyColumn(Modifier.fillMaxWidth()) {
-                    items(movements, key = { it.id }) { m ->
-                        Row(
-                            Modifier.fillMaxWidth().padding(vertical = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(Modifier.weight(1f)) {
-                                Text(m.type.replaceFirstChar { it.uppercase() }, fontWeight = FontWeight.Medium)
-                                Text(
-                                    m.note?.takeIf { it.isNotBlank() } ?: dashTime(m.createdAt),
-                                    style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
-                                )
-                            }
-                            Text(
-                                (if (m.delta >= 0) "+" else "") + trimQty(m.delta),
-                                fontWeight = FontWeight.Bold,
-                                color = if (m.delta >= 0) t.success else MaterialTheme.colorScheme.error
-                            )
-                            Spacer(Modifier.width(10.dp))
-                            Text("= ${trimQty(m.balanceAfter)}", color = t.inkTertiary, fontSize = 12.sp)
-                        }
-                        HorizontalDivider(color = t.surfaceBorder)
+    PosDialog(title = "Stock history · ${item.name}", onDismiss = onDismiss) {
+        if (movements.isEmpty()) {
+            Text("No stock movements yet.", color = t.inkTertiary)
+        } else {
+            movements.forEach { m ->
+                Row(
+                    Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(m.type.replaceFirstChar { it.uppercase() }, fontWeight = FontWeight.Medium, color = t.inkPrimary)
+                        Text(
+                            m.note?.takeIf { it.isNotBlank() } ?: dashTime(m.createdAt),
+                            style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
+                        )
                     }
+                    Text(
+                        (if (m.delta >= 0) "+" else "") + trimQty(m.delta),
+                        fontWeight = FontWeight.Bold,
+                        color = if (m.delta >= 0) t.success else t.danger
+                    )
+                    Spacer(Modifier.width(10.dp))
+                    Text("= ${trimQty(m.balanceAfter)}", color = t.inkTertiary, fontSize = 12.sp)
                 }
+                HorizontalDivider(color = t.surfaceBorder)
             }
         }
-    )
+    }
 }
 
 // ───────────────────────── CUSTOMERS ─────────────────────────
 
 @Composable
 private fun CustomersScreen(vm: PosViewModel, currency: String) {
+    val t = LocalPosTokens.current
     val customers by vm.customers.collectAsState()
     var showAdd by remember { mutableStateOf(false) }
     var selected by remember { mutableStateOf<Customer?>(null) }
     var showRecentCalls by remember { mutableStateOf(false) }
     // Non-null => open the Add dialog pre-filled from a contact pick or a recent call.
     var prefill by remember { mutableStateOf<PickedContact?>(null) }
+    var search by remember { mutableStateOf("") }
 
     val totalOutstanding = customers.sumOf { it.balance }
+    val q = search.trim().lowercase()
+    val shown = remember(customers, q) {
+        if (q.isEmpty()) customers
+        else customers.filter {
+            it.customer.name.lowercase().contains(q) ||
+                (it.customer.phone?.lowercase()?.contains(q) == true)
+        }
+    }
 
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
-            if (totalOutstanding > 0) {
-                Card(
-                    Modifier.fillMaxWidth().padding(12.dp),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.errorContainer
+            Column(Modifier.padding(12.dp)) {
+                Text("Customers", color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 22.sp)
+                Text(
+                    "${customers.size} account" + if (customers.size == 1) "" else "s",
+                    color = t.inkTertiary, fontSize = 12.sp
+                )
+                if (totalOutstanding > 0) {
+                    Spacer(Modifier.height(10.dp))
+                    PosMetricCard(
+                        "Owed to you", money(totalOutstanding, currency),
+                        Modifier.fillMaxWidth(), accent = t.danger, sub = "across all accounts"
                     )
-                ) {
-                    Row(
-                        Modifier.fillMaxWidth().padding(16.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text("Total owed to you", color = MaterialTheme.colorScheme.onErrorContainer)
-                        Text(
-                            money(totalOutstanding, currency), fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onErrorContainer
-                        )
-                    }
                 }
+                Spacer(Modifier.height(10.dp))
+                PosField(
+                    value = search, onValueChange = { search = it },
+                    label = "Search customer", placeholder = "Name or phone",
+                    modifier = Modifier.fillMaxWidth()
+                )
             }
-            if (customers.isEmpty()) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            if (shown.isEmpty()) {
+                Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                     Text(
-                        "No customers yet.\nAdd one to sell on credit.",
-                        color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center
+                        if (customers.isEmpty()) "No customers yet.\nAdd one to sell on credit."
+                        else "No customers match your search.",
+                        color = t.inkTertiary, textAlign = TextAlign.Center
                     )
                 }
             } else {
-                LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(12.dp)) {
-                    items(customers, key = { it.customer.id }) { cb ->
-                        Card(
-                            Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                LazyColumn(
+                    Modifier.weight(1f).fillMaxWidth(),
+                    contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 88.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(shown, key = { it.customer.id }) { cb ->
+                        val owes = cb.balance > 0.0
+                        val accent = if (owes) t.danger else t.brand.s600
+                        Row(
+                            Modifier.fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(t.surface1)
+                                .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
                                 .clickable { selected = cb.customer }
+                                .padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Row(
-                                Modifier.fillMaxWidth().padding(14.dp),
-                                verticalAlignment = Alignment.CenterVertically
+                            Box(
+                                Modifier.size(38.dp).clip(CircleShape).background(accent.copy(alpha = 0.14f)),
+                                contentAlignment = Alignment.Center
                             ) {
-                                Column(Modifier.weight(1f)) {
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Text(cb.customer.name, fontWeight = FontWeight.Medium)
-                                        if (cb.customer.wholesale) {
-                                            Spacer(Modifier.width(6.dp))
-                                            WholesaleBadge()
-                                        }
-                                    }
-                                    cb.customer.phone?.takeIf { it.isNotBlank() }?.let {
-                                        Text(
-                                            it, style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
+                                Text(cb.customer.name.take(1).uppercase(), color = accent, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                            }
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(cb.customer.name, fontWeight = FontWeight.Bold, color = t.inkPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    if (cb.customer.wholesale) {
+                                        Spacer(Modifier.width(6.dp))
+                                        WholesaleBadge()
                                     }
                                 }
-                                if (cb.balance > 0) {
-                                    Text(
-                                        money(cb.balance, currency), fontWeight = FontWeight.Bold,
-                                        color = MaterialTheme.colorScheme.error
-                                    )
-                                } else {
-                                    Text(
-                                        "Settled", style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
+                                cb.customer.phone?.takeIf { it.isNotBlank() }?.let {
+                                    Text(it, style = MaterialTheme.typography.bodySmall, color = t.inkTertiary, maxLines = 1)
                                 }
+                            }
+                            Spacer(Modifier.width(8.dp))
+                            if (owes) {
+                                Text(money(cb.balance, currency), fontWeight = FontWeight.Black, fontSize = 16.sp, color = t.danger)
+                            } else {
+                                Box(
+                                    Modifier.clip(RoundedCornerShape(6.dp)).background(t.success.copy(alpha = 0.13f))
+                                        .padding(horizontal = 8.dp, vertical = 3.dp)
+                                ) { Text("Settled", color = t.success, fontSize = 11.sp, fontWeight = FontWeight.Bold) }
                             }
                         }
                     }
@@ -4949,66 +4881,36 @@ private fun AddCustomerDialog(
         picked.name?.let { name = it }
         picked.phone?.let { phone = it }
     }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = {
-            Button(
-                enabled = name.isNotBlank(),
-                onClick = { onSave(name, phone, email, address, note, wholesale) }
-            ) { Text("Save") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-        title = { Text("New customer") },
-        text = {
-            Column(Modifier.verticalScroll(rememberScrollState())) {
-                TextButton(onClick = pickContact, modifier = Modifier.align(Alignment.End)) {
-                    Icon(Icons.Filled.Contacts, contentDescription = null)
-                    Spacer(Modifier.width(6.dp))
-                    Text("Pick from contacts")
+    PosContainedForm(
+        title = "New customer",
+        onDismiss = onDismiss,
+        confirmLabel = "Save",
+        confirmEnabled = name.isNotBlank(),
+        onConfirm = { onSave(name, phone, email, address, note, wholesale) }
+    ) {
+        val t = LocalPosTokens.current
+        TextButton(onClick = pickContact, modifier = Modifier.align(Alignment.End)) {
+            Icon(Icons.Filled.Contacts, contentDescription = null)
+            Spacer(Modifier.width(6.dp))
+            Text("Pick from contacts")
+        }
+        PosFormCard {
+            PosField(value = name, onValueChange = { name = it }, label = "Name", modifier = Modifier.fillMaxWidth())
+            PosField(value = phone, onValueChange = { phone = it }, label = "Phone  (optional)", keyboardType = KeyboardType.Phone, modifier = Modifier.fillMaxWidth())
+            PosField(value = email, onValueChange = { email = it }, label = "Email  (optional)", keyboardType = KeyboardType.Email, modifier = Modifier.fillMaxWidth())
+            PosField(value = address, onValueChange = { address = it }, label = "Address  (optional)", modifier = Modifier.fillMaxWidth())
+            PosField(value = note, onValueChange = { note = it }, label = "Note  (optional)", modifier = Modifier.fillMaxWidth())
+        }
+        PosFormCard {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Wholesale customer", color = t.inkPrimary, fontWeight = FontWeight.Medium)
+                    Text("Charge trade / box prices", style = MaterialTheme.typography.bodySmall, color = t.inkTertiary)
                 }
-                OutlinedTextField(
-                    value = name, onValueChange = { name = it },
-                    label = { Text("Name") }, singleLine = true, modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = phone, onValueChange = { phone = it },
-                    label = { Text("Phone  (optional)") }, singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = email, onValueChange = { email = it },
-                    label = { Text("Email  (optional)") }, singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = address, onValueChange = { address = it },
-                    label = { Text("Address  (optional)") }, modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = note, onValueChange = { note = it },
-                    label = { Text("Note  (optional)") }, modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(4.dp))
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Wholesale customer")
-                        Text(
-                            "Charge trade / box prices",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    Switch(checked = wholesale, onCheckedChange = { wholesale = it })
-                }
+                Switch(checked = wholesale, onCheckedChange = { wholesale = it })
             }
         }
-    )
+    }
 }
 
 /**
@@ -5049,45 +4951,36 @@ private fun RecentCallersDialog(
         customers.mapNotNull { cb -> phoneKey(cb.customer.phone)?.let { it to cb } }.toMap()
     }
 
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
-        title = { Text("Recent callers") },
-        text = {
-            when {
-                !granted -> Column {
-                    Text(
-                        "Call-log access is needed to show recent callers.",
-                        style = MaterialTheme.typography.bodyMedium
-                    )
-                    Spacer(Modifier.height(12.dp))
-                    Button(onClick = { permLauncher.launch(Manifest.permission.READ_CALL_LOG) }) {
-                        Text("Grant access")
-                    }
-                }
-                loading -> Box(
-                    Modifier.fillMaxWidth().height(120.dp), contentAlignment = Alignment.Center
-                ) { CircularProgressIndicator() }
-                calls.isEmpty() -> Text(
-                    "No recent calls found.", color = MaterialTheme.colorScheme.onSurfaceVariant
+    PosDialog(title = "Recent callers", onDismiss = onDismiss) {
+        when {
+            !granted -> Column {
+                Text(
+                    "Call-log access is needed to show recent callers.",
+                    style = MaterialTheme.typography.bodyMedium, color = LocalPosTokens.current.inkSecondary
                 )
-                else -> Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
-                    calls.forEach { call ->
-                        val match = byKey[phoneKey(call.number)]
-                        RecentCallerRow(
-                            call = call,
-                            match = match,
-                            currency = currency,
-                            onClick = {
-                                if (match != null) onOpenCustomer(match.customer)
-                                else onAddFromCall(call)
-                            }
-                        )
-                    }
+                Spacer(Modifier.height(12.dp))
+                Button(onClick = { permLauncher.launch(Manifest.permission.READ_CALL_LOG) }) {
+                    Text("Grant access")
                 }
             }
+            loading -> Box(
+                Modifier.fillMaxWidth().height(120.dp), contentAlignment = Alignment.Center
+            ) { CircularProgressIndicator() }
+            calls.isEmpty() -> Text("No recent calls found.", color = LocalPosTokens.current.inkTertiary)
+            else -> calls.forEach { call ->
+                val match = byKey[phoneKey(call.number)]
+                RecentCallerRow(
+                    call = call,
+                    match = match,
+                    currency = currency,
+                    onClick = {
+                        if (match != null) onOpenCustomer(match.customer)
+                        else onAddFromCall(call)
+                    }
+                )
+            }
         }
-    )
+    }
 }
 
 @Composable
@@ -5165,155 +5058,145 @@ private fun CustomerDetailDialog(
     var showPayout by remember { mutableStateOf(false) }
     var wholesale by remember { mutableStateOf(customer.wholesale) }
 
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
-        dismissButton = {
-            when {
-                balance > 0 -> Button(onClick = { showPay = true }) { Text("Record payment") }
-                changeOwed > 0 -> Button(onClick = { showPayout = true }) { Text("Pay out") }
+    PosDialog(title = customer.name, onDismiss = onDismiss) {
+        val t = LocalPosTokens.current
+        val changeTypes = remember { setOf("change_owed", "refund_owed", "change_paid", "refund_paid") }
+
+        val contactLines = listOfNotNull(
+            customer.phone?.takeIf { it.isNotBlank() },
+            customer.email?.takeIf { it.isNotBlank() },
+            customer.address?.takeIf { it.isNotBlank() }
+        )
+        if (contactLines.isNotEmpty()) {
+            Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                contactLines.forEach { Text(it, style = MaterialTheme.typography.bodySmall, color = t.inkTertiary) }
             }
-        },
-        title = { Text(customer.name) },
-        text = {
-            Column {
-                customer.phone?.takeIf { it.isNotBlank() }?.let {
-                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-                customer.email?.takeIf { it.isNotBlank() }?.let {
-                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-                customer.address?.takeIf { it.isNotBlank() }?.let {
-                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-                Spacer(Modifier.height(12.dp))
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Text("Wholesale customer", Modifier.weight(1f), fontWeight = FontWeight.Medium)
-                    Switch(
-                        checked = wholesale,
-                        onCheckedChange = { wholesale = it; vm.setCustomerWholesale(customer, it) }
-                    )
-                }
-                Spacer(Modifier.height(4.dp))
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    when {
-                        balance > 0 -> {
-                            Text("Balance owed", fontWeight = FontWeight.Bold)
-                            Text(
-                                money(balance, currency), fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.error
+        }
+
+        // Balance summary + primary action.
+        val balAccent = when {
+            balance > 0 -> t.danger
+            changeOwed > 0 -> t.brand.s600
+            else -> t.success
+        }
+        val balLabel = when {
+            balance > 0 -> "Balance owed"
+            changeOwed > 0 -> "You owe (change)"
+            else -> "Settled"
+        }
+        val balValue = when {
+            balance > 0 -> money(balance, currency)
+            changeOwed > 0 -> money(changeOwed, currency)
+            else -> money(0.0, currency)
+        }
+        PosMetricCard(balLabel, balValue, Modifier.fillMaxWidth(), accent = balAccent)
+        when {
+            balance > 0 -> Button(
+                onClick = { showPay = true }, modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = t.brand.s600, contentColor = t.inkOnBrand)
+            ) { Text("Record payment") }
+            changeOwed > 0 -> Button(
+                onClick = { showPayout = true }, modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = t.brand.s600, contentColor = t.inkOnBrand)
+            ) { Text("Pay out change") }
+        }
+
+        PosFormCard {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text("Wholesale customer", Modifier.weight(1f), color = t.inkPrimary, fontWeight = FontWeight.Medium)
+                Switch(
+                    checked = wholesale,
+                    onCheckedChange = { wholesale = it; vm.setCustomerWholesale(customer, it) }
+                )
+            }
+        }
+
+        // Statement PDFs.
+        Column(verticalArrangement = Arrangement.spacedBy(0.dp)) {
+            TextButton(
+                onClick = {
+                    val biz = bizForPdf ?: return@TextButton
+                    val entries = history.sortedBy { it.createdAt }
+                        .filter { it.type == "credit_owed" || it.type == "credit_paid" }
+                        .map {
+                            PdfDocs.StatementEntry(
+                                date = it.createdAt,
+                                label = if (it.type == "credit_owed") "Charged" else "Payment",
+                                amount = if (it.type == "credit_owed") it.amount else -it.amount
                             )
                         }
-                        changeOwed > 0 -> {
-                            // Overpaid credit or change booked to account — the shop owes them.
-                            Text("You owe (change)", fontWeight = FontWeight.Bold)
-                            Text(
-                                money(changeOwed, currency), fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.primary
-                            )
+                    pdfScope.launch {
+                        val file = withContext(Dispatchers.IO) {
+                            PdfDocs.customerStatement(pdfCtx, biz, "Debt Statement", customer.name, entries)
                         }
-                        else -> {
-                            Text("Settled", fontWeight = FontWeight.Bold)
-                            Text(
-                                money(0.0, currency), fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-                        }
+                        PdfFiles.share(pdfCtx, file, "Statement — ${customer.name}")
                     }
                 }
-                Spacer(Modifier.height(8.dp))
+            ) {
+                Icon(Icons.Filled.Share, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("Share debt statement PDF")
+            }
+            if (history.any { it.type in changeTypes }) {
                 TextButton(
                     onClick = {
                         val biz = bizForPdf ?: return@TextButton
                         val entries = history.sortedBy { it.createdAt }
-                            .filter { it.type == "credit_owed" || it.type == "credit_paid" }
+                            .filter { it.type in changeTypes }
                             .map {
+                                val owed = it.type == "change_owed" || it.type == "refund_owed"
                                 PdfDocs.StatementEntry(
                                     date = it.createdAt,
-                                    label = if (it.type == "credit_owed") "Charged" else "Payment",
-                                    amount = if (it.type == "credit_owed") it.amount else -it.amount
+                                    label = when (it.type) {
+                                        "change_owed" -> "Change owed"
+                                        "refund_owed" -> "Refund owed"
+                                        "change_paid" -> "Change paid"
+                                        else -> "Refund paid"
+                                    },
+                                    amount = if (owed) it.amount else -it.amount
                                 )
                             }
                         pdfScope.launch {
                             val file = withContext(Dispatchers.IO) {
-                                PdfDocs.customerStatement(pdfCtx, biz, "Debt Statement", customer.name, entries)
+                                PdfDocs.customerStatement(pdfCtx, biz, "Change & Refund Statement", customer.name, entries)
                             }
-                            PdfFiles.share(pdfCtx, file, "Statement — ${customer.name}")
+                            PdfFiles.share(pdfCtx, file, "Change statement — ${customer.name}")
                         }
                     }
                 ) {
                     Icon(Icons.Filled.Share, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(6.dp))
-                    Text("Share debt statement PDF")
+                    Text("Share change/refund statement PDF")
                 }
-                // Change/refund statement (§5) — money the shop owes THIS customer.
-                // Only shown when there's change/refund ledger activity to report.
-                val changeTypes = remember { setOf("change_owed", "refund_owed", "change_paid", "refund_paid") }
-                if (history.any { it.type in changeTypes }) {
-                    TextButton(
-                        onClick = {
-                            val biz = bizForPdf ?: return@TextButton
-                            val entries = history.sortedBy { it.createdAt }
-                                .filter { it.type in changeTypes }
-                                .map {
-                                    val owed = it.type == "change_owed" || it.type == "refund_owed"
-                                    PdfDocs.StatementEntry(
-                                        date = it.createdAt,
-                                        label = when (it.type) {
-                                            "change_owed" -> "Change owed"
-                                            "refund_owed" -> "Refund owed"
-                                            "change_paid" -> "Change paid"
-                                            else -> "Refund paid"
-                                        },
-                                        amount = if (owed) it.amount else -it.amount
-                                    )
-                                }
-                            pdfScope.launch {
-                                val file = withContext(Dispatchers.IO) {
-                                    PdfDocs.customerStatement(pdfCtx, biz, "Change & Refund Statement", customer.name, entries)
-                                }
-                                PdfFiles.share(pdfCtx, file, "Change statement — ${customer.name}")
-                            }
-                        }
+            }
+        }
+
+        // Activity — scrolls with the dialog (no nested scroll).
+        PosSectionLabel("Activity")
+        if (history.isEmpty()) {
+            Text("No credit activity yet.", color = t.inkTertiary)
+        } else {
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                history.forEach { txn ->
+                    val meta = creditRowMeta(txn.type)
+                    Row(
+                        Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Icon(Icons.Filled.Share, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(6.dp))
-                        Text("Share change/refund statement PDF")
-                    }
-                }
-                Spacer(Modifier.height(4.dp))
-                HorizontalDivider()
-                Spacer(Modifier.height(8.dp))
-                if (history.isEmpty()) {
-                    Text("No credit activity yet.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                } else {
-                    Column(Modifier.heightIn(max = 240.dp).verticalScroll(rememberScrollState())) {
-                        history.forEach { txn ->
-                            val meta = creditRowMeta(txn.type)
-                            Row(
-                                Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Column(Modifier.weight(1f)) {
-                                    Text(meta.label, style = MaterialTheme.typography.bodyMedium)
-                                    Text(syncTimeLabel(txn.createdAt),
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                }
-                                Text(
-                                    (if (meta.positive) "+" else "-") + money(txn.amount, currency),
-                                    color = when {
-                                        meta.positive && !meta.weOwe -> MaterialTheme.colorScheme.error
-                                        else -> MaterialTheme.colorScheme.primary
-                                    }
-                                )
-                            }
+                        Column(Modifier.weight(1f)) {
+                            Text(meta.label, style = MaterialTheme.typography.bodyMedium, color = t.inkPrimary)
+                            Text(syncTimeLabel(txn.createdAt), style = MaterialTheme.typography.bodySmall, color = t.inkTertiary)
                         }
+                        Text(
+                            (if (meta.positive) "+" else "-") + money(txn.amount, currency),
+                            fontWeight = FontWeight.Bold,
+                            color = if (meta.positive && !meta.weOwe) t.danger else t.brand.s600
+                        )
                     }
                 }
             }
         }
-    )
+    }
 
     if (showPay) {
         RecordPaymentDialog(
@@ -5346,12 +5229,12 @@ private fun CustomerDetailDialog(
 private data class CreditRowMeta(val label: String, val positive: Boolean, val weOwe: Boolean)
 
 private fun creditRowMeta(type: String): CreditRowMeta = when (type) {
-    "credit_owed" -> CreditRowMeta("Charged", positive = true, weOwe = false)
-    "credit_paid" -> CreditRowMeta("Payment", positive = false, weOwe = false)
-    "change_owed" -> CreditRowMeta("Change owed", positive = true, weOwe = true)
-    "refund_owed" -> CreditRowMeta("Refund owed", positive = true, weOwe = true)
-    "change_paid" -> CreditRowMeta("Change paid", positive = false, weOwe = true)
-    "refund_paid" -> CreditRowMeta("Refund paid", positive = false, weOwe = true)
+    "credit_owed" -> CreditRowMeta("Charged to account", positive = true, weOwe = false)
+    "credit_paid" -> CreditRowMeta("Repaid you", positive = false, weOwe = false)
+    "change_owed" -> CreditRowMeta("Change you owe", positive = true, weOwe = true)
+    "refund_owed" -> CreditRowMeta("Refund you owe", positive = true, weOwe = true)
+    "change_paid" -> CreditRowMeta("Change paid back", positive = false, weOwe = true)
+    "refund_paid" -> CreditRowMeta("Refund paid back", positive = false, weOwe = true)
     else -> CreditRowMeta("Payment", positive = false, weOwe = false)
 }
 
@@ -5369,33 +5252,24 @@ private fun RecordPaymentDialog(
     var note by remember { mutableStateOf("") }
     val amount = amountText.toDoubleOrNull()
     val valid = amount != null && amount > 0
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = {
-            Button(enabled = valid, onClick = { onConfirm(amount ?: 0.0, note) }) { Text(actionLabel) }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-        title = { Text(title) },
-        text = {
-            Column {
-                Text("$owedLabel: ${money(maxAmount, currency)}",
-                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = amountText,
-                    onValueChange = { amountText = it.filter { ch -> ch.isDigit() || ch == '.' } },
-                    label = { Text("Amount received") }, singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = note, onValueChange = { note = it },
-                    label = { Text("Note  (optional)") }, modifier = Modifier.fillMaxWidth()
-                )
-            }
+    PosContainedForm(
+        title = title,
+        onDismiss = onDismiss,
+        confirmLabel = actionLabel,
+        confirmEnabled = valid,
+        onConfirm = { onConfirm(amount ?: 0.0, note) }
+    ) {
+        val t = LocalPosTokens.current
+        Text("$owedLabel: ${money(maxAmount, currency)}", style = MaterialTheme.typography.bodySmall, color = t.inkTertiary)
+        PosFormCard {
+            PosField(
+                value = amountText,
+                onValueChange = { amountText = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                label = "Amount received", keyboardType = KeyboardType.Decimal, modifier = Modifier.fillMaxWidth()
+            )
+            PosField(value = note, onValueChange = { note = it }, label = "Note  (optional)", modifier = Modifier.fillMaxWidth())
         }
-    )
+    }
 }
 
 // ───────────────────────── EXPENSES ─────────────────────────
@@ -5479,17 +5353,20 @@ private fun ExpensesScreen(vm: PosViewModel, currency: String) {
                 Spacer(Modifier.height(12.dp))
 
                 // Summary bar: count + red running total.
-                Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = t.surface1)) {
-                    Row(
-                        Modifier.fillMaxWidth().padding(16.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            "${filtered.size} expense" + if (filtered.size == 1) "" else "s",
-                            color = t.inkSecondary, fontSize = 13.sp, modifier = Modifier.weight(1f)
-                        )
-                        Text(money(total, currency), color = t.danger, fontWeight = FontWeight.Black, fontSize = 22.sp)
-                    }
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(t.surface1)
+                        .border(1.dp, t.surfaceBorder, RoundedCornerShape(14.dp))
+                        .padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "${filtered.size} expense" + if (filtered.size == 1) "" else "s",
+                        color = t.inkSecondary, fontSize = 13.sp, modifier = Modifier.weight(1f)
+                    )
+                    Text(money(total, currency), color = t.danger, fontWeight = FontWeight.Black, fontSize = 22.sp)
                 }
             }
 
@@ -5510,37 +5387,40 @@ private fun ExpensesScreen(vm: PosViewModel, currency: String) {
                     contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 96.dp)
                 ) {
                     items(filtered, key = { it.id }) { e ->
-                        Card(
-                            Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable { editing = e }
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(t.surface1)
+                                .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
+                                .clickable { editing = e }
+                                .padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Row(
-                                Modifier.fillMaxWidth().padding(14.dp),
-                                verticalAlignment = Alignment.CenterVertically
+                            Box(
+                                Modifier.size(34.dp).clip(RoundedCornerShape(10.dp))
+                                    .background(t.danger.copy(alpha = 0.12f)),
+                                contentAlignment = Alignment.Center
                             ) {
-                                Box(
-                                    Modifier.size(34.dp).clip(RoundedCornerShape(10.dp))
-                                        .background(t.danger.copy(alpha = 0.12f)),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(
-                                        Icons.Filled.Receipt, contentDescription = null,
-                                        tint = t.danger, modifier = Modifier.size(16.dp)
-                                    )
-                                }
-                                Spacer(Modifier.width(12.dp))
-                                Column(Modifier.weight(1f)) {
-                                    Text(e.category, fontWeight = FontWeight.Bold, color = t.inkPrimary)
-                                    Text(
-                                        e.date + (e.description?.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""),
-                                        style = MaterialTheme.typography.bodySmall, color = t.inkTertiary,
-                                        maxLines = 1, overflow = TextOverflow.Ellipsis
-                                    )
-                                }
-                                Text(money(e.amount, currency), fontWeight = FontWeight.Black, color = t.danger)
-                                Spacer(Modifier.width(4.dp))
-                                IconButton(onClick = { deleting = e }) {
-                                    Icon(Icons.Filled.Delete, contentDescription = "Delete", tint = t.inkTertiary)
-                                }
+                                Icon(
+                                    Icons.Filled.Receipt, contentDescription = null,
+                                    tint = t.danger, modifier = Modifier.size(16.dp)
+                                )
+                            }
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(e.category, fontWeight = FontWeight.Bold, color = t.inkPrimary)
+                                Text(
+                                    e.date + (e.description?.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""),
+                                    fontSize = 12.sp, color = t.inkTertiary,
+                                    maxLines = 1, overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            Text(money(e.amount, currency), fontWeight = FontWeight.Black, color = t.danger)
+                            Spacer(Modifier.width(4.dp))
+                            IconButton(onClick = { deleting = e }) {
+                                Icon(Icons.Filled.Delete, contentDescription = "Delete", tint = t.inkTertiary)
                             }
                         }
                     }
@@ -5598,19 +5478,18 @@ private fun ExpenseModal(
 
     val parsedAmount = amount.replace(',', '.').toDoubleOrNull() ?: 0.0
 
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = {
-            Button(
-                enabled = parsedAmount > 0 && date.isNotBlank(),
-                onClick = { onSave(category, parsedAmount, date.trim(), description.trim().ifBlank { null }) }
-            ) { Text("Save") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-        title = { Text(if (initial == null) "New expense" else "Edit expense") },
-        text = {
-            Column(Modifier.verticalScroll(rememberScrollState())) {
-                // Category picker (OutlinedButton + dropdown, like the tender picker).
+    PosContainedForm(
+        title = if (initial == null) "New expense" else "Edit expense",
+        onDismiss = onDismiss,
+        confirmLabel = "Save",
+        confirmEnabled = parsedAmount > 0 && date.isNotBlank(),
+        onConfirm = { onSave(category, parsedAmount, date.trim(), description.trim().ifBlank { null }) }
+    ) {
+        val t = LocalPosTokens.current
+        PosFormCard {
+            Column {
+                Text("Category", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = t.inkTertiary)
+                Spacer(Modifier.height(3.dp))
                 Box(Modifier.fillMaxWidth()) {
                     OutlinedButton(onClick = { catOpen = true }, modifier = Modifier.fillMaxWidth()) {
                         Text(category, modifier = Modifier.weight(1f))
@@ -5618,35 +5497,16 @@ private fun ExpenseModal(
                     }
                     DropdownMenu(expanded = catOpen, onDismissRequest = { catOpen = false }) {
                         EXPENSE_CATEGORIES.forEach { c ->
-                            DropdownMenuItem(
-                                text = { Text(c) },
-                                onClick = { category = c; catOpen = false }
-                            )
+                            DropdownMenuItem(text = { Text(c) }, onClick = { category = c; catOpen = false })
                         }
                     }
                 }
-                Spacer(Modifier.height(10.dp))
-                OutlinedTextField(
-                    value = amount, onValueChange = { amount = it },
-                    label = { Text("Amount") }, singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(10.dp))
-                OutlinedTextField(
-                    value = date, onValueChange = { date = it },
-                    label = { Text("Date  (yyyy-mm-dd)") }, singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(10.dp))
-                OutlinedTextField(
-                    value = description, onValueChange = { description = it },
-                    label = { Text("Description  (optional)") },
-                    modifier = Modifier.fillMaxWidth()
-                )
             }
+            PosField(value = amount, onValueChange = { amount = it }, label = "Amount", keyboardType = KeyboardType.Decimal, modifier = Modifier.fillMaxWidth())
+            PosField(value = date, onValueChange = { date = it }, label = "Date  (yyyy-mm-dd)", modifier = Modifier.fillMaxWidth())
+            PosField(value = description, onValueChange = { description = it }, label = "Description  (optional)", modifier = Modifier.fillMaxWidth())
         }
-    )
+    }
 }
 
 // ───────────────────────── SUPPLIERS ─────────────────────────
@@ -5711,35 +5571,38 @@ private fun SuppliersScreen(vm: PosViewModel) {
                     contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 96.dp)
                 ) {
                     items(filtered, key = { it.id }) { s ->
-                        Card(
-                            Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable { editing = s }
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(t.surface1)
+                                .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
+                                .clickable { editing = s }
+                                .padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Row(
-                                Modifier.fillMaxWidth().padding(14.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column(Modifier.weight(1f)) {
-                                    Text(s.name, fontWeight = FontWeight.Bold, color = t.inkPrimary)
-                                    listOfNotNull(
-                                        s.phone?.takeIf { it.isNotBlank() },
-                                        s.email?.takeIf { it.isNotBlank() },
-                                        s.address?.takeIf { it.isNotBlank() }
-                                    ).forEach { line ->
-                                        Text(
-                                            line, style = MaterialTheme.typography.bodySmall,
-                                            color = t.inkSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis
-                                        )
-                                    }
-                                    s.notes?.takeIf { it.isNotBlank() }?.let {
-                                        Text(
-                                            it, style = MaterialTheme.typography.bodySmall,
-                                            color = t.inkTertiary, maxLines = 2, overflow = TextOverflow.Ellipsis
-                                        )
-                                    }
+                            Column(Modifier.weight(1f)) {
+                                Text(s.name, fontWeight = FontWeight.Bold, color = t.inkPrimary)
+                                listOfNotNull(
+                                    s.phone?.takeIf { it.isNotBlank() },
+                                    s.email?.takeIf { it.isNotBlank() },
+                                    s.address?.takeIf { it.isNotBlank() }
+                                ).forEach { line ->
+                                    Text(
+                                        line, fontSize = 12.sp,
+                                        color = t.inkSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis
+                                    )
                                 }
-                                IconButton(onClick = { deleting = s }) {
-                                    Icon(Icons.Filled.Delete, contentDescription = "Delete", tint = t.inkTertiary)
+                                s.notes?.takeIf { it.isNotBlank() }?.let {
+                                    Text(
+                                        it, fontSize = 12.sp,
+                                        color = t.inkTertiary, maxLines = 2, overflow = TextOverflow.Ellipsis
+                                    )
                                 }
+                            }
+                            IconButton(onClick = { deleting = s }) {
+                                Icon(Icons.Filled.Delete, contentDescription = "Delete", tint = t.inkTertiary)
                             }
                         }
                     }
@@ -5795,50 +5658,21 @@ private fun SupplierModal(
     var address by remember { mutableStateOf(initial?.address ?: "") }
     var notes by remember { mutableStateOf(initial?.notes ?: "") }
 
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = {
-            Button(
-                enabled = name.isNotBlank(),
-                onClick = { onSave(name, phone, email, address, notes) }
-            ) { Text("Save") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-        title = { Text(if (initial == null) "New supplier" else "Edit supplier") },
-        text = {
-            Column(Modifier.verticalScroll(rememberScrollState())) {
-                OutlinedTextField(
-                    value = name, onValueChange = { name = it },
-                    label = { Text("Supplier name") }, singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(10.dp))
-                OutlinedTextField(
-                    value = phone, onValueChange = { phone = it },
-                    label = { Text("Phone  (optional)") }, singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(10.dp))
-                OutlinedTextField(
-                    value = email, onValueChange = { email = it },
-                    label = { Text("Email  (optional)") }, singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(10.dp))
-                OutlinedTextField(
-                    value = address, onValueChange = { address = it },
-                    label = { Text("Address  (optional)") }, singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(10.dp))
-                OutlinedTextField(
-                    value = notes, onValueChange = { notes = it },
-                    label = { Text("Notes  (optional)") },
-                    modifier = Modifier.fillMaxWidth()
-                )
-            }
+    PosContainedForm(
+        title = if (initial == null) "New supplier" else "Edit supplier",
+        onDismiss = onDismiss,
+        confirmLabel = "Save",
+        confirmEnabled = name.isNotBlank(),
+        onConfirm = { onSave(name, phone, email, address, notes) }
+    ) {
+        PosFormCard {
+            PosField(value = name, onValueChange = { name = it }, label = "Supplier name", modifier = Modifier.fillMaxWidth())
+            PosField(value = phone, onValueChange = { phone = it }, label = "Phone  (optional)", keyboardType = KeyboardType.Phone, modifier = Modifier.fillMaxWidth())
+            PosField(value = email, onValueChange = { email = it }, label = "Email  (optional)", keyboardType = KeyboardType.Email, modifier = Modifier.fillMaxWidth())
+            PosField(value = address, onValueChange = { address = it }, label = "Address  (optional)", modifier = Modifier.fillMaxWidth())
+            PosField(value = notes, onValueChange = { notes = it }, label = "Notes  (optional)", modifier = Modifier.fillMaxWidth())
         }
-    )
+    }
 }
 
 // ───────────────────────── PURCHASE ORDERS ─────────────────────────
@@ -5938,43 +5772,46 @@ private fun PurchaseOrdersScreen(vm: PosViewModel, currency: String) {
                     items(filtered, key = { it.po.id }) { pwl ->
                         val po = pwl.po
                         val total = pwl.lines.sumOf { it.qty * it.unitCost }
-                        Card(
-                            Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable { detail = pwl }
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(t.surface1)
+                                .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
+                                .clickable { detail = pwl }
+                                .padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Row(
-                                Modifier.fillMaxWidth().padding(14.dp),
-                                verticalAlignment = Alignment.CenterVertically
+                            Box(
+                                Modifier.size(34.dp).clip(RoundedCornerShape(10.dp)).background(t.brand.s50),
+                                contentAlignment = Alignment.Center
                             ) {
-                                Box(
-                                    Modifier.size(34.dp).clip(RoundedCornerShape(10.dp)).background(t.brand.s50),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(
-                                        Icons.Filled.LocalShipping, contentDescription = null,
-                                        tint = t.brand.s600, modifier = Modifier.size(16.dp)
-                                    )
-                                }
-                                Spacer(Modifier.width(12.dp))
-                                Column(Modifier.weight(1f)) {
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Text(po.ref, fontWeight = FontWeight.Bold, color = t.inkPrimary)
-                                        Spacer(Modifier.width(8.dp))
-                                        PoStatusBadge(po.status)
-                                    }
-                                    Text(
-                                        po.supplierName.ifBlank { "No supplier" },
-                                        style = MaterialTheme.typography.bodySmall, color = t.inkSecondary,
-                                        maxLines = 1, overflow = TextOverflow.Ellipsis
-                                    )
-                                    Text(
-                                        "${pwl.lines.size} item" + (if (pwl.lines.size == 1) "" else "s") +
-                                            " · " + dashTime(po.createdAt),
-                                        style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
-                                    )
-                                }
-                                Text(money(total, currency), fontWeight = FontWeight.Black, color = t.inkPrimary)
-                                Icon(Icons.Filled.ChevronRight, contentDescription = null, tint = t.inkTertiary)
+                                Icon(
+                                    Icons.Filled.LocalShipping, contentDescription = null,
+                                    tint = t.brand.s600, modifier = Modifier.size(16.dp)
+                                )
                             }
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(po.ref, fontWeight = FontWeight.Bold, color = t.inkPrimary)
+                                    Spacer(Modifier.width(8.dp))
+                                    PoStatusBadge(po.status)
+                                }
+                                Text(
+                                    po.supplierName.ifBlank { "No supplier" },
+                                    fontSize = 12.sp, color = t.inkSecondary,
+                                    maxLines = 1, overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    "${pwl.lines.size} item" + (if (pwl.lines.size == 1) "" else "s") +
+                                        " · " + dashTime(po.createdAt),
+                                    fontSize = 12.sp, color = t.inkTertiary
+                                )
+                            }
+                            Text(money(total, currency), fontWeight = FontWeight.Black, color = t.inkPrimary)
+                            Icon(Icons.Filled.ChevronRight, contentDescription = null, tint = t.inkTertiary)
                         }
                     }
                 }
@@ -6076,47 +5913,40 @@ private fun PoCreateDialog(vm: PosViewModel, currency: String, onDismiss: () -> 
     }
     val orderTotal = lines.sumOf { it.qty * it.unitCost }
 
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = {
-            Button(
-                enabled = lines.isNotEmpty(),
-                onClick = { vm.createPurchaseOrder(supplierId, supplierName, notes, lines.toList()); onDismiss() }
-            ) { Text("Save draft") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-        title = { Text("New purchase order") },
-        text = {
-            Column(Modifier.verticalScroll(rememberScrollState())) {
-                // Supplier picker.
-                Box(Modifier.fillMaxWidth()) {
-                    OutlinedButton(onClick = { supplierOpen = true }, modifier = Modifier.fillMaxWidth()) {
-                        Text(supplierName.ifBlank { "Select supplier  (optional)" }, modifier = Modifier.weight(1f))
-                        Text("Change", style = MaterialTheme.typography.labelMedium)
-                    }
-                    DropdownMenu(expanded = supplierOpen, onDismissRequest = { supplierOpen = false }) {
-                        DropdownMenuItem(
-                            text = { Text("— No supplier —") },
-                            onClick = { supplierId = null; supplierName = ""; supplierOpen = false }
-                        )
-                        suppliers.forEach { s ->
-                            DropdownMenuItem(
-                                text = { Text(s.name) },
-                                onClick = { supplierId = s.id; supplierName = s.name; supplierOpen = false }
-                            )
-                        }
-                    }
-                }
-                Spacer(Modifier.height(10.dp))
-
-                // Product search → tap a result to add a line.
-                OutlinedTextField(
-                    value = search, onValueChange = { search = it },
-                    label = { Text("Add product (name / SKU)") },
-                    leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
-                    singleLine = true, modifier = Modifier.fillMaxWidth()
+    PosContainedForm(
+        title = "New purchase order",
+        onDismiss = onDismiss,
+        confirmLabel = "Save draft",
+        confirmEnabled = lines.isNotEmpty(),
+        onConfirm = { vm.createPurchaseOrder(supplierId, supplierName, notes, lines.toList()); onDismiss() }
+    ) {
+        // Supplier picker.
+        Box(Modifier.fillMaxWidth()) {
+            OutlinedButton(onClick = { supplierOpen = true }, modifier = Modifier.fillMaxWidth()) {
+                Text(supplierName.ifBlank { "Select supplier  (optional)" }, modifier = Modifier.weight(1f))
+                Text("Change", style = MaterialTheme.typography.labelMedium)
+            }
+            DropdownMenu(expanded = supplierOpen, onDismissRequest = { supplierOpen = false }) {
+                DropdownMenuItem(
+                    text = { Text("— No supplier —") },
+                    onClick = { supplierId = null; supplierName = ""; supplierOpen = false }
                 )
-                matches.forEach { item ->
+                suppliers.forEach { s ->
+                    DropdownMenuItem(
+                        text = { Text(s.name) },
+                        onClick = { supplierId = s.id; supplierName = s.name; supplierOpen = false }
+                    )
+                }
+            }
+        }
+
+        // Product search → tap a result to add a line.
+        PosField(
+            value = search, onValueChange = { search = it },
+            label = "Add product (name / SKU)", modifier = Modifier.fillMaxWidth()
+        )
+        run {
+            matches.forEach { item ->
                     val already = lines.any { it.itemId == item.id }
                     Row(
                         Modifier.fillMaxWidth()
@@ -6167,14 +5997,12 @@ private fun PoCreateDialog(vm: PosViewModel, currency: String, onDismiss: () -> 
                     }
                 }
 
-                Spacer(Modifier.height(10.dp))
-                OutlinedTextField(
+                PosField(
                     value = notes, onValueChange = { notes = it },
-                    label = { Text("Notes  (optional)") }, modifier = Modifier.fillMaxWidth()
+                    label = "Notes  (optional)", modifier = Modifier.fillMaxWidth()
                 )
-            }
         }
-    )
+    }
 }
 
 /** Read-only detail sheet + lifecycle actions (mark sent / receive / cancel). */
@@ -6192,60 +6020,53 @@ private fun PoDetailDialog(
     val total = pwl.lines.sumOf { it.qty * it.unitCost }
     val open = po.status == "draft" || po.status == "sent"
 
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = {
-            when (po.status) {
-                "draft" -> Button(onClick = onMarkSent) { Text("Mark as sent") }
-                "sent" -> Button(onClick = onReceive) { Text("Receive stock") }
-                else -> TextButton(onClick = onDismiss) { Text("Close") }
-            }
-        },
-        dismissButton = {
-            if (open) TextButton(onClick = onCancel) { Text("Cancel PO", color = t.danger) }
-            else TextButton(onClick = onDismiss) { Text("Close") }
-        },
-        title = {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(po.ref, fontWeight = FontWeight.Black)
-                Spacer(Modifier.width(8.dp))
-                PoStatusBadge(po.status)
-            }
-        },
-        text = {
-            Column(Modifier.verticalScroll(rememberScrollState())) {
-                Text(po.supplierName.ifBlank { "No supplier" }, color = t.inkSecondary)
-                Text(dashTime(po.createdAt), style = MaterialTheme.typography.bodySmall, color = t.inkTertiary)
-                Spacer(Modifier.height(10.dp))
-                pwl.lines.forEach { l ->
-                    Row(
-                        Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(Modifier.weight(1f)) {
-                            Text(l.name, color = t.inkPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Text(
-                                "${trimQty(l.qty)} × ${money(l.unitCost, currency)}" +
-                                    (l.receivedQty?.let { " · recv ${trimQty(it)}" } ?: ""),
-                                style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
-                            )
-                        }
-                        Text(money(l.qty * l.unitCost, currency), fontWeight = FontWeight.SemiBold, color = t.inkPrimary)
+    PosDialog(title = po.ref, onDismiss = onDismiss) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            PoStatusBadge(po.status)
+            Spacer(Modifier.width(8.dp))
+            Text(po.supplierName.ifBlank { "No supplier" }, color = t.inkSecondary)
+        }
+        Text(dashTime(po.createdAt), style = MaterialTheme.typography.bodySmall, color = t.inkTertiary)
+        PosFormCard {
+            pwl.lines.forEach { l ->
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(l.name, color = t.inkPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            "${trimQty(l.qty)} × ${money(l.unitCost, currency)}" +
+                                (l.receivedQty?.let { " · recv ${trimQty(it)}" } ?: ""),
+                            style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
+                        )
                     }
+                    Text(money(l.qty * l.unitCost, currency), fontWeight = FontWeight.SemiBold, color = t.inkPrimary)
                 }
-                Spacer(Modifier.height(8.dp))
-                Row(Modifier.fillMaxWidth()) {
-                    Text("Total", fontWeight = FontWeight.Bold, color = t.inkSecondary, modifier = Modifier.weight(1f))
-                    Text(money(total, currency), fontWeight = FontWeight.Black, color = t.inkPrimary)
-                }
-                po.notes?.takeIf { it.isNotBlank() }?.let {
-                    Spacer(Modifier.height(10.dp))
-                    Text("Notes", fontWeight = FontWeight.Bold, color = t.inkSecondary)
-                    Text(it, style = MaterialTheme.typography.bodySmall, color = t.inkTertiary)
-                }
+            }
+            Row(Modifier.fillMaxWidth()) {
+                Text("Total", fontWeight = FontWeight.Bold, color = t.inkSecondary, modifier = Modifier.weight(1f))
+                Text(money(total, currency), fontWeight = FontWeight.Black, color = t.inkPrimary)
             }
         }
-    )
+        po.notes?.takeIf { it.isNotBlank() }?.let {
+            Text("Notes", fontWeight = FontWeight.Bold, color = t.inkSecondary)
+            Text(it, style = MaterialTheme.typography.bodySmall, color = t.inkTertiary)
+        }
+        // Lifecycle actions.
+        when (po.status) {
+            "draft" -> Button(
+                onClick = onMarkSent, modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = t.brand.s600, contentColor = t.inkOnBrand)
+            ) { Text("Mark as sent") }
+            "sent" -> Button(
+                onClick = onReceive, modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = t.brand.s600, contentColor = t.inkOnBrand)
+            ) { Text("Receive stock") }
+        }
+        if (open) {
+            OutlinedButton(onClick = onCancel, modifier = Modifier.fillMaxWidth()) {
+                Text("Cancel PO", color = t.danger)
+            }
+        }
+    }
 }
 
 /** Receive sheet: per-line quantity (defaults to ordered), optional box→unit mode. */
@@ -6263,50 +6084,43 @@ private fun PoReceiveDialog(
         mutableMapOf<String, String>().apply { pwl.lines.forEach { put(it.id, trimQty(it.qty)) } }
     }
 
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = {
-            Button(onClick = {
-                val parsed = entered.mapValues { (_, v) -> v.replace(',', '.').toDoubleOrNull() ?: 0.0 }
-                onConfirm(parsed, boxMode)
-            }) { Text("Confirm receive") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-        title = { Text("Receive ${pwl.po.ref}") },
-        text = {
-            Column(Modifier.verticalScroll(rememberScrollState())) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Switch(checked = boxMode, onCheckedChange = { boxMode = it })
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        "Quantities are in boxes (× pack size)",
-                        color = t.inkSecondary, style = MaterialTheme.typography.bodySmall
-                    )
+    PosContainedForm(
+        title = "Receive ${pwl.po.ref}",
+        onDismiss = onDismiss,
+        confirmLabel = "Confirm receive",
+        onConfirm = {
+            val parsed = entered.mapValues { (_, v) -> v.replace(',', '.').toDoubleOrNull() ?: 0.0 }
+            onConfirm(parsed, boxMode)
+        }
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Switch(checked = boxMode, onCheckedChange = { boxMode = it })
+            Spacer(Modifier.width(8.dp))
+            Text(
+                "Quantities are in boxes (× pack size)",
+                color = t.inkSecondary, style = MaterialTheme.typography.bodySmall
+            )
+        }
+        pwl.lines.forEach { l ->
+            var qtyText by remember(l.id) { mutableStateOf(entered[l.id] ?: trimQty(l.qty)) }
+            Row(
+                Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(l.name, color = t.inkPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text("ordered ${trimQty(l.qty)}", style = MaterialTheme.typography.bodySmall, color = t.inkTertiary)
                 }
-                Spacer(Modifier.height(8.dp))
-                pwl.lines.forEach { l ->
-                    var qtyText by remember(l.id) { mutableStateOf(entered[l.id] ?: trimQty(l.qty)) }
-                    Row(
-                        Modifier.fillMaxWidth().padding(vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(Modifier.weight(1f)) {
-                            Text(l.name, color = t.inkPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Text("ordered ${trimQty(l.qty)}", style = MaterialTheme.typography.bodySmall, color = t.inkTertiary)
-                        }
-                        OutlinedTextField(
-                            value = qtyText,
-                            onValueChange = { qtyText = it; entered[l.id] = it },
-                            label = { Text(if (boxMode) "Boxes" else "Units") },
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                            modifier = Modifier.width(120.dp)
-                        )
-                    }
-                }
+                PosField(
+                    value = qtyText,
+                    onValueChange = { qtyText = it; entered[l.id] = it },
+                    label = if (boxMode) "Boxes" else "Units",
+                    keyboardType = KeyboardType.Decimal,
+                    modifier = Modifier.width(120.dp)
+                )
             }
         }
-    )
+    }
 }
 
 // ───────────────────────── CHANGE & CREDIT ─────────────────────────
@@ -6320,6 +6134,19 @@ private fun PoReceiveDialog(
  * a change/refund the shop owes opens Pay out. (Overpaying a debt is booked as change
  * owed by the repository, so it lands here too.)
  */
+/** One customer's rolled-up position in each ledger, derived from their transactions:
+ *  [creditBal] = what they owe the shop (debt); [changeBal] = what the shop owes them. */
+private data class CcAccount(
+    val customer: Customer,
+    val name: String,
+    val creditBal: Double,
+    val changeBal: Double,
+    val hasCredit: Boolean,
+    val hasChange: Boolean,
+    val lastAt: Long,
+    val lastRef: String?,
+)
+
 @Composable
 private fun ChangeCreditScreen(vm: PosViewModel, currency: String) {
     val t = LocalPosTokens.current
@@ -6329,138 +6156,146 @@ private fun ChangeCreditScreen(vm: PosViewModel, currency: String) {
     val totalOwedToCustomers by vm.totalChangeOwedFlow().collectAsState(initial = 0.0)
 
     var search by remember { mutableStateOf("") }
-    var typeFilter by remember { mutableStateOf("all") }      // all | credit_owed | credit_paid
-    var payFor by remember { mutableStateOf<String?>(null) }  // customerId settling a DEBT
-    var payoutFor by remember { mutableStateOf<String?>(null) } // customerId being PAID OUT change
+    var ledgerMode by remember { mutableStateOf("credit") }   // credit (they owe you) | change (you owe them)
+    var status by remember { mutableStateOf("unsettled") }    // unsettled | settled
+    var detailFor by remember { mutableStateOf<Customer?>(null) }
 
     val totalOwed = customers.sumOf { it.balance.coerceAtLeast(0.0) }
-    val activeAccounts = customers.count { it.balance > 0.0 }
 
-    val filtered = remember(ledger, search, typeFilter) {
-        val q = search.trim().lowercase()
-        ledger.filter { row ->
-            (typeFilter == "all" || row.txn.type == typeFilter) &&
-                (q.isEmpty() || row.customerName.lowercase().contains(q))
+    // Roll the flat ledger up per customer into the two derived balances.
+    val accounts = remember(ledger, customers) {
+        val custById = customers.associateBy { it.customer.id }
+        ledger.groupBy { it.txn.customerId }.mapNotNull { (cid, rows) ->
+            val cust = custById[cid]?.customer ?: return@mapNotNull null
+            var creditOwed = 0.0; var creditPaid = 0.0
+            var changeOwed = 0.0; var changePaid = 0.0
+            var hasCredit = false; var hasChange = false
+            var lastAt = 0L; var lastRef: String? = null
+            rows.forEach { r ->
+                when (r.txn.type) {
+                    "credit_owed" -> { creditOwed += r.txn.amount; hasCredit = true }
+                    "credit_paid" -> { creditPaid += r.txn.amount; hasCredit = true }
+                    "change_owed", "refund_owed" -> { changeOwed += r.txn.amount; hasChange = true }
+                    "change_paid", "refund_paid" -> { changePaid += r.txn.amount; hasChange = true }
+                }
+                if (r.txn.createdAt >= lastAt) {
+                    lastAt = r.txn.createdAt
+                    r.saleRef?.let { lastRef = it }
+                }
+            }
+            CcAccount(cust, cust.name, creditOwed - creditPaid, changeOwed - changePaid, hasCredit, hasChange, lastAt, lastRef)
         }
     }
+
+    val q = search.trim().lowercase()
+    val isCredit = ledgerMode == "credit"
+    val settledView = status == "settled"
+    val rows = accounts.filter { a ->
+        val hasLedger = if (isCredit) a.hasCredit else a.hasChange
+        val bal = if (isCredit) a.creditBal else a.changeBal
+        val matchesStatus = if (settledView) bal <= 0.005 else bal > 0.005
+        hasLedger && matchesStatus && (q.isEmpty() || a.name.lowercase().contains(q))
+    }.sortedWith(
+        compareByDescending<CcAccount> { if (isCredit) it.creditBal else it.changeBal }.thenBy { it.name }
+    )
 
     Column(Modifier.fillMaxSize()) {
         Column(Modifier.padding(12.dp)) {
             Text("Change & Credit", color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 22.sp)
-            Text(
-                "$activeAccounts active account" + if (activeAccounts == 1) "" else "s",
-                color = t.inkTertiary, fontSize = 12.sp
-            )
+            Text("What customers owe you, and what you owe them", color = t.inkTertiary, fontSize = 12.sp)
             Spacer(Modifier.height(12.dp))
 
-            // Summary cards (two-up, like the web's owe/owed pair).
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                CreditSummaryCard(
-                    Modifier.weight(1f), "Customers owe you",
-                    money(totalOwed, currency), "credit outstanding",
-                    t.danger, t.surface1, t.inkTertiary
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                PosMetricCard(
+                    "Customers owe you", money(totalOwed, currency),
+                    Modifier.weight(1f), accent = t.danger, sub = "credit outstanding"
                 )
-                CreditSummaryCard(
-                    Modifier.weight(1f), "You owe customers",
-                    money(totalOwedToCustomers, currency), "change + refunds",
-                    t.brand.s600, t.surface1, t.inkTertiary
+                PosMetricCard(
+                    "You owe customers", money(totalOwedToCustomers, currency),
+                    Modifier.weight(1f), accent = t.brand.s600, sub = "change + refunds"
                 )
             }
             Spacer(Modifier.height(12.dp))
 
-            // Type filter chips.
-            Row(
-                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                listOf("all" to "All", "credit_owed" to "Charged", "credit_paid" to "Payments")
-                    .forEach { (key, label) ->
-                        FilterChip(
-                            selected = typeFilter == key,
-                            onClick = { typeFilter = key },
-                            label = { Text(label) }
-                        )
-                    }
-            }
+            // View 1 — whose ledger: customer debt vs change the shop owes back.
+            PosSegmented(
+                listOf("credit" to "Credit", "change" to "Change"),
+                ledgerMode
+            ) { ledgerMode = it }
             Spacer(Modifier.height(8.dp))
+            // View 2 — outstanding vs cleared.
+            PosSegmented(
+                listOf("unsettled" to "Unsettled", "settled" to "Settled"),
+                status
+            ) { status = it }
+            Spacer(Modifier.height(10.dp))
 
-            OutlinedTextField(
+            PosField(
                 value = search, onValueChange = { search = it },
-                placeholder = { Text("Search customer…") },
-                leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
-                singleLine = true, modifier = Modifier.fillMaxWidth()
+                label = "Search customer", placeholder = "Name", modifier = Modifier.fillMaxWidth()
             )
         }
 
-        if (filtered.isEmpty()) {
+        if (rows.isEmpty()) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(
-                        Icons.Filled.Payments, contentDescription = null,
-                        tint = t.inkTertiary, modifier = Modifier.size(36.dp)
-                    )
+                    Icon(Icons.Filled.Payments, contentDescription = null, tint = t.inkTertiary, modifier = Modifier.size(36.dp))
                     Spacer(Modifier.height(8.dp))
-                    Text("No credit activity yet.", color = t.inkTertiary)
+                    Text(
+                        when {
+                            settledView && isCredit -> "No settled debts yet."
+                            settledView -> "No settled change yet."
+                            isCredit -> "No one owes you right now."
+                            else -> "You don't owe any change."
+                        },
+                        color = t.inkTertiary
+                    )
                 }
             }
         } else {
             LazyColumn(
                 Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                items(filtered, key = { it.txn.id }) { row ->
-                    val meta = creditRowMeta(row.txn.type)
-                    val stillOwesDebt =
-                        (customers.firstOrNull { it.customer.id == row.txn.customerId }?.balance ?: 0.0) > 0.0
-                    // A debt charge is payable while the customer still owes; a "we owe"
-                    // charge (change/refund owed) opens the pay-out flow instead.
-                    val onClick: (() -> Unit)? = when {
-                        row.txn.type == "credit_owed" && stillOwesDebt -> ({ payFor = row.txn.customerId })
-                        meta.positive && meta.weOwe -> ({ payoutFor = row.txn.customerId })
-                        else -> null
-                    }
+                items(rows, key = { it.customer.id }) { a ->
+                    val bal = if (isCredit) a.creditBal else a.changeBal
                     val accent = when {
-                        meta.positive && !meta.weOwe -> t.danger        // customer owes us
-                        meta.positive && meta.weOwe -> t.brand.s600      // we owe the customer
-                        else -> t.success                                // a payment / pay-out
+                        settledView -> t.success
+                        isCredit -> t.danger
+                        else -> t.brand.s600
                     }
-                    val rowMod = Modifier.fillMaxWidth().padding(vertical = 4.dp)
-                    Card(if (onClick != null) rowMod.clickable(onClick = onClick) else rowMod) {
-                        Row(
-                            Modifier.fillMaxWidth().padding(14.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(t.surface1)
+                            .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
+                            .clickable { detailFor = a.customer }
+                            .padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(
+                            Modifier.size(38.dp).clip(CircleShape).background(accent.copy(alpha = 0.14f)),
+                            contentAlignment = Alignment.Center
                         ) {
+                            Text(a.name.take(1).uppercase(), color = accent, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(a.name, fontWeight = FontWeight.Bold, color = t.inkPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            val sub = if (a.lastRef != null) "From sale #${a.lastRef} · ${dashTime(a.lastAt)}"
+                            else dashTime(a.lastAt)
+                            Text(sub, style = MaterialTheme.typography.bodySmall, color = t.inkTertiary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        if (settledView) {
                             Box(
-                                Modifier.size(34.dp).clip(RoundedCornerShape(10.dp))
-                                    .background(accent.copy(alpha = 0.12f)),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(
-                                    if (meta.positive) Icons.Filled.Add else Icons.Filled.Check,
-                                    contentDescription = null,
-                                    tint = accent,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                            }
-                            Spacer(Modifier.width(12.dp))
-                            Column(Modifier.weight(1f)) {
-                                Text(row.customerName, fontWeight = FontWeight.Bold, color = t.inkPrimary)
-                                Text(
-                                    meta.label + " · " + dashTime(row.txn.createdAt),
-                                    style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
-                                )
-                                row.txn.note?.takeIf { it.isNotBlank() }?.let {
-                                    Text(
-                                        it, style = MaterialTheme.typography.bodySmall,
-                                        color = t.inkTertiary, maxLines = 1, overflow = TextOverflow.Ellipsis
-                                    )
-                                }
-                            }
-                            Text(
-                                (if (meta.positive) "+" else "−") + money(row.txn.amount, currency),
-                                fontWeight = FontWeight.Black,
-                                color = accent
-                            )
+                                Modifier.clip(RoundedCornerShape(6.dp)).background(t.success.copy(alpha = 0.13f))
+                                    .padding(horizontal = 8.dp, vertical = 3.dp)
+                            ) { Text("Settled", color = t.success, fontSize = 11.sp, fontWeight = FontWeight.Bold) }
+                        } else {
+                            Text(money(bal, currency), fontWeight = FontWeight.Black, fontSize = 16.sp, color = accent)
                         }
                     }
                 }
@@ -6468,48 +6303,8 @@ private fun ChangeCreditScreen(vm: PosViewModel, currency: String) {
         }
     }
 
-    payFor?.let { cid ->
-        val balance by vm.balanceFlow(cid).collectAsState(initial = 0.0)
-        RecordPaymentDialog(maxAmount = balance, currency = currency, onDismiss = { payFor = null }) { amount, note ->
-            vm.recordRepayment(cid, amount, note.ifBlank { null })
-            payFor = null
-        }
-    }
-
-    payoutFor?.let { cid ->
-        val changeBal by vm.changeBalanceFlow(cid).collectAsState(initial = 0.0)
-        RecordPaymentDialog(
-            maxAmount = changeBal, currency = currency,
-            title = "Pay out change", owedLabel = "We owe", actionLabel = "Pay out",
-            onDismiss = { payoutFor = null }
-        ) { amount, note ->
-            vm.recordChangePayment(cid, amount.coerceAtMost(changeBal), note.ifBlank { null })
-            payoutFor = null
-        }
-    }
-}
-
-/** Compact KPI card used by the Change & Credit summary row. */
-@Composable
-private fun CreditSummaryCard(
-    modifier: Modifier,
-    label: String,
-    value: String,
-    sub: String,
-    accent: Color,
-    container: Color,
-    subColor: Color
-) {
-    Card(modifier, colors = CardDefaults.cardColors(containerColor = container)) {
-        Column(Modifier.padding(14.dp)) {
-            Text(
-                label.uppercase(), fontSize = 10.sp, fontWeight = FontWeight.Bold,
-                color = accent, letterSpacing = 0.5.sp
-            )
-            Spacer(Modifier.height(4.dp))
-            Text(value, fontSize = 22.sp, fontWeight = FontWeight.Black, color = accent)
-            Text(sub, fontSize = 9.sp, color = subColor)
-        }
+    detailFor?.let { c ->
+        CustomerDetailDialog(vm = vm, customer = c, currency = currency, onDismiss = { detailFor = null })
     }
 }
 
@@ -6719,26 +6514,24 @@ private fun DashboardScreen(vm: PosViewModel, business: Business) {
 
 @Composable
 private fun DashKpiCard(label: String, value: String, modifier: Modifier = Modifier, valueColor: Color? = null) {
-    val t = LocalPosTokens.current
-    Card(modifier, colors = CardDefaults.cardColors(containerColor = t.surface1)) {
-        Column(Modifier.fillMaxWidth().padding(14.dp)) {
-            Text(label.uppercase(), color = t.inkTertiary, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp)
-            Spacer(Modifier.height(4.dp))
-            Text(value, color = valueColor ?: t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 20.sp, maxLines = 1)
-        }
-    }
+    // Shares the design-system metric tile so the dashboard matches every other screen.
+    PosMetricCard(label = label, value = value, modifier = modifier, accent = valueColor)
 }
 
 /** Card with a bold title and arbitrary body, followed by spacing. */
 @Composable
 private fun DashSectionCard(title: String, content: @Composable () -> Unit) {
     val t = LocalPosTokens.current
-    Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = t.surface1)) {
-        Column(Modifier.fillMaxWidth().padding(16.dp)) {
-            Text(title, color = t.inkPrimary, fontWeight = FontWeight.Bold, fontSize = 14.sp)
-            Spacer(Modifier.height(10.dp))
-            content()
-        }
+    Column(
+        Modifier.fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(t.surface1)
+            .border(1.dp, t.surfaceBorder, RoundedCornerShape(14.dp))
+            .padding(16.dp)
+    ) {
+        Text(title, color = t.inkPrimary, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+        Spacer(Modifier.height(10.dp))
+        content()
     }
     Spacer(Modifier.height(12.dp))
 }
@@ -6795,44 +6588,30 @@ private fun ZReportDialog(business: Business, recent: List<SaleEntity>, onDismis
     val expected = open + cashSales
     val variance = (cnt ?: expected) - expected
 
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
-        title = { Text("Z-Report · Cash up") },
-        text = {
-            Column(Modifier.verticalScroll(rememberScrollState())) {
-                Text("Today, ${todays.size} sale${if (todays.size == 1) "" else "s"}", color = t.inkTertiary, fontSize = 12.sp)
-                Spacer(Modifier.height(8.dp))
-                ZRow("Sales today", money(totalSales, currency))
-                ZRow("Cash sales", money(cashSales, currency))
-                Spacer(Modifier.height(10.dp))
-                OutlinedTextField(
-                    opening, { opening = it.filter { c -> c.isDigit() || c == '.' } },
-                    label = { Text("Opening float") }, singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(6.dp))
-                ZRow("Expected in drawer", money(expected, currency))
-                Spacer(Modifier.height(10.dp))
-                OutlinedTextField(
-                    counted, { counted = it.filter { c -> c.isDigit() || c == '.' } },
-                    label = { Text("Counted cash") }, singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                    modifier = Modifier.fillMaxWidth()
-                )
-                if (cnt != null) {
-                    Spacer(Modifier.height(10.dp))
-                    val (lbl, col) = when {
-                        kotlin.math.abs(variance) < 0.005 -> "Balanced" to t.success
-                        variance > 0 -> "Over by ${money(variance, currency)}" to t.warning
-                        else -> "Short by ${money(-variance, currency)}" to t.danger
-                    }
-                    Text(lbl, color = col, fontWeight = FontWeight.Black, fontSize = 16.sp)
+    PosDialog(title = "Z-Report · Cash up", onDismiss = onDismiss) {
+        Text("Today, ${todays.size} sale${if (todays.size == 1) "" else "s"}", color = t.inkTertiary, fontSize = 12.sp)
+        PosFormCard {
+            ZRow("Sales today", money(totalSales, currency))
+            ZRow("Cash sales", money(cashSales, currency))
+            PosField(
+                opening, { opening = it.filter { c -> c.isDigit() || c == '.' } },
+                "Opening float", keyboardType = KeyboardType.Decimal, modifier = Modifier.fillMaxWidth()
+            )
+            ZRow("Expected in drawer", money(expected, currency))
+            PosField(
+                counted, { counted = it.filter { c -> c.isDigit() || c == '.' } },
+                "Counted cash", keyboardType = KeyboardType.Decimal, modifier = Modifier.fillMaxWidth()
+            )
+            if (cnt != null) {
+                val (lbl, col) = when {
+                    kotlin.math.abs(variance) < 0.005 -> "Balanced" to t.success
+                    variance > 0 -> "Over by ${money(variance, currency)}" to t.warning
+                    else -> "Short by ${money(-variance, currency)}" to t.danger
                 }
+                Text(lbl, color = col, fontWeight = FontWeight.Black, fontSize = 16.sp)
             }
         }
-    )
+    }
 }
 
 @Composable
@@ -6859,6 +6638,7 @@ private fun dashTime(ms: Long): String =
 
 @Composable
 private fun ReportsScreen(vm: PosViewModel, business: Business) {
+    val t = LocalPosTokens.current
     val currency = business.currency
     val range by vm.reportRange.collectAsState()
     val summary by vm.reportSummary.collectAsState()
@@ -6873,104 +6653,78 @@ private fun ReportsScreen(vm: PosViewModel, business: Business) {
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp)
     ) {
+        Text("Sales & Reports", color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 22.sp)
+        Spacer(Modifier.height(10.dp))
+
         // Date-window picker.
         Row(
             Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             ReportRange.values().forEach { r ->
-                FilterChip(
-                    selected = range == r,
-                    onClick = { vm.setReportRange(r) },
-                    label = { Text(r.label) }
-                )
+                FilterChip(selected = range == r, onClick = { vm.setReportRange(r) }, label = { Text(r.label) })
             }
         }
         Spacer(Modifier.height(12.dp))
 
-        // Headline: total sales for the window.
-        Card(
-            Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.primaryContainer
-            )
+        // Headline hero — net takings for the window.
+        Column(
+            Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(t.brand.s600).padding(20.dp)
         ) {
-            Column(Modifier.fillMaxWidth().padding(20.dp)) {
-                Text(
-                    if (refunds > 0.0) "Total sales (net)" else "Total sales",
-                    color = MaterialTheme.colorScheme.onPrimaryContainer
-                )
-                Text(
-                    money(netSales, currency),
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 30.sp,
-                    color = MaterialTheme.colorScheme.onPrimaryContainer
-                )
-                Text(
-                    "$netCount sale${if (netCount == 1) "" else "s"}",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onPrimaryContainer
-                )
-            }
+            Text(
+                if (refunds > 0.0) "Total sales (net)" else "Total sales",
+                color = t.inkOnBrand.copy(alpha = 0.85f), fontSize = 13.sp, fontWeight = FontWeight.SemiBold
+            )
+            Text(money(netSales, currency), color = t.inkOnBrand, fontWeight = FontWeight.Black, fontSize = 30.sp)
+            Text(
+                "$netCount sale${if (netCount == 1) "" else "s"} · ${range.label}",
+                color = t.inkOnBrand.copy(alpha = 0.85f), fontSize = 12.sp
+            )
         }
         Spacer(Modifier.height(12.dp))
 
         // VAT / discounts / averages.
-        Card(Modifier.fillMaxWidth()) {
-            Column(Modifier.fillMaxWidth().padding(16.dp)) {
-                Text("Breakdown", fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(8.dp))
-                if (business.vatEnabled) {
-                    ReportStatRow("Sales excl. VAT", money(summary.net, currency))
-                    ReportStatRow(
-                        "VAT collected (${trimPct(business.vatPercent)}%)",
-                        money(summary.vat, currency)
-                    )
-                }
-                ReportStatRow("Discounts given", money(summary.discount, currency))
-                if (refunds > 0.0) {
-                    ReportStatRow("Gross sales", money(summary.gross, currency))
-                    ReportStatRow("Refunds paid", "-${money(refunds, currency)}")
-                    HorizontalDivider(Modifier.padding(vertical = 6.dp))
-                    ReportStatRow("Net sales", money(netSales, currency))
-                }
-                if (netCount > 0) {
-                    ReportStatRow("Average sale", money(netSales / netCount, currency))
-                }
+        PosFormCard {
+            PosSectionLabel("Breakdown")
+            if (business.vatEnabled) {
+                ReportStatRow("Sales excl. VAT", money(summary.net, currency))
+                ReportStatRow("VAT collected (${trimPct(business.vatPercent)}%)", money(summary.vat, currency))
+            }
+            ReportStatRow("Discounts given", money(summary.discount, currency))
+            if (refunds > 0.0) {
+                ReportStatRow("Gross sales", money(summary.gross, currency))
+                ReportStatRow("Refunds paid", "-${money(refunds, currency)}")
+                HorizontalDivider(color = t.surfaceBorder)
+                ReportStatRow("Net sales", money(netSales, currency))
+            }
+            if (netCount > 0) {
+                ReportStatRow("Average sale", money(netSales / netCount, currency))
             }
         }
         Spacer(Modifier.height(12.dp))
 
         // Money in, grouped by tender.
-        Card(Modifier.fillMaxWidth()) {
-            Column(Modifier.fillMaxWidth().padding(16.dp)) {
-                Text("By payment method", fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(8.dp))
-                if (breakdown.isEmpty()) {
-                    Text(
-                        "No sales in this period.",
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                } else {
-                    breakdown.forEach { row ->
-                        val label = PaymentMethod.fromCode(row.method)?.label
-                            ?: if (row.method == "credit") "Credit (unpaid)" else row.method
-                        Row(
-                            Modifier.fillMaxWidth().padding(vertical = 6.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(Modifier.weight(1f)) {
-                                Text(label)
-                                Text(
-                                    "${row.count} sale${if (row.count == 1) "" else "s"}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                            Text(money(row.total, currency), fontWeight = FontWeight.SemiBold)
+        PosFormCard {
+            PosSectionLabel("By payment method")
+            if (breakdown.isEmpty()) {
+                Text("No sales in this period.", color = t.inkTertiary, style = MaterialTheme.typography.bodySmall)
+            } else {
+                breakdown.forEach { row ->
+                    val label = PaymentMethod.fromCode(row.method)?.label
+                        ?: if (row.method == "credit") "Credit (unpaid)" else row.method
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(label, color = t.inkPrimary)
+                            Text(
+                                "${row.count} sale${if (row.count == 1) "" else "s"}",
+                                style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
+                            )
                         }
+                        Text(money(row.total, currency), fontWeight = FontWeight.SemiBold, color = t.inkPrimary)
                     }
                 }
             }
@@ -6981,12 +6735,10 @@ private fun ReportsScreen(vm: PosViewModel, business: Business) {
 
 @Composable
 private fun ReportStatRow(label: String, value: String) {
-    Row(
-        Modifier.fillMaxWidth().padding(vertical = 6.dp),
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
-        Text(label, style = MaterialTheme.typography.bodyMedium)
-        Text(value, fontWeight = FontWeight.SemiBold)
+    val t = LocalPosTokens.current
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        Text(label, style = MaterialTheme.typography.bodyMedium, color = t.inkSecondary)
+        Text(value, fontWeight = FontWeight.SemiBold, color = t.inkPrimary)
     }
 }
 
@@ -6994,6 +6746,7 @@ private fun ReportStatRow(label: String, value: String) {
 
 @Composable
 private fun ReceiptsScreen(vm: PosViewModel, business: Business, printer: PrinterUi) {
+    val t = LocalPosTokens.current
     val currency = business.currency
     val sales by vm.recentSales.collectAsState()
     val quotes by vm.quotes.collectAsState()
@@ -7004,41 +6757,53 @@ private fun ReceiptsScreen(vm: PosViewModel, business: Business, printer: Printe
     var showQuotes by remember { mutableStateOf(false) }
 
     Column(Modifier.fillMaxSize()) {
-        Card(
-            Modifier.fillMaxWidth().padding(12.dp),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
-        ) {
-            Column(Modifier.padding(16.dp)) {
-                Text("Today", style = MaterialTheme.typography.labelLarge)
-                Text(money(takings, currency), fontWeight = FontWeight.Bold, fontSize = 28.sp)
-                Text("$countToday sale${if (countToday == 1) "" else "s"}")
+        Column(Modifier.padding(12.dp)) {
+            Text("Receipts", color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 22.sp)
+            Spacer(Modifier.height(10.dp))
+            // Today's takings hero.
+            Column(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(t.brand.s600).padding(16.dp)
+            ) {
+                Text("Today", color = t.inkOnBrand.copy(alpha = 0.85f), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                Text(money(takings, currency), color = t.inkOnBrand, fontWeight = FontWeight.Black, fontSize = 28.sp)
+                Text("$countToday sale${if (countToday == 1) "" else "s"}", color = t.inkOnBrand.copy(alpha = 0.85f), fontSize = 12.sp)
             }
+            Spacer(Modifier.height(10.dp))
+            // Receipts ⇄ Quotes (§1.2 parity). Quotes are local documents, never a sale.
+            PosSegmented(
+                listOf(
+                    "receipts" to "Receipts",
+                    "quotes" to (if (quotes.isNotEmpty()) "Quotes (${quotes.size})" else "Quotes")
+                ),
+                if (showQuotes) "quotes" else "receipts"
+            ) { showQuotes = it == "quotes" }
         }
-        // Receipts ⇄ Quotes (§1.2 parity). Quotes are local documents, never a sale.
-        Row(Modifier.padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            FilterChip(selected = !showQuotes, onClick = { showQuotes = false }, label = { Text("Receipts") })
-            FilterChip(
-                selected = showQuotes, onClick = { showQuotes = true },
-                label = { Text(if (quotes.isNotEmpty()) "Quotes (${quotes.size})" else "Quotes") }
-            )
-        }
-        Spacer(Modifier.height(8.dp))
-        HorizontalDivider()
         if (showQuotes) {
             QuotesList(quotes, currency, business, printer, vm)
         } else if (sales.isEmpty()) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("No sales yet", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Text("No sales yet", color = t.inkTertiary)
             }
         } else {
-            LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(12.dp)) {
+            LazyColumn(
+                Modifier.weight(1f).fillMaxWidth(),
+                contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
                 items(sales, key = { it.id }) { sale ->
                     val refunded = refundedBySale[sale.id] ?: 0.0
                     val fullyRefunded = refunded > 0.0 && refunded >= sale.total - 0.01
-                    Row(Modifier.fillMaxWidth().padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(t.surface1)
+                            .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
+                            .padding(start = 12.dp, top = 6.dp, bottom = 6.dp, end = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
                         Column(Modifier.weight(1f)) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text("#${sale.receiptNo ?: sale.id.takeLast(6).uppercase()}", fontWeight = FontWeight.Medium)
+                                Text("#${sale.receiptNo ?: sale.id.takeLast(6).uppercase()}", fontWeight = FontWeight.Bold, color = t.inkPrimary)
                                 if (refunded > 0.0) {
                                     Spacer(Modifier.width(6.dp))
                                     RefundedBadge(fully = fullyRefunded)
@@ -7046,30 +6811,24 @@ private fun ReceiptsScreen(vm: PosViewModel, business: Business, printer: Printe
                             }
                             Text(
                                 if (sale.synced) "Synced" else "On device",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
                             )
                         }
                         Text(
                             money(sale.total, currency),
-                            fontWeight = FontWeight.Bold,
+                            fontWeight = FontWeight.Bold, color = t.inkPrimary,
                             textDecoration = if (fullyRefunded) TextDecoration.LineThrough else null
                         )
-                        IconButton(onClick = {
-                            printer.printReceipt(business, sale) { vm.loadLines(sale.id) }
-                        }) {
-                            Icon(Icons.Filled.Print, contentDescription = "Reprint")
+                        IconButton(onClick = { printer.printReceipt(business, sale) { vm.loadLines(sale.id) } }) {
+                            Icon(Icons.Filled.Print, contentDescription = "Reprint", tint = t.inkSecondary)
                         }
-                        IconButton(onClick = {
-                            printer.sharePdfReceipt(business, sale) { vm.loadLines(sale.id) }
-                        }) {
-                            Icon(Icons.Filled.Share, contentDescription = "Share PDF")
+                        IconButton(onClick = { printer.sharePdfReceipt(business, sale) { vm.loadLines(sale.id) } }) {
+                            Icon(Icons.Filled.Share, contentDescription = "Share PDF", tint = t.inkSecondary)
                         }
                         IconButton(onClick = { refundFor = sale }) {
-                            Icon(Icons.Filled.AssignmentReturn, contentDescription = "Refund")
+                            Icon(Icons.Filled.AssignmentReturn, contentDescription = "Refund", tint = t.inkSecondary)
                         }
                     }
-                    HorizontalDivider()
                 }
             }
         }
@@ -7095,14 +6854,26 @@ private fun QuotesList(
         }
         return
     }
+    val t = LocalPosTokens.current
     val ctx = LocalContext.current
     val now = System.currentTimeMillis()
-    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(12.dp)) {
+    LazyColumn(
+        Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
         items(quotes, key = { it.id }) { q ->
             val expired = q.validUntil != null && q.validUntil < now
-            Row(Modifier.fillMaxWidth().padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+            Row(
+                Modifier.fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(t.surface1)
+                    .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
+                    .padding(start = 12.dp, top = 6.dp, bottom = 6.dp, end = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 Column(Modifier.weight(1f)) {
-                    Text("#${q.receiptNo ?: q.id.takeLast(6).uppercase()}", fontWeight = FontWeight.Medium)
+                    Text("#${q.receiptNo ?: q.id.takeLast(6).uppercase()}", fontWeight = FontWeight.Bold, color = t.inkPrimary)
                     val vu = q.validUntil?.let { SimpleDateFormat("dd MMM yyyy", Locale.getDefault()).format(Date(it)) }
                     Text(
                         when {
@@ -7111,25 +6882,24 @@ private fun QuotesList(
                             else -> "Valid until $vu"
                         },
                         style = MaterialTheme.typography.bodySmall,
-                        color = if (expired) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+                        color = if (expired) t.danger else t.inkTertiary
                     )
                 }
-                Text(money(q.total, currency), fontWeight = FontWeight.Bold)
+                Text(money(q.total, currency), fontWeight = FontWeight.Bold, color = t.inkPrimary)
                 IconButton(onClick = {
                     vm.loadQuoteToCart(q.id) {
                         Toast.makeText(ctx, "Loaded into cart — open Sell to check out", Toast.LENGTH_SHORT).show()
                     }
                 }) {
-                    Icon(Icons.Filled.ShoppingCart, contentDescription = "Load quote into cart")
+                    Icon(Icons.Filled.ShoppingCart, contentDescription = "Load quote into cart", tint = t.inkSecondary)
                 }
                 IconButton(onClick = { printer.printReceipt(business, q) { vm.loadLines(q.id) } }) {
-                    Icon(Icons.Filled.Print, contentDescription = "Reprint quote")
+                    Icon(Icons.Filled.Print, contentDescription = "Reprint quote", tint = t.inkSecondary)
                 }
                 IconButton(onClick = { printer.sharePdfReceipt(business, q) { vm.loadLines(q.id) } }) {
-                    Icon(Icons.Filled.Share, contentDescription = "Share quote PDF")
+                    Icon(Icons.Filled.Share, contentDescription = "Share quote PDF", tint = t.inkSecondary)
                 }
             }
-            HorizontalDivider()
         }
     }
 }
@@ -7141,17 +6911,15 @@ private fun QuotesList(
  */
 @Composable
 private fun RefundedBadge(fully: Boolean) {
-    val bg = if (fully) MaterialTheme.colorScheme.errorContainer
-    else MaterialTheme.colorScheme.tertiaryContainer
-    val fg = if (fully) MaterialTheme.colorScheme.onErrorContainer
-    else MaterialTheme.colorScheme.onTertiaryContainer
+    val t = LocalPosTokens.current
+    val color = if (fully) t.danger else t.warning
     Box(
-        Modifier.clip(RoundedCornerShape(4.dp)).background(bg)
+        Modifier.clip(RoundedCornerShape(4.dp)).background(color.copy(alpha = 0.14f))
             .padding(horizontal = 6.dp, vertical = 2.dp)
     ) {
         Text(
-            if (fully) "REFUNDED" else "PART REFUND",
-            color = fg,
+            if (fully) "Refunded" else "Part refund",
+            color = color,
             fontSize = 10.sp,
             fontWeight = FontWeight.Bold
         )
@@ -7237,193 +7005,178 @@ private fun RefundDialog(
     val payoutOk = canOwe || outstanding <= 0.005
     val confirmEnabled = refundTotal > 0.0 && payoutOk && !submitting
 
-    AlertDialog(
-        onDismissRequest = { if (!submitting) onDismiss() },
-        title = { Text("Refund #${sale.receiptNo ?: sale.id.takeLast(6).uppercase()}") },
-        text = {
-            Column(
-                Modifier.fillMaxWidth().heightIn(max = 460.dp).verticalScroll(rememberScrollState())
-            ) {
-                if (ls == null) {
-                    Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
-                        CircularProgressIndicator()
-                    }
-                } else {
+    val t = LocalPosTokens.current
+    PosContainedForm(
+        title = "Refund #${sale.receiptNo ?: sale.id.takeLast(6).uppercase()}",
+        onDismiss = { if (!submitting) onDismiss() },
+        confirmLabel = "Refund " + money(refundTotal, currency),
+        confirmEnabled = confirmEnabled,
+        onConfirm = {
+            val src = ls ?: return@PosContainedForm
+            submitting = true
+            val returns = src.mapNotNull { line ->
+                val q = returnQty[line.id] ?: 0.0
+                if (q <= 0.0) null
+                else RefundLineInput(
+                    saleLine = line,
+                    qtyReturned = q,
+                    restock = restock[line.id] ?: true
+                )
+            }
+            val payout = if (payoutNow > 0.0) Tender(method = payoutMethod, amount = payoutNow) else null
+            vm.createRefund(sale, returns, payout, reason.ifBlank { null }) {
+                Toast.makeText(context, "Refund recorded", Toast.LENGTH_SHORT).show()
+                onDismiss()
+            }
+        }
+    ) {
+        if (ls == null) {
+            Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(color = t.brand.s600)
+            }
+        } else {
+            Text(
+                "Choose what's coming back. The refund is proportional to what was paid.",
+                fontSize = 12.sp, color = t.inkTertiary
+            )
+            ls.forEach { line ->
+                val already = alreadyReturned[line.id] ?: 0.0
+                val maxReturn = (line.qty - already).coerceAtLeast(0.0)
+                val qty = returnQty[line.id] ?: 0.0
+                Column(Modifier.fillMaxWidth()) {
+                    Text(line.name, fontWeight = FontWeight.Medium, color = t.inkPrimary)
                     Text(
-                        "Choose what's coming back. The refund is proportional to what was paid.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        "Sold ${fmtQty(line.qty)} @ ${money(line.unitPrice, currency)}" +
+                            if (already > 0) " · ${fmtQty(already)} already returned" else "",
+                        fontSize = 12.sp, color = t.inkTertiary
                     )
-                    Spacer(Modifier.height(8.dp))
-                    ls.forEach { line ->
-                        val already = alreadyReturned[line.id] ?: 0.0
-                        val maxReturn = (line.qty - already).coerceAtLeast(0.0)
-                        val qty = returnQty[line.id] ?: 0.0
-                        Column(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
-                            Text(line.name, fontWeight = FontWeight.Medium)
-                            Text(
-                                "Sold ${fmtQty(line.qty)} @ ${money(line.unitPrice, currency)}" +
-                                    if (already > 0) " · ${fmtQty(already)} already returned" else "",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                IconButton(
-                                    enabled = qty > 0.0,
-                                    onClick = { returnQty[line.id] = (qty - 1).coerceAtLeast(0.0) }
-                                ) { Icon(Icons.Filled.Remove, contentDescription = "Less") }
-                                Text(
-                                    fmtQty(qty),
-                                    Modifier.widthIn(min = 28.dp),
-                                    textAlign = TextAlign.Center
-                                )
-                                IconButton(
-                                    enabled = qty < maxReturn,
-                                    onClick = { returnQty[line.id] = (qty + 1).coerceAtMost(maxReturn) }
-                                ) { Icon(Icons.Filled.Add, contentDescription = "More") }
-                                Spacer(Modifier.weight(1f))
-                                Text("Restock", style = MaterialTheme.typography.bodySmall)
-                                Spacer(Modifier.width(6.dp))
-                                Switch(
-                                    checked = restock[line.id] ?: true,
-                                    onCheckedChange = { restock[line.id] = it }
-                                )
-                            }
-                        }
-                        HorizontalDivider()
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Text("Refund total", fontWeight = FontWeight.Medium)
-                        Text(money(refundTotal, currency), fontWeight = FontWeight.Bold)
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    Box {
-                        OutlinedButton(onClick = { methodOpen = true }) {
-                            Text("Refund via: ${refundMethodLabel(payoutMethod)}")
-                        }
-                        DropdownMenu(expanded = methodOpen, onDismissRequest = { methodOpen = false }) {
-                            REFUND_METHODS.forEach { m ->
-                                DropdownMenuItem(
-                                    text = { Text(refundMethodLabel(m)) },
-                                    onClick = { payoutMethod = m; methodOpen = false }
-                                )
-                            }
-                        }
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    OutlinedTextField(
-                        value = payoutText,
-                        onValueChange = { payoutText = it },
-                        label = { Text("Paying back now") },
-                        placeholder = { Text(money(refundTotal, currency)) },
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    if (outstanding > 0.005) {
-                        Spacer(Modifier.height(4.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(
+                            enabled = qty > 0.0,
+                            onClick = { returnQty[line.id] = (qty - 1).coerceAtLeast(0.0) }
+                        ) { Icon(Icons.Filled.Remove, contentDescription = "Less", tint = t.inkSecondary) }
                         Text(
-                            if (canOwe)
-                                "Owed to ${sale.customerName ?: "customer"}: ${money(outstanding, currency)} — tracked in Change & Credit"
-                            else
-                                "Walk-in refund must be paid in full (${money(refundTotal, currency)}). Leave the amount blank to pay it all now.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = if (canOwe) MaterialTheme.colorScheme.outline else MaterialTheme.colorScheme.error
+                            fmtQty(qty),
+                            Modifier.widthIn(min = 28.dp),
+                            textAlign = TextAlign.Center, color = t.inkPrimary
+                        )
+                        IconButton(
+                            enabled = qty < maxReturn,
+                            onClick = { returnQty[line.id] = (qty + 1).coerceAtMost(maxReturn) }
+                        ) { Icon(Icons.Filled.Add, contentDescription = "More", tint = t.inkSecondary) }
+                        Spacer(Modifier.weight(1f))
+                        Text("Restock", fontSize = 12.sp, color = t.inkSecondary)
+                        Spacer(Modifier.width(6.dp))
+                        Switch(
+                            checked = restock[line.id] ?: true,
+                            onCheckedChange = { restock[line.id] = it }
                         )
                     }
-                    Spacer(Modifier.height(8.dp))
-                    OutlinedTextField(
-                        value = reason,
-                        onValueChange = { reason = it },
-                        label = { Text("Reason (optional)") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
+                }
+                HorizontalDivider(color = t.surfaceBorder)
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("Refund total", fontWeight = FontWeight.Medium, color = t.inkPrimary)
+                Text(money(refundTotal, currency), fontWeight = FontWeight.Bold, color = t.inkPrimary)
+            }
+            Box {
+                OutlinedButton(onClick = { methodOpen = true }) {
+                    Text("Refund via: ${refundMethodLabel(payoutMethod)}")
+                }
+                DropdownMenu(expanded = methodOpen, onDismissRequest = { methodOpen = false }) {
+                    REFUND_METHODS.forEach { m ->
+                        DropdownMenuItem(
+                            text = { Text(refundMethodLabel(m)) },
+                            onClick = { payoutMethod = m; methodOpen = false }
+                        )
+                    }
                 }
             }
-        },
-        confirmButton = {
-            Button(
-                enabled = confirmEnabled,
-                onClick = {
-                    val src = ls ?: return@Button
-                    submitting = true
-                    val returns = src.mapNotNull { line ->
-                        val q = returnQty[line.id] ?: 0.0
-                        if (q <= 0.0) null
-                        else RefundLineInput(
-                            saleLine = line,
-                            qtyReturned = q,
-                            restock = restock[line.id] ?: true
-                        )
-                    }
-                    val payout = if (payoutNow > 0.0) Tender(method = payoutMethod, amount = payoutNow) else null
-                    vm.createRefund(sale, returns, payout, reason.ifBlank { null }) {
-                        Toast.makeText(context, "Refund recorded", Toast.LENGTH_SHORT).show()
-                        onDismiss()
-                    }
-                }
-            ) { Text("Refund " + money(refundTotal, currency)) }
-        },
-        dismissButton = {
-            TextButton(enabled = !submitting, onClick = onDismiss) { Text("Cancel") }
+            PosField(
+                value = payoutText,
+                onValueChange = { payoutText = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                label = "Paying back now",
+                placeholder = money(refundTotal, currency),
+                keyboardType = KeyboardType.Decimal,
+                modifier = Modifier.fillMaxWidth()
+            )
+            if (outstanding > 0.005) {
+                Text(
+                    if (canOwe)
+                        "Owed to ${sale.customerName ?: "customer"}: ${money(outstanding, currency)} — tracked in Change & Credit"
+                    else
+                        "Walk-in refund must be paid in full (${money(refundTotal, currency)}). Leave the amount blank to pay it all now.",
+                    fontSize = 12.sp,
+                    color = if (canOwe) t.inkTertiary else t.danger
+                )
+            }
+            PosField(
+                value = reason,
+                onValueChange = { reason = it },
+                label = "Reason (optional)",
+                modifier = Modifier.fillMaxWidth()
+            )
         }
-    )
+    }
 }
 
 /** Refund history (immutable ledger). Owed refunds get a "Record payout" action. */
 @Composable
 private fun RefundsScreen(vm: PosViewModel, business: Business, printer: PrinterUi) {
+    val t = LocalPosTokens.current
     val currency = business.currency
     val refunds by vm.refunds.collectAsState()
     var payoutFor by remember { mutableStateOf<Refund?>(null) }
 
     Column(Modifier.fillMaxSize()) {
+        Column(Modifier.padding(12.dp)) {
+            Text("Refunds", color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 22.sp)
+        }
         if (refunds.isEmpty()) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("No refunds yet", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Text("No refunds yet", color = t.inkTertiary)
             }
         } else {
-            LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(12.dp)) {
+            LazyColumn(
+                Modifier.weight(1f).fillMaxWidth(),
+                contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
                 items(refunds, key = { it.refund.id }) { rw ->
                     val r = rw.refund
-                    Column(Modifier.fillMaxWidth().padding(vertical = 10.dp)) {
+                    val owed = r.status == "owed"
+                    Column(
+                        Modifier.fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(t.surface1)
+                            .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
+                            .padding(12.dp)
+                    ) {
                         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                             Column(Modifier.weight(1f)) {
                                 Text(
                                     "Refund on #${r.saleReceiptNo ?: r.saleId.takeLast(6).uppercase()}",
-                                    fontWeight = FontWeight.Medium
+                                    fontWeight = FontWeight.Bold, color = t.inkPrimary
                                 )
                                 Text(
                                     (r.customerName ?: "Walk-in") + (r.createdByName?.let { " · by $it" } ?: ""),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
                                 )
-                                Text(
-                                    agoText(r.createdAt),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
+                                Text(agoText(r.createdAt), style = MaterialTheme.typography.bodySmall, color = t.inkTertiary)
                             }
                             Column(horizontalAlignment = Alignment.End) {
-                                Text(money(r.refundTotal, currency), fontWeight = FontWeight.Bold)
-                                val owed = r.status == "owed"
+                                Text(money(r.refundTotal, currency), fontWeight = FontWeight.Bold, color = t.inkPrimary)
                                 Text(
                                     if (owed) "Balance owed" else "Settled",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = if (owed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.outline
+                                    color = if (owed) t.danger else t.success
                                 )
                             }
-                            IconButton(onClick = {
-                                printer.printRefund(business, r, rw.lines) { vm.refundPayments(r.id) }
-                            }) {
-                                Icon(Icons.Filled.Print, contentDescription = "Print refund")
+                            IconButton(onClick = { printer.printRefund(business, r, rw.lines) { vm.refundPayments(r.id) } }) {
+                                Icon(Icons.Filled.Print, contentDescription = "Print refund", tint = t.inkSecondary)
                             }
-                            IconButton(onClick = {
-                                printer.sharePdfRefund(business, r, rw.lines) { vm.refundPayments(r.id) }
-                            }) {
-                                Icon(Icons.Filled.Share, contentDescription = "Share refund PDF")
+                            IconButton(onClick = { printer.sharePdfRefund(business, r, rw.lines) { vm.refundPayments(r.id) } }) {
+                                Icon(Icons.Filled.Share, contentDescription = "Share refund PDF", tint = t.inkSecondary)
                             }
                         }
                         val retLines = rw.lines
@@ -7431,16 +7184,14 @@ private fun RefundsScreen(vm: PosViewModel, business: Business, printer: Printer
                             Spacer(Modifier.height(4.dp))
                             Text(
                                 retLines.joinToString(", ") { "${fmtQty(it.qty)}× ${it.name}" },
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
                             )
                         }
-                        if (r.status == "owed") {
+                        if (owed) {
                             Spacer(Modifier.height(6.dp))
                             OutlinedButton(onClick = { payoutFor = r }) { Text("Record payout") }
                         }
                     }
-                    HorizontalDivider()
                 }
             }
         }
@@ -7459,6 +7210,7 @@ private fun RefundPayoutDialog(
     refund: Refund,
     onDismiss: () -> Unit
 ) {
+    val t = LocalPosTokens.current
     val currency = business.currency
     val context = LocalContext.current
     var amountText by remember(refund.id) { mutableStateOf("") }
@@ -7466,51 +7218,43 @@ private fun RefundPayoutDialog(
     var methodOpen by remember { mutableStateOf(false) }
     val amount = amountText.toDoubleOrNull() ?: 0.0
 
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Record refund payout") },
-        text = {
-            Column(Modifier.fillMaxWidth()) {
-                Text(
-                    "Refund on #${refund.saleReceiptNo ?: refund.saleId.takeLast(6).uppercase()} — total ${money(refund.refundTotal, currency)}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                Spacer(Modifier.height(8.dp))
-                Box {
-                    OutlinedButton(onClick = { methodOpen = true }) {
-                        Text("Via: ${refundMethodLabel(method)}")
-                    }
-                    DropdownMenu(expanded = methodOpen, onDismissRequest = { methodOpen = false }) {
-                        REFUND_METHODS.forEach { m ->
-                            DropdownMenuItem(
-                                text = { Text(refundMethodLabel(m)) },
-                                onClick = { method = m; methodOpen = false }
-                            )
-                        }
-                    }
-                }
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = amountText,
-                    onValueChange = { amountText = it },
-                    label = { Text("Amount handed back") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
+    PosContainedForm(
+        title = "Record refund payout",
+        onDismiss = onDismiss,
+        confirmLabel = "Record",
+        confirmEnabled = amount > 0.0,
+        onConfirm = {
+            vm.recordRefundPayout(refund.id, Tender(method = method, amount = amount)) {
+                Toast.makeText(context, "Payout recorded", Toast.LENGTH_SHORT).show()
+                onDismiss()
             }
-        },
-        confirmButton = {
-            Button(enabled = amount > 0.0, onClick = {
-                vm.recordRefundPayout(refund.id, Tender(method = method, amount = amount)) {
-                    Toast.makeText(context, "Payout recorded", Toast.LENGTH_SHORT).show()
-                    onDismiss()
+        }
+    ) {
+        Text(
+            "Refund on #${refund.saleReceiptNo ?: refund.saleId.takeLast(6).uppercase()} — total ${money(refund.refundTotal, currency)}",
+            fontSize = 12.sp, color = t.inkTertiary
+        )
+        Box {
+            OutlinedButton(onClick = { methodOpen = true }) {
+                Text("Via: ${refundMethodLabel(method)}")
+            }
+            DropdownMenu(expanded = methodOpen, onDismissRequest = { methodOpen = false }) {
+                REFUND_METHODS.forEach { m ->
+                    DropdownMenuItem(
+                        text = { Text(refundMethodLabel(m)) },
+                        onClick = { method = m; methodOpen = false }
+                    )
                 }
-            }) { Text("Record") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
-    )
+            }
+        }
+        PosField(
+            value = amountText,
+            onValueChange = { amountText = it.filter { ch -> ch.isDigit() || ch == '.' } },
+            label = "Amount handed back",
+            keyboardType = KeyboardType.Decimal,
+            modifier = Modifier.fillMaxWidth()
+        )
+    }
 }
 
 // ───────────────────────── SETTINGS ─────────────────────────
@@ -7528,6 +7272,7 @@ private enum class SettingsCat(val label: String, val editsBusiness: Boolean) {
 
 @Composable
 private fun SettingsScreen(vm: PosViewModel, business: Business, printer: PrinterUi) {
+    val t = LocalPosTokens.current
     val theme by vm.themeChoice.collectAsState()
     val prefs by vm.shopPrefs.collectAsState()
     var showResetStock by remember { mutableStateOf(false) }
@@ -7700,8 +7445,8 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
             Text(
                 "Choose which methods cashiers can use at checkout. Money goes directly " +
                     "to your own accounts — never through ON-SPOT POS.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+                fontSize = 12.sp,
+                color = t.inkTertiary
             )
             Spacer(Modifier.height(4.dp))
             SettingsSwitch("Cash", cashEnabled) { cashEnabled = it }
@@ -7722,8 +7467,8 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
                 Text(
                     "The Integration Key is kept on this device only — it is never uploaded " +
                         "to the cloud or shared with the ON-SPOT POS platform.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    fontSize = 12.sp,
+                    color = t.inkTertiary
                 )
             }
 
@@ -7774,8 +7519,8 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
             Text(
                 "A cashier giving a whole-sale discount above this percentage needs an admin " +
                     "PIN to approve it. Admins are never asked. Set 0 to never require approval.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+                fontSize = 12.sp,
+                color = t.inkTertiary
             )
             SettingsField("Approval threshold (%)", trimPct(prefs.discountThresholdPct)) {
                 it.toDoubleOrNull()?.coerceIn(0.0, 100.0)?.let { p ->
@@ -7789,8 +7534,8 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
             Text(
                 "The most a cashier may take off a single cart line. This is a hard limit — " +
                     "they can't go past it, no PIN overrides it. Set 0 for no limit.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+                fontSize = 12.sp,
+                color = t.inkTertiary
             )
             SettingsField(
                 "Max discount per item (${currency.ifBlank { "USD" }})",
@@ -7810,8 +7555,8 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
                 "Keep your books in ${currency.ifBlank { "USD" }} but also accept a second " +
                     "currency at the till (handy for USD + ZiG). Leave the code blank or the " +
                     "rate at 0 to switch it off.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+                fontSize = 12.sp,
+                color = t.inkTertiary
             )
             SettingsField("Second currency code (e.g. ZWG)", prefs.secondCurrencyCode) {
                 vm.savePrefs(prefs.copy(secondCurrencyCode = it.uppercase().trim()))
@@ -7826,34 +7571,33 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
                     rateText = if (prefs.secondCurrencyRate > 0.0) trimPct(prefs.secondCurrencyRate) else ""
                 }
             }
-            OutlinedTextField(
+            Spacer(Modifier.height(6.dp))
+            PosField(
                 value = rateText,
                 onValueChange = {
                     rateText = it.filter { ch -> ch.isDigit() || ch == '.' }
                     vm.savePrefs(prefs.copy(secondCurrencyRate = rateText.toDoubleOrNull() ?: 0.0))
                 },
-                label = {
-                    Text("Rate — ${prefs.secondCurrencyCode.ifBlank { "second currency" }} per 1 ${currency.ifBlank { "USD" }}")
-                },
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)
+                label = "Rate — ${prefs.secondCurrencyCode.ifBlank { "second currency" }} per 1 ${currency.ifBlank { "USD" }}",
+                keyboardType = KeyboardType.Decimal,
+                modifier = Modifier.fillMaxWidth()
             )
             if (secondCurrencyActive(prefs.secondCurrencyCode, prefs.secondCurrencyRate)) {
+                Spacer(Modifier.height(4.dp))
                 Text(
                     "Example: ${money(1.0, currency.ifBlank { "USD" })} = " +
                         money(baseToSecond(1.0, prefs.secondCurrencyRate), prefs.secondCurrencyCode),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.primary
+                    fontSize = 12.sp,
+                    color = t.brand.s600
                 )
             }
           }
 
           if (settingsCat == SettingsCat.Receipt) {
             // ---- Printer ----
-            Text("Receipt printer", style = MaterialTheme.typography.titleMedium)
+            Text("Receipt printer", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = t.inkPrimary)
             Spacer(Modifier.height(6.dp))
-            Text("Printer type", style = MaterialTheme.typography.bodyMedium)
+            Text("Printer type", fontSize = 14.sp, color = t.inkSecondary)
             Spacer(Modifier.height(4.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 PRINTER_TYPES.forEach { (id, label) ->
@@ -7869,8 +7613,8 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
                 "bluetooth" -> {
                     Text(
                         printerName ?: "No printer selected",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        fontSize = 14.sp,
+                        color = t.inkTertiary
                     )
                     Spacer(Modifier.height(8.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -7889,8 +7633,8 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
                 "rawbt" -> {
                     Text(
                         "Prints through the RawBT app (install it separately). RawBT can drive Bluetooth, USB and network printers it supports.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        fontSize = 12.sp,
+                        color = t.inkTertiary
                     )
                     Spacer(Modifier.height(8.dp))
                     OutlinedButton(onClick = { printer.test(edited()) }) {
@@ -7902,8 +7646,8 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
                 else -> {
                     Text(
                         "Prints to the built-in printer on a Sunmi handheld device.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        fontSize = 12.sp,
+                        color = t.inkTertiary
                     )
                     Spacer(Modifier.height(8.dp))
                     OutlinedButton(onClick = { printer.test(edited()) }) {
@@ -7915,7 +7659,7 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
             }
 
             Spacer(Modifier.height(12.dp))
-            Text("Paper width", style = MaterialTheme.typography.bodyMedium)
+            Text("Paper width", fontSize = 14.sp, color = t.inkSecondary)
             Spacer(Modifier.height(4.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 FilterChip(
@@ -7937,11 +7681,11 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
             }
 
             Spacer(Modifier.height(12.dp))
-            Text("Receipt style preset", style = MaterialTheme.typography.bodyMedium)
+            Text("Receipt style preset", fontSize = 14.sp, color = t.inkSecondary)
             Text(
                 "A quick look layered over the toggles below.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+                fontSize = 12.sp,
+                color = t.inkTertiary
             )
             Spacer(Modifier.height(4.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -7966,7 +7710,8 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
             Spacer(Modifier.height(20.dp))
             Button(
                 onClick = { vm.saveBusiness(edited()) },
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = t.brand.s600, contentColor = t.inkOnBrand)
             ) { Text("Save settings") }
           }
 
@@ -7989,20 +7734,20 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
             SettingsSectionHeader("Danger zone")
             Text(
                 "These actions cannot be undone.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+                fontSize = 12.sp,
+                color = t.inkTertiary
             )
             Spacer(Modifier.height(8.dp))
             OutlinedButton(
                 onClick = { showResetStock = true },
                 modifier = Modifier.fillMaxWidth(),
-                colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = t.danger)
             ) { Text("Reset all stock to zero") }
             Spacer(Modifier.height(8.dp))
             OutlinedButton(
                 onClick = { showWipeSales = true },
                 modifier = Modifier.fillMaxWidth(),
-                colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = t.danger)
             ) { Text("Wipe all sales history") }
 
             // The bring-your-own-database sync panel is a cloud-mode feature.
@@ -8050,6 +7795,7 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
 /** Set / change / remove the optional local device PIN (no-cloud mode). */
 @Composable
 private fun DevicePinSettings(vm: PosViewModel) {
+    val t = LocalPosTokens.current
     val hasPin by vm.hasLocalPin.collectAsState()
     var showSet by remember { mutableStateOf(false) }
     var showRemove by remember { mutableStateOf(false) }
@@ -8057,12 +7803,16 @@ private fun DevicePinSettings(vm: PosViewModel) {
     Text(
         if (hasPin) "A PIN is required each time the app opens."
         else "The till opens without a lock. Add a PIN to require it every time the app opens.",
-        style = MaterialTheme.typography.bodySmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant
+        fontSize = 12.sp,
+        color = t.inkTertiary
     )
     Spacer(Modifier.height(8.dp))
     if (!hasPin) {
-        Button(onClick = { showSet = true }, modifier = Modifier.fillMaxWidth()) {
+        Button(
+            onClick = { showSet = true },
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = t.brand.s600, contentColor = t.inkOnBrand)
+        ) {
             Text("Set device PIN")
         }
     } else {
@@ -8073,7 +7823,7 @@ private fun DevicePinSettings(vm: PosViewModel) {
             OutlinedButton(
                 onClick = { showRemove = true },
                 modifier = Modifier.weight(1f),
-                colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = t.danger)
             ) { Text("Remove PIN") }
         }
     }
@@ -8103,60 +7853,59 @@ private fun LocalPinDialog(title: String, onDismiss: () -> Unit, onSave: (String
     var confirm by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
 
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = {
-            TextButton(onClick = {
-                when {
-                    pin.length < 4 -> error = "PIN must be at least 4 digits"
-                    pin != confirm -> error = "PINs don't match"
-                    else -> onSave(pin)
-                }
-            }) { Text("Save") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-        title = { Text(title) },
-        text = {
-            Column {
-                OutlinedTextField(
-                    value = pin,
-                    onValueChange = { new -> if (new.length <= 6 && new.all { it.isDigit() }) { pin = new; error = null } },
-                    label = { Text("PIN (4-6 digits)") },
-                    singleLine = true,
-                    visualTransformation = PasswordVisualTransformation(),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = confirm,
-                    onValueChange = { new -> if (new.length <= 6 && new.all { it.isDigit() }) { confirm = new; error = null } },
-                    label = { Text("Confirm PIN") },
-                    singleLine = true,
-                    visualTransformation = PasswordVisualTransformation(),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                    modifier = Modifier.fillMaxWidth()
-                )
-                if (error != null) {
-                    Spacer(Modifier.height(8.dp))
-                    Text(error!!, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
-                }
+    PosContainedForm(
+        title = title,
+        onDismiss = onDismiss,
+        confirmLabel = "Save",
+        onConfirm = {
+            when {
+                pin.length < 4 -> error = "PIN must be at least 4 digits"
+                pin != confirm -> error = "PINs don't match"
+                else -> onSave(pin)
             }
         }
-    )
+    ) {
+        val t = LocalPosTokens.current
+        PosFormCard {
+            PosField(
+                value = pin,
+                onValueChange = { new -> if (new.length <= 6 && new.all { it.isDigit() }) { pin = new; error = null } },
+                label = "PIN (4-6 digits)",
+                keyboardType = KeyboardType.NumberPassword,
+                visualTransformation = PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth()
+            )
+            PosField(
+                value = confirm,
+                onValueChange = { new -> if (new.length <= 6 && new.all { it.isDigit() }) { confirm = new; error = null } },
+                label = "Confirm PIN",
+                keyboardType = KeyboardType.NumberPassword,
+                visualTransformation = PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
+        if (error != null) {
+            Text(error!!, color = t.danger, style = MaterialTheme.typography.bodySmall)
+        }
+    }
 }
 
 /** The opt-in that turns on cloud (team) mode: login, staff accounts, attribution, sync. */
 @Composable
 private fun ConnectCloudCard(vm: PosViewModel) {
+    val t = LocalPosTokens.current
     Text(
         "Cloud mode adds staff logins, per-cashier PINs, sales attribution and backup/sync " +
             "across devices. Everything already on this device stays put.",
-        style = MaterialTheme.typography.bodySmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant
+        fontSize = 12.sp,
+        color = t.inkTertiary
     )
     Spacer(Modifier.height(8.dp))
-    Button(onClick = { vm.connectCloud() }, modifier = Modifier.fillMaxWidth()) {
+    Button(
+        onClick = { vm.connectCloud() },
+        modifier = Modifier.fillMaxWidth(),
+        colors = ButtonDefaults.buttonColors(containerColor = t.brand.s600, contentColor = t.inkOnBrand)
+    ) {
         Text("Connect cloud")
     }
 }
@@ -8169,6 +7918,7 @@ private fun ConnectCloudCard(vm: PosViewModel) {
  */
 @Composable
 private fun CloudSyncSection(vm: PosViewModel) {
+    val t = LocalPosTokens.current
     val connection by vm.connection.collectAsState()
     val status by vm.syncStatus.collectAsState()
     val lastSyncAt by vm.lastSyncAt.collectAsState()
@@ -8186,40 +7936,38 @@ private fun CloudSyncSection(vm: PosViewModel) {
     var showSetup by remember { mutableStateOf(false) }
 
     Spacer(Modifier.height(28.dp))
-    HorizontalDivider()
+    HorizontalDivider(color = t.surfaceBorder)
     Spacer(Modifier.height(16.dp))
     Row(verticalAlignment = Alignment.CenterVertically) {
         Icon(
             if (connected) Icons.Filled.CloudDone else Icons.Filled.CloudOff,
             contentDescription = null,
-            tint = if (connected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
+            tint = if (connected) t.brand.s600 else t.inkTertiary
         )
         Spacer(Modifier.width(8.dp))
-        Text("Cloud sync", style = MaterialTheme.typography.titleMedium)
+        Text("Cloud sync", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = t.inkPrimary)
     }
     Spacer(Modifier.height(4.dp))
     Text(
         "Optional. The app works fully offline. Connect your own Supabase database " +
             "to back up sales and sync across devices — the data stays in your account, not ours.",
-        style = MaterialTheme.typography.bodySmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant
+        fontSize = 12.sp,
+        color = t.inkTertiary
     )
     Spacer(Modifier.height(12.dp))
 
     if (!connected) {
-        OutlinedTextField(
+        PosField(
             value = url,
             onValueChange = { url = it.trim(); message = null },
-            label = { Text("Supabase URL (https://xxxx.supabase.co)") },
-            singleLine = true,
+            label = "Supabase URL (https://xxxx.supabase.co)",
             modifier = Modifier.fillMaxWidth()
         )
         Spacer(Modifier.height(8.dp))
-        OutlinedTextField(
+        PosField(
             value = key,
             onValueChange = { key = it.trim(); message = null },
-            label = { Text("Anon (public) API key") },
-            singleLine = true,
+            label = "Anon (public) API key",
             modifier = Modifier.fillMaxWidth()
         )
         Spacer(Modifier.height(8.dp))
@@ -8253,12 +8001,13 @@ private fun CloudSyncSection(vm: PosViewModel) {
                         isError = outcome !is SyncOutcome.Success
                         message = outcome.label()
                     }
-                }
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = t.brand.s600, contentColor = t.inkOnBrand)
             ) {
                 if (busy) {
                     CircularProgressIndicator(
                         Modifier.size(16.dp), strokeWidth = 2.dp,
-                        color = MaterialTheme.colorScheme.onPrimary
+                        color = t.inkOnBrand
                     )
                     Spacer(Modifier.width(8.dp))
                 }
@@ -8269,7 +8018,8 @@ private fun CloudSyncSection(vm: PosViewModel) {
             Spacer(Modifier.height(8.dp))
             Button(
                 onClick = { showSetup = true },
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = t.brand.s600, contentColor = t.inkOnBrand)
             ) {
                 Icon(Icons.Filled.Storage, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
@@ -8292,6 +8042,7 @@ private fun CloudSyncSection(vm: PosViewModel) {
         Text(
             connection!!.url,
             fontWeight = FontWeight.Medium,
+            color = t.inkPrimary,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
         )
@@ -8305,20 +8056,20 @@ private fun CloudSyncSection(vm: PosViewModel) {
         }
         Text(
             statusText,
-            style = MaterialTheme.typography.bodySmall,
-            color = if (status is SyncStatus.Error) MaterialTheme.colorScheme.error
-            else MaterialTheme.colorScheme.outline
+            fontSize = 12.sp,
+            color = if (status is SyncStatus.Error) t.danger else t.inkTertiary
         )
         Spacer(Modifier.height(12.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
                 enabled = status !is SyncStatus.Syncing,
-                onClick = { vm.syncNow() }
+                onClick = { vm.syncNow() },
+                colors = ButtonDefaults.buttonColors(containerColor = t.brand.s600, contentColor = t.inkOnBrand)
             ) {
                 if (status is SyncStatus.Syncing) {
                     CircularProgressIndicator(
                         Modifier.size(16.dp), strokeWidth = 2.dp,
-                        color = MaterialTheme.colorScheme.onPrimary
+                        color = t.inkOnBrand
                     )
                 } else {
                     Icon(Icons.Filled.Sync, contentDescription = null)
@@ -8334,12 +8085,12 @@ private fun CloudSyncSection(vm: PosViewModel) {
         val pushOn by vm.cloudPushEnabled.collectAsState()
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
-                Text("Upload this device's data", fontWeight = FontWeight.Medium)
+                Text("Upload this device's data", fontWeight = FontWeight.Medium, color = t.inkPrimary)
                 Text(
                     "Off = pull only (safe). On also PUSHES this device's sales, refunds " +
                         "and edited products up to the shared database — clear any test data first.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    fontSize = 12.sp,
+                    color = t.inkTertiary
                 )
             }
             Switch(checked = pushOn, onCheckedChange = { vm.setCloudPushEnabled(it) })
@@ -8350,10 +8101,11 @@ private fun CloudSyncSection(vm: PosViewModel) {
 
 @Composable
 private fun SyncMessage(text: String, isError: Boolean) {
+    val t = LocalPosTokens.current
     Text(
         text,
-        style = MaterialTheme.typography.bodySmall,
-        color = if (isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+        fontSize = 12.sp,
+        color = if (isError) t.danger else t.brand.s600
     )
     Spacer(Modifier.height(8.dp))
 }
@@ -8376,99 +8128,78 @@ private fun DatabaseSetupSheet(
     var checking by remember { mutableStateOf(false) }
     var checkMsg by remember { mutableStateOf<String?>(null) }
 
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = {
-            Button(
-                enabled = !checking,
-                onClick = {
-                    checking = true; checkMsg = null
-                    recheck { res ->
-                        checking = false
-                        if (res is ConnectionTest.Ok) { onReady(); onDismiss() }
-                        else checkMsg = res.label()
-                    }
-                }
-            ) {
-                if (checking) {
-                    CircularProgressIndicator(
-                        Modifier.size(16.dp), strokeWidth = 2.dp,
-                        color = MaterialTheme.colorScheme.onPrimary
-                    )
-                    Spacer(Modifier.width(8.dp))
-                }
-                Text("I've run it — re-check")
-            }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
-        title = { Text("Set up your database") },
-        text = {
-            Column(Modifier.verticalScroll(rememberScrollState())) {
-                Text(
-                    "Your database is empty. It needs a one-time setup — about 30 seconds. " +
-                        "Copy the setup script, run it once in your Supabase SQL editor, then re-check. " +
-                        "Running it again later is harmless — it never deletes your data.",
-                    style = MaterialTheme.typography.bodyMedium
-                )
-                Spacer(Modifier.height(12.dp))
-                OutlinedButton(
-                    onClick = {
-                        clipboard.setText(AnnotatedString(SUPABASE_SETUP_SQL))
-                        Toast.makeText(context, "Setup SQL copied", Toast.LENGTH_SHORT).show()
-                    },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Icon(Icons.Filled.ContentCopy, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text("Copy setup SQL")
-                }
-                Spacer(Modifier.height(8.dp))
-                OutlinedButton(
-                    onClick = {
-                        runCatching {
-                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(sqlEditorUrl(url))))
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Icon(Icons.Filled.OpenInNew, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text("Open Supabase SQL editor")
-                }
-                Spacer(Modifier.height(8.dp))
-                OutlinedButton(
-                    onClick = {
-                        val send = Intent(Intent.ACTION_SEND).apply {
-                            type = "text/plain"
-                            putExtra(Intent.EXTRA_SUBJECT, "ON-SPOT POS — Supabase setup SQL")
-                            putExtra(Intent.EXTRA_TEXT, SUPABASE_SETUP_SQL)
-                        }
-                        runCatching { context.startActivity(Intent.createChooser(send, "Share setup SQL")) }
-                    },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Icon(Icons.Filled.Share, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text("Share SQL (send to a PC)")
-                }
-                Spacer(Modifier.height(16.dp))
-                Text("Steps", fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    "1. Open your Supabase SQL editor (button above).\n" +
-                        "2. Paste the copied SQL into a new query.\n" +
-                        "3. Press Run.\n" +
-                        "4. Come back and tap \"I've run it — re-check\".",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                checkMsg?.let {
-                    Spacer(Modifier.height(12.dp))
-                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
-                }
+    PosContainedForm(
+        title = "Set up your database",
+        onDismiss = onDismiss,
+        confirmLabel = if (checking) "Checking…" else "I've run it — re-check",
+        confirmEnabled = !checking,
+        dismissLabel = "Close",
+        onConfirm = {
+            checking = true; checkMsg = null
+            recheck { res ->
+                checking = false
+                if (res is ConnectionTest.Ok) { onReady(); onDismiss() }
+                else checkMsg = res.label()
             }
         }
-    )
+    ) {
+        val t = LocalPosTokens.current
+        Text(
+            "Your database is empty. It needs a one-time setup — about 30 seconds. " +
+                "Copy the setup script, run it once in your Supabase SQL editor, then re-check. " +
+                "Running it again later is harmless — it never deletes your data.",
+            style = MaterialTheme.typography.bodyMedium, color = t.inkSecondary
+        )
+        OutlinedButton(
+            onClick = {
+                clipboard.setText(AnnotatedString(SUPABASE_SETUP_SQL))
+                Toast.makeText(context, "Setup SQL copied", Toast.LENGTH_SHORT).show()
+            },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Icon(Icons.Filled.ContentCopy, contentDescription = null)
+            Spacer(Modifier.width(8.dp))
+            Text("Copy setup SQL")
+        }
+        OutlinedButton(
+            onClick = {
+                runCatching {
+                    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(sqlEditorUrl(url))))
+                }
+            },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Icon(Icons.Filled.OpenInNew, contentDescription = null)
+            Spacer(Modifier.width(8.dp))
+            Text("Open Supabase SQL editor")
+        }
+        OutlinedButton(
+            onClick = {
+                val send = Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_SUBJECT, "ON-SPOT POS — Supabase setup SQL")
+                    putExtra(Intent.EXTRA_TEXT, SUPABASE_SETUP_SQL)
+                }
+                runCatching { context.startActivity(Intent.createChooser(send, "Share setup SQL")) }
+            },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Icon(Icons.Filled.Share, contentDescription = null)
+            Spacer(Modifier.width(8.dp))
+            Text("Share SQL (send to a PC)")
+        }
+        Text("Steps", fontWeight = FontWeight.SemiBold, color = t.inkPrimary)
+        Text(
+            "1. Open your Supabase SQL editor (button above).\n" +
+                "2. Paste the copied SQL into a new query.\n" +
+                "3. Press Run.\n" +
+                "4. Come back and tap \"I've run it — re-check\".",
+            style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
+        )
+        checkMsg?.let {
+            Text(it, style = MaterialTheme.typography.bodySmall, color = t.danger)
+        }
+    }
 }
 
 /** Deep-link to the SQL editor of the project in [url] (`https://<ref>.supabase.co`),
@@ -8506,45 +8237,46 @@ private fun PrinterPickerDialog(
     onSelect: (PrinterDevice) -> Unit,
     onDismiss: () -> Unit
 ) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
-        title = { Text("Paired printers") },
-        text = {
-            if (devices.isEmpty()) {
-                Text("No paired Bluetooth devices found. Pair your thermal printer in Android Settings → Bluetooth first, then come back.")
-            } else {
-                LazyColumn {
-                    items(devices, key = { it.mac }) { dev ->
-                        Column(
-                            Modifier.fillMaxWidth().clickable { onSelect(dev) }.padding(vertical = 12.dp)
-                        ) {
-                            Text(dev.name, fontWeight = FontWeight.Medium)
-                            Text(dev.mac, style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                    }
+    PosDialog(title = "Paired printers", onDismiss = onDismiss) {
+        val t = LocalPosTokens.current
+        if (devices.isEmpty()) {
+            Text(
+                "No paired Bluetooth devices found. Pair your thermal printer in Android Settings → Bluetooth first, then come back.",
+                color = t.inkSecondary
+            )
+        } else {
+            devices.forEach { dev ->
+                Column(
+                    Modifier.fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(t.surface1)
+                        .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
+                        .clickable { onSelect(dev) }
+                        .padding(14.dp)
+                ) {
+                    Text(dev.name, fontWeight = FontWeight.Bold, color = t.inkPrimary)
+                    Text(dev.mac, style = MaterialTheme.typography.bodySmall, color = t.inkTertiary)
                 }
             }
         }
-    )
+    }
 }
 
 @Composable
 private fun SettingsField(label: String, value: String, onChange: (String) -> Unit) {
-    OutlinedTextField(
+    // Dense design-system field (propagates to every Settings input).
+    PosField(
         value = value,
         onValueChange = onChange,
-        label = { Text(label) },
-        singleLine = true,
-        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)
+        label = label,
+        modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp)
     )
 }
 
 @Composable
 private fun SettingsSectionHeader(title: String) {
-    Text(title, style = MaterialTheme.typography.titleMedium)
-    Spacer(Modifier.height(4.dp))
+    PosSectionLabel(title)
+    Spacer(Modifier.height(6.dp))
 }
 
 /** Horizontal, scrollable category picker at the top of Settings (mobile-first). */
@@ -8566,11 +8298,12 @@ private fun SettingsCategoryBar(selected: SettingsCat, onSelect: (SettingsCat) -
 
 @Composable
 private fun SettingsSwitch(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    val t = LocalPosTokens.current
     Row(
         Modifier.fillMaxWidth().padding(vertical = 2.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(label, Modifier.weight(1f))
+        Text(label, Modifier.weight(1f), color = t.inkPrimary)
         Switch(checked = checked, onCheckedChange = onChange)
     }
 }

@@ -187,6 +187,11 @@ class PosRepository(private val db: PosDatabase) {
     fun creditLedgerFlow(businessId: String): Flow<List<CreditTxn>> =
         creditDao.observeForBusiness(businessId)
 
+    /** (saleId → receipt reference) map source for labelling ledger rows with the sale
+     *  that created them. */
+    fun saleRefsFlow(businessId: String): Flow<List<SaleRef>> =
+        saleDao.observeSaleRefs(businessId)
+
     suspend fun saveCustomer(customer: Customer) =
         customerDao.upsert(customer.copy(updatedAt = now(), pendingSync = true))
 
