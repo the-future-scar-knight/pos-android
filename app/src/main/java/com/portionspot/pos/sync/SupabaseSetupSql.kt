@@ -53,6 +53,7 @@ create table if not exists public.customers (
     address          text,
     notes            text,
     balance          numeric not null default 0,
+    credit_limit     numeric,
     is_trade_account boolean not null default false,
     updated_at       timestamptz not null default now()
 );
@@ -68,10 +69,12 @@ create table if not exists public.sales (
     payments       jsonb not null default '[]'::jsonb,
     subtotal       numeric not null default 0,
     total_discount numeric not null default 0,
+    markup_total   numeric not null default 0,
     vat_amount     numeric not null default 0,
     grand_total    numeric not null default 0,
     amount_paid    numeric not null default 0,
     change_given   numeric not null default 0,
+    change_owed    numeric not null default 0,
     amount_owing   numeric not null default 0,
     pay_method     text,
     cashier        text,

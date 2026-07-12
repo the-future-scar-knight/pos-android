@@ -158,6 +158,7 @@ data class CustomerDto(
     val address: String? = null,
     val notes: String? = null,
     val balance: String? = null,
+    @SerialName("credit_limit") val creditLimit: String? = null,
     @SerialName("is_trade_account") val isTradeAccount: Boolean = false,
     @SerialName("updated_at") val updatedAt: String? = null,
 )
@@ -177,6 +178,9 @@ fun CustomerDto.toCustomer(businessId: String, local: Customer?): Customer {
         address = address,
         note = notes,
         wholesale = isTradeAccount,
+        // credit_limit is user-set master data on the cloud (the web has an editable
+        // field); take the cloud value, falling back to the local one when unset.
+        creditLimit = creditLimit?.toDoubleOrNull() ?: local?.creditLimit,
         updatedAt = IsoTime.toMillis(updatedAt),
         deleted = false,
         pendingSync = false,
@@ -298,6 +302,9 @@ data class SaleItemJson(
     val subMode: String? = null,
     val unitPrice: Double = 0.0,
     val lineDiscount: Double = 0.0,
+    // Per-line markup (cashier-only; folded into the price on customer receipts, but
+    // recorded here so the shop can report on it in the cloud/web). Mirrors lineDiscount.
+    val lineMarkup: Double = 0.0,
     val unitsPerLine: Int = 1,
     val boxSize: Int? = null,
 )
@@ -320,11 +327,13 @@ data class SaleDto(
     val items: List<SaleItemJson> = emptyList(),
     val subtotal: String? = null,
     @SerialName("total_discount") val totalDiscount: String? = null,
+    @SerialName("markup_total") val markupTotal: String? = null,
     @SerialName("vat_amount") val vatAmount: String? = null,
     @SerialName("grand_total") val grandTotal: String? = null,
     val payments: List<SalePaymentJson> = emptyList(),
     @SerialName("amount_paid") val amountPaid: String? = null,
     @SerialName("change_given") val changeGiven: String? = null,
+    @SerialName("change_owed") val changeOwed: String? = null,
     @SerialName("amount_owing") val amountOwing: String? = null,
     @SerialName("pay_method") val payMethod: String? = null,
     val cashier: String? = null,
@@ -346,9 +355,11 @@ fun SaleDto.toSaleEntity(businessId: String): SaleEntity = SaleEntity(
     discountTotal = totalDiscount.toMoney(),
     taxTotal = vatAmount.toMoney(),
     total = grandTotal.toMoney(),
+    markupTotal = markupTotal.toMoney(),
     paymentMethod = payMethod ?: "cash",
     amountPaid = amountPaid.toMoney(),
     changeDue = changeGiven?.toDoubleOrNull(),
+    changeOwed = changeOwed?.toDoubleOrNull(),
     paymentStatus = "paid",
     note = notes?.ifBlank { null },
     customerId = customerId?.ifBlank { null },
@@ -373,6 +384,7 @@ fun SaleDto.toSaleLines(businessId: String, resolveItemId: (String?) -> String?)
             qty = li.qty,
             unitPrice = li.unitPrice,
             lineDiscount = li.lineDiscount,
+            lineMarkup = li.lineMarkup,
             lineTotal = li.unitPrice * li.qty - li.lineDiscount,
             mode = li.mode,
             unitsPerLine = if (li.unitsPerLine < 1) 1 else li.unitsPerLine,
@@ -447,11 +459,13 @@ data class SalePushDto(
     val items: List<SaleItemJson> = emptyList(),
     val subtotal: Double = 0.0,
     @SerialName("total_discount") val totalDiscount: Double = 0.0,
+    @SerialName("markup_total") val markupTotal: Double = 0.0,
     @SerialName("vat_amount") val vatAmount: Double = 0.0,
     @SerialName("grand_total") val grandTotal: Double = 0.0,
     val payments: List<SalePaymentJson> = emptyList(),
     @SerialName("amount_paid") val amountPaid: Double = 0.0,
     @SerialName("change_given") val changeGiven: Double = 0.0,
+    @SerialName("change_owed") val changeOwed: Double = 0.0,
     @SerialName("amount_owing") val amountOwing: Double = 0.0,
     @SerialName("pay_method") val payMethod: String = "cash",
     val cashier: String = "",
@@ -474,6 +488,7 @@ private fun SaleLine.toItemJson(sku: String?): SaleItemJson = SaleItemJson(
     subMode = if (mode == "box") "boxes" else "",
     unitPrice = unitPrice,
     lineDiscount = lineDiscount,
+    lineMarkup = lineMarkup,
     unitsPerLine = unitsPerLine,
     boxSize = if (mode == "box") unitsPerLine else null,
 )
@@ -496,11 +511,13 @@ fun buildSalePush(
         items = lines.map { it.toItemJson(skuOf(it.itemId)) },
         subtotal = sale.subtotal,
         totalDiscount = sale.discountTotal,
+        markupTotal = sale.markupTotal,
         vatAmount = sale.taxTotal,
         grandTotal = sale.total,
         payments = payments.map { SalePaymentJson(amount = it.amount, method = it.method) },
         amountPaid = sale.amountPaid,
         changeGiven = sale.changeDue ?: 0.0,
+        changeOwed = sale.changeOwed ?: 0.0,
         payMethod = sale.paymentMethod,
         cashier = sale.createdByName ?: "",
         cashierId = sale.createdBy ?: "",
@@ -544,8 +561,10 @@ fun buildRefundPush(
     updatedAt = IsoTime.toIso(refund.updatedAt),
 )
 
-/** Customer push (upsert on local_id). Deliberately OMITS `balance`/`credit_limit`:
- *  those are ledger-derived and owned by whoever computes them — never overwrite them. */
+/** Customer push (upsert on local_id). Deliberately OMITS `balance` — it is
+ *  ledger-derived and owned by whoever computes it, so we never overwrite it.
+ *  `credit_limit` IS synced: it's user-set master data (the web exposes an editable
+ *  field), so it two-way syncs like name/phone. */
 @Serializable
 data class CustomerPushDto(
     @SerialName("local_id") val localId: String,
@@ -553,6 +572,7 @@ data class CustomerPushDto(
     val phone: String? = null,
     val email: String? = null,
     val address: String? = null,
+    @SerialName("credit_limit") val creditLimit: Double? = null,
     @SerialName("is_trade_account") val isTradeAccount: Boolean = false,
     val notes: String? = null,
     @SerialName("updated_at") val updatedAt: String,
@@ -564,6 +584,7 @@ fun Customer.toCustomerPush() = CustomerPushDto(
     phone = phone,
     email = email,
     address = address,
+    creditLimit = creditLimit,
     isTradeAccount = wholesale,
     notes = note,
     updatedAt = IsoTime.toIso(updatedAt),
