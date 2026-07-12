@@ -1288,11 +1288,14 @@ class PosRepository(private val db: PosDatabase) {
             owedRefunds = refundDao.owedOnce(businessId),
             pendingPayments = mobileMoneyDao.pendingOnce(businessId),
             largeSales = saleDao.largeSalesOnce(businessId, salesWindow, thresholds.largeSaleMin),
-            agingRows = DebtAging.compute(
-                creditDao.allForBusinessOnce(businessId),
-                customerDao.allForBusiness(businessId).associate { it.id to it.name },
-                nowMs
-            ),
+            agingRows = customerDao.allForBusiness(businessId).let { custs ->
+                DebtAging.compute(
+                    creditDao.allForBusinessOnce(businessId),
+                    custs.associate { it.id to it.name },
+                    nowMs,
+                    custs.associate { it.id to it.creditLimit },
+                )
+            },
             pendingSyncCount = pendingSyncCount,
             lastSyncAt = lastSyncAt,
             thresholds = thresholds

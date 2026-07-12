@@ -12,7 +12,12 @@ package com.portionspot.pos.data
 object DebtAging {
     private const val DAY = 24L * 60 * 60 * 1000
 
-    fun compute(txns: List<CreditTxn>, nameById: Map<String, String>, nowMs: Long): List<DebtAgingRow> {
+    fun compute(
+        txns: List<CreditTxn>,
+        nameById: Map<String, String>,
+        nowMs: Long,
+        limitById: Map<String, Double?> = emptyMap(),
+    ): List<DebtAgingRow> {
         val byCustomer = txns
             .filter { it.type == "credit_owed" || it.type == "credit_paid" }
             .groupBy { it.customerId }
@@ -58,7 +63,8 @@ object DebtAging {
                         bucket30to60 = b30,
                         bucket60to90 = b60,
                         bucket90plus = b90,
-                        oldestAt = if (oldest == Long.MAX_VALUE) 0L else oldest
+                        oldestAt = if (oldest == Long.MAX_VALUE) 0L else oldest,
+                        creditLimit = limitById[cid]
                     )
                 )
             }

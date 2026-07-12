@@ -3512,6 +3512,18 @@ private fun PaymentDialog(
                 )
                 Switch(checked = onCredit, onCheckedChange = { onCredit = it })
             }
+            // Advisory credit-limit warning: this is NOT a block — the cashier can still
+            // complete, and the admin is informed afterwards (over-limit notification).
+            if (onCredit) {
+                val bal = customers.firstOrNull { it.customer.id == selected!!.id }?.balance ?: 0.0
+                val limit = selected!!.creditLimit
+                if (limit != null && bal + remaining > limit + 0.005) {
+                    Text(
+                        "Over ${selected!!.name}'s ${money(limit, currency)} credit limit — they'd owe ${money(bal + remaining, currency)}. The sale can still go through; an admin will be notified.",
+                        color = t.warning, fontSize = 12.sp, fontWeight = FontWeight.Medium
+                    )
+                }
+            }
         }
         if (remaining > 0 && selected == null) {
             Text(

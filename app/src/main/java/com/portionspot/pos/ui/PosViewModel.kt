@@ -654,6 +654,9 @@ class PosViewModel(
             )
             _lastReceipt.value = LastReceipt(saved.sale, saved.lines)
             _cart.value = emptyList()
+            // A credit sale can push a customer over their limit — reconcile the admin
+            // feed now so the over-limit alert appears without waiting for the worker.
+            if (onCredit && customer != null) sweepNotifications()
         }
     }
 

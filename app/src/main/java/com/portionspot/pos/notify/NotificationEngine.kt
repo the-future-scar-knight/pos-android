@@ -132,6 +132,19 @@ object NotificationEngine {
             }
         }
 
+        // ---- Customer over their credit limit (admin is informed; sale still went
+        //      through — the cashier only gets an advisory warning) ----
+        for (row in s.agingRows) {
+            val limit = row.creditLimit ?: continue
+            if (row.total > limit + 0.005) {
+                out += NotifCandidate(
+                    "sales", "danger", "Over credit limit",
+                    "${row.customerName} owes ${money(row.total, s.currency)} — over their ${money(limit, s.currency)} limit.",
+                    "overlimit:${row.customerId}", "customer", row.customerId, s.nowMs, pushWorthy = true
+                )
+            }
+        }
+
         // ---- Device hasn't synced while records are pending ----
         if (s.pendingSyncCount > 0) {
             val since = s.lastSyncAt ?: 0L

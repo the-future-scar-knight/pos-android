@@ -396,7 +396,10 @@ data class DebtAgingRow(
     val bucket30to60: Double = 0.0,
     val bucket60to90: Double = 0.0,
     val bucket90plus: Double = 0.0,
-    val oldestAt: Long = 0L
+    val oldestAt: Long = 0L,
+    /** The customer's credit ceiling (null = no limit set); carried so the notification
+     *  engine can flag a balance that has gone over it. */
+    val creditLimit: Double? = null
 ) {
     val total: Double get() = bucket0to30 + bucket30to60 + bucket60to90 + bucket90plus
 }

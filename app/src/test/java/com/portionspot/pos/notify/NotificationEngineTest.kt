@@ -1,5 +1,6 @@
 package com.portionspot.pos.notify
 
+import com.portionspot.pos.data.DebtAgingRow
 import com.portionspot.pos.data.Item
 import com.portionspot.pos.data.MobileMoneyReceipt
 import com.portionspot.pos.data.Refund
@@ -22,9 +23,10 @@ class NotificationEngineTest {
         owed: List<Refund> = emptyList(),
         pending: List<MobileMoneyReceipt> = emptyList(),
         large: List<SaleEntity> = emptyList(),
+        aging: List<DebtAgingRow> = emptyList(),
         pendingSync: Int = 0,
         lastSync: Long? = now
-    ) = NotifSnapshot(now, "USD", items, owed, pending, large, emptyList(), pendingSync, lastSync, th)
+    ) = NotifSnapshot(now, "USD", items, owed, pending, large, aging, pendingSync, lastSync, th)
 
     private fun refund(total: Double, hoursAgo: Int) =
         Refund(businessId = "b", saleId = "s", refundTotal = total, status = "owed", createdAt = now - hoursAgo * HOUR)
@@ -69,5 +71,24 @@ class NotificationEngineTest {
     @Test fun large_sale_is_flagged() {
         val sale = SaleEntity(businessId = "b", total = 600.0, soldAt = now)
         assertNotNull(NotificationEngine.compute(snap(large = listOf(sale))).firstOrNull { it.dedupeKey == "largesale:${sale.id}" })
+    }
+
+    @Test fun over_credit_limit_flagged_only_when_balance_exceeds_limit() {
+        fun aging(owed: Double, limit: Double?) =
+            DebtAgingRow(customerId = "c1", customerName = "Pachedu", bucket0to30 = owed, creditLimit = limit)
+
+        // Over the limit → a pushable danger alert.
+        val over = NotificationEngine.compute(snap(aging = listOf(aging(120.0, 100.0))))
+            .firstOrNull { it.dedupeKey == "overlimit:c1" }
+        assertNotNull(over)
+        assertEquals("danger", over!!.severity)
+        assertTrue(over.pushWorthy)
+
+        // Within the limit → nothing.
+        assertNull(NotificationEngine.compute(snap(aging = listOf(aging(80.0, 100.0))))
+            .firstOrNull { it.dedupeKey == "overlimit:c1" })
+        // No limit set → nothing.
+        assertNull(NotificationEngine.compute(snap(aging = listOf(aging(120.0, null))))
+            .firstOrNull { it.dedupeKey == "overlimit:c1" })
     }
 }
