@@ -353,6 +353,41 @@ val MIGRATION_17_18 = object : Migration(17, 18) {
     }
 }
 
+/**
+ * v18 → v19: per-customer credit limit. Adds a nullable `creditLimit` (REAL) to
+ * `customers` — a local-only credit ceiling the cashier can set when editing a
+ * customer. Additive + nullable, so existing rows keep NULL (no limit set) and
+ * nothing is dropped.
+ */
+val MIGRATION_18_19 = object : Migration(18, 19) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE customers ADD COLUMN creditLimit REAL")
+    }
+}
+
+/**
+ * v19 → v20: per-item markup. Mirrors the per-item discount plumbing but ADDS to the
+ * line price instead of subtracting. Adds `lineMarkup` to `sale_items` (per-line
+ * markup snapshot) and `markupTotal` to `sales` (sum of per-item markups, the mirror
+ * of `discountTotal`). Local-only — the shared cloud schema has no markup column, so
+ * these are never pushed. Additive + defaulted, so existing rows keep 0 and nothing
+ * is dropped.
+ */
+val MIGRATION_19_20 = object : Migration(19, 20) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE sale_items ADD COLUMN lineMarkup REAL NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE sales ADD COLUMN markupTotal REAL NOT NULL DEFAULT 0")
+    }
+}
+
+// Records the change the shop still owes the customer (change due minus change
+// handed over now). Nullable; local-only (the cloud has no such column).
+val MIGRATION_20_21 = object : Migration(20, 21) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE sales ADD COLUMN changeOwed REAL")
+    }
+}
+
 @Database(
     entities = [
         Business::class,
@@ -375,7 +410,7 @@ val MIGRATION_17_18 = object : Migration(17, 18) {
         AppNotification::class,
         AuditEntry::class
     ],
-    version = 18,
+    version = 21,
     exportSchema = false
 )
 abstract class PosDatabase : RoomDatabase() {
@@ -417,7 +452,8 @@ abstract class PosDatabase : RoomDatabase() {
                         MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9,
                         MIGRATION_9_10, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14,
                         MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17,
-                        MIGRATION_17_18
+                        MIGRATION_17_18, MIGRATION_18_19, MIGRATION_19_20,
+                        MIGRATION_20_21
                     )
                     .fallbackToDestructiveMigration()
                     .build()

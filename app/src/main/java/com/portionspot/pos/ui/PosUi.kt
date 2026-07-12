@@ -67,6 +67,7 @@ import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.Contacts
 import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.automirrored.filled.ViewList
 import androidx.compose.material.icons.filled.Inventory2
@@ -2129,6 +2130,7 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
             business = business,
             subtotal = cart.sumOf { it.lineSubtotal },
             itemDiscount = cart.sumOf { it.lineDiscountApplied },
+            itemMarkup = cart.sumOf { it.lineMarkupApplied },
             currency = currency,
             secondCode = prefs.secondCurrencyCode,
             secondRate = prefs.secondCurrencyRate,
@@ -2138,12 +2140,12 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
             onPaynowInitiate = { amount, onResult -> vm.paynowInitiate(amount, onResult) },
             onPaynowPoll = { reference, onResult -> vm.paynowPoll(reference, onResult) },
             onDismiss = { showPayment = false }
-        ) { payments, discount, customer, onCredit, changeAsCredit ->
+        ) { payments, discount, customer, onCredit, changeGiven ->
             showPayment = false
             if (vm.discountNeedsApproval(discount, cart.sumOf { it.lineSubtotal })) {
-                pendingSale = PendingSale(payments, discount, customer, onCredit, changeAsCredit)
+                pendingSale = PendingSale(payments, discount, customer, onCredit, changeGiven)
             } else {
-                vm.checkout(payments, discount, customer, onCredit, changeAsCredit)
+                vm.checkout(payments, discount, customer, onCredit, changeGiven)
             }
         }
     }
@@ -2151,6 +2153,7 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
         QuoteDialog(
             subtotal = cart.sumOf { it.lineSubtotal },
             itemDiscount = cart.sumOf { it.lineDiscountApplied },
+            itemMarkup = cart.sumOf { it.lineMarkupApplied },
             currency = currency,
             customers = customers,
             validityDays = prefs.defaultQuoteValidityDays,
@@ -2170,7 +2173,7 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
             reason = "A discount of ${money(pending.discount, currency)} needs manager approval.",
             onVerify = { pin -> vm.verifyAdminPin(pin) },
             onApproved = {
-                vm.checkout(pending.payments, pending.discount, pending.customer, pending.onCredit, pending.changeAsCredit)
+                vm.checkout(pending.payments, pending.discount, pending.customer, pending.onCredit, pending.changeGiven)
                 pendingSale = null
             },
             onDismiss = { pendingSale = null }
@@ -2582,6 +2585,7 @@ private fun CartBar(
 private fun QuoteDialog(
     subtotal: Double,
     itemDiscount: Double = 0.0,
+    itemMarkup: Double = 0.0,
     currency: String,
     customers: List<CustomerWithBalance>,
     validityDays: Int,
@@ -2590,7 +2594,7 @@ private fun QuoteDialog(
 ) {
     var customer by remember { mutableStateOf<Customer?>(null) }
     var discountText by remember { mutableStateOf("") }
-    val netGoods = (subtotal - itemDiscount).coerceAtLeast(0.0)
+    val netGoods = (subtotal - itemDiscount + itemMarkup).coerceAtLeast(0.0)
     val discount = (discountText.toDoubleOrNull() ?: 0.0).coerceIn(0.0, netGoods)
     val total = (netGoods - discount).coerceAtLeast(0.0)
     PosContainedForm(
@@ -2764,7 +2768,7 @@ private data class PendingSale(
     val discount: Double,
     val customer: Customer?,
     val onCredit: Boolean,
-    val changeAsCredit: Boolean
+    val changeGiven: Double
 )
 
 /**
@@ -2912,6 +2916,7 @@ private fun CartDialog(cart: List<CartLine>, currency: String, vm: PosViewModel,
     val t = LocalPosTokens.current
     var editingQtyLine by remember { mutableStateOf<CartLine?>(null) }
     var editingDiscountLine by remember { mutableStateOf<CartLine?>(null) }
+    var editingMarkupLine by remember { mutableStateOf<CartLine?>(null) }
     PosDialog(title = "Cart", onDismiss = onDismiss) {
         if (cart.isEmpty()) {
             Text("Cart is empty", color = t.inkTertiary)
@@ -2939,6 +2944,21 @@ private fun CartDialog(cart: List<CartLine>, currency: String, vm: PosViewModel,
                                 .padding(top = 2.dp)
                                 .clip(RoundedCornerShape(6.dp))
                                 .clickable { editingDiscountLine = line }
+                                .padding(vertical = 2.dp, horizontal = 2.dp)
+                        )
+                        // Per-item markup affordance (tap to set/edit) — mirror of the
+                        // discount above, but ADDS to the line.
+                        Text(
+                            if (line.lineMarkupApplied > 0)
+                                "Plus ${money(line.lineMarkupApplied, currency)} — edit"
+                            else "Add markup",
+                            color = if (line.lineMarkupApplied > 0) t.accentBlue else t.inkTertiary,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier
+                                .padding(top = 2.dp)
+                                .clip(RoundedCornerShape(6.dp))
+                                .clickable { editingMarkupLine = line }
                                 .padding(vertical = 2.dp, horizontal = 2.dp)
                         )
                     }
@@ -3002,6 +3022,17 @@ private fun CartDialog(cart: List<CartLine>, currency: String, vm: PosViewModel,
             onConfirm = { amount -> vm.setLineDiscount(line.lineKey, amount); editingDiscountLine = null }
         )
     }
+
+    editingMarkupLine?.let { line ->
+        // Re-read the live line so the dialog reflects the latest qty/price.
+        val current = cart.firstOrNull { it.lineKey == line.lineKey } ?: line
+        SetLineMarkupDialog(
+            line = current,
+            currency = currency,
+            onDismiss = { editingMarkupLine = null },
+            onConfirm = { amount -> vm.setLineMarkup(line.lineKey, amount); editingMarkupLine = null }
+        )
+    }
 }
 
 /**
@@ -3051,6 +3082,49 @@ private fun SetLineDiscountDialog(
             }
             Text(
                 "Line total: ${money(line.lineGross - amount, currency)}",
+                color = t.inkPrimary, fontWeight = FontWeight.SemiBold, fontSize = 13.sp
+            )
+        }
+    }
+}
+
+/**
+ * Per-item markup entry — the mirror of [SetLineDiscountDialog] that ADDS a currency
+ * amount to this one line instead of taking it off. There is no cap (markup has no
+ * admin ceiling), so the typed amount is only floored at 0. Confirm with 0 to clear.
+ */
+@Composable
+private fun SetLineMarkupDialog(
+    line: CartLine,
+    currency: String,
+    onDismiss: () -> Unit,
+    onConfirm: (Double) -> Unit
+) {
+    val t = LocalPosTokens.current
+    var text by remember { mutableStateOf(if (line.lineMarkup > 0) trimQty(line.lineMarkup) else "") }
+    val typed = text.replace(',', '.').toDoubleOrNull() ?: 0.0
+    val amount = typed.coerceAtLeast(0.0)
+    PosContainedForm(
+        title = "Line markup",
+        onDismiss = onDismiss,
+        confirmLabel = "Apply",
+        onConfirm = { onConfirm(amount) }
+    ) {
+        Text(line.name, color = t.inkSecondary, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(
+            "${trimQty(line.qty)} × ${money(line.unitPrice, currency)} = ${money(line.lineGross, currency)}",
+            color = t.inkTertiary, fontSize = 12.sp
+        )
+        PosFormCard {
+            PosField(
+                value = text,
+                onValueChange = { text = it.filter { ch -> ch.isDigit() || ch == '.' || ch == ',' } },
+                label = "Markup ($ added to this line)",
+                keyboardType = KeyboardType.Decimal,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Text(
+                "Line total: ${money(line.lineGross + amount, currency)}",
                 color = t.inkPrimary, fontWeight = FontWeight.SemiBold, fontSize = 13.sp
             )
         }
@@ -3147,6 +3221,7 @@ private fun PaymentDialog(
     business: Business,
     subtotal: Double,
     itemDiscount: Double = 0.0,
+    itemMarkup: Double = 0.0,
     currency: String,
     secondCode: String = "",
     secondRate: Double = 0.0,
@@ -3156,7 +3231,7 @@ private fun PaymentDialog(
     onPaynowInitiate: (amount: Double, onResult: (PaynowInit) -> Unit) -> Unit = { _, _ -> },
     onPaynowPoll: (reference: String, onResult: (PaynowPoll) -> Unit) -> Unit = { _, _ -> },
     onDismiss: () -> Unit,
-    onConfirm: (payments: List<Tender>, discount: Double, customer: Customer?, onCredit: Boolean, changeAsCredit: Boolean) -> Unit
+    onConfirm: (payments: List<Tender>, discount: Double, customer: Customer?, onCredit: Boolean, changeGiven: Double) -> Unit
 ) {
     // Tender options the owner switched on in Settings (always at least Cash).
     val methods = remember(business) {
@@ -3169,7 +3244,9 @@ private fun PaymentDialog(
     var amountText by remember { mutableStateOf("") }
     var referenceText by remember { mutableStateOf("") }
     var onCredit by remember { mutableStateOf(false) }
-    var changeAsCredit by remember { mutableStateOf(false) }
+    // When there's overpayment change, completing opens a prompt to capture how much
+    // change was actually handed over now (the rest is recorded as change owed).
+    var showChangePrompt by remember { mutableStateOf(false) }
 
     // Dual-currency: the shop keeps its books in [currency] but may also take tender
     // in a SECOND currency (e.g. ZiG). entryCur2 = the cashier is typing the amount in
@@ -3178,10 +3255,11 @@ private fun PaymentDialog(
     val cur2On = secondCurrencyActive(secondCode, secondRate)
     var entryCur2 by remember { mutableStateOf(false) }
 
-    // Business-level VAT mirrors PosRepository.checkout(): tax on the discounted base.
-    // Per-item discounts ([itemDiscount]) already came off before this whole-sale
-    // discount; the taxable base is the goods value net of both.
-    val netGoods = (subtotal - itemDiscount).coerceAtLeast(0.0)
+    // Business-level VAT mirrors PosRepository.checkout(): tax on the discounted +
+    // marked-up base. Per-item discounts ([itemDiscount]) already came off and per-item
+    // markups ([itemMarkup]) already went on before this whole-sale discount; the
+    // taxable base is the goods value net of both, plus markup.
+    val netGoods = (subtotal - itemDiscount + itemMarkup).coerceAtLeast(0.0)
     val discount = (discountText.toDoubleOrNull() ?: 0.0).coerceIn(0.0, netGoods)
     val taxableBase = netGoods - discount
     val vat = if (business.vatEnabled) taxableBase * business.vatPercent / 100.0 else 0.0
@@ -3235,19 +3313,22 @@ private fun PaymentDialog(
         confirmLabel = if (!fullyPaid && creditValid) "Charge to credit" else "Complete sale",
         confirmEnabled = valid,
         onConfirm = {
-            onConfirm(
-                tenders.toList(),
-                discount,
-                selected,
-                onCredit && remaining > 0.0,
-                changeAsCredit && overpay > 0.0 && selected != null
-            )
+            // Overpayment => prompt for the change actually given before completing;
+            // otherwise complete straight away with no change to reconcile.
+            if (overpay > 0.0) {
+                showChangePrompt = true
+            } else {
+                onConfirm(tenders.toList(), discount, selected, onCredit && remaining > 0.0, 0.0)
+            }
         }
     ) {
         val t = LocalPosTokens.current
         TotalRow("Subtotal", money(subtotal, currency))
         if (itemDiscount > 0) {
             TotalRow("Item discounts", "-${money(itemDiscount, currency)}")
+        }
+        if (itemMarkup > 0) {
+            TotalRow("Item markups", "+${money(itemMarkup, currency)}")
         }
         PosField(
             value = discountText,
@@ -3432,24 +3513,78 @@ private fun PaymentDialog(
                 Switch(checked = onCredit, onCheckedChange = { onCredit = it })
             }
         }
-        if (selected != null && overpay > 0) {
-            Row(
-                Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text(
-                    "Owe ${money(overpay, currency)} change to account",
-                    modifier = Modifier.weight(1f).padding(end = 12.dp), color = t.inkPrimary
-                )
-                Switch(checked = changeAsCredit, onCheckedChange = { changeAsCredit = it })
-            }
-        }
         if (remaining > 0 && selected == null) {
             Text(
                 "Add payment to cover the total, or pick a customer to sell on credit.",
                 color = t.danger, fontSize = 12.sp
             )
+        }
+    }
+
+    // Overpayment => capture how much change was handed over now; the remainder is
+    // recorded (and printed) as change still owed to the customer.
+    if (showChangePrompt) {
+        ChangePromptDialog(
+            changeDue = overpay,
+            currency = currency,
+            onDismiss = { showChangePrompt = false },
+            onConfirm = { given ->
+                showChangePrompt = false
+                onConfirm(
+                    tenders.toList(),
+                    discount,
+                    selected,
+                    onCredit && remaining > 0.0,
+                    given.coerceIn(0.0, overpay)
+                )
+            }
+        )
+    }
+}
+
+/**
+ * Prompt shown when a sale overpays: it states the change due and asks how much of
+ * it the cashier is handing over now (blank => 0). The parent records/prints only
+ * the remainder as change owed. The entered amount can never exceed the change due.
+ */
+@Composable
+private fun ChangePromptDialog(
+    changeDue: Double,
+    currency: String,
+    onDismiss: () -> Unit,
+    onConfirm: (changeGiven: Double) -> Unit
+) {
+    var givenText by remember { mutableStateOf("") }
+    val entered = givenText.toDoubleOrNull()
+    // Blank is valid (=> 0 given, full change owed); a typed value must be within range.
+    val valid = givenText.isBlank() || (entered != null && entered >= 0.0 && entered <= changeDue + 0.0001)
+    val given = (entered ?: 0.0).coerceIn(0.0, changeDue)
+    val owed = (changeDue - given).coerceAtLeast(0.0)
+
+    PosContainedForm(
+        title = "Change to give",
+        onDismiss = onDismiss,
+        confirmLabel = "Complete sale",
+        confirmEnabled = valid,
+        onConfirm = { onConfirm(given) }
+    ) {
+        val t = LocalPosTokens.current
+        TotalRow("Change due", money(changeDue, currency))
+        PosField(
+            value = givenText,
+            onValueChange = { givenText = it.filter { ch -> ch.isDigit() || ch == '.' } },
+            label = "Change given now",
+            keyboardType = KeyboardType.Decimal,
+            modifier = Modifier.fillMaxWidth()
+        )
+        if (entered != null && entered > changeDue + 0.0001) {
+            Text(
+                "Change given can't be more than ${money(changeDue, currency)}.",
+                color = t.danger, fontSize = 12.sp
+            )
+        }
+        if (owed > 0.0) {
+            TotalRow("Change owed", money(owed, currency))
         }
     }
 }
@@ -4047,7 +4182,9 @@ private fun ReceiptDialog(
             Text("Valid until: $vu", style = MaterialTheme.typography.bodySmall, color = t.inkSecondary)
         }
         PosFormCard {
-            TotalRow("Subtotal", money(sale.subtotal, currency))
+            // Markup is folded into the subtotal (never shown as its own line) so this
+            // receipt view matches the printed/shared one and hides markup from the customer.
+            TotalRow("Subtotal", money(sale.subtotal + sale.markupTotal, currency))
             if (sale.discountTotal > 0) TotalRow("Discount", "-${money(sale.discountTotal, currency)}")
             if (sale.taxTotal > 0) TotalRow("VAT", money(sale.taxTotal, currency))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -4067,7 +4204,7 @@ private fun ReceiptDialog(
                     TotalRow("Paid via", PaymentMethod.fromCode(sale.paymentMethod)?.label ?: sale.paymentMethod)
                 }
                 sale.paymentRef?.takeIf { it.isNotBlank() }?.let { TotalRow("Reference", it) }
-                sale.changeDue?.takeIf { it > 0 }?.let { TotalRow("Change given", money(it, currency)) }
+                sale.changeOwed?.takeIf { it > 0 }?.let { TotalRow("Change owed", money(it, currency)) }
             }
         }
         OutlinedButton(onClick = onPrint, modifier = Modifier.fillMaxWidth()) {
@@ -4107,10 +4244,11 @@ private fun shareReceipt(
     sb.appendLine("--------------------------------")
     lines.forEach { line ->
         sb.appendLine("${trimQty(line.qty)} x ${line.name}")
-        sb.appendLine("    ${money(line.lineTotal, currency)}")
+        // Markup folded into the line amount — never itemised on a customer receipt.
+        sb.appendLine("    ${money(line.lineTotal + line.lineMarkup, currency)}")
     }
     sb.appendLine("--------------------------------")
-    sb.appendLine("Subtotal: ${money(sale.subtotal, currency)}")
+    sb.appendLine("Subtotal: ${money(sale.subtotal + sale.markupTotal, currency)}")
     if (sale.discountTotal > 0) sb.appendLine("Discount: -${money(sale.discountTotal, currency)}")
     if (sale.taxTotal > 0) sb.appendLine("VAT: ${money(sale.taxTotal, currency)}")
     sb.appendLine("TOTAL: ${money(sale.total, currency)}")
@@ -4118,7 +4256,7 @@ private fun shareReceipt(
         if (sale.paymentMethod != "cash" && sale.paymentMethod != "credit") {
             sb.appendLine("Paid via: ${PaymentMethod.fromCode(sale.paymentMethod)?.label ?: sale.paymentMethod}")
         }
-        sale.changeDue?.takeIf { it > 0 }?.let { sb.appendLine("Change: ${money(it, currency)}") }
+        sale.changeOwed?.takeIf { it > 0 }?.let { sb.appendLine("Change owed: ${money(it, currency)}") }
     }
     business.receiptFooter?.takeIf { it.isNotBlank() }?.let { sb.appendLine(); sb.appendLine(it) }
 
@@ -4977,9 +5115,10 @@ private fun CustomersScreen(vm: PosViewModel, currency: String) {
         AddCustomerDialog(
             initialName = prefill?.name.orEmpty(),
             initialPhone = prefill?.phone.orEmpty(),
+            title = "New customer",
             onDismiss = { showAdd = false; prefill = null }
-        ) { name, phone, email, address, note, wholesale ->
-            vm.addCustomer(name, phone, email, address, note, wholesale)
+        ) { name, phone, email, address, note, wholesale, creditLimit ->
+            vm.addCustomer(name, phone, email, address, note, wholesale, creditLimit)
             showAdd = false; prefill = null
         }
     }
@@ -5012,19 +5151,35 @@ private fun WholesaleBadge() {
     }
 }
 
+/**
+ * Shared Add / Edit customer form. Defaults produce the "New customer" flow; passing
+ * the `initial*` values + a title/confirmLabel drives it as an in-place editor. The
+ * onSave lambda hands back every editable field (name, phone, email, address, note,
+ * wholesale, creditLimit) so the caller can create or update as appropriate.
+ */
 @Composable
 private fun AddCustomerDialog(
     initialName: String = "",
     initialPhone: String = "",
+    initialEmail: String = "",
+    initialAddress: String = "",
+    initialNote: String = "",
+    initialWholesale: Boolean = false,
+    initialCreditLimit: Double? = null,
+    title: String = "New customer",
+    confirmLabel: String = "Save",
     onDismiss: () -> Unit,
-    onSave: (String, String, String, String, String, Boolean) -> Unit
+    onSave: (String, String, String, String, String, Boolean, Double?) -> Unit
 ) {
     var name by remember { mutableStateOf(initialName) }
     var phone by remember { mutableStateOf(initialPhone) }
-    var email by remember { mutableStateOf("") }
-    var address by remember { mutableStateOf("") }
-    var note by remember { mutableStateOf("") }
-    var wholesale by remember { mutableStateOf(false) }
+    var email by remember { mutableStateOf(initialEmail) }
+    var address by remember { mutableStateOf(initialAddress) }
+    var note by remember { mutableStateOf(initialNote) }
+    var wholesale by remember { mutableStateOf(initialWholesale) }
+    var creditLimit by remember {
+        mutableStateOf(initialCreditLimit?.let { if (it % 1.0 == 0.0) it.toLong().toString() else it.toString() } ?: "")
+    }
     // System number picker — fills name + phone from the phone's contacts. Needs no
     // permission (the picker grants a one-shot read on the chosen contact).
     val pickContact = rememberContactPicker { picked ->
@@ -5032,11 +5187,11 @@ private fun AddCustomerDialog(
         picked.phone?.let { phone = it }
     }
     PosContainedForm(
-        title = "New customer",
+        title = title,
         onDismiss = onDismiss,
-        confirmLabel = "Save",
+        confirmLabel = confirmLabel,
         confirmEnabled = name.isNotBlank(),
-        onConfirm = { onSave(name, phone, email, address, note, wholesale) }
+        onConfirm = { onSave(name, phone, email, address, note, wholesale, creditLimit.trim().toDoubleOrNull()) }
     ) {
         val t = LocalPosTokens.current
         TextButton(onClick = pickContact, modifier = Modifier.align(Alignment.End)) {
@@ -5050,11 +5205,12 @@ private fun AddCustomerDialog(
             PosField(value = email, onValueChange = { email = it }, label = "Email  (optional)", keyboardType = KeyboardType.Email, modifier = Modifier.fillMaxWidth())
             PosField(value = address, onValueChange = { address = it }, label = "Address  (optional)", modifier = Modifier.fillMaxWidth())
             PosField(value = note, onValueChange = { note = it }, label = "Note  (optional)", modifier = Modifier.fillMaxWidth())
+            PosField(value = creditLimit, onValueChange = { creditLimit = it }, label = "Credit Limit ($)  (optional)", keyboardType = KeyboardType.Decimal, modifier = Modifier.fillMaxWidth())
         }
         PosFormCard {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
-                    Text("Wholesale customer", color = t.inkPrimary, fontWeight = FontWeight.Medium)
+                    Text("Trade account", color = t.inkPrimary, fontWeight = FontWeight.Medium)
                     Text("Charge trade / box prices", style = MaterialTheme.typography.bodySmall, color = t.inkTertiary)
                 }
                 Switch(checked = wholesale, onCheckedChange = { wholesale = it })
@@ -5207,6 +5363,7 @@ private fun CustomerDetailDialog(
     val pdfScope = rememberCoroutineScope()
     var showPay by remember { mutableStateOf(false) }
     var showPayout by remember { mutableStateOf(false) }
+    var showEdit by remember { mutableStateOf(false) }
     var wholesale by remember { mutableStateOf(customer.wholesale) }
     // Top-level view switch + the receipt opened by tapping a purchase.
     var tab by remember { mutableStateOf("purchases") }
@@ -5217,10 +5374,18 @@ private fun CustomerDetailDialog(
         val t = LocalPosTokens.current
         val changeTypes = remember { setOf("change_owed", "refund_owed", "change_paid", "refund_paid") }
 
-        Text(
-            if (wholesale) "Wholesale Customer" else "Retail Customer",
-            style = MaterialTheme.typography.bodySmall, color = t.inkSecondary, fontWeight = FontWeight.Medium
-        )
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                if (wholesale) "Wholesale Customer" else "Retail Customer",
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.bodySmall, color = t.inkSecondary, fontWeight = FontWeight.Medium
+            )
+            TextButton(onClick = { showEdit = true }, colors = ButtonDefaults.textButtonColors(contentColor = t.brand.s600)) {
+                Icon(Icons.Filled.Edit, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("Edit")
+            }
+        }
         val contactLines = listOfNotNull(
             customer.phone?.takeIf { it.isNotBlank() },
             customer.email?.takeIf { it.isNotBlank() },
@@ -5230,6 +5395,12 @@ private fun CustomerDetailDialog(
             Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
                 contactLines.forEach { Text(it, style = MaterialTheme.typography.bodySmall, color = t.inkTertiary) }
             }
+        }
+        customer.creditLimit?.let { limit ->
+            Text(
+                "Credit limit: ${money(limit, currency)}",
+                style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
+            )
         }
 
         PosSegmented(
@@ -5373,6 +5544,24 @@ private fun CustomerDetailDialog(
         }
     }
 
+    if (showEdit) {
+        AddCustomerDialog(
+            initialName = customer.name,
+            initialPhone = customer.phone.orEmpty(),
+            initialEmail = customer.email.orEmpty(),
+            initialAddress = customer.address.orEmpty(),
+            initialNote = customer.note.orEmpty(),
+            initialWholesale = customer.wholesale,
+            initialCreditLimit = customer.creditLimit,
+            title = "Edit customer",
+            confirmLabel = "Save changes",
+            onDismiss = { showEdit = false }
+        ) { name, phone, email, address, note, ws, creditLimit ->
+            vm.updateCustomer(customer, name, phone, email, address, note, ws, creditLimit)
+            wholesale = ws
+            showEdit = false
+        }
+    }
     if (showPay) {
         RecordPaymentDialog(
             maxAmount = balance,

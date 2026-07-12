@@ -136,13 +136,19 @@ object EscPos {
             cmd(ESC, 0x45, 0x01)
             line(ln.name.take(w))
             cmd(ESC, 0x45, 0x00)
-            line(twoCol("  x${trimQty(ln.qty)} @ ${fmt(ln.unitPrice, cur)}", fmt(ln.lineTotal, cur), w))
+            // Per-line markup is folded into the shown price/amount so it reads as the
+            // ordinary price. Markup is a cashier-only concept and is NEVER itemised on
+            // the customer's receipt.
+            val shownLine = ln.lineTotal + ln.lineMarkup
+            val shownUnit = if (ln.qty != 0.0) shownLine / ln.qty else ln.unitPrice
+            line(twoCol("  x${trimQty(ln.qty)} @ ${fmt(shownUnit, cur)}", fmt(shownLine, cur), w))
             if (ln.lineDiscount > 0) line(twoCol("  Discount", "-${fmt(ln.lineDiscount, cur)}", w))
         }
         line(dashes(w))
 
-        // Totals
-        line(twoCol("Subtotal", fmt(sale.subtotal, cur), w))
+        // Totals — the subtotal carries the folded-in markup so the arithmetic
+        // reconciles (Subtotal - Discount + VAT = TOTAL) without ever naming markup.
+        line(twoCol("Subtotal", fmt(sale.subtotal + sale.markupTotal, cur), w))
         if (sale.discountTotal > 0) line(twoCol("Discount", "-${fmt(sale.discountTotal, cur)}", w))
         if (sale.taxTotal > 0) {
             val vatLabel = if (business.vatEnabled) "VAT ${trimQty(business.vatPercent)}%" else "VAT"
@@ -168,17 +174,22 @@ object EscPos {
             }
             "cash" -> {
                 line(twoCol("Cash", fmt(sale.tendered ?: sale.total, cur), w))
-                if (style.showChange) sale.changeDue?.takeIf { it > 0 }?.let { chg ->
-                    line(twoCol("Change", fmt(chg, cur), w))
-                    if (cur2On) {
-                        line(twoCol("  @ ${trimQty(style.secondRate)}", fmt(baseToSecond(chg, style.secondRate), style.secondCode), w))
-                    }
-                }
             }
             else -> {
                 val label = PaymentMethod.fromCode(sale.paymentMethod)?.label ?: "Paid"
                 line(twoCol(label, fmt(sale.total, cur), w))
                 sale.paymentRef?.takeIf { it.isNotBlank() }?.let { line("Ref: $it") }
+            }
+        }
+
+        // Change we couldn't hand over in full => still owed (any tender, not just cash).
+        // Never prints the change actually given, only the outstanding remainder.
+        if (!isQuote && style.showPayment && style.showChange) {
+            sale.changeOwed?.takeIf { it > 0 }?.let { owed ->
+                line(twoCol("Change owed", fmt(owed, cur), w))
+                if (cur2On) {
+                    line(twoCol("  @ ${trimQty(style.secondRate)}", fmt(baseToSecond(owed, style.secondRate), style.secondCode), w))
+                }
             }
         }
 

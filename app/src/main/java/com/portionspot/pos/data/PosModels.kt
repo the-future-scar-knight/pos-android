@@ -150,12 +150,14 @@ data class SaleEntity(
     val validUntil: Long? = null,
     val subtotal: Double = 0.0,
     val discountTotal: Double = 0.0,
+    @ColumnInfo(defaultValue = "0") val markupTotal: Double = 0.0,  // sum of per-item markups (mirrors discountTotal)
     val taxTotal: Double = 0.0,
     val total: Double = 0.0,
     val paymentMethod: String = "cash",   // single tender code, or "split" when >1 payment row
     val tendered: Double? = null,
     @ColumnInfo(defaultValue = "0") val amountPaid: Double = 0.0,  // sum of all SalePayment rows
     val changeDue: Double? = null,         // change actually given back to the customer
+    val changeOwed: Double? = null,        // change the shop still owes the customer (given back < change due)
     val paymentRef: String? = null,        // mobile-money / Paynow reference number
     val paymentStatus: String = "paid",    // paid | unpaid (credit) | pending (Paynow)
     val note: String? = null,
@@ -189,6 +191,7 @@ data class SaleLine(
     val qty: Double = 1.0,
     val unitPrice: Double = 0.0,          // snapshot
     val lineDiscount: Double = 0.0,
+    @ColumnInfo(defaultValue = "0") val lineMarkup: Double = 0.0,
     val lineTax: Double = 0.0,
     val lineTotal: Double = 0.0,
     // Price mode + pack size, snapshotted so a parked cart can be rebuilt and the
@@ -431,6 +434,13 @@ data class Customer(
      * by the sync engine.
      */
     @ColumnInfo(defaultValue = "0") val wholesale: Boolean = false,
+    /**
+     * Local-only per-customer credit ceiling (null = unset / no explicit limit). Like
+     * [wholesale] it is NOT read back from the shared `customers` table on pull, so the
+     * sync engine preserves it across pulls (toCustomer copies onto the existing local
+     * row without touching this field). Stored and displayed only — no checkout gating.
+     */
+    @ColumnInfo val creditLimit: Double? = null,
     val updatedAt: Long = now(),
     val deleted: Boolean = false,
     /** Local-only: true => has unsynced local edits to push. Never sent to cloud. */

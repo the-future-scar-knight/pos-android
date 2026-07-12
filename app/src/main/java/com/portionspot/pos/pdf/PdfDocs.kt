@@ -56,13 +56,17 @@ object PdfDocs {
 
         y = row(c, "Item", "Qty", "Amount", y, bold = true)
         for (ln in lines) {
-            y = row(c, ln.name, trimQty(ln.qty), money(ln.lineTotal, cur), y)
+            // Markup is folded into the line amount — never itemised on a customer receipt.
+            y = row(c, ln.name, trimQty(ln.qty), money(ln.lineTotal + ln.lineMarkup, cur), y)
         }
         y = rule(c, y)
-        y = totalRow(c, "Subtotal", money(sale.subtotal, cur), y)
+        // Subtotal carries the folded-in markup so the totals reconcile without naming it.
+        y = totalRow(c, "Subtotal", money(sale.subtotal + sale.markupTotal, cur), y)
         if (sale.discountTotal > 0) y = totalRow(c, "Discount", "-${money(sale.discountTotal, cur)}", y)
         if (sale.taxTotal > 0) y = totalRow(c, "VAT", money(sale.taxTotal, cur), y)
         y = totalRow(c, "TOTAL", money(sale.total, cur), y, bold = true)
+        // Change still owed to the customer (never the change already handed over).
+        if (!isQuote) sale.changeOwed?.takeIf { it > 0 }?.let { y = totalRow(c, "Change owed", money(it, cur), y) }
 
         footer(c, business)
         doc.finishPage(page)

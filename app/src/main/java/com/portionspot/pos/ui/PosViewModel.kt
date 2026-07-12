@@ -598,6 +598,18 @@ class PosViewModel(
     /** The admin-set ceiling on a single line's discount (0 = unlimited). */
     val maxItemDiscount: Double get() = _shopPrefs.value.maxItemDiscount
 
+    /**
+     * Set a fixed-amount markup on a cart line — the mirror of [setLineDiscount] that
+     * ADDS to the line instead of subtracting. Markup has no cap (a shop can price up
+     * as far as it likes), so the [amount] is only floored at 0.
+     */
+    fun setLineMarkup(lineKey: String, amount: Double) {
+        _cart.value = _cart.value.map { line ->
+            if (line.lineKey != lineKey) line
+            else line.copy(lineMarkup = amount.coerceAtLeast(0.0))
+        }
+    }
+
     fun removeLine(lineKey: String) {
         _cart.value = _cart.value.filterNot { it.lineKey == lineKey }
     }
@@ -611,8 +623,8 @@ class PosViewModel(
     /**
      * Complete the cart against one or more [payments] (a split sale has several).
      * [discount] is in currency units. [onCredit] puts the unpaid shortfall on the
-     * [customer]'s account; [changeAsCredit] books any overpayment as change owed
-     * to the customer instead of handing it back.
+     * [customer]'s account; [changeGiven] is how much of any overpayment change the
+     * cashier handed over now — the remainder is recorded as change still owed.
      *
      * VAT is read from the active business so the cashier never has to think
      * about it — it is applied automatically when the business has it enabled.
@@ -622,7 +634,7 @@ class PosViewModel(
         discount: Double = 0.0,
         customer: Customer? = null,
         onCredit: Boolean = false,
-        changeAsCredit: Boolean = false
+        changeGiven: Double = 0.0
     ) {
         val bid = businessId.value ?: return
         val lines = _cart.value
@@ -633,7 +645,7 @@ class PosViewModel(
                 bid, lines, payments, discount,
                 customer = customer,
                 onCredit = onCredit,
-                changeAsCredit = changeAsCredit,
+                changeGiven = changeGiven,
                 vatEnabled = biz?.vatEnabled ?: false,
                 vatPercent = biz?.vatPercent ?: 0.0,
                 totalRounding = _shopPrefs.value.checkoutRounding,
@@ -836,7 +848,8 @@ class PosViewModel(
         email: String? = null,
         address: String? = null,
         note: String? = null,
-        wholesale: Boolean = false
+        wholesale: Boolean = false,
+        creditLimit: Double? = null
     ) {
         val bid = businessId.value ?: return
         if (name.isBlank()) return
@@ -849,7 +862,37 @@ class PosViewModel(
                     email = email?.trim()?.ifBlank { null },
                     address = address?.trim()?.ifBlank { null },
                     note = note?.trim()?.ifBlank { null },
-                    wholesale = wholesale
+                    wholesale = wholesale,
+                    creditLimit = creditLimit
+                )
+            )
+        }
+    }
+
+    /** Save edits to an existing customer's details (keeps the same id; re-flags for sync). */
+    fun updateCustomer(
+        customer: Customer,
+        name: String,
+        phone: String?,
+        email: String?,
+        address: String?,
+        note: String?,
+        wholesale: Boolean,
+        creditLimit: Double?
+    ) {
+        if (name.isBlank()) return
+        viewModelScope.launch {
+            repo.saveCustomer(
+                customer.copy(
+                    name = name.trim(),
+                    phone = phone?.trim()?.ifBlank { null },
+                    email = email?.trim()?.ifBlank { null },
+                    address = address?.trim()?.ifBlank { null },
+                    note = note?.trim()?.ifBlank { null },
+                    wholesale = wholesale,
+                    creditLimit = creditLimit,
+                    updatedAt = System.currentTimeMillis(),
+                    pendingSync = true
                 )
             )
         }
