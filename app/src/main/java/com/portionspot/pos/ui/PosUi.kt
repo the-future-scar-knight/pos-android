@@ -67,6 +67,8 @@ import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.Contacts
 import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.GridView
+import androidx.compose.material.icons.automirrored.filled.ViewList
 import androidx.compose.material.icons.filled.Inventory2
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.Payments
@@ -126,6 +128,7 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -1938,6 +1941,9 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
 
     var search by remember { mutableStateOf("") }
     var selectedCat by remember { mutableStateOf("All") }
+    // Grid (default) vs dense LIST browsing. Persisted for the session so the cashier's
+    // preference survives config changes / screen switches (rememberSaveable, no data layer).
+    var listView by rememberSaveable { mutableStateOf(false) }
     var showCart by remember { mutableStateOf(false) }
     var showPayment by remember { mutableStateOf(false) }
     var quoteMode by remember { mutableStateOf(false) }
@@ -1977,6 +1983,8 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
                 Box(Modifier.weight(1f)) {
                     SearchField(value = search, onValue = { search = it }, onClear = { search = "" })
                 }
+                Spacer(Modifier.width(8.dp))
+                ViewToggle(listView = listView, onToggle = { listView = it })
                 Spacer(Modifier.width(8.dp))
                 FilledTonalIconButton(onClick = { scanning = true }) {
                     Icon(Icons.Filled.QrCodeScanner, contentDescription = "Scan to cart")
@@ -2028,19 +2036,36 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
             }
         } else {
             val gridDimens = LocalPosDimens.current
-            LazyVerticalGrid(
-                columns = GridCells.Fixed(gridDimens.productColumns),
-                modifier = Modifier.weight(1f).fillMaxWidth(),
-                contentPadding = PaddingValues(gridDimens.gridPadding),
-                horizontalArrangement = Arrangement.spacedBy(gridDimens.gridSpacing),
-                verticalArrangement = Arrangement.spacedBy(gridDimens.gridSpacing)
-            ) {
-                items(filtered, key = { it.id }) { item ->
-                    val inCart = cart.filter { it.itemId == item.id }.sumOf { it.qty }.toInt()
-                    ProductCard(item, currency, inCart) {
-                        val hasBox = item.boxSize > 1 && item.boxPrice > 0.0
-                        val hasWs = item.wholesalePrice > 0.0 && item.wholesalePrice != item.price
-                        if (hasBox || hasWs) priceModalItem = item else vm.addToCart(item, "retail")
+            // Shared add-to-cart handler: box/WS items open the price picker, everything
+            // else goes straight in at retail. Grid card and list row both call THIS —
+            // no duplicated pricing logic.
+            val onPick: (Item) -> Unit = { item ->
+                val hasBox = item.boxSize > 1 && item.boxPrice > 0.0
+                val hasWs = item.wholesalePrice > 0.0 && item.wholesalePrice != item.price
+                if (hasBox || hasWs) priceModalItem = item else vm.addToCart(item, "retail")
+            }
+            if (listView) {
+                LazyColumn(
+                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                    contentPadding = PaddingValues(gridDimens.gridPadding),
+                    verticalArrangement = Arrangement.spacedBy(gridDimens.gridSpacing)
+                ) {
+                    items(filtered, key = { it.id }) { item ->
+                        val inCart = cart.filter { it.itemId == item.id }.sumOf { it.qty }.toInt()
+                        ProductListRow(item, currency, inCart) { onPick(item) }
+                    }
+                }
+            } else {
+                LazyVerticalGrid(
+                    columns = GridCells.Fixed(gridDimens.productColumns),
+                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                    contentPadding = PaddingValues(gridDimens.gridPadding),
+                    horizontalArrangement = Arrangement.spacedBy(gridDimens.gridSpacing),
+                    verticalArrangement = Arrangement.spacedBy(gridDimens.gridSpacing)
+                ) {
+                    items(filtered, key = { it.id }) { item ->
+                        val inCart = cart.filter { it.itemId == item.id }.sumOf { it.qty }.toInt()
+                        ProductCard(item, currency, inCart) { onPick(item) }
                     }
                 }
             }
@@ -2278,6 +2303,131 @@ private fun ProductCard(item: Item, currency: String, inCart: Int, onClick: () -
                     fontFamily = FontFamily.Monospace, maxLines = 1, overflow = TextOverflow.Ellipsis
                 )
             }
+        }
+    }
+}
+
+/**
+ * Grid ⇄ List view switch for the POS product browser. A tight two-icon segmented
+ * pill (brand-filled active segment) matching the PosSegmented look, sized to sit
+ * inline with the search field. Material icons only — no emoji.
+ */
+@Composable
+private fun ViewToggle(listView: Boolean, onToggle: (Boolean) -> Unit) {
+    val t = LocalPosTokens.current
+    Row(
+        Modifier
+            .height(44.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(t.surface2)
+            .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
+            .padding(3.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        @Composable
+        fun seg(active: Boolean, icon: androidx.compose.ui.graphics.vector.ImageVector, desc: String, onClick: () -> Unit) {
+            Box(
+                Modifier
+                    .size(width = 34.dp, height = 38.dp)
+                    .clip(RoundedCornerShape(9.dp))
+                    .background(if (active) t.brand.s600 else Color.Transparent)
+                    .clickable(onClick = onClick),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    icon, contentDescription = desc,
+                    tint = if (active) t.inkOnBrand else t.inkSecondary,
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+        }
+        seg(!listView, Icons.Filled.GridView, "Grid view") { onToggle(false) }
+        seg(listView, Icons.AutoMirrored.Filled.ViewList, "List view") { onToggle(true) }
+    }
+}
+
+/**
+ * Dense single-row product presentation for the POS list view. Same tap behaviour as
+ * [ProductCard] (caller passes the shared add-to-cart handler): retail price prominent,
+ * name, then Box/WS secondary prices inline, plus stock badge and cart-count bubble.
+ * Deliberately short so many products are visible at once on the small handheld.
+ */
+@Composable
+private fun ProductListRow(item: Item, currency: String, inCart: Int, onClick: () -> Unit) {
+    val t = LocalPosTokens.current
+    val d = LocalPosDimens.current
+    val tracked = item.trackStock
+    val isOut = tracked && item.stockQty <= 0.0
+    val hasBox = item.boxSize > 1 && item.boxPrice > 0.0
+    val hasWs = item.wholesalePrice > 0.0
+    val heroImage = item.imageModel?.takeIf { item.showImage }
+
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .heightIn(min = d.listRowMinHeight)
+            .clip(RoundedCornerShape(12.dp))
+            .background(t.surface1)
+            .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
+            .alpha(if (isOut) 0.45f else 1f)
+            .clickable(enabled = !isOut, onClick = onClick)
+            .padding(horizontal = d.listRowPadding, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        // Optional thumbnail, or a cart-count bubble stand-in on the left edge.
+        if (heroImage != null) {
+            ProductImage(
+                model = heroImage,
+                contentDescription = item.name,
+                modifier = Modifier.size(d.listThumb),
+                shape = RoundedCornerShape(9.dp),
+            )
+            Spacer(Modifier.width(10.dp))
+        }
+        Column(Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (inCart > 0) {
+                    Box(
+                        Modifier.size(18.dp).clip(CircleShape).background(t.brand.s600),
+                        contentAlignment = Alignment.Center
+                    ) { BadgeNumber(inCart.toString(), color = t.inkOnBrand, fontSize = 9.sp) }
+                    Spacer(Modifier.width(6.dp))
+                }
+                Text(
+                    item.name,
+                    color = t.inkPrimary, fontWeight = FontWeight.SemiBold,
+                    fontSize = d.cardNameSize, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false)
+                )
+                if (item.productType == "set" || item.productType == "piece") {
+                    Spacer(Modifier.width(6.dp))
+                    TypeBadge(item)
+                }
+            }
+            if (hasBox || hasWs) {
+                Spacer(Modifier.height(2.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (hasBox) {
+                        Text("Box ", color = t.inkTertiary, fontSize = d.cardMetaSize)
+                        Text(money(item.boxPrice, currency), color = t.inkSecondary, fontSize = d.cardMetaSize, fontWeight = FontWeight.SemiBold)
+                    }
+                    if (hasBox && hasWs) Spacer(Modifier.width(10.dp))
+                    if (hasWs) {
+                        Text("WS ", color = t.accentBlue, fontSize = d.cardMetaSize)
+                        Text(money(item.wholesalePrice, currency), color = t.accentBlue, fontSize = d.cardMetaSize, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            }
+        }
+        Spacer(Modifier.width(10.dp))
+        Column(horizontalAlignment = Alignment.End) {
+            Text(
+                money(item.price, currency),
+                color = t.brand.s600, fontWeight = FontWeight.Black, fontSize = d.cardPriceSize, maxLines = 1
+            )
+            Spacer(Modifier.height(2.dp))
+            StockBadge(item)
         }
     }
 }
@@ -5051,17 +5201,26 @@ private fun CustomerDetailDialog(
     // Money the SHOP owes THIS customer — change booked to their account + unpaid refunds.
     val changeOwed by vm.changeBalanceFlow(customer.id).collectAsState(initial = 0.0)
     val history by vm.creditHistory(customer.id).collectAsState(initial = emptyList())
+    val sales by vm.salesForCustomer(customer.id).collectAsState(initial = emptyList())
     val bizForPdf by vm.business.collectAsState()
     val pdfCtx = LocalContext.current
     val pdfScope = rememberCoroutineScope()
     var showPay by remember { mutableStateOf(false) }
     var showPayout by remember { mutableStateOf(false) }
     var wholesale by remember { mutableStateOf(customer.wholesale) }
+    // Top-level view switch + the receipt opened by tapping a purchase.
+    var tab by remember { mutableStateOf("purchases") }
+    var receiptFor by remember { mutableStateOf<SaleEntity?>(null) }
+    val printer = rememberPrinterUi { vm.shopPrefs.value }
 
     PosDialog(title = customer.name, onDismiss = onDismiss) {
         val t = LocalPosTokens.current
         val changeTypes = remember { setOf("change_owed", "refund_owed", "change_paid", "refund_paid") }
 
+        Text(
+            if (wholesale) "Wholesale Customer" else "Retail Customer",
+            style = MaterialTheme.typography.bodySmall, color = t.inkSecondary, fontWeight = FontWeight.Medium
+        )
         val contactLines = listOfNotNull(
             customer.phone?.takeIf { it.isNotBlank() },
             customer.email?.takeIf { it.isNotBlank() },
@@ -5073,6 +5232,22 @@ private fun CustomerDetailDialog(
             }
         }
 
+        PosSegmented(
+            options = listOf("purchases" to "Purchases", "credit" to "Credit & Change"),
+            selected = tab,
+        ) { tab = it }
+
+        if (tab == "purchases") {
+            CustomerPurchasesTab(
+                vm = vm,
+                sales = sales,
+                currency = currency,
+                onOpenReceipt = { receiptFor = it }
+            )
+            return@PosDialog
+        }
+
+        // ───── CREDIT & CHANGE tab ─────
         // Balance summary + primary action.
         val balAccent = when {
             balance > 0 -> t.danger
@@ -5222,7 +5397,166 @@ private fun CustomerDetailDialog(
             showPayout = false
         }
     }
+    // Tap a purchase → the same on-screen receipt viewer used after checkout. Lines are
+    // fetched lazily for just the opened sale.
+    receiptFor?.let { sale ->
+        val biz = bizForPdf
+        if (biz != null) {
+            var lines by remember(sale.id) { mutableStateOf<List<SaleLine>?>(null) }
+            LaunchedEffect(sale.id) { lines = vm.loadLines(sale.id) }
+            lines?.let { loaded ->
+                ReceiptDialog(
+                    sale = sale,
+                    lines = loaded,
+                    business = biz,
+                    currency = currency,
+                    onPrint = { printer.printReceipt(biz, sale) { loaded } },
+                    onDismiss = { receiptFor = null }
+                )
+            }
+        }
+    }
 }
+
+/** Start-of-current-month, local, epoch-millis (mirrors PosViewModel.startOfMonth). */
+private fun startOfThisMonth(): Long = Calendar.getInstance().apply {
+    set(Calendar.DAY_OF_MONTH, 1)
+    set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+}.timeInMillis
+
+/** Start-of-current-year, local, epoch-millis. */
+private fun startOfThisYear(): Long = Calendar.getInstance().apply {
+    set(Calendar.DAY_OF_YEAR, 1)
+    set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+}.timeInMillis
+
+private val PURCHASE_DATE_FMT = SimpleDateFormat("dd MMM yyyy, HH:mm", Locale.getDefault())
+private val PURCHASE_DAY_FMT = SimpleDateFormat("dd MMM yyyy", Locale.getDefault())
+
+/**
+ * Purchases tab of the customer detail dialog — web-parity. Two metric cards
+ * (Total Spent / Avg Purchase) over a time-range filter that narrows BOTH the metrics
+ * and the newest-first list of completed sales. Each row shows the receipt no, when +
+ * who rang it up, a short item summary, a payment-method badge, an optional change
+ * badge, and the sale total; tapping opens that sale's on-screen receipt.
+ *
+ * Rendered inside PosDialog's scrolling Column, so the list is a plain forEach (no
+ * nested LazyColumn). Item summaries are fetched lazily for the filtered set.
+ */
+@Composable
+private fun CustomerPurchasesTab(
+    vm: PosViewModel,
+    sales: List<SaleEntity>,
+    currency: String,
+    onOpenReceipt: (SaleEntity) -> Unit,
+) {
+    val t = LocalPosTokens.current
+    var range by remember { mutableStateOf("all") }
+    val from = remember(range) {
+        when (range) {
+            "month" -> startOfThisMonth()
+            "year" -> startOfThisYear()
+            else -> 0L
+        }
+    }
+    val shown = remember(sales, from) { sales.filter { it.soldAt >= from } }
+
+    // Metrics over the filtered window.
+    val total = shown.sumOf { it.total }
+    val count = shown.size
+    val avg = if (count > 0) total / count else 0.0
+    val lastDate = shown.maxByOrNull { it.soldAt }?.soldAt
+    val lastLabel = lastDate?.let { PURCHASE_DAY_FMT.format(Date(it)) } ?: "—"
+
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        PosMetricCard(
+            "Total Spent", money(total, currency), Modifier.weight(1f),
+            sub = "$count purchase${if (count == 1) "" else "s"}"
+        )
+        PosMetricCard(
+            "Avg Purchase", money(avg, currency), Modifier.weight(1f),
+            sub = "Last: $lastLabel"
+        )
+    }
+
+    PosSegmented(
+        options = listOf("all" to "All Time", "month" to "This Month", "year" to "This Year"),
+        selected = range,
+    ) { range = it }
+
+    // Lazily resolve a short item summary per shown sale (loads only what's on screen).
+    val summaries = remember { mutableStateMapOf<String, String>() }
+    LaunchedEffect(shown) {
+        shown.forEach { sale ->
+            if (!summaries.containsKey(sale.id)) {
+                val lines = vm.loadLines(sale.id)
+                summaries[sale.id] = purchaseSummary(lines)
+            }
+        }
+    }
+
+    if (shown.isEmpty()) {
+        Text("No purchases in this period.", color = t.inkTertiary)
+        return
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        shown.forEach { sale ->
+            val payLabel = PaymentMethod.fromCode(sale.paymentMethod)?.label ?: sale.paymentMethod
+            val change = sale.changeDue ?: 0.0
+            Row(
+                Modifier.fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(t.surface1)
+                    .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
+                    .clickable { onOpenReceipt(sale) }
+                    .padding(12.dp),
+                verticalAlignment = Alignment.Top
+            ) {
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Text(
+                        "#${sale.receiptNo ?: sale.id.takeLast(6).uppercase()}",
+                        fontWeight = FontWeight.Bold, color = t.inkPrimary
+                    )
+                    Text(
+                        "${PURCHASE_DATE_FMT.format(Date(sale.soldAt))} · ${sale.createdByName ?: "Admin"}",
+                        style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
+                    )
+                    summaries[sale.id]?.takeIf { it.isNotBlank() }?.let {
+                        Text(it, style = MaterialTheme.typography.bodySmall, color = t.inkSecondary)
+                    }
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        PurchaseBadge(payLabel, t.accentBlue)
+                        if (change > 0) PurchaseBadge("Change: ${money(change, currency)}", t.brand.s600)
+                    }
+                }
+                Text(
+                    money(sale.total, currency),
+                    fontWeight = FontWeight.Bold, color = t.inkPrimary,
+                    modifier = Modifier.padding(start = 8.dp)
+                )
+            }
+        }
+    }
+}
+
+/** Small tinted pill used on purchase rows (payment method, change). */
+@Composable
+private fun PurchaseBadge(text: String, color: Color) {
+    Box(
+        Modifier.clip(RoundedCornerShape(6.dp)).background(color.copy(alpha = 0.12f))
+            .padding(horizontal = 6.dp, vertical = 2.dp)
+    ) {
+        Text(text, color = color, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+/** Compact web-style summary of a sale's lines, e.g. "2× Delo Oil 5L · 1× Filter". */
+private fun purchaseSummary(lines: List<SaleLine>): String =
+    lines.joinToString("  ·  ") { "${trimQty(it.qty)}× ${it.name}" }
 
 /** Display metadata for a credit-ledger row: label, whether it ADDS to its balance
  *  (shows "+"), and whether it belongs to the shop-owes-customer ledger (vs debt). */
@@ -6237,8 +6571,18 @@ private fun ChangeCreditScreen(vm: PosViewModel, currency: String) {
         }
 
         if (rows.isEmpty()) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            // weight(1f) (not fillMaxSize) so the empty state only claims the space LEFT
+            // under the header — on the short Sunmi screen fillMaxSize pushed the centred
+            // text down past the bottom nav, clipping "No one owes you right now."
+            // verticalScroll guarantees it stays reachable even if the header is tall.
+            Box(
+                Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(
+                    Modifier.padding(vertical = 32.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
                     Icon(Icons.Filled.Payments, contentDescription = null, tint = t.inkTertiary, modifier = Modifier.size(36.dp))
                     Spacer(Modifier.height(8.dp))
                     Text(
@@ -6248,14 +6592,15 @@ private fun ChangeCreditScreen(vm: PosViewModel, currency: String) {
                             isCredit -> "No one owes you right now."
                             else -> "You don't owe any change."
                         },
-                        color = t.inkTertiary
+                        color = t.inkTertiary, textAlign = TextAlign.Center
                     )
                 }
             }
         } else {
             LazyColumn(
-                Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                Modifier.weight(1f).fillMaxWidth(),
+                // Bottom room clears the floating cart FAB on this non-Sell screen.
+                contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 88.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 items(rows, key = { it.customer.id }) { a ->
@@ -6787,7 +7132,9 @@ private fun ReceiptsScreen(vm: PosViewModel, business: Business, printer: Printe
         } else {
             LazyColumn(
                 Modifier.weight(1f).fillMaxWidth(),
-                contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 12.dp),
+                // Extra bottom room so the floating cart FAB (shown on non-Sell screens
+                // when a sale is in progress) never covers the last receipt's actions.
+                contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 88.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 items(sales, key = { it.id }) { sale ->

@@ -891,6 +891,11 @@ class PosViewModel(
     fun creditHistory(customerId: String): Flow<List<CreditTxn>> =
         repo.creditHistoryFlow(customerId)
 
+    /** Completed sales for one customer, newest first — Purchases tab of the
+     *  customer detail dialog. */
+    fun salesForCustomer(customerId: String): Flow<List<SaleEntity>> =
+        repo.salesForCustomerFlow(customerId)
+
     // ---- Refunds & returns (prompt §11) ----------------------------------
 
     /** Whole-shop refund history (newest first), each with its returned lines. */

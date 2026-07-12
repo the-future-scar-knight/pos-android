@@ -264,6 +264,11 @@ data class PosDimens(
     val cardPriceSize: TextUnit,
     val cardNameSize: TextUnit,
     val cardMetaSize: TextUnit,
+    // Dense single-row (LIST) presentation of the same product — a compact
+    // alternative to the grid card, used by the POS list-view toggle.
+    val listRowMinHeight: Dp,
+    val listRowPadding: Dp,
+    val listThumb: Dp,
 )
 
 fun posDimensFor(widthDp: Int): PosDimens {
@@ -274,29 +279,38 @@ fun posDimensFor(widthDp: Int): PosDimens {
         else -> PosWidthClass.Large
     }
     return when (cls) {
+        // Compact = the Sunmi handheld: a low-DPI, physically SHORT screen. The old
+        // 140dp card meant that with the soft keyboard open you could barely see a
+        // full row of two. Tightened here (shorter card, smaller hero band, trimmed
+        // padding/type) so at least a full row of 2 stays comfortably visible while
+        // typing a search. Medium+ are left roomy for real phones/tablets.
         PosWidthClass.Compact -> PosDimens(
             widthClass = cls, productColumns = 2,
-            gridPadding = 10.dp, gridSpacing = 8.dp,
-            cardHeight = 140.dp, cardPadding = 10.dp, cardCorner = 14.dp, cardImageHeight = 50.dp,
-            cardPriceSize = 15.sp, cardNameSize = 11.sp, cardMetaSize = 9.sp,
+            gridPadding = 8.dp, gridSpacing = 8.dp,
+            cardHeight = 116.dp, cardPadding = 8.dp, cardCorner = 12.dp, cardImageHeight = 42.dp,
+            cardPriceSize = 14.sp, cardNameSize = 11.sp, cardMetaSize = 9.sp,
+            listRowMinHeight = 52.dp, listRowPadding = 10.dp, listThumb = 38.dp,
         )
         PosWidthClass.Medium -> PosDimens(
             widthClass = cls, productColumns = 2,
             gridPadding = 12.dp, gridSpacing = 10.dp,
             cardHeight = 152.dp, cardPadding = 12.dp, cardCorner = 16.dp, cardImageHeight = 56.dp,
             cardPriceSize = 16.sp, cardNameSize = 12.sp, cardMetaSize = 10.sp,
+            listRowMinHeight = 58.dp, listRowPadding = 12.dp, listThumb = 42.dp,
         )
         PosWidthClass.Expanded -> PosDimens(
             widthClass = cls, productColumns = 3,
             gridPadding = 16.dp, gridSpacing = 12.dp,
             cardHeight = 168.dp, cardPadding = 14.dp, cardCorner = 18.dp, cardImageHeight = 66.dp,
             cardPriceSize = 18.sp, cardNameSize = 13.sp, cardMetaSize = 11.sp,
+            listRowMinHeight = 62.dp, listRowPadding = 14.dp, listThumb = 46.dp,
         )
         PosWidthClass.Large -> PosDimens(
             widthClass = cls, productColumns = 4,
             gridPadding = 20.dp, gridSpacing = 14.dp,
             cardHeight = 184.dp, cardPadding = 16.dp, cardCorner = 20.dp, cardImageHeight = 78.dp,
             cardPriceSize = 20.sp, cardNameSize = 14.sp, cardMetaSize = 11.sp,
+            listRowMinHeight = 66.dp, listRowPadding = 16.dp, listThumb = 50.dp,
         )
     }
 }

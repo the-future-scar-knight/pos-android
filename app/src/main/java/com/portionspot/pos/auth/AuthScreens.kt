@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -124,40 +125,50 @@ internal fun AuthScaffold(
                     }
                 }
             }
+            // Scroll container fills the space; the inner column wraps its own
+            // height and is centered via Arrangement.Center. On a tall screen this
+            // centers without a giant white band, and when the keyboard is up the
+            // symmetric vertical padding keeps content off the keyboard edge while
+            // the content overflows into a graceful scroll instead of an empty void.
             Column(
                 Modifier
                     .fillMaxSize()
                     .then(if (onBack == null) Modifier.safeDrawingPadding() else Modifier)
                     .imePadding()
                     .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 24.dp),
+                    .padding(horizontal = 24.dp, vertical = 24.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center,
             ) {
-                Box(
-                    Modifier
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(t.brand.s50)
-                        .padding(14.dp),
+                Column(
+                    Modifier.wrapContentHeight(),
+                    horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
-                    Icon(
-                        Icons.Rounded.Storefront,
-                        contentDescription = null,
-                        tint = t.brand.s600,
-                        modifier = Modifier.width(36.dp).height(36.dp),
+                    Box(
+                        Modifier
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(t.brand.s50)
+                            .padding(14.dp),
+                    ) {
+                        Icon(
+                            Icons.Rounded.Storefront,
+                            contentDescription = null,
+                            tint = t.brand.s600,
+                            modifier = Modifier.width(36.dp).height(36.dp),
+                        )
+                    }
+                    Spacer(Modifier.height(14.dp))
+                    Text(
+                        title,
+                        fontSize = 22.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = t.inkPrimary,
                     )
+                    Spacer(Modifier.height(4.dp))
+                    Text(subtitle, fontSize = 14.sp, color = t.inkSecondary)
+                    Spacer(Modifier.height(24.dp))
+                    content()
                 }
-                Spacer(Modifier.height(14.dp))
-                Text(
-                    title,
-                    fontSize = 22.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = t.inkPrimary,
-                )
-                Spacer(Modifier.height(4.dp))
-                Text(subtitle, fontSize = 14.sp, color = t.inkSecondary)
-                Spacer(Modifier.height(24.dp))
-                content()
             }
         }
     }

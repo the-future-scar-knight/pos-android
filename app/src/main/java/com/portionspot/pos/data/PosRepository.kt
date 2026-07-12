@@ -48,6 +48,9 @@ class PosRepository(private val db: PosDatabase) {
     fun recentSalesFlow(businessId: String): Flow<List<SaleEntity>> =
         saleDao.observeRecent(businessId)
 
+    fun salesForCustomerFlow(customerId: String): Flow<List<SaleEntity>> =
+        saleDao.observeSalesForCustomer(customerId)
+
     fun takingsSinceFlow(businessId: String, since: Long): Flow<Double> =
         saleDao.observeTakingsSince(businessId, since)
 

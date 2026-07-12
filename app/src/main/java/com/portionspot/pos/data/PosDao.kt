@@ -113,6 +113,14 @@ interface SaleDao {
     )
     fun observeRecent(businessId: String, limit: Int = 100): Flow<List<SaleEntity>>
 
+    /** Completed sales for one customer, newest first — powers the Purchases tab of
+     *  the customer detail dialog. */
+    @Query(
+        "SELECT * FROM sales WHERE customerId = :customerId AND deleted = 0 " +
+            "AND status = 'completed' ORDER BY soldAt DESC"
+    )
+    fun observeSalesForCustomer(customerId: String): Flow<List<SaleEntity>>
+
     /** (id, receiptNo) for every live sale — cheap lookup to label ledger rows with the
      *  originating transaction's reference. */
     @Query("SELECT id, receiptNo FROM sales WHERE businessId = :businessId AND deleted = 0")
