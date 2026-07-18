@@ -140,44 +140,52 @@ internal fun AuthScaffold(
                     .then(if (onBack == null) Modifier.safeDrawingPadding() else Modifier)
                     .imePadding()
             ) {
+                // Center the form when it fits. When the keyboard shrinks the viewport
+                // and the form is taller than the remaining space, the inner Box grows
+                // PAST the viewport, so its content anchors at the TOP and the whole thing
+                // scrolls from the top — the title/logo can never be clipped or covered.
                 val viewportHeight = maxHeight
-                Column(
+                Box(
                     Modifier
-                        .fillMaxWidth()
+                        .fillMaxSize()
                         .verticalScroll(rememberScrollState())
-                        .heightIn(min = viewportHeight)
-                        .padding(horizontal = 24.dp, vertical = 24.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center,
                 ) {
-                    Column(
-                        Modifier.wrapContentHeight(),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                    ) {
                     Box(
                         Modifier
-                            .clip(RoundedCornerShape(16.dp))
-                            .background(t.brand.s50)
-                            .padding(14.dp),
+                            .fillMaxWidth()
+                            .heightIn(min = viewportHeight)
+                            .padding(horizontal = 24.dp, vertical = 24.dp),
+                        contentAlignment = Alignment.Center,
                     ) {
-                        Icon(
-                            Icons.Rounded.Storefront,
-                            contentDescription = null,
-                            tint = t.brand.s600,
-                            modifier = Modifier.width(36.dp).height(36.dp),
-                        )
-                    }
-                    Spacer(Modifier.height(14.dp))
-                    Text(
-                        title,
-                        fontSize = 22.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = t.inkPrimary,
-                    )
-                    Spacer(Modifier.height(4.dp))
-                    Text(subtitle, fontSize = 14.sp, color = t.inkSecondary)
-                    Spacer(Modifier.height(24.dp))
-                    content()
+                        Column(
+                            Modifier.wrapContentHeight(),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                        ) {
+                            Box(
+                                Modifier
+                                    .clip(RoundedCornerShape(16.dp))
+                                    .background(t.brand.s50)
+                                    .padding(14.dp),
+                            ) {
+                                Icon(
+                                    Icons.Rounded.Storefront,
+                                    contentDescription = null,
+                                    tint = t.brand.s600,
+                                    modifier = Modifier.width(36.dp).height(36.dp),
+                                )
+                            }
+                            Spacer(Modifier.height(14.dp))
+                            Text(
+                                title,
+                                fontSize = 22.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = t.inkPrimary,
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            Text(subtitle, fontSize = 14.sp, color = t.inkSecondary)
+                            Spacer(Modifier.height(24.dp))
+                            content()
+                        }
                     }
                 }
             }
