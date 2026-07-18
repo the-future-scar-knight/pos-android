@@ -5,12 +5,14 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
@@ -125,25 +127,33 @@ internal fun AuthScaffold(
                     }
                 }
             }
-            // Scroll container fills the space; the inner column wraps its own
-            // height and is centered via Arrangement.Center. On a tall screen this
-            // centers without a giant white band, and when the keyboard is up the
-            // symmetric vertical padding keeps content off the keyboard edge while
-            // the content overflows into a graceful scroll instead of an empty void.
-            Column(
+            // Scroll container fills the space. The scrolling column is forced to be at
+            // LEAST the viewport tall (heightIn min = maxHeight) and centers its content:
+            // when the form is short it sits centered (the original look); when the
+            // keyboard is up and the content is taller than the shrunken viewport, the
+            // column grows past the viewport so Center becomes a top-anchored layout and
+            // the whole thing scrolls FROM THE TOP — the title/logo stay reachable instead
+            // of being pushed off-screen.
+            BoxWithConstraints(
                 Modifier
                     .fillMaxSize()
                     .then(if (onBack == null) Modifier.safeDrawingPadding() else Modifier)
                     .imePadding()
-                    .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 24.dp, vertical = 24.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.Center,
             ) {
+                val viewportHeight = maxHeight
                 Column(
-                    Modifier.wrapContentHeight(),
+                    Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState())
+                        .heightIn(min = viewportHeight)
+                        .padding(horizontal = 24.dp, vertical = 24.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center,
                 ) {
+                    Column(
+                        Modifier.wrapContentHeight(),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
                     Box(
                         Modifier
                             .clip(RoundedCornerShape(16.dp))
@@ -168,6 +178,7 @@ internal fun AuthScaffold(
                     Text(subtitle, fontSize = 14.sp, color = t.inkSecondary)
                     Spacer(Modifier.height(24.dp))
                     content()
+                    }
                 }
             }
         }

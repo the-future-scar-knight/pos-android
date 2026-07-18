@@ -629,6 +629,15 @@ class PosViewModel(
      * VAT is read from the active business so the cashier never has to think
      * about it — it is applied automatically when the business has it enabled.
      */
+    /**
+     * Re-entrancy guard for [checkout]. A double-tap on the pay-confirm button can fire
+     * checkout() twice before the dialog recomposes away — each pass would mint a fresh
+     * saleId + receiptNo and record a DUPLICATE completed sale. The flag is checked and
+     * set synchronously (both Compose callbacks and viewModelScope.launch run on the main
+     * thread) so the second call returns before it can start, and is cleared in a finally.
+     */
+    private var checkoutInFlight = false
+
     fun checkout(
         payments: List<Tender>,
         discount: Double = 0.0,
@@ -639,24 +648,30 @@ class PosViewModel(
         val bid = businessId.value ?: return
         val lines = _cart.value
         if (lines.isEmpty()) return
+        if (checkoutInFlight) return
+        checkoutInFlight = true
         val biz = business.value
         viewModelScope.launch {
-            val saved = repo.checkout(
-                bid, lines, payments, discount,
-                customer = customer,
-                onCredit = onCredit,
-                changeGiven = changeGiven,
-                vatEnabled = biz?.vatEnabled ?: false,
-                vatPercent = biz?.vatPercent ?: 0.0,
-                totalRounding = _shopPrefs.value.checkoutRounding,
-                cashierId = currentCashierId,
-                cashierName = currentCashierName
-            )
-            _lastReceipt.value = LastReceipt(saved.sale, saved.lines)
-            _cart.value = emptyList()
-            // A credit sale can push a customer over their limit — reconcile the admin
-            // feed now so the over-limit alert appears without waiting for the worker.
-            if (onCredit && customer != null) sweepNotifications()
+            try {
+                val saved = repo.checkout(
+                    bid, lines, payments, discount,
+                    customer = customer,
+                    onCredit = onCredit,
+                    changeGiven = changeGiven,
+                    vatEnabled = biz?.vatEnabled ?: false,
+                    vatPercent = biz?.vatPercent ?: 0.0,
+                    totalRounding = _shopPrefs.value.checkoutRounding,
+                    cashierId = currentCashierId,
+                    cashierName = currentCashierName
+                )
+                _lastReceipt.value = LastReceipt(saved.sale, saved.lines)
+                _cart.value = emptyList()
+                // A credit sale can push a customer over their limit — reconcile the admin
+                // feed now so the over-limit alert appears without waiting for the worker.
+                if (onCredit && customer != null) sweepNotifications()
+            } finally {
+                checkoutInFlight = false
+            }
         }
     }
 

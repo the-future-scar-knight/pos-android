@@ -11,7 +11,13 @@ import kotlinx.coroutines.withContext
 sealed class SyncStatus {
     object Idle : SyncStatus()
     object Syncing : SyncStatus()
-    data class Done(val pushed: Int, val pulled: Int, val at: Long) : SyncStatus()
+    /** [warnings] carries per-table push failures from a partial pass (empty = clean). */
+    data class Done(
+        val pushed: Int,
+        val pulled: Int,
+        val at: Long,
+        val warnings: List<String> = emptyList()
+    ) : SyncStatus()
     data class Error(val message: String) : SyncStatus()
 }
 
@@ -35,9 +41,13 @@ class SyncManager(
         SupabaseRest(url.trim().trimEnd('/'), key.trim()).test()
     }
 
-    /** Save the connection, arm periodic background sync, and sync once right now. */
+    /** Save the connection, arm periodic background sync, and sync once right now.
+     *  Connecting a cloud DB enables PUSH by default so locally-created rows actually
+     *  upload — pull-only was leaving customers/sales stuck at pendingSync=1 forever.
+     *  The user-facing toggle can still turn it back off. */
     suspend fun connect(url: String, key: String): SyncOutcome {
         config.saveConnection(url, key)
+        config.setPushEnabled(true)
         SyncWorker.schedulePeriodic(appContext)
         return runNow()
     }
@@ -54,7 +64,7 @@ class SyncManager(
         val outcome = engine.sync()
         _status.value = when (outcome) {
             is SyncOutcome.Success ->
-                SyncStatus.Done(outcome.pushed, outcome.pulled, System.currentTimeMillis())
+                SyncStatus.Done(outcome.pushed, outcome.pulled, System.currentTimeMillis(), outcome.pushErrors)
             is SyncOutcome.Failed -> SyncStatus.Error(outcome.message)
             SyncOutcome.NotConfigured -> SyncStatus.Idle
         }

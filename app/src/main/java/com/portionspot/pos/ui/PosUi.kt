@@ -182,6 +182,7 @@ import com.portionspot.pos.data.Customer
 import com.portionspot.pos.data.CustomerWithBalance
 import com.portionspot.pos.data.DebtAgingRow
 import com.portionspot.pos.device.CallLogAccess
+import com.portionspot.pos.device.ConnectivityObserver
 import com.portionspot.pos.media.ProductImages
 import com.portionspot.pos.device.PickedContact
 import com.portionspot.pos.device.RecentCall
@@ -664,7 +665,12 @@ private fun MobileMoneyScreen(vm: PosViewModel, currency: String) {
                 }
             }
         } else {
-            LazyColumn(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            LazyColumn(
+                Modifier.fillMaxSize(),
+                // Clear the floating cart (bottom-anchored pill) so it can't sit over the last row.
+                contentPadding = PaddingValues(bottom = 96.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
                 items(list, key = { it.id }) { r ->
                     MmReceiptCard(
                         r = r,
@@ -1684,7 +1690,15 @@ private fun MobileTopBar(
                     )
                 }
             }
-            Icon(Icons.Filled.Wifi, contentDescription = "Online", tint = t.onlinePill, modifier = Modifier.size(16.dp))
+            // Real connectivity, not a hardcoded green Wi-Fi: online => Wi-Fi in the
+            // online tint, offline => WifiOff muted. Driven by the system ConnectivityManager.
+            val online by ConnectivityObserver.rememberOnlineState()
+            Icon(
+                imageVector = if (online) Icons.Filled.Wifi else Icons.Filled.WifiOff,
+                contentDescription = if (online) "Online" else "Offline",
+                tint = if (online) t.onlinePill else t.inkTertiary,
+                modifier = Modifier.size(16.dp)
+            )
         }
         HorizontalDivider(color = t.surfaceBorder)
     }
@@ -3247,6 +3261,10 @@ private fun PaymentDialog(
     // When there's overpayment change, completing opens a prompt to capture how much
     // change was actually handed over now (the rest is recorded as change owed).
     var showChangePrompt by remember { mutableStateOf(false) }
+    // Double-tap guard: the instant we hand a sale off to be completed we disable the
+    // confirm control so a second tap (before the dialog recomposes away) can't fire a
+    // duplicate checkout. Belt-and-suspenders alongside the ViewModel in-flight guard.
+    var submitting by remember { mutableStateOf(false) }
 
     // Dual-currency: the shop keeps its books in [currency] but may also take tender
     // in a SECOND currency (e.g. ZiG). entryCur2 = the cashier is typing the amount in
@@ -3311,13 +3329,16 @@ private fun PaymentDialog(
         title = "Take payment",
         onDismiss = onDismiss,
         confirmLabel = if (!fullyPaid && creditValid) "Charge to credit" else "Complete sale",
-        confirmEnabled = valid,
+        confirmEnabled = valid && !submitting,
         onConfirm = {
             // Overpayment => prompt for the change actually given before completing;
-            // otherwise complete straight away with no change to reconcile.
+            // otherwise complete straight away with no change to reconcile. Mark
+            // submitting on the direct path so the button can't be tapped twice; the
+            // change-prompt path defers completion to that dialog's own confirm.
             if (overpay > 0.0) {
                 showChangePrompt = true
             } else {
+                submitting = true
                 onConfirm(tenders.toList(), discount, selected, onCredit && remaining > 0.0, 0.0)
             }
         }
@@ -3542,6 +3563,7 @@ private fun PaymentDialog(
             onDismiss = { showChangePrompt = false },
             onConfirm = { given ->
                 showChangePrompt = false
+                submitting = true
                 onConfirm(
                     tenders.toList(),
                     discount,
@@ -3567,6 +3589,7 @@ private fun ChangePromptDialog(
     onConfirm: (changeGiven: Double) -> Unit
 ) {
     var givenText by remember { mutableStateOf("") }
+    var submitting by remember { mutableStateOf(false) }
     val entered = givenText.toDoubleOrNull()
     // Blank is valid (=> 0 given, full change owed); a typed value must be within range.
     val valid = givenText.isBlank() || (entered != null && entered >= 0.0 && entered <= changeDue + 0.0001)
@@ -3577,8 +3600,8 @@ private fun ChangePromptDialog(
         title = "Change to give",
         onDismiss = onDismiss,
         confirmLabel = "Complete sale",
-        confirmEnabled = valid,
-        onConfirm = { onConfirm(given) }
+        confirmEnabled = valid && !submitting,
+        onConfirm = { submitting = true; onConfirm(given) }
     ) {
         val t = LocalPosTokens.current
         TotalRow("Change due", money(changeDue, currency))
@@ -7687,7 +7710,8 @@ private fun RefundsScreen(vm: PosViewModel, business: Business, printer: Printer
         } else {
             LazyColumn(
                 Modifier.weight(1f).fillMaxWidth(),
-                contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 12.dp),
+                // bottom clears the floating cart pill so it never covers the last refund.
+                contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 96.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 items(refunds, key = { it.refund.id }) { rw ->
@@ -7947,7 +7971,11 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
         }
     }
 
-    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp)) {
+    LazyColumn(
+        Modifier.fillMaxSize(),
+        // bottom clears the floating cart pill so it never covers the last setting.
+        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 96.dp)
+    ) {
         item {
             SettingsCategoryBar(selected = settingsCat, onSelect = { settingsCat = it })
             Spacer(Modifier.height(16.dp))
@@ -8599,13 +8627,16 @@ private fun CloudSyncSection(vm: PosViewModel) {
             SyncStatus.Idle ->
                 lastSyncAt?.let { "Last synced ${syncTimeLabel(it)}" } ?: "Connected — not synced yet"
             SyncStatus.Syncing -> "Syncing…"
-            is SyncStatus.Done -> "Synced ${s.pushed} up · ${s.pulled} down · ${syncTimeLabel(s.at)}"
+            is SyncStatus.Done ->
+                "Synced ${s.pushed} up · ${s.pulled} down · ${syncTimeLabel(s.at)}" +
+                    if (s.warnings.isEmpty()) "" else "\nUpload issues — ${s.warnings.joinToString("; ")}"
             is SyncStatus.Error -> "Sync error: ${s.message}"
         }
+        val hasWarnings = (status as? SyncStatus.Done)?.warnings?.isNotEmpty() == true
         Text(
             statusText,
             fontSize = 12.sp,
-            color = if (status is SyncStatus.Error) t.danger else t.inkTertiary
+            color = if (status is SyncStatus.Error || hasWarnings) t.danger else t.inkTertiary
         )
         Spacer(Modifier.height(12.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -8771,7 +8802,9 @@ private fun ConnectionTest.label(): String = when (this) {
 }
 
 private fun SyncOutcome.label(): String = when (this) {
-    is SyncOutcome.Success -> "Connected. Synced $pushed up · $pulled down."
+    is SyncOutcome.Success ->
+        "Connected. Synced $pushed up · $pulled down." +
+            if (pushErrors.isEmpty()) "" else " Upload issues — ${pushErrors.joinToString("; ")}"
     SyncOutcome.NotConfigured -> "Enter your URL and key first."
     is SyncOutcome.Failed -> "Connected, but first sync failed: $message"
 }

@@ -17,10 +17,22 @@ import kotlinx.serialization.encodeToString
 
 /** Outcome of one sync pass, surfaced to the UI. */
 sealed class SyncOutcome {
-    data class Success(val pushed: Int, val pulled: Int) : SyncOutcome()
+    /**
+     * The pass completed. [pushErrors] holds a per-table message for any table whose
+     * push failed while others still went up (e.g. "customers: column local_id missing").
+     * Empty = a clean pass; non-empty = partial success the UI should surface.
+     */
+    data class Success(
+        val pushed: Int,
+        val pulled: Int,
+        val pushErrors: List<String> = emptyList()
+    ) : SyncOutcome()
     object NotConfigured : SyncOutcome()
     data class Failed(val message: String) : SyncOutcome()
 }
+
+/** Internal result of the push half: how many rows went up, and per-table failures. */
+private data class PushResult(val pushed: Int, val errors: List<String>)
 
 /**
  * Two-way sync against the user's own Supabase. Local Room is always the
@@ -53,12 +65,13 @@ class PosSyncEngine(
         ensureFreshToken()
         val api = SupabaseRest(conn.url, conn.anonKey, accessToken)
         try {
-            // STAGE 1: PULL-ONLY. Push is intentionally disabled until the repoint is
-            // proven on-device, so local test data can never reach the shared prod DB.
-            val pushed = push(api)
+            // Push each table independently (one table failing no longer aborts the
+            // whole pass), then pull. Per-table push failures ride back on Success so
+            // the UI can name the table and error instead of a blanket "Sync failed".
+            val pushResult = push(api)
             val pulled = pull(api)
             config.setLastSyncAt(System.currentTimeMillis())
-            SyncOutcome.Success(pushed, pulled)
+            SyncOutcome.Success(pushResult.pushed, pulled, pushResult.errors)
         } catch (e: Exception) {
             SyncOutcome.Failed(e.message ?: "Sync failed")
         }
@@ -73,103 +86,121 @@ class PosSyncEngine(
      * re-push never rewrites an existing shared row. Products and customers/credit push
      * (overwrite / derived-balance risk) are separate later sub-stages.
      */
-    private suspend fun push(api: SupabaseRest): Int {
-        if (!config.pushEnabled()) return 0
-        val bid = businessDao.getOnce()?.id ?: return 0
+    private suspend fun push(api: SupabaseRest): PushResult {
+        if (!config.pushEnabled()) return PushResult(0, emptyList())
+        val bid = businessDao.getOnce()?.id ?: return PushResult(0, emptyList())
         // local itemId → sku, so pushed line items carry the cloud product reference.
         val skuById = itemDao.allForBusinessOnce(bid)
             .filter { !it.sku.isNullOrBlank() }
             .associate { it.id to it.sku!! }
         val skuOf: (String?) -> String? = { itemId -> itemId?.let { skuById[it] } }
         var n = 0
+        val errors = mutableListOf<String>()
+
+        // Run one table's push in isolation: a thrown failure is recorded against the
+        // table name and swallowed so the remaining tables still get their turn. Only
+        // the block that reaches its own markSynced marks its rows clean, so a failed
+        // table's rows stay pending and retry next pass.
+        suspend fun pushTable(table: String, block: suspend () -> Int) {
+            try {
+                n += block()
+            } catch (e: Exception) {
+                errors.add("$table: ${e.message ?: e.javaClass.simpleName}")
+            }
+        }
 
         // products — only locally-edited items that carry a sku (the cloud conflict key).
         // First resolve any pending product image: upload the local copy to Storage and
         // swap in the resulting public URL. An item whose upload fails is dropped from
         // THIS push (its row stays pending) so it retries next pass instead of shipping
         // a device-local path as image_url.
-        val pendingProducts = itemDao.pending().filter { !it.sku.isNullOrBlank() && !it.deleted }
-        val products = pendingProducts.mapNotNull { item ->
-            if (!item.imagePending) return@mapNotNull item
-            val bytes = ProductImages.readBytes(item.imageLocalPath)
-            if (bytes == null) {
-                // Removed image, or the local file vanished: clear the flag and push the
-                // (possibly null) image_url as-is so the cleared state reaches the cloud.
-                val cleared = item.copy(imagePending = false)
-                itemDao.upsert(cleared)
-                cleared
-            } else {
-                try {
-                    val path = ProductImages.objectPath(bid, item.id)
-                    api.uploadObject("product-images", path, bytes, ProductImages.CONTENT_TYPE)
-                    val uploaded = item.copy(
-                        imageUrl = api.publicUrl("product-images", path),
-                        imagePending = false,
-                    )
-                    itemDao.upsert(uploaded)
-                    uploaded
-                } catch (_: Exception) {
-                    null   // leave pending; skip this cycle and retry on the next sync
+        pushTable("products") {
+            val pendingProducts = itemDao.pending().filter { !it.sku.isNullOrBlank() && !it.deleted }
+            val products = pendingProducts.mapNotNull { item ->
+                if (!item.imagePending) return@mapNotNull item
+                val bytes = ProductImages.readBytes(item.imageLocalPath)
+                if (bytes == null) {
+                    // Removed image, or the local file vanished: clear the flag and push the
+                    // (possibly null) image_url as-is so the cleared state reaches the cloud.
+                    val cleared = item.copy(imagePending = false)
+                    itemDao.upsert(cleared)
+                    cleared
+                } else {
+                    try {
+                        val path = ProductImages.objectPath(bid, item.id)
+                        api.uploadObject("product-images", path, bytes, ProductImages.CONTENT_TYPE)
+                        val uploaded = item.copy(
+                            imageUrl = api.publicUrl("product-images", path),
+                            imagePending = false,
+                        )
+                        itemDao.upsert(uploaded)
+                        uploaded
+                    } catch (_: Exception) {
+                        null   // leave pending; skip this cycle and retry on the next sync
+                    }
                 }
             }
-        }
-        if (products.isNotEmpty()) {
+            if (products.isEmpty()) return@pushTable 0
             api.upsert("products", syncJson.encodeToString(products.map { it.toProductPush() }), "sku")
             itemDao.markSynced(products.map { it.id })
-            n += products.size
+            products.size
         }
 
         // customers (upsert on local_id; balance/credit_limit deliberately not sent).
-        val customers = customerDao.pending()
-        if (customers.isNotEmpty()) {
+        pushTable("customers") {
+            val customers = customerDao.pending()
+            if (customers.isEmpty()) return@pushTable 0
             api.upsert("customers", syncJson.encodeToString(customers.map { it.toCustomerPush() }), "local_id")
             customerDao.markSynced(customers.map { it.id })
-            n += customers.size
+            customers.size
         }
 
         // credit — after customers, so every referenced customer has a cloud bigint id
         // to resolve customer_id to. Unresolved rows are left for a later pass.
-        val credit = creditDao.pending()
-        if (credit.isNotEmpty()) {
+        pushTable("credit_transactions") {
+            val credit = creditDao.pending()
+            if (credit.isEmpty()) return@pushTable 0
             val localToCloud = customerIdMap(api).entries.associate { (cloud, local) -> local to cloud }
             val pushable = credit.mapNotNull { c ->
                 val cloudCid = localToCloud[c.customerId] ?: return@mapNotNull null
                 c to c.toCreditPush(cloudCid, null)
             }
-            if (pushable.isNotEmpty()) {
-                api.upsert("credit_transactions", syncJson.encodeToString(pushable.map { it.second }), "local_id")
-                creditDao.markSynced(pushable.map { it.first.id })
-                n += pushable.size
-            }
+            if (pushable.isEmpty()) return@pushTable 0
+            api.upsert("credit_transactions", syncJson.encodeToString(pushable.map { it.second }), "local_id")
+            creditDao.markSynced(pushable.map { it.first.id })
+            pushable.size
         }
 
         // mobile-money receipts (upsert on txn_code — idempotent).
-        val mm = mobileMoneyDao.pending()
-        if (mm.isNotEmpty()) {
+        pushTable("mobile_money_receipts") {
+            val mm = mobileMoneyDao.pending()
+            if (mm.isEmpty()) return@pushTable 0
             api.upsert("mobile_money_receipts", syncJson.encodeToString(mm.map { it.toPush() }), "txn_code")
             mobileMoneyDao.markSynced(mm.map { it.id })
-            n += mm.size
+            mm.size
         }
 
-        val sales = saleDao.pendingSales().filter { it.status == "completed" }
-        if (sales.isNotEmpty()) {
+        pushTable("sales") {
+            val sales = saleDao.pendingSales().filter { it.status == "completed" }
+            if (sales.isEmpty()) return@pushTable 0
             val dtos = sales.map { s ->
                 buildSalePush(s, saleDao.allLinesForSale(s.id), salePaymentDao.forSale(s.id), skuOf)
             }
             api.upsert("sales", syncJson.encodeToString(dtos), "id", ignoreDuplicates = true)
             sales.forEach { saleDao.markSaleSynced(it.id) }
-            n += sales.size
+            sales.size
         }
 
-        val refunds = refundDao.pending()
-        if (refunds.isNotEmpty()) {
+        pushTable("refunds") {
+            val refunds = refundDao.pending()
+            if (refunds.isEmpty()) return@pushTable 0
             val dtos = refunds.map { r -> buildRefundPush(r, refundDao.linesFor(r.id), skuOf) }
             api.upsert("sales", syncJson.encodeToString(dtos), "id", ignoreDuplicates = true)
             refundDao.markSynced(refunds.map { it.id })
-            n += refunds.size
+            refunds.size
         }
 
-        return n
+        return PushResult(n, errors)
     }
 
     // ── pull ──────────────────────────────────────────────────────────────
