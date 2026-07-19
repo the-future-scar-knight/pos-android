@@ -12,6 +12,10 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
 import java.util.Collections
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
 
 /**
  * Real internet reachability, read from the system [ConnectivityManager] instead of
@@ -33,6 +37,43 @@ object ConnectivityObserver {
         val caps = cm.getNetworkCapabilities(network) ?: return false
         return caps.hasInternet()
     }
+
+    /**
+     * Live online/offline as a plain [Flow] (no Compose), for non-UI collectors like the
+     * sync manager that wants to flush queued writes the moment the device reconnects.
+     * Emits the current state immediately, then on every validated-network change.
+     * Distinct so a flap that nets out to no change doesn't spam collectors.
+     */
+    fun onlineFlow(context: Context): Flow<Boolean> = callbackFlow {
+        val cm = context.applicationContext
+            .getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        val validated = Collections.synchronizedSet(HashSet<Network>())
+        fun emit() { trySend(validated.isNotEmpty()) }
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                if (caps.hasInternet()) validated.add(network) else validated.remove(network)
+                emit()
+            }
+            override fun onLost(network: Network) { validated.remove(network); emit() }
+            override fun onUnavailable() { emit() }
+        }
+        trySend(currentlyOnline(context))
+        var registered = false
+        try {
+            val request = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            cm?.registerNetworkCallback(request, callback)
+            registered = true
+        } catch (_: Exception) {
+            // Some OEM/emulator states throw; the seeded value above still stands.
+        }
+        awaitClose {
+            if (registered) {
+                try { cm?.unregisterNetworkCallback(callback) } catch (_: Exception) {}
+            }
+        }
+    }.distinctUntilChanged()
 
     private fun NetworkCapabilities.hasInternet(): Boolean =
         hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&

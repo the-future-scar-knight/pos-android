@@ -36,6 +36,8 @@ class SyncConfig(private val dao: SettingDao) {
         // Forget where we were so a future reconnect re-pulls from scratch.
         TABLES.forEach { dao.delete(cursorKey(it)) }
         dao.delete(KEY_LAST_SYNC)
+        dao.delete(KEY_LAST_UPLOAD)
+        dao.delete(KEY_LAST_DOWNLOAD)
     }
 
     /**
@@ -60,10 +62,22 @@ class SyncConfig(private val dao: SettingDao) {
 
     suspend fun setLastSyncAt(ts: Long) = dao.put(Setting(KEY_LAST_SYNC, ts.toString()))
 
+    /** When this device last pushed >0 rows UP (distinct from a pull-only pass). */
+    suspend fun lastUploadAt(): Long? = dao.get(KEY_LAST_UPLOAD)?.toLongOrNull()
+
+    suspend fun setLastUploadAt(ts: Long) = dao.put(Setting(KEY_LAST_UPLOAD, ts.toString()))
+
+    /** When this device last pulled >0 rows DOWN. */
+    suspend fun lastDownloadAt(): Long? = dao.get(KEY_LAST_DOWNLOAD)?.toLongOrNull()
+
+    suspend fun setLastDownloadAt(ts: Long) = dao.put(Setting(KEY_LAST_DOWNLOAD, ts.toString()))
+
     companion object {
         const val KEY_URL = "supabase_url"
         const val KEY_KEY = "supabase_key"
         const val KEY_LAST_SYNC = "last_sync_at"
+        const val KEY_LAST_UPLOAD = "last_upload_at"
+        const val KEY_LAST_DOWNLOAD = "last_download_at"
         const val KEY_PUSH = "sync_push_enabled"
 
         /** Cloud tables Android syncs (the shared web-POS schema). */

@@ -70,11 +70,30 @@ class PosSyncEngine(
             // the UI can name the table and error instead of a blanket "Sync failed".
             val pushResult = push(api)
             val pulled = pull(api)
-            config.setLastSyncAt(System.currentTimeMillis())
+            val at = System.currentTimeMillis()
+            config.setLastSyncAt(at)
+            // Split timestamps so the owner can SEE the two directions independently:
+            // only stamp a direction that actually moved rows this pass.
+            if (pushResult.pushed > 0) config.setLastUploadAt(at)
+            if (pulled > 0) config.setLastDownloadAt(at)
             SyncOutcome.Success(pushResult.pushed, pulled, pushResult.errors)
         } catch (e: Exception) {
             SyncOutcome.Failed(e.message ?: "Sync failed")
         }
+    }
+
+    /**
+     * How many local rows are waiting to go UP — the sum of every pushable table's
+     * pending set (products, customers, credit, mobile-money, sales, refunds). Drives
+     * the "N to upload" badge in the UI so the owner can SEE work is queued. Read-only.
+     */
+    suspend fun pendingUploadCount(): Int = withContext(Dispatchers.IO) {
+        itemDao.pending().count { !it.sku.isNullOrBlank() && !it.deleted } +
+            customerDao.pending().size +
+            creditDao.pending().size +
+            mobileMoneyDao.pending().size +
+            saleDao.pendingSales().count { it.status == "completed" } +
+            refundDao.pending().size
     }
 
     // ── push (Stage 2) ──────────────────────────────────────────────────────
@@ -156,14 +175,38 @@ class PosSyncEngine(
         }
 
         // credit — after customers, so every referenced customer has a cloud bigint id
-        // to resolve customer_id to. Unresolved rows are left for a later pass.
+        // to resolve customer_id to.
+        //
+        // NEVER silently drop a money row (the old mapNotNull did, forever):
+        //   • blank/no customer (walk-in change) → push with customer_id = null (nullable
+        //     cloud column), so it reaches the DB instead of rotting as pending.
+        //   • a real customer that hasn't synced up THIS pass → leave the row pending
+        //     (don't mark it synced) AND raise a visible warning; it retries next pass.
         pushTable("credit_transactions") {
             val credit = creditDao.pending()
             if (credit.isEmpty()) return@pushTable 0
             val localToCloud = customerIdMap(api).entries.associate { (cloud, local) -> local to cloud }
-            val pushable = credit.mapNotNull { c ->
-                val cloudCid = localToCloud[c.customerId] ?: return@mapNotNull null
-                c to c.toCreditPush(cloudCid, null)
+            val pushable = mutableListOf<Pair<com.portionspot.pos.data.CreditTxn, CreditPushDto>>()
+            var unresolved = 0
+            for (c in credit) {
+                val hasCustomer = !c.customerId.isBlank()
+                if (!hasCustomer) {
+                    // Walk-in change/refund: no customer to resolve — push with null.
+                    pushable.add(c to c.toCreditPush(null, null))
+                    continue
+                }
+                val cloudCid = localToCloud[c.customerId]
+                if (cloudCid == null) {
+                    // Referenced customer isn't up yet: keep this row pending, retry later.
+                    unresolved++
+                    continue
+                }
+                pushable.add(c to c.toCreditPush(cloudCid, null))
+            }
+            if (unresolved > 0) {
+                errors.add(
+                    "credit_transactions: $unresolved row(s) waiting on their customer to sync — will retry"
+                )
             }
             if (pushable.isEmpty()) return@pushTable 0
             api.upsert("credit_transactions", syncJson.encodeToString(pushable.map { it.second }), "local_id")

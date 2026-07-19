@@ -384,6 +384,16 @@ class PosViewModel(
     private val _lastSyncAt = MutableStateFlow<Long?>(null)
     val lastSyncAt: StateFlow<Long?> = _lastSyncAt.asStateFlow()
 
+    // Split direction timestamps + queue depth so the owner can SEE sync working.
+    private val _lastUploadAt = MutableStateFlow<Long?>(null)
+    val lastUploadAt: StateFlow<Long?> = _lastUploadAt.asStateFlow()
+
+    private val _lastDownloadAt = MutableStateFlow<Long?>(null)
+    val lastDownloadAt: StateFlow<Long?> = _lastDownloadAt.asStateFlow()
+
+    private val _pendingUpload = MutableStateFlow(0)
+    val pendingUpload: StateFlow<Int> = _pendingUpload.asStateFlow()
+
     /** Stage-2 master switch: whether local data is pushed UP to the cloud. Default
      *  off so the repoint is pull-only until the owner opts in (after clearing test
      *  data). See [setCloudPushEnabled]. */
@@ -430,6 +440,13 @@ class PosViewModel(
             _bootLoaded.value = true
         }
         refreshSyncState()
+        // Any completed sync pass (manual, debounced, or background) → refresh the split
+        // timestamps and queue depth so the sync sheet/settings reflect it live.
+        viewModelScope.launch {
+            sync.status.collect { s ->
+                if (s is SyncStatus.Done) refreshSyncState()
+            }
+        }
     }
 
     // ── App mode / onboarding / local PIN actions ─────────────────────────
@@ -762,6 +779,8 @@ class PosViewModel(
                 // A credit sale can push a customer over their limit — reconcile the admin
                 // feed now so the over-limit alert appears without waiting for the worker.
                 if (onCredit && customer != null) sweepNotifications()
+                // Money moved: get it to the cloud within seconds, not the 15-min cycle.
+                nudgeSync("checkout")
             } finally {
                 checkoutInFlight = false
             }
@@ -818,7 +837,10 @@ class PosViewModel(
     fun createCustomer(name: String, phone: String? = null, onCreated: (Customer) -> Unit) {
         val bid = businessId.value ?: return
         if (name.isBlank()) return
-        viewModelScope.launch { onCreated(repo.createCustomer(bid, name, phone)) }
+        viewModelScope.launch {
+            onCreated(repo.createCustomer(bid, name, phone))
+            nudgeSync("createCustomer")
+        }
     }
 
     // ---- Parked / held sales ---------------------------------------------
@@ -911,12 +933,16 @@ class PosViewModel(
                     showImage = showImage
                 )
             )
+            nudgeSync("addItem")
         }
     }
 
     /** Persist edits to an existing item (rename, reprice, restock, toggle tracking). */
     fun updateItem(item: Item) {
-        viewModelScope.launch { repo.saveItem(item) }
+        viewModelScope.launch {
+            repo.saveItem(item)
+            nudgeSync("updateItem")
+        }
     }
 
     // ---- Inventory (Stage B): low-stock, movements, adjustments ----------
@@ -1010,13 +1036,17 @@ class PosViewModel(
                     pendingSync = true
                 )
             )
+            nudgeSync("updateCustomer")
         }
     }
 
     /** Flip the local-only wholesale flag on an existing customer. */
     fun setCustomerWholesale(customer: Customer, wholesale: Boolean) {
         if (customer.wholesale == wholesale) return
-        viewModelScope.launch { repo.saveCustomer(customer.copy(wholesale = wholesale)) }
+        viewModelScope.launch {
+            repo.saveCustomer(customer.copy(wholesale = wholesale))
+            nudgeSync("customerWholesale")
+        }
     }
 
     /** Pay down a customer's outstanding balance. */
@@ -1025,6 +1055,7 @@ class PosViewModel(
         if (amount <= 0) return
         viewModelScope.launch {
             repo.recordRepayment(bid, customerId, amount, note, currentCashierId, currentCashierName)
+            nudgeSync("repayment")
         }
     }
 
@@ -1043,6 +1074,7 @@ class PosViewModel(
         if (amount <= 0) return
         viewModelScope.launch {
             repo.recordChangePayment(bid, customerId, amount, note, currentCashierId, currentCashierName)
+            nudgeSync("changePayment")
         }
     }
 
@@ -1096,6 +1128,7 @@ class PosViewModel(
                 cashierId = currentCashierId,
                 cashierName = currentCashierName
             )
+            nudgeSync("refund")
             onDone()
         }
     }
@@ -1105,6 +1138,7 @@ class PosViewModel(
         if (tender.amount <= 0) return
         viewModelScope.launch {
             repo.recordRefundPayout(refundId, tender, currentCashierId, currentCashierName)
+            nudgeSync("refundPayout")
             onDone()
         }
     }
@@ -1139,7 +1173,10 @@ class PosViewModel(
 
     /** Assign an unmatched payment to a customer (then it awaits verification). */
     fun assignMobileMoneyCustomer(receiptId: String, customer: Customer) {
-        viewModelScope.launch { repo.assignMobileMoneyCustomer(receiptId, customer) }
+        viewModelScope.launch {
+            repo.assignMobileMoneyCustomer(receiptId, customer)
+            nudgeSync("mmAssign")
+        }
     }
 
     /**
@@ -1156,6 +1193,7 @@ class PosViewModel(
     ) {
         viewModelScope.launch {
             repo.verifyMobileMoney(receiptId, customer, purpose, note, currentCashierId, currentCashierName)
+            nudgeSync("mmVerify")
             onDone()
         }
     }
@@ -1194,7 +1232,10 @@ class PosViewModel(
      * queue — back to "To verify" if it still has a matched customer, else "Unmatched".
      */
     fun unverifyMobileMoney(receiptId: String) {
-        viewModelScope.launch { repo.unverifyMobileMoney(receiptId, currentCashierId, currentCashierName) }
+        viewModelScope.launch {
+            repo.unverifyMobileMoney(receiptId, currentCashierId, currentCashierName)
+            nudgeSync("mmUnverify")
+        }
     }
 
     // ---- Admin: notifications / audit / end-of-day / aging (Phase 7, §8) --
@@ -1272,6 +1313,7 @@ class PosViewModel(
     fun voidRefund(refundId: String, onDone: () -> Unit = {}) {
         viewModelScope.launch {
             repo.voidRefund(refundId, currentCashierId, currentCashierName)
+            nudgeSync("voidRefund")
             onDone()
         }
     }
@@ -1282,6 +1324,7 @@ class PosViewModel(
         if (amount <= 0.0) return
         viewModelScope.launch {
             repo.writeOffDebt(bid, customerId, amount, currentCashierId, currentCashierName)
+            nudgeSync("writeOff")
             onDone()
         }
     }
@@ -1477,8 +1520,26 @@ class PosViewModel(
         viewModelScope.launch {
             _connection.value = sync.connection()
             _lastSyncAt.value = sync.lastSyncAt()
+            _lastUploadAt.value = sync.lastUploadAt()
+            _lastDownloadAt.value = sync.lastDownloadAt()
+            _pendingUpload.value = sync.pendingUploadCount()
             _cloudPushEnabled.value = sync.config.pushEnabled()
         }
+    }
+
+    /** Refresh just the queue depth (cheap) — after a local write, for the badge. */
+    fun refreshPendingUpload() {
+        viewModelScope.launch { _pendingUpload.value = sync.pendingUploadCount() }
+    }
+
+    /**
+     * Fire-and-forget: nudge cloud sync after a money-moving local write and refresh the
+     * pending badge. Debounced inside [SyncManager], so calling it on every mutation is
+     * cheap and a burst collapses to one pass. Never blocks the caller.
+     */
+    private fun nudgeSync(reason: String) {
+        sync.requestSync(reason)
+        refreshPendingUpload()
     }
 
     /** Turn cloud PUSH on/off (Stage 2). Off by default; only enable after the pull

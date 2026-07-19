@@ -492,6 +492,8 @@ fun AppRoot(
     val shopName = business?.name ?: "Spot POS"
     val cartCount = cart.sumOf { it.qty }.toInt()
     val mmPending by vm.mmPendingCount.collectAsState()
+    val pendingUpload by vm.pendingUpload.collectAsState()
+    var showSyncSheet by remember { mutableStateOf(false) }
 
     Box(Modifier.fillMaxSize()) {
         Scaffold(
@@ -501,6 +503,8 @@ fun AppRoot(
                     shopName = shopName,
                     logoUri = business?.logoUri,
                     adminBack = onExitToAdmin,
+                    pendingUpload = pendingUpload,
+                    onSyncClick = { showSyncSheet = true },
                     onMenu = { drawerOpen = true }
                 )
             },
@@ -544,6 +548,12 @@ fun AppRoot(
         // stays visible and one tap jumps back to the till.
         if (screen != Screen.Sell && !drawerOpen && !moreOpen) {
             FloatingCart(vm, currency, onGoToSell = { screen = Screen.Sell })
+        }
+
+        // Tap the top-bar status icon → a quick sync status sheet (what's queued, when
+        // it last uploaded/downloaded, and a manual "Sync now").
+        if (showSyncSheet) {
+            SyncStatusSheet(vm, onDismiss = { showSyncSheet = false })
         }
 
         if (moreOpen) {

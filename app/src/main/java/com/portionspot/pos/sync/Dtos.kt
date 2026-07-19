@@ -604,7 +604,9 @@ fun Customer.toCustomerPush() = CustomerPushDto(
 @Serializable
 data class CreditPushDto(
     @SerialName("local_id") val localId: String,
-    @SerialName("customer_id") val customerId: String,
+    // Nullable: a walk-in change/refund row has no customer, and the cloud column is
+    // nullable — pushing null is correct, never a reason to silently drop a money row.
+    @SerialName("customer_id") val customerId: String? = null,
     @SerialName("customer_name") val customerName: String? = null,
     val type: String,
     val amount: Double = 0.0,
@@ -614,7 +616,7 @@ data class CreditPushDto(
     @SerialName("updated_at") val updatedAt: String,
 )
 
-fun CreditTxn.toCreditPush(cloudCustomerId: String, customerName: String?) = CreditPushDto(
+fun CreditTxn.toCreditPush(cloudCustomerId: String?, customerName: String?) = CreditPushDto(
     localId = id,
     customerId = cloudCustomerId,
     customerName = customerName,
