@@ -785,9 +785,17 @@ interface ExpenseDao {
     @Upsert
     suspend fun upsert(expense: Expense)
 
-    /** Soft-delete (tombstone) so the row is hidden but recoverable. */
-    @Query("UPDATE expenses SET deleted = 1, updatedAt = :at WHERE id = :id")
+    /** Soft-delete (tombstone) so the row is hidden but recoverable. Re-queues for
+     *  sync so the tombstone itself reaches the cloud. */
+    @Query("UPDATE expenses SET deleted = 1, updatedAt = :at, pendingSync = 1 WHERE id = :id")
     suspend fun softDelete(id: String, at: Long)
+
+    // ---- sync ----
+    @Query("SELECT * FROM expenses WHERE pendingSync = 1")
+    suspend fun pending(): List<Expense>
+
+    @Query("UPDATE expenses SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun markSynced(ids: List<String>)
 }
 
 @Dao
@@ -812,6 +820,19 @@ interface CashTxnDao {
 
     @Query("SELECT * FROM cash_txns WHERE businessId = :businessId AND deleted = 0 ORDER BY createdAt DESC LIMIT :limit")
     suspend fun recent(businessId: String, limit: Int = 100): List<CashTxn>
+
+    // ---- sync ----
+    @Query("SELECT * FROM cash_txns WHERE id = :id LIMIT 1")
+    suspend fun getById(id: String): CashTxn?
+
+    @Upsert
+    suspend fun upsert(txn: CashTxn)
+
+    @Query("SELECT * FROM cash_txns WHERE pendingSync = 1")
+    suspend fun pending(): List<CashTxn>
+
+    @Query("UPDATE cash_txns SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun markSynced(ids: List<String>)
 }
 
 @Dao
@@ -828,9 +849,16 @@ interface SupplierDao {
     @Upsert
     suspend fun upsert(supplier: Supplier)
 
-    /** Soft-delete (tombstone) so the row is hidden but recoverable. */
-    @Query("UPDATE suppliers SET deleted = 1, updatedAt = :at WHERE id = :id")
+    /** Soft-delete (tombstone) so the row is hidden but recoverable. Re-queues for sync. */
+    @Query("UPDATE suppliers SET deleted = 1, updatedAt = :at, pendingSync = 1 WHERE id = :id")
     suspend fun softDelete(id: String, at: Long)
+
+    // ---- sync ----
+    @Query("SELECT * FROM suppliers WHERE pendingSync = 1")
+    suspend fun pending(): List<Supplier>
+
+    @Query("UPDATE suppliers SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun markSynced(ids: List<String>)
 }
 
 @Dao
@@ -875,7 +903,24 @@ interface PurchaseOrderDao {
     @Upsert
     suspend fun upsertLine(line: PurchaseOrderLine)
 
-    /** Soft-delete the header (lines are left in place, hidden with the parent). */
-    @Query("UPDATE purchase_orders SET deleted = 1, updatedAt = :at WHERE id = :id")
+    /** Soft-delete the header (lines are left in place, hidden with the parent).
+     *  Re-queues for sync so the tombstone reaches the cloud. */
+    @Query("UPDATE purchase_orders SET deleted = 1, updatedAt = :at, pendingSync = 1 WHERE id = :id")
     suspend fun softDelete(id: String, at: Long)
+
+    // ---- sync ----
+    @Query("SELECT * FROM purchase_order_items WHERE id = :id LIMIT 1")
+    suspend fun getLineById(id: String): PurchaseOrderLine?
+
+    @Query("SELECT * FROM purchase_orders WHERE pendingSync = 1")
+    suspend fun pending(): List<PurchaseOrder>
+
+    @Query("UPDATE purchase_orders SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun markSynced(ids: List<String>)
+
+    @Query("SELECT * FROM purchase_order_items WHERE pendingSync = 1")
+    suspend fun pendingLines(): List<PurchaseOrderLine>
+
+    @Query("UPDATE purchase_order_items SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun markLinesSynced(ids: List<String>)
 }

@@ -1,15 +1,19 @@
 package com.portionspot.pos.sync
 
 import com.portionspot.pos.data.BusinessDao
+import com.portionspot.pos.data.CashTxnDao
 import com.portionspot.pos.data.CreditDao
 import com.portionspot.pos.data.CustomerDao
+import com.portionspot.pos.data.ExpenseDao
 import com.portionspot.pos.data.Item
 import com.portionspot.pos.data.ItemDao
 import com.portionspot.pos.data.MobileMoneyDao
+import com.portionspot.pos.data.PurchaseOrderDao
 import com.portionspot.pos.data.RefundDao
 import com.portionspot.pos.data.SaleDao
 import com.portionspot.pos.data.SaleEntity
 import com.portionspot.pos.data.SalePaymentDao
+import com.portionspot.pos.data.SupplierDao
 import com.portionspot.pos.media.ProductImages
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -55,6 +59,10 @@ class PosSyncEngine(
     private val creditDao: CreditDao,
     private val refundDao: RefundDao,
     private val mobileMoneyDao: MobileMoneyDao,
+    private val expenseDao: ExpenseDao,
+    private val cashTxnDao: CashTxnDao,
+    private val supplierDao: SupplierDao,
+    private val poDao: PurchaseOrderDao,
     private val config: SyncConfig,
     /** Current signed-in user's JWT for RLS; null falls back to anon (denied). */
     private val accessToken: () -> String? = { null },
@@ -85,8 +93,9 @@ class PosSyncEngine(
 
     /**
      * How many local rows are waiting to go UP — the sum of every pushable table's
-     * pending set (products, customers, credit, mobile-money, sales, refunds). Drives
-     * the "N to upload" badge in the UI so the owner can SEE work is queued. Read-only.
+     * pending set (products, customers, credit, mobile-money, sales, refunds, plus the
+     * accounting spine and supplier orders). Drives the "N to upload" badge in the UI so
+     * the owner can SEE work is queued. Read-only.
      */
     suspend fun pendingUploadCount(): Int = withContext(Dispatchers.IO) {
         itemDao.pending().count { !it.sku.isNullOrBlank() && !it.deleted } +
@@ -94,7 +103,12 @@ class PosSyncEngine(
             creditDao.pending().size +
             mobileMoneyDao.pending().size +
             saleDao.pendingSales().count { it.status == "completed" } +
-            refundDao.pending().size
+            refundDao.pending().size +
+            expenseDao.pending().size +
+            cashTxnDao.pending().size +
+            supplierDao.pending().size +
+            poDao.pending().size +
+            poDao.pendingLines().size
     }
 
     // ── push (Stage 2) ──────────────────────────────────────────────────────
@@ -265,6 +279,69 @@ class PosSyncEngine(
             refunds.size
         }
 
+        // ── accounting spine + supplier orders (owner-approved for the cloud) ──
+        // All five upsert on `local_id`, so a re-push overwrites this device's own row
+        // and never anyone else's. Each block is isolated: one failing table records a
+        // warning and leaves its rows pending, the rest still go up.
+
+        // expenses — approvals, funding splits and recurring schedules.
+        pushTable("expenses") {
+            val rows = expenseDao.pending()
+            if (rows.isEmpty()) return@pushTable 0
+            api.upsert("expenses", syncJson.encodeToString(rows.map { it.toExpensePush() }), "local_id")
+            expenseDao.markSynced(rows.map { it.id })
+            rows.size
+        }
+
+        // cash_txns — the append-only cash-on-hand ledger.
+        pushTable("cash_txns") {
+            val rows = cashTxnDao.pending()
+            if (rows.isEmpty()) return@pushTable 0
+            api.upsert("cash_txns", syncJson.encodeToString(rows.map { it.toCashTxnPush() }), "local_id")
+            cashTxnDao.markSynced(rows.map { it.id })
+            rows.size
+        }
+
+        // ORDER MATTERS from here: suppliers → purchase_orders → purchase_order_items,
+        // so a PO's supplier (and a line's PO) is already up when the child arrives.
+        pushTable("suppliers") {
+            val rows = supplierDao.pending()
+            if (rows.isEmpty()) return@pushTable 0
+            api.upsert("suppliers", syncJson.encodeToString(rows.map { it.toSupplierPush() }), "local_id")
+            supplierDao.markSynced(rows.map { it.id })
+            rows.size
+        }
+
+        pushTable("purchase_orders") {
+            val rows = poDao.pending()
+            if (rows.isEmpty()) return@pushTable 0
+            api.upsert(
+                "purchase_orders",
+                syncJson.encodeToString(rows.map { it.toPurchaseOrderPush() }),
+                "local_id"
+            )
+            poDao.markSynced(rows.map { it.id })
+            rows.size
+        }
+
+        // PO lines last. A line has no clock of its own, so its cloud timestamps come
+        // from its parent PO's updatedAt (falling back to now for an orphan line, which
+        // still keeps the pull cursor moving forward).
+        pushTable("purchase_order_items") {
+            val rows = poDao.pendingLines()
+            if (rows.isEmpty()) return@pushTable 0
+            val stampFor = HashMap<String, Long>()
+            val dtos = rows.map { line ->
+                val stamp = stampFor.getOrPut(line.poId) {
+                    poDao.getById(line.poId)?.updatedAt ?: System.currentTimeMillis()
+                }
+                line.toPurchaseOrderLinePush(stamp)
+            }
+            api.upsert("purchase_order_items", syncJson.encodeToString(dtos), "local_id")
+            poDao.markLinesSynced(rows.map { it.id })
+            rows.size
+        }
+
         return PushResult(n, errors)
     }
 
@@ -279,7 +356,110 @@ class PosSyncEngine(
         n += pullSales(api, bid)
         n += pullCredit(api, bid)
         n += pullMobileMoney(api, bid)
+        // Accounting spine + supplier orders. Same last-write-wins-by-updated_at rule,
+        // same per-table cursor; parents (suppliers, POs) before children (PO lines).
+        n += pullExpenses(api, bid)
+        n += pullCashTxns(api, bid)
+        n += pullSuppliers(api, bid)
+        n += pullPurchaseOrders(api, bid)
+        n += pullPurchaseOrderLines(api)
         return n
+    }
+
+    /** expenses → local expenses, bridged by local_id. */
+    private suspend fun pullExpenses(api: SupabaseRest, bid: String): Int {
+        val rows = syncJson.decodeFromString<List<ExpenseDto>>(
+            api.selectSince("expenses", config.cursor("expenses"), PAGE)
+        )
+        if (rows.isEmpty()) return 0
+        var applied = 0
+        for (dto in rows) {
+            val local = expenseDao.getById(dto.bridgeId())
+            if (local == null || IsoTime.toMillis(dto.updatedAt) > local.updatedAt) {
+                expenseDao.upsert(dto.toExpense(bid, local))
+                applied++
+            }
+        }
+        config.setCursor("expenses", rows.maxOf { it.cursorStamp() })
+        return applied
+    }
+
+    /** cash_txns → local cash ledger, bridged by local_id. */
+    private suspend fun pullCashTxns(api: SupabaseRest, bid: String): Int {
+        val rows = syncJson.decodeFromString<List<CashTxnDto>>(
+            api.selectSince("cash_txns", config.cursor("cash_txns"), PAGE)
+        )
+        if (rows.isEmpty()) return 0
+        var applied = 0
+        for (dto in rows) {
+            val local = cashTxnDao.getById(dto.bridgeId())
+            if (local == null || IsoTime.toMillis(dto.updatedAt) > local.updatedAt) {
+                cashTxnDao.upsert(dto.toCashTxn(bid, local))
+                applied++
+            }
+        }
+        config.setCursor("cash_txns", rows.maxOf { it.cursorStamp() })
+        return applied
+    }
+
+    /** suppliers → local suppliers, bridged by local_id. */
+    private suspend fun pullSuppliers(api: SupabaseRest, bid: String): Int {
+        val rows = syncJson.decodeFromString<List<SupplierDto>>(
+            api.selectSince("suppliers", config.cursor("suppliers"), PAGE)
+        )
+        if (rows.isEmpty()) return 0
+        var applied = 0
+        for (dto in rows) {
+            val local = supplierDao.getById(dto.bridgeId())
+            if (local == null || IsoTime.toMillis(dto.updatedAt) > local.updatedAt) {
+                supplierDao.upsert(dto.toSupplier(bid, local))
+                applied++
+            }
+        }
+        config.setCursor("suppliers", rows.maxOf { it.cursorStamp() })
+        return applied
+    }
+
+    /** purchase_orders → local POs, bridged by local_id. */
+    private suspend fun pullPurchaseOrders(api: SupabaseRest, bid: String): Int {
+        val rows = syncJson.decodeFromString<List<PurchaseOrderDto>>(
+            api.selectSince("purchase_orders", config.cursor("purchase_orders"), PAGE)
+        )
+        if (rows.isEmpty()) return 0
+        var applied = 0
+        for (dto in rows) {
+            val local = poDao.getById(dto.bridgeId())
+            if (local == null || IsoTime.toMillis(dto.updatedAt) > local.updatedAt) {
+                poDao.upsert(dto.toPurchaseOrder(bid, local))
+                applied++
+            }
+        }
+        config.setCursor("purchase_orders", rows.maxOf { it.cursorStamp() })
+        return applied
+    }
+
+    /**
+     * purchase_order_items → local PO lines, bridged by local_id and linked to their
+     * header by `po_local_id`. A line whose header hasn't arrived yet is still applied
+     * (the link is a plain value, no FK), so it can never be silently dropped.
+     */
+    private suspend fun pullPurchaseOrderLines(api: SupabaseRest): Int {
+        val rows = syncJson.decodeFromString<List<PurchaseOrderLineDto>>(
+            api.selectSince("purchase_order_items", config.cursor("purchase_order_items"), PAGE)
+        )
+        if (rows.isEmpty()) return 0
+        var applied = 0
+        for (dto in rows) {
+            val local = poDao.getLineById(dto.bridgeId())
+            // Lines carry no local clock, so the header's updated_at is the tiebreak.
+            val localStamp = local?.poId?.let { poDao.getById(it)?.updatedAt } ?: 0L
+            if (local == null || IsoTime.toMillis(dto.updatedAt) > localStamp) {
+                poDao.upsertLine(dto.toPurchaseOrderLine(local))
+                applied++
+            }
+        }
+        config.setCursor("purchase_order_items", rows.maxOf { it.cursorStamp() })
+        return applied
     }
 
     /** cloud customers.id (as text) → Android customer id (its local_id). The bridge

@@ -82,7 +82,9 @@ class SyncConfig(private val dao: SettingDao) {
 
         /** Cloud tables Android syncs (the shared web-POS schema). */
         val TABLES = listOf(
-            "products", "customers", "sales", "credit_transactions", "mobile_money_receipts"
+            "products", "customers", "sales", "credit_transactions", "mobile_money_receipts",
+            // Accounting spine + supplier orders (owner-approved for cloud sync).
+            "expenses", "cash_txns", "suppliers", "purchase_orders", "purchase_order_items"
         )
 
         private fun cursorKey(table: String) = "cursor_$table"

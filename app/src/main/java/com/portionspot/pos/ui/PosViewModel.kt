@@ -1421,6 +1421,7 @@ class PosViewModel(
                 periodStart, periodEnd, currentCashierId, currentCashierName
             ) ?: return@launch
             repo.notifyExpenseSubmitted(e)
+            nudgeSync("submitExpense")
         }
     }
 
@@ -1432,37 +1433,56 @@ class PosViewModel(
         if (amount <= 0) return
         viewModelScope.launch {
             repo.updatePendingExpense(id, category, amount, date, description, recurring, recurrencePeriod)
+            nudgeSync("updateExpense")
         }
     }
 
     /** Approve (post) a pending expense with the chosen funding mode: cash | available |
      *  capital (the shortfall decision from §9.4). */
     fun approveExpense(id: String, mode: String) {
-        viewModelScope.launch { repo.approveExpense(id, mode, currentCashierId, currentCashierName) }
+        viewModelScope.launch {
+            repo.approveExpense(id, mode, currentCashierId, currentCashierName)
+            nudgeSync("approveExpense")
+        }
     }
 
     /** Cash-on-hand right now (for deciding whether a shortfall dialog is needed). */
     suspend fun cashOnHandNow(): Double = businessId.value?.let { repo.cashOnHandOnce(it) } ?: 0.0
 
     fun rejectExpense(id: String) {
-        viewModelScope.launch { repo.rejectExpense(id, currentCashierId, currentCashierName) }
+        viewModelScope.launch {
+            repo.rejectExpense(id, currentCashierId, currentCashierName)
+            nudgeSync("rejectExpense")
+        }
     }
 
     fun setRecurringActive(templateId: String, active: Boolean) {
-        viewModelScope.launch { repo.setRecurringActive(templateId, active) }
+        viewModelScope.launch {
+            repo.setRecurringActive(templateId, active)
+            nudgeSync("recurringActive")
+        }
     }
 
     fun editRecurringAmount(templateId: String, newAmount: Double) {
         if (newAmount <= 0) return
-        viewModelScope.launch { repo.editRecurringAmount(templateId, newAmount) }
+        viewModelScope.launch {
+            repo.editRecurringAmount(templateId, newAmount)
+            nudgeSync("recurringAmount")
+        }
     }
 
     fun cancelRecurring(templateId: String) {
-        viewModelScope.launch { repo.cancelRecurring(templateId) }
+        viewModelScope.launch {
+            repo.cancelRecurring(templateId)
+            nudgeSync("cancelRecurring")
+        }
     }
 
     fun deleteExpense(id: String) {
-        viewModelScope.launch { repo.deleteExpense(id) }
+        viewModelScope.launch {
+            repo.deleteExpense(id)
+            nudgeSync("deleteExpense")
+        }
     }
 
     /** Admin: set the opening cash float (persisted device-local). */
@@ -1474,7 +1494,10 @@ class PosViewModel(
     /** Admin: record an ad-hoc cash top-up (+) or payout (−) against the drawer. */
     fun recordCashAdjustment(amount: Double, note: String) {
         val bid = businessId.value ?: return
-        viewModelScope.launch { repo.recordCashAdjustment(bid, amount, note, currentCashierId, currentCashierName) }
+        viewModelScope.launch {
+            repo.recordCashAdjustment(bid, amount, note, currentCashierId, currentCashierName)
+            nudgeSync("cashAdjustment")
+        }
     }
 
     // ---- Suppliers --------------------------------------------------------
@@ -1499,11 +1522,17 @@ class PosViewModel(
             notes = notes?.trim()?.ifBlank { null }
         )
         val supplier = if (id == null) base else base.copy(id = id)
-        viewModelScope.launch { repo.saveSupplier(supplier) }
+        viewModelScope.launch {
+            repo.saveSupplier(supplier)
+            nudgeSync("saveSupplier")
+        }
     }
 
     fun deleteSupplier(id: String) {
-        viewModelScope.launch { repo.deleteSupplier(id) }
+        viewModelScope.launch {
+            repo.deleteSupplier(id)
+            nudgeSync("deleteSupplier")
+        }
     }
 
     // ---- Purchase orders --------------------------------------------------
@@ -1530,17 +1559,24 @@ class PosViewModel(
                 notes?.trim()?.ifBlank { null }, eta, lines, payNow, fundingMode,
                 currentCashierId, currentCashierName
             )
+            nudgeSync("createPurchaseOrder")
         }
     }
 
     /** Draft → placed. */
     fun markPoSent(poId: String) {
-        viewModelScope.launch { repo.markPoSent(poId) }
+        viewModelScope.launch {
+            repo.markPoSent(poId)
+            nudgeSync("markPoSent")
+        }
     }
 
     /** Cancel an open PO (rolls back its pending stock, clears the payable). */
     fun cancelPo(poId: String) {
-        viewModelScope.launch { repo.cancelPo(poId) }
+        viewModelScope.launch {
+            repo.cancelPo(poId)
+            nudgeSync("cancelPo")
+        }
     }
 
     /**
@@ -1549,12 +1585,18 @@ class PosViewModel(
      * whole outstanding order.
      */
     fun confirmArrival(poId: String, receivedByLine: Map<String, Double>? = null) {
-        viewModelScope.launch { repo.confirmArrival(poId, receivedByLine, currentCashierId, currentCashierName) }
+        viewModelScope.launch {
+            repo.confirmArrival(poId, receivedByLine, currentCashierId, currentCashierName)
+            nudgeSync("confirmArrival")
+        }
     }
 
     /** Settle a PO's supplier balance from cash. [mode]: cash (all) | available (what cash there is). */
     fun recordSupplierPayment(poId: String, mode: String) {
-        viewModelScope.launch { repo.recordSupplierPayment(poId, mode, currentCashierId, currentCashierName) }
+        viewModelScope.launch {
+            repo.recordSupplierPayment(poId, mode, currentCashierId, currentCashierName)
+            nudgeSync("supplierPayment")
+        }
     }
 
     // ---- Cloud sync actions ----------------------------------------------

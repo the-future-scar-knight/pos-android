@@ -626,17 +626,17 @@ class PosRepository(private val db: PosDatabase) {
     private fun ymd(epoch: Long): String =
         java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date(epoch))
 
-    // ---- suppliers (local-only; never synced) -----------------------------
+    // ---- suppliers (synced: cloud `suppliers`, upsert on local_id) --------
 
     fun suppliersFlow(businessId: String): Flow<List<Supplier>> =
         supplierDao.observeForBusiness(businessId)
 
     suspend fun saveSupplier(supplier: Supplier) =
-        supplierDao.upsert(supplier.copy(updatedAt = now()))
+        supplierDao.upsert(supplier.copy(updatedAt = now(), pendingSync = true))
 
     suspend fun deleteSupplier(id: String) = supplierDao.softDelete(id, now())
 
-    // ---- purchase orders (local-only; never synced) -----------------------
+    // ---- purchase orders (synced: `purchase_orders` + `purchase_order_items`) ----
 
     fun purchaseOrdersFlow(businessId: String): Flow<List<PurchaseOrderWithLines>> =
         poDao.observeWithLines(businessId)
@@ -780,7 +780,7 @@ class PosRepository(private val db: PosDatabase) {
     suspend fun markPoSent(poId: String) {
         val po = poDao.getById(poId) ?: return
         val stamp = now()
-        poDao.upsert(po.copy(status = "placed", sentAt = stamp, updatedAt = stamp))
+        poDao.upsert(po.copy(status = "placed", sentAt = stamp, updatedAt = stamp, pendingSync = true))
     }
 
     /**
@@ -809,7 +809,12 @@ class PosRepository(private val db: PosDatabase) {
                     )
                 }
             }
-            poDao.upsert(po.copy(status = "cancelled", payableRemainder = 0.0, updatedAt = stamp))
+            poDao.upsert(
+                po.copy(
+                    status = "cancelled", payableRemainder = 0.0,
+                    updatedAt = stamp, pendingSync = true
+                )
+            )
         }
     }
 
@@ -858,14 +863,14 @@ class PosRepository(private val db: PosDatabase) {
                     }
                 }
                 val newReceived = already + recv
-                poDao.upsertLine(line.copy(receivedQty = newReceived))
+                poDao.upsertLine(line.copy(receivedQty = newReceived, pendingSync = true))
                 if (newReceived + CENT < line.qty) allDone = false
             }
             poDao.upsert(
                 po.copy(
                     status = if (allDone) "received" else "partial",
                     receivedAt = if (allDone) stamp else po.receivedAt,
-                    updatedAt = stamp
+                    updatedAt = stamp, pendingSync = true
                 )
             )
             auditDao.insert(
@@ -909,7 +914,7 @@ class PosRepository(private val db: PosDatabase) {
                 po.copy(
                     cashPaid = po.cashPaid + pay,
                     payableRemainder = (remainder - pay).coerceAtLeast(0.0),
-                    updatedAt = stamp
+                    updatedAt = stamp, pendingSync = true
                 )
             )
             auditDao.insert(
@@ -2364,11 +2369,16 @@ class PosRepository(private val db: PosDatabase) {
 
     private fun fmtMoney(n: Double): String = String.format(java.util.Locale.US, "%.2f", n)
 
-    /** Count of local rows not yet pushed to the cloud — feeds the "not synced" alert. */
+    /** Count of local rows not yet pushed to the cloud — feeds the "not synced" alert.
+     *  B3/B4 excluded expenses, cash, suppliers and purchase orders while they were
+     *  local-only; they sync now, so leaving them out would UNDER-report and make the
+     *  indicator lie. All five are counted. */
     suspend fun pendingSyncCount(): Int =
         businessDao.pending().size + itemDao.pending().size + saleDao.pendingSales().size +
             customerDao.pending().size + creditDao.pending().size + refundDao.pending().size +
-            mobileMoneyDao.pending().size
+            mobileMoneyDao.pending().size + expenseDao.pending().size +
+            cashTxnDao.pending().size + supplierDao.pending().size +
+            poDao.pending().size + poDao.pendingLines().size
 
     /** Admin notification thresholds (§8), read from device-local settings with defaults. */
     suspend fun loadNotifThresholds(): NotifThresholds = NotifThresholds(

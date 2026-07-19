@@ -509,6 +509,47 @@ val MIGRATION_24_25 = object : Migration(24, 25) {
     }
 }
 
+/**
+ * v25 → v26: cloud sync for the accounting/supplier tables.
+ *
+ * The owner approved pushing the previously LOCAL-ONLY features to the shared Supabase,
+ * and the cloud tables (`expenses`, `cash_txns`, `suppliers`, `purchase_orders`,
+ * `purchase_order_items`, plus `products.unit/price_per_unit/stock_measured`) now exist.
+ * `expenses` and `cash_txns` were already built sync-ready (they carry localId +
+ * pendingSync); the three supplier-order tables were not, so they gain both here.
+ *
+ * BACKFILL matters: every row already on the device is stamped `localId = id` and
+ * `pendingSync = 1` so the whole existing history uploads on the FIRST sync pass rather
+ * than only rows touched from now on. expenses/cash_txns are re-stamped pending for the
+ * same reason — nothing ever marked them synced, but this makes it explicit.
+ */
+val MIGRATION_25_26 = object : Migration(25, 26) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        // suppliers / purchase_orders / purchase_order_items become sync-ready.
+        db.execSQL("ALTER TABLE suppliers ADD COLUMN localId TEXT NOT NULL DEFAULT ''")
+        db.execSQL("ALTER TABLE suppliers ADD COLUMN pendingSync INTEGER NOT NULL DEFAULT 1")
+        db.execSQL("UPDATE suppliers SET localId = id, pendingSync = 1")
+
+        db.execSQL("ALTER TABLE purchase_orders ADD COLUMN localId TEXT NOT NULL DEFAULT ''")
+        db.execSQL("ALTER TABLE purchase_orders ADD COLUMN pendingSync INTEGER NOT NULL DEFAULT 1")
+        db.execSQL("UPDATE purchase_orders SET localId = id, pendingSync = 1")
+
+        db.execSQL("ALTER TABLE purchase_order_items ADD COLUMN localId TEXT NOT NULL DEFAULT ''")
+        db.execSQL("ALTER TABLE purchase_order_items ADD COLUMN pendingSync INTEGER NOT NULL DEFAULT 1")
+        db.execSQL("UPDATE purchase_order_items SET localId = id, pendingSync = 1")
+
+        // Already-recorded expenses / cash movements: make sure they queue for upload.
+        db.execSQL("UPDATE expenses SET localId = id WHERE localId IS NULL OR localId = ''")
+        db.execSQL("UPDATE expenses SET pendingSync = 1")
+        db.execSQL("UPDATE cash_txns SET localId = id WHERE localId IS NULL OR localId = ''")
+        db.execSQL("UPDATE cash_txns SET pendingSync = 1")
+
+        // Measured products now have cloud columns — re-queue the catalogue so the
+        // unit / price_per_unit / stock_measured this device holds reaches the cloud.
+        db.execSQL("UPDATE items SET pendingSync = 1 WHERE productType = 'measured'")
+    }
+}
+
 @Database(
     entities = [
         Business::class,
@@ -532,7 +573,7 @@ val MIGRATION_24_25 = object : Migration(24, 25) {
         AppNotification::class,
         AuditEntry::class
     ],
-    version = 25,
+    version = 26,
     exportSchema = false
 )
 abstract class PosDatabase : RoomDatabase() {
@@ -577,7 +618,7 @@ abstract class PosDatabase : RoomDatabase() {
                         MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17,
                         MIGRATION_17_18, MIGRATION_18_19, MIGRATION_19_20,
                         MIGRATION_20_21, MIGRATION_21_22, MIGRATION_22_23,
-                        MIGRATION_23_24, MIGRATION_24_25
+                        MIGRATION_23_24, MIGRATION_24_25, MIGRATION_25_26
                     )
                     .fallbackToDestructiveMigration()
                     .build()

@@ -126,8 +126,9 @@ data class Item(
     // pricePerUnit × the decimal quantity the cashier enters. [stockMeasured] is the
     // decimal on-hand quantity (in [unit]s), drawn down by the sold quantity at
     // checkout — the integer stockQty is left untouched for measured items.
-    // Both are LOCAL-ONLY: the cloud `products` table has no matching columns, so they
-    // are never pushed and are preserved across a pull-merge.
+    // Both now SYNC: the cloud `products` table carries `unit`, `price_per_unit` and
+    // `stock_measured`, so they push up and pull down like any other product field (a
+    // null cloud value is treated as "not set" and never wipes the local one).
     @ColumnInfo(defaultValue = "0") val pricePerUnit: Double = 0.0,
     @ColumnInfo(defaultValue = "0") val stockMeasured: Double = 0.0,
     // ──── Pending (incoming) stock from a purchase order (B4) — LOCAL-ONLY ────
@@ -572,8 +573,7 @@ data class BalanceRow(
  * EDIT the amount, or CANCEL (tombstone the template) at any time.
  *
  * [date] is a `yyyy-MM-dd` string (matches the web) so day-bucketed filters need no
- * timezone math. LOCAL-ONLY today, but SYNC-READY: every row carries [localId],
- * [updatedAt] and [pendingSync] so a future cloud push can adopt it unchanged.
+ * timezone math. SYNCED: the cloud `expenses` table upserts on [localId].
  */
 @Entity(tableName = "expenses", indices = [Index("businessId")])
 data class Expense(
@@ -610,7 +610,7 @@ data class Expense(
     val createdAt: Long = now(),
     val updatedAt: Long = now(),
     val deleted: Boolean = false,
-    /** Local-only: true => has unsynced local edits to push. Never sent to cloud yet. */
+    /** true => has unsynced local edits waiting to push to the cloud. */
     val pendingSync: Boolean = true
 )
 
@@ -624,7 +624,7 @@ data class Expense(
  * only the cash actually paid drains the drawer.
  *
  * Append-only and immutable: a correction is a new "adjust" row, never an edit.
- * LOCAL-ONLY today but SYNC-READY ([localId] / [updatedAt] / [pendingSync]).
+ * SYNCED: the cloud `cash_txns` table upserts on [localId].
  */
 @Entity(tableName = "cash_txns", indices = [Index("businessId")])
 data class CashTxn(
@@ -642,18 +642,19 @@ data class CashTxn(
     val createdAt: Long = now(),
     val updatedAt: Long = now(),
     val deleted: Boolean = false,
-    /** Local-only: true => has unsynced local edits to push. Never sent to cloud yet. */
+    /** true => has unsynced local edits waiting to push to the cloud. */
     val pendingSync: Boolean = true
 )
 
 /**
- * A goods supplier / vendor. Local-only (the web keeps these in Dexie, not the
- * cloud schema), so there is no `pendingSync` column. Purchase orders denormalise
- * the supplier's name onto each PO, so a tombstoned supplier never breaks history.
+ * A goods supplier / vendor. Purchase orders denormalise the supplier's name onto
+ * each PO, so a tombstoned supplier never breaks history. SYNCED: the cloud
+ * `suppliers` table upserts on [localId] (= the Android UUID).
  */
 @Entity(tableName = "suppliers", indices = [Index("businessId")])
 data class Supplier(
     @PrimaryKey val id: String = newId(),
+    val localId: String = id,             // cloud upsert key (defaults to id)
     val businessId: String,
     val name: String,
     val phone: String? = null,
@@ -662,12 +663,14 @@ data class Supplier(
     val notes: String? = null,
     val createdAt: Long = now(),
     val updatedAt: Long = now(),
-    val deleted: Boolean = false
+    val deleted: Boolean = false,
+    /** true => has unsynced local edits waiting to push to the cloud `suppliers` table. */
+    val pendingSync: Boolean = true
 )
 
 /**
- * A purchase order (restock request to a [Supplier]). LOCAL-ONLY, like the web's
- * Dexie store — the cloud schema has no `purchase_orders` table, so no pendingSync.
+ * A purchase order (restock request to a [Supplier]). SYNCED: the cloud
+ * `purchase_orders` table upserts on [localId] (= the Android UUID).
  * Lifecycle: draft → placed → (partial) → received (or cancelled). [supplierName] is
  * denormalised so deleting a supplier never orphans PO history. [ref] is the human code
  * `PO-YYMMDD-NNNN`.
@@ -683,6 +686,7 @@ data class Supplier(
 @Entity(tableName = "purchase_orders", indices = [Index("businessId")])
 data class PurchaseOrder(
     @PrimaryKey val id: String = newId(),
+    val localId: String = id,               // cloud upsert key (defaults to id)
     val businessId: String,
     val ref: String,
     val supplierId: String? = null,
@@ -698,7 +702,9 @@ data class PurchaseOrder(
     val sentAt: Long? = null,
     val receivedAt: Long? = null,
     val updatedAt: Long = now(),
-    val deleted: Boolean = false
+    val deleted: Boolean = false,
+    /** true => has unsynced local edits waiting to push to `purchase_orders`. */
+    val pendingSync: Boolean = true
 )
 
 /**
@@ -715,6 +721,7 @@ data class PurchaseOrder(
 @Entity(tableName = "purchase_order_items", indices = [Index("poId")])
 data class PurchaseOrderLine(
     @PrimaryKey val id: String = newId(),
+    val localId: String = id,               // cloud upsert key (defaults to id)
     val poId: String,
     val itemId: String? = null,
     val name: String = "",
@@ -724,7 +731,9 @@ data class PurchaseOrderLine(
     val sellPrice: Double? = null,
     val stockOnArrival: Boolean = true,
     val productType: String = "piece",
-    val receivedQty: Double? = null
+    val receivedQty: Double? = null,
+    /** true => has unsynced local edits waiting to push to `purchase_order_items`. */
+    val pendingSync: Boolean = true
 )
 
 /**

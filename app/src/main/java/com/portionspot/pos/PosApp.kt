@@ -33,7 +33,9 @@ class AppContainer(app: Application) {
     val syncEngine: PosSyncEngine = PosSyncEngine(
         database.businessDao(), database.itemDao(), database.saleDao(),
         database.salePaymentDao(), database.customerDao(), database.creditDao(),
-        database.refundDao(), database.mobileMoneyDao(), syncConfig,
+        database.refundDao(), database.mobileMoneyDao(),
+        database.expenseDao(), database.cashTxnDao(),
+        database.supplierDao(), database.purchaseOrderDao(), syncConfig,
         accessToken = authManager::accessTokenOrNull,
         ensureFreshToken = { authManager.refreshIfNeeded() }
     )
