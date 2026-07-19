@@ -527,6 +527,10 @@ interface RefundDao {
     @Query("SELECT * FROM refunds WHERE saleId = :saleId AND deleted = 0")
     suspend fun forSaleOnce(saleId: String): List<Refund>
 
+    /** Money already refunded against one sale — the gate on editing it in place (B5). */
+    @Query("SELECT COALESCE(SUM(refundTotal), 0) FROM refunds WHERE saleId = :saleId AND deleted = 0")
+    suspend fun refundedTotalForSaleOnce(saleId: String): Double
+
     /** Refunds still owing money — one-shot for the notification engine (§8). */
     @Query("SELECT * FROM refunds WHERE businessId = :businessId AND deleted = 0 AND status = 'owed'")
     suspend fun owedOnce(businessId: String): List<Refund>
@@ -699,6 +703,10 @@ interface AuditDao {
             "ORDER BY createdAt DESC LIMIT :limit"
     )
     fun observeForBusiness(businessId: String, limit: Int = 300): Flow<List<AuditEntry>>
+
+    /** The append-only trail for ONE entity (a sale's edit history), newest first. */
+    @Query("SELECT * FROM audit_log WHERE entityId = :entityId ORDER BY createdAt DESC")
+    fun observeForEntity(entityId: String): Flow<List<AuditEntry>>
 
     @Query("DELETE FROM audit_log WHERE businessId = :businessId")
     suspend fun wipe(businessId: String)

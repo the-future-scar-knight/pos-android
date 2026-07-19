@@ -8,6 +8,7 @@ import com.portionspot.pos.data.ItemDao
 import com.portionspot.pos.data.MobileMoneyDao
 import com.portionspot.pos.data.RefundDao
 import com.portionspot.pos.data.SaleDao
+import com.portionspot.pos.data.SaleEntity
 import com.portionspot.pos.data.SalePaymentDao
 import com.portionspot.pos.media.ProductImages
 import kotlinx.coroutines.Dispatchers
@@ -226,10 +227,31 @@ class PosSyncEngine(
         pushTable("sales") {
             val sales = saleDao.pendingSales().filter { it.status == "completed" }
             if (sales.isEmpty()) return@pushTable 0
-            val dtos = sales.map { s ->
-                buildSalePush(s, saleDao.allLinesForSale(s.id), salePaymentDao.forSale(s.id), skuOf)
+            // Tombstoned lines (removed by a B5 in-place edit) must not reach the cloud
+            // item JSON — only what the receipt says NOW.
+            suspend fun dtoFor(s: SaleEntity) = buildSalePush(
+                s,
+                saleDao.allLinesForSale(s.id).filter { !it.deleted },
+                salePaymentDao.forSale(s.id),
+                skuOf
+            )
+            // A never-edited sale is append-only: ignore-duplicates so a re-push can
+            // never rewrite a shared row. An EDITED receipt is the deliberate exception —
+            // it must overwrite its own cloud row (same id) or the correction is lost, so
+            // it goes up with merge-duplicates. Split into two calls, same conflict key.
+            val (edited, fresh) = sales.partition { it.editedAt != null }
+            if (fresh.isNotEmpty()) {
+                api.upsert(
+                    "sales", syncJson.encodeToString(fresh.map { dtoFor(it) }),
+                    "id", ignoreDuplicates = true
+                )
             }
-            api.upsert("sales", syncJson.encodeToString(dtos), "id", ignoreDuplicates = true)
+            if (edited.isNotEmpty()) {
+                api.upsert(
+                    "sales", syncJson.encodeToString(edited.map { dtoFor(it) }),
+                    "id", ignoreDuplicates = false
+                )
+            }
             sales.forEach { saleDao.markSaleSynced(it.id) }
             sales.size
         }

@@ -28,6 +28,8 @@ import com.portionspot.pos.data.RefundPayment
 import com.portionspot.pos.data.RefundWithLines
 import com.portionspot.pos.data.SaleEntity
 import com.portionspot.pos.data.SaleLine
+import com.portionspot.pos.data.SalePayment
+import com.portionspot.pos.data.isEditable
 import com.portionspot.pos.data.SalesSummary
 import com.portionspot.pos.data.SaleStamp
 import com.portionspot.pos.data.StockMovement
@@ -535,6 +537,7 @@ class PosViewModel(
             defaultQuoteValidityDays = repo.getSetting(KEY_QUOTE_DAYS)?.toIntOrNull() ?: d.defaultQuoteValidityDays,
             discountThresholdPct = repo.getSetting(KEY_DISCOUNT_THRESHOLD)?.toDoubleOrNull() ?: d.discountThresholdPct,
             maxItemDiscount = repo.getSetting(KEY_MAX_ITEM_DISCOUNT)?.toDoubleOrNull() ?: d.maxItemDiscount,
+            saleEditWindowMinutes = repo.getSetting(KEY_SALE_EDIT_WINDOW)?.toIntOrNull() ?: d.saleEditWindowMinutes,
             marginFormula = repo.getSetting(KEY_MARGIN_FORMULA) ?: d.marginFormula,
             autoConvertUnitsToBoxes = repo.getSetting(KEY_AUTO_BOXES)?.toBooleanStrictOrNull() ?: d.autoConvertUnitsToBoxes,
             printerType = repo.getSetting(KEY_PRINTER_TYPE) ?: d.printerType,
@@ -568,6 +571,7 @@ class PosViewModel(
             repo.putSetting(KEY_QUOTE_DAYS, prefs.defaultQuoteValidityDays.toString())
             repo.putSetting(KEY_DISCOUNT_THRESHOLD, prefs.discountThresholdPct.toString())
             repo.putSetting(KEY_MAX_ITEM_DISCOUNT, prefs.maxItemDiscount.toString())
+            repo.putSetting(KEY_SALE_EDIT_WINDOW, prefs.saleEditWindowMinutes.toString())
             repo.putSetting(KEY_MARGIN_FORMULA, prefs.marginFormula)
             repo.putSetting(KEY_AUTO_BOXES, prefs.autoConvertUnitsToBoxes.toString())
             repo.putSetting(KEY_PRINTER_TYPE, prefs.printerType)
@@ -876,6 +880,45 @@ class PosViewModel(
 
     /** Lines for a past sale — used when reprinting from the Receipts list. */
     suspend fun loadLines(saleId: String): List<SaleLine> = repo.linesForSale(saleId)
+
+    // ---- View + edit a receipt (B5) --------------------------------------
+
+    /** Tenders recorded against a past sale — the payment block of the detail view. */
+    suspend fun loadPayments(saleId: String): List<SalePayment> = repo.paymentsForSale(saleId)
+
+    /** Append-only edit history for one receipt, newest first. */
+    fun auditForSale(saleId: String): Flow<List<AuditEntry>> = repo.auditForSaleFlow(saleId)
+
+    /** How long after a sale the owner may still correct it (0 = editing off). */
+    val saleEditWindowMinutes: Int get() = _shopPrefs.value.saleEditWindowMinutes
+
+    /** True while [sale] is still correctable in place under the current shop setting. */
+    fun canEditSale(sale: SaleEntity): Boolean = sale.isEditable(saleEditWindowMinutes)
+
+    /**
+     * Rewrite [sale] in place from [lines] (the full final basket). Same receipt, same
+     * id — the repository re-runs checkout's math, moves only the stock delta, books any
+     * payment difference on the existing change/credit ledger and appends the audit
+     * trail. [onDone] reports whether the edit was accepted (false => the window closed,
+     * or the receipt has a refund against it).
+     */
+    fun editSale(sale: SaleEntity, lines: List<CartLine>, onDone: (Boolean) -> Unit = {}) {
+        viewModelScope.launch {
+            val biz = business.value
+            val result = repo.editSale(
+                saleId = sale.id,
+                cart = lines,
+                windowMinutes = saleEditWindowMinutes,
+                vatEnabled = biz?.vatEnabled ?: false,
+                vatPercent = biz?.vatPercent ?: 0.0,
+                totalRounding = _shopPrefs.value.checkoutRounding,
+                cashierId = currentCashierId,
+                cashierName = currentCashierName
+            )
+            if (result != null) nudgeSync("saleEdit")
+            onDone(result != null)
+        }
+    }
 
     // ---- Settings --------------------------------------------------------
 
@@ -1792,6 +1835,7 @@ class PosViewModel(
         private const val KEY_QUOTE_DAYS = "quote_validity_days"
         private const val KEY_DISCOUNT_THRESHOLD = "discount_threshold_pct"
         private const val KEY_MAX_ITEM_DISCOUNT = "max_item_discount"
+        private const val KEY_SALE_EDIT_WINDOW = "sale_edit_window_min"
         private const val KEY_MARGIN_FORMULA = "margin_formula"
         private const val KEY_AUTO_BOXES = "auto_units_to_boxes"
         private const val KEY_PRINTER_TYPE = "printer_type"

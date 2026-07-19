@@ -1233,6 +1233,275 @@ class PosRepository(private val db: PosDatabase) {
         return SaleWithLines(savedSale, lines)
     }
 
+    // ---- edit a receipt in place, within the admin window (B5) ------------
+
+    /**
+     * Rewrite an existing completed sale IN PLACE from [cart] — the caller's full,
+     * final set of lines. The sale keeps its **id, receiptNo, soldAt, tenders and
+     * cashier attribution**; only the goods, the derived money and the settlement
+     * position move. There is never a second receipt: one sale, one row, edited.
+     *
+     * Everything derived is recomputed through the SAME path checkout uses
+     * ([computeSaleTotals] over the cart's own line getters, plus the identical
+     * [totalRounding] step), so an edited receipt and a freshly rung one can never
+     * disagree on the math.
+     *
+     * Stock moves by the DELTA only, per item: extra quantity draws the shelf down
+     * (`sale`), removed quantity puts it back (`return`). Measured items (B1) move
+     * their decimal `stockMeasured`; everything else moves whole units
+     * (qty x unitsPerLine) off `stockQty` — mirroring [checkout] exactly.
+     *
+     * The payment delta is never swallowed. [amountPaid] and any change already handed
+     * over are FIXED (an edit doesn't re-open the till), so the customer's position
+     * shifts by exactly `oldTotal - newTotal`, and that difference is booked through
+     * B2's existing ledger: the customer now owing more => `credit_owed`; the shop now
+     * owing them => `change_owed`. On a walk-in there is nobody to attach it to, so it
+     * is recorded as an un-attributed till discrepancy in the audit log instead.
+     *
+     * Every edit appends [AuditEntry] rows (per-line diffs + a totals summary). The
+     * sale row itself is mutable-in-place; the audit log is the append-only history.
+     *
+     * Returns the rewritten sale + lines, or null when the sale is gone, is not an
+     * editable completed sale, is outside [windowMinutes], or has been refunded
+     * (a refunded receipt must not have its goods moved under the refund).
+     */
+    suspend fun editSale(
+        saleId: String,
+        cart: List<CartLine>,
+        windowMinutes: Int,
+        vatEnabled: Boolean = false,
+        vatPercent: Double = 0.0,
+        discount: Double = 0.0,
+        totalRounding: Double = 0.0,
+        cashierId: String? = null,
+        cashierName: String? = null
+    ): SaleWithLines? {
+        val sale = saleDao.getSaleById(saleId) ?: return null
+        val stamp = now()
+        // Window + status gate, evaluated at the SOURCE so a stale screen can't slip an
+        // edit through after the receipt has locked.
+        if (!sale.isEditable(windowMinutes, stamp)) return null
+        // A receipt with money already returned against it is off limits: editing the
+        // goods underneath a refund would make both records lie.
+        if (refundDao.refundedTotalForSaleOnce(saleId) > CENT) return null
+        if (cart.isEmpty()) return null
+
+        val businessId = sale.businessId
+        val oldLines = saleDao.linesForSale(saleId)
+        val oldTotal = sale.total
+
+        // ── money: identical computation to checkout ──
+        val subtotal = cart.sumOf { it.lineSubtotal }
+        val perItemDiscount = cart.sumOf { it.lineDiscountApplied }
+        val perItemMarkup = cart.sumOf { it.lineMarkupApplied }
+        val totals = computeSaleTotals(subtotal, discount + perItemDiscount, vatEnabled, vatPercent, perItemMarkup)
+        val newTotal = if (totalRounding > 0.0)
+            Math.round(totals.total / totalRounding) * totalRounding
+        else totals.total
+
+        // ── settlement: tenders and change already handed over are FIXED ──
+        val amountPaid = sale.amountPaid
+        val changeGivenActual = (sale.changeDue ?: 0.0).coerceAtLeast(0.0)
+        // The customer's position after the edit. Positive => the shop is holding money
+        // that belongs to them (we owe change); negative => they still owe the shop.
+        val newPosition = amountPaid - changeGivenActual - newTotal
+        val newChangeOwed = newPosition.coerceAtLeast(0.0)
+        val newOwing = (-newPosition).coerceAtLeast(0.0)
+        // What the EDIT itself moved. amountPaid/changeGiven cancel out, so the shift is
+        // purely the change in the total — book only that, never the whole balance again.
+        val delta = newTotal - oldTotal
+        val customerId = sale.customerId
+
+        val newLines = cart.map { c ->
+            SaleLine(
+                saleId = saleId,
+                businessId = businessId,
+                itemId = c.itemId,
+                name = if (c.mode == "box") "${c.name} (Box of ${c.unitsPerLine})" else c.name,
+                qty = c.qty,
+                unitPrice = c.unitPrice,
+                lineTax = 0.0,
+                lineDiscount = c.lineDiscountApplied,
+                lineMarkup = c.lineMarkupApplied,
+                lineTotal = c.lineSubtotal,
+                mode = c.mode,
+                unitsPerLine = c.unitsPerLine,
+                updatedAt = stamp
+            )
+        }
+
+        // ── stock delta, aggregated per item so a re-moded line nets out correctly ──
+        // Units are counted the way checkout draws them: measured items in their decimal
+        // quantity, everything else in whole units (qty x unitsPerLine).
+        suspend fun unitsByItem(
+            rows: List<Pair<String?, Pair<Double, Int>>>
+        ): Map<String, Double> {
+            val out = mutableMapOf<String, Double>()
+            for ((itemId, qtyUnits) in rows) {
+                val id = itemId ?: continue
+                val item = itemDao.getById(id) ?: continue
+                val (qty, unitsPerLine) = qtyUnits
+                val units = if (item.isMeasured) qty else qty * unitsPerLine
+                out[id] = (out[id] ?: 0.0) + units
+            }
+            return out
+        }
+        val oldUnits = unitsByItem(oldLines.map { it.itemId to (it.qty to it.unitsPerLine) })
+        val newUnits = unitsByItem(cart.map { it.itemId to (it.qty to it.unitsPerLine) })
+
+        // ── human-readable diff for the audit trail ──
+        val oldQtyByName = oldLines.groupBy { it.name }.mapValues { (_, ls) -> ls.sumOf { it.qty } }
+        val newQtyByName = newLines.groupBy { it.name }.mapValues { (_, ls) -> ls.sumOf { it.qty } }
+        val diffs = mutableListOf<String>()
+        for (name in (oldQtyByName.keys + newQtyByName.keys)) {
+            val before = oldQtyByName[name] ?: 0.0
+            val after = newQtyByName[name] ?: 0.0
+            if (kotlin.math.abs(after - before) < 0.0001) continue
+            diffs += when {
+                before <= 0.0 -> "Added ${trimQty(after)} x $name"
+                after <= 0.0 -> "Removed ${trimQty(before)} x $name"
+                else -> "Qty $name ${trimQty(before)} -> ${trimQty(after)}"
+            }
+        }
+        val receiptLabel = "#${sale.receiptNo ?: saleId.takeLast(6).uppercase()}"
+
+        val updated = sale.copy(
+            subtotal = subtotal,
+            discountTotal = totals.discount,
+            markupTotal = perItemMarkup,
+            taxTotal = totals.taxTotal,
+            total = newTotal,
+            changeOwed = newChangeOwed.takeIf { it > CENT },
+            paymentStatus = if (newOwing > CENT) "unpaid" else "paid",
+            editedAt = stamp,
+            editCount = sale.editCount + 1,
+            updatedAt = stamp,
+            // Re-queue for the cloud: the push upserts on id, so the SAME cloud row is
+            // rewritten with the corrected goods and totals (no duplicate receipt).
+            synced = false
+        )
+
+        db.withTransaction {
+            // Replace the goods: the removed lines are tombstoned rather than erased, so
+            // the local row history stays append-only-ish and the sync push can still see
+            // what used to be there. Live reads (linesForSale) filter deleted = 0.
+            saleDao.upsertLines(oldLines.map { it.copy(deleted = true, updatedAt = stamp) })
+            saleDao.insertLines(newLines)
+            saleDao.upsertSale(updated)
+
+            // Stock: move only the difference, in the direction it went.
+            for (itemId in (oldUnits.keys + newUnits.keys)) {
+                val before = oldUnits[itemId] ?: 0.0
+                val after = newUnits[itemId] ?: 0.0
+                val change = after - before
+                if (kotlin.math.abs(change) < 0.0001) continue
+                val item = itemDao.getById(itemId) ?: continue
+                if (!item.trackStock) continue
+                val measured = item.isMeasured
+                val onHand = if (measured) item.stockMeasured else item.stockQty
+                val remaining = (onHand - change).coerceAtLeast(0.0)
+                val next = if (measured) item.copy(stockMeasured = remaining, updatedAt = stamp, pendingSync = true)
+                else item.copy(stockQty = remaining, updatedAt = stamp, pendingSync = true)
+                itemDao.upsert(next)
+                movementDao.insert(
+                    StockMovement(
+                        businessId = businessId,
+                        itemId = itemId,
+                        // More sold => a further draw-down; fewer sold => goods back on the shelf.
+                        type = if (change > 0) "sale" else "return",
+                        delta = -change,
+                        balanceAfter = remaining,
+                        note = "Edited sale $receiptLabel",
+                        createdBy = cashierId,
+                        createdByName = cashierName,
+                        createdAt = stamp
+                    )
+                )
+            }
+
+            // The payment delta goes somewhere — always.
+            if (kotlin.math.abs(delta) > CENT) {
+                if (customerId != null) {
+                    creditDao.insert(
+                        CreditTxn(
+                            businessId = businessId,
+                            customerId = customerId,
+                            saleId = saleId,
+                            // Total went UP => they owe the difference. Went DOWN => we do.
+                            type = if (delta > 0) "credit_owed" else "change_owed",
+                            amount = kotlin.math.abs(delta),
+                            note = "Receipt $receiptLabel edited",
+                            createdBy = cashierId,
+                            createdByName = cashierName,
+                            createdAt = stamp,
+                            updatedAt = stamp
+                        )
+                    )
+                } else {
+                    // Walk-in: no account to carry it. Record the till imbalance so an
+                    // admin sees the money that didn't reconcile.
+                    auditDao.insert(
+                        AuditEntry(
+                            businessId = businessId,
+                            action = if (delta > 0) "till_short" else "till_over",
+                            entityType = "sale",
+                            entityId = saleId,
+                            summary = if (delta > 0)
+                                "Till shortage ${fmtMoney(delta)} — walk-in receipt $receiptLabel edited upward, difference not collected"
+                            else
+                                "Till overage ${fmtMoney(-delta)} — walk-in receipt $receiptLabel edited downward, difference not refunded",
+                            meta = fmtMoney(kotlin.math.abs(delta)),
+                            createdBy = cashierId,
+                            createdByName = cashierName,
+                            createdAt = stamp
+                        )
+                    )
+                }
+            }
+
+            // Append-only history: one row per line change, then the totals summary.
+            for (d in diffs) {
+                auditDao.insert(
+                    AuditEntry(
+                        businessId = businessId,
+                        action = "sale_edit_line",
+                        entityType = "sale",
+                        entityId = saleId,
+                        summary = "$receiptLabel: $d",
+                        meta = d,
+                        createdBy = cashierId,
+                        createdByName = cashierName,
+                        createdAt = stamp
+                    )
+                )
+            }
+            auditDao.insert(
+                AuditEntry(
+                    businessId = businessId,
+                    action = "sale_edit",
+                    entityType = "sale",
+                    entityId = saleId,
+                    summary = "Receipt $receiptLabel edited — total ${fmtMoney(oldTotal)} -> ${fmtMoney(newTotal)}",
+                    meta = diffs.joinToString("; ").ifBlank { "No line changes" },
+                    createdBy = cashierId,
+                    createdByName = cashierName,
+                    createdAt = stamp
+                )
+            )
+        }
+        return SaleWithLines(updated, newLines)
+    }
+
+    /** Whole numbers read without a trailing ".0" in audit summaries. */
+    private fun trimQty(q: Double): String =
+        if (q == q.toLong().toDouble()) q.toLong().toString() else String.format(java.util.Locale.US, "%.2f", q)
+
+    /** Tenders recorded against a sale — the payment block of the receipt detail view. */
+    suspend fun paymentsForSale(saleId: String): List<SalePayment> = paymentDao.forSale(saleId)
+
+    /** Append-only edit/audit history for ONE sale, newest first (receipt detail view). */
+    fun auditForSaleFlow(saleId: String): Flow<List<AuditEntry>> = auditDao.observeForEntity(saleId)
+
     // ---- quotes (§1.2 parity) --------------------------------------------
 
     /**

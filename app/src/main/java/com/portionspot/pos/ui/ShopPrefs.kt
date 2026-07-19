@@ -37,6 +37,11 @@ data class ShopPrefs(
     // single cart line. This is a ceiling the till physically enforces — unlike
     // [discountThresholdPct] (a PIN gate), it can never be exceeded. 0 = no limit.
     val maxItemDiscount: Double = 0.0,
+    // ── Receipt editing (B5) ──
+    // How long after a sale the owner may still correct the receipt IN PLACE (add or
+    // remove items, change quantities). Outside this window the receipt is locked and
+    // a correction must go through a void/refund instead. 0 = editing off entirely.
+    val saleEditWindowMinutes: Int = 30,
     // ── Margins ──
     val marginFormula: String = "markup",    // "markup" (over cost) or "gross" (of price)
     val autoConvertUnitsToBoxes: Boolean = false, // show stock as N boxes + loose units
@@ -110,6 +115,15 @@ data class ReceiptStyleFlags(
     val showTagline: Boolean,
     val showAddress: Boolean,
     val showFooter: Boolean,
+)
+
+/** Receipt-edit window presets surfaced as chips in Settings (B5). */
+val SALE_EDIT_WINDOWS = listOf(
+    0 to "Off",
+    15 to "15 min",
+    30 to "30 min",
+    60 to "1 hour",
+    240 to "4 hours",
 )
 
 /** Rounding-step presets surfaced as chips for the tax/price rounding pickers. */

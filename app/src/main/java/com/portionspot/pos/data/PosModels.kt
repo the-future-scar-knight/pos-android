@@ -208,9 +208,32 @@ data class SaleEntity(
     val serverCreatedAt: Long? = null,    // server time, set on sync
     val updatedAt: Long = now(),
     val deleted: Boolean = false,
+    // ──── In-place edit within the admin window (B5) ────
+    // The receipt is edited IN PLACE (same id, same receiptNo) — never duplicated —
+    // so there is exactly one row per sale. These two are the visible marker; the
+    // append-only `audit_log` holds the actual before/after history.
+    /** When the receipt was last edited; null => never edited. */
+    val editedAt: Long? = null,
+    /** How many times it has been edited. */
+    @ColumnInfo(defaultValue = "0") val editCount: Int = 0,
     /** false until the WorkManager sync (later milestone) pushes it to Supabase. */
     val synced: Boolean = false
 )
+
+/** True when this receipt has been edited in place at least once (B5). */
+val SaleEntity.wasEdited: Boolean get() = editedAt != null
+
+/**
+ * Is [this] sale still inside the shop's edit window? Editing is deliberately narrow:
+ * only a COMPLETED sale (never a quote, park, void or refund row) and only while
+ * `now - soldAt <= windowMinutes`. Past that the receipt is locked and a correction
+ * has to go through a void/refund, which leaves its own trail.
+ */
+fun SaleEntity.isEditable(windowMinutes: Int, now: Long = now()): Boolean =
+    status == "completed" &&
+        !deleted &&
+        windowMinutes > 0 &&
+        now - soldAt <= windowMinutes * 60_000L
 
 /** One line of a completed sale. name/unitPrice are SNAPSHOTS at sale time. */
 @Entity(

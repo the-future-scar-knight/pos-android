@@ -497,6 +497,18 @@ val MIGRATION_23_24 = object : Migration(23, 24) {
     }
 }
 
+/**
+ * B5 — view + edit receipt. A receipt edited inside the admin window is rewritten IN
+ * PLACE (same id, same receiptNo), so the only new state is the marker saying it
+ * happened. The actual what-changed history is append-only rows in `audit_log`.
+ */
+val MIGRATION_24_25 = object : Migration(24, 25) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE sales ADD COLUMN editedAt INTEGER")
+        db.execSQL("ALTER TABLE sales ADD COLUMN editCount INTEGER NOT NULL DEFAULT 0")
+    }
+}
+
 @Database(
     entities = [
         Business::class,
@@ -520,7 +532,7 @@ val MIGRATION_23_24 = object : Migration(23, 24) {
         AppNotification::class,
         AuditEntry::class
     ],
-    version = 24,
+    version = 25,
     exportSchema = false
 )
 abstract class PosDatabase : RoomDatabase() {
@@ -565,7 +577,7 @@ abstract class PosDatabase : RoomDatabase() {
                         MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17,
                         MIGRATION_17_18, MIGRATION_18_19, MIGRATION_19_20,
                         MIGRATION_20_21, MIGRATION_21_22, MIGRATION_22_23,
-                        MIGRATION_23_24
+                        MIGRATION_23_24, MIGRATION_24_25
                     )
                     .fallbackToDestructiveMigration()
                     .build()
