@@ -1937,6 +1937,8 @@ private fun MobileTopBar(
     shopName: String,
     logoUri: String?,
     adminBack: (() -> Unit)? = null,
+    pendingUpload: Int = 0,
+    onSyncClick: () -> Unit = {},
     onMenu: () -> Unit
 ) {
     val t = LocalPosTokens.current
@@ -1969,14 +1971,26 @@ private fun MobileTopBar(
                 }
             }
             // Real connectivity, not a hardcoded green Wi-Fi: online => Wi-Fi in the
-            // online tint, offline => WifiOff muted. Driven by the system ConnectivityManager.
+            // online tint, offline => WifiOff muted. Tap for the sync status sheet; a
+            // warning dot shows when local rows are still waiting to upload.
             val online by ConnectivityObserver.rememberOnlineState()
-            Icon(
-                imageVector = if (online) Icons.Filled.Wifi else Icons.Filled.WifiOff,
-                contentDescription = if (online) "Online" else "Offline",
-                tint = if (online) t.onlinePill else t.inkTertiary,
-                modifier = Modifier.size(16.dp)
-            )
+            Box(
+                Modifier.size(36.dp).clip(CircleShape).clickable(onClick = onSyncClick),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = if (online) Icons.Filled.Wifi else Icons.Filled.WifiOff,
+                    contentDescription = if (online) "Online — sync status" else "Offline — sync status",
+                    tint = if (online) t.onlinePill else t.inkTertiary,
+                    modifier = Modifier.size(16.dp)
+                )
+                if (pendingUpload > 0) {
+                    Box(
+                        Modifier.align(Alignment.TopEnd).padding(top = 4.dp, end = 4.dp)
+                            .size(8.dp).clip(CircleShape).background(t.warning)
+                    )
+                }
+            }
         }
         HorizontalDivider(color = t.surfaceBorder)
     }
@@ -2114,6 +2128,121 @@ private fun MoreSheet(current: Screen, onSelect: (Screen) -> Unit, onDismiss: ()
                 }
             }
         }
+    }
+}
+
+/** Quick sync status sheet (tap the top-bar Wi-Fi icon): what's queued to upload,
+ *  when data last went up / came down, any per-table warnings, and a manual "Sync
+ *  now". A lightweight peek at the fuller Sync screen. */
+@Composable
+private fun SyncStatusSheet(vm: PosViewModel, onDismiss: () -> Unit) {
+    val t = LocalPosTokens.current
+    val connection by vm.connection.collectAsState()
+    val status by vm.syncStatus.collectAsState()
+    val lastUpload by vm.lastUploadAt.collectAsState()
+    val lastDownload by vm.lastDownloadAt.collectAsState()
+    val pending by vm.pendingUpload.collectAsState()
+    val online by ConnectivityObserver.rememberOnlineState()
+
+    LaunchedEffect(Unit) { vm.refreshPendingUpload() }
+
+    fun clock(ts: Long?): String =
+        if (ts == null || ts <= 0L) "never"
+        else java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date(ts))
+
+    Box(
+        Modifier.fillMaxSize().background(Color(0x73000000)).clickable(onClick = onDismiss),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        Column(
+            Modifier.fillMaxWidth()
+                .clip(RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp))
+                .background(t.surface1)
+                .navigationBarsPadding()
+                .padding(horizontal = 16.dp, vertical = 12.dp)
+                .clickable(enabled = false) {}
+        ) {
+            Box(
+                Modifier.align(Alignment.CenterHorizontally).padding(bottom = 14.dp)
+                    .width(36.dp).height(4.dp).clip(RoundedCornerShape(2.dp)).background(t.surface4)
+            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    if (online) Icons.Filled.Wifi else Icons.Filled.WifiOff,
+                    contentDescription = null,
+                    tint = if (online) t.onlinePill else t.inkTertiary,
+                    modifier = Modifier.size(18.dp)
+                )
+                Text(
+                    if (online) "Online" else "Offline",
+                    color = t.inkPrimary, fontWeight = FontWeight.Bold, fontSize = 16.sp,
+                    modifier = Modifier.weight(1f)
+                )
+                if (status is SyncStatus.Syncing) {
+                    CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp, color = t.brand.s500)
+                }
+            }
+
+            if (connection == null) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "Cloud sync is off. Connect your database in Settings to back up and sync across devices.",
+                    fontSize = 12.sp, color = t.inkTertiary
+                )
+            } else {
+                Spacer(Modifier.height(8.dp))
+                SyncStatRow("Last upload", clock(lastUpload))
+                SyncStatRow("Last download", clock(lastDownload))
+                SyncStatRow(
+                    "Waiting to upload",
+                    if (pending > 0) "$pending row(s)" else "all synced",
+                    highlight = pending > 0
+                )
+                val warnings = (status as? SyncStatus.Done)?.warnings.orEmpty()
+                if (warnings.isNotEmpty()) {
+                    Spacer(Modifier.height(8.dp))
+                    warnings.forEach { w -> Text("• $w", fontSize = 11.sp, color = t.warning) }
+                }
+                (status as? SyncStatus.Error)?.let {
+                    Spacer(Modifier.height(8.dp))
+                    Text(it.message, fontSize = 11.sp, color = t.danger)
+                }
+                Spacer(Modifier.height(14.dp))
+                Button(
+                    onClick = { vm.syncNow() },
+                    enabled = online && status !is SyncStatus.Syncing,
+                    modifier = Modifier.fillMaxWidth().height(44.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = t.brand.s600, contentColor = t.inkOnBrand
+                    )
+                ) {
+                    Icon(Icons.Filled.Sync, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Sync now")
+                }
+            }
+            Spacer(Modifier.height(6.dp))
+        }
+    }
+}
+
+@Composable
+private fun SyncStatRow(label: String, value: String, highlight: Boolean = false) {
+    val t = LocalPosTokens.current
+    Row(
+        Modifier.fillMaxWidth().padding(vertical = 5.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(label, fontSize = 13.sp, color = t.inkSecondary, modifier = Modifier.weight(1f))
+        Text(
+            value,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = if (highlight) t.warning else t.inkPrimary
+        )
     }
 }
 
