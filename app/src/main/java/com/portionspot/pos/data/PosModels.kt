@@ -107,9 +107,12 @@ data class Item(
     @ColumnInfo(defaultValue = "0") val boxPrice: Double = 0.0,
     @ColumnInfo(defaultValue = "1") val boxSize: Int = 1,
     // How the product is sold (mirrors the web catalog's product_type):
-    //   "box"   — sold by the box AND/OR as loose units (uses boxSize/boxPrice).
-    //   "set"   — sold only as a complete set (no box split; stock counts sets).
-    //   "piece" — sold individually, no box (stock counts pieces).
+    //   "box"      — sold by the box AND/OR as loose units (uses boxSize/boxPrice).
+    //   "set"      — sold only as a complete set (no box split; stock counts sets).
+    //   "piece"    — sold individually, no box (stock counts pieces).
+    //   "measured" — sold by a DECIMAL quantity of [unit] (e.g. 2.35 kg). Pricing is
+    //                [pricePerUnit] × qty and on-hand lives in [stockMeasured]; the
+    //                integer box/piece stock (stockQty) is NOT used for measured items.
     // Drives the product form's field set and the type-aware stock wording.
     @ColumnInfo(defaultValue = "box") val productType: String = "box",
     val cost: Double? = null,
@@ -118,6 +121,15 @@ data class Item(
     val stockQty: Double = 0.0,
     @ColumnInfo(defaultValue = "0") val reorderLevel: Double = 0.0,  // low-stock threshold
     val unit: String = "pc",
+    // ──── Measured (unit-priced) products — productType == "measured" ────
+    // [pricePerUnit] is the price of ONE [unit] (kg, L, m, …); a measured line costs
+    // pricePerUnit × the decimal quantity the cashier enters. [stockMeasured] is the
+    // decimal on-hand quantity (in [unit]s), drawn down by the sold quantity at
+    // checkout — the integer stockQty is left untouched for measured items.
+    // Both are LOCAL-ONLY: the cloud `products` table has no matching columns, so they
+    // are never pushed and are preserved across a pull-merge.
+    @ColumnInfo(defaultValue = "0") val pricePerUnit: Double = 0.0,
+    @ColumnInfo(defaultValue = "0") val stockMeasured: Double = 0.0,
     val colorHex: String? = null,        // tile colour when no image
     // ──── Product image (mirrors the cloud `products.image_url` + `show_image`) ────
     // [imageUrl] is the REMOTE Supabase Storage public URL — this is what syncs to the
@@ -135,6 +147,13 @@ data class Item(
     /** Local-only: true => has unsynced local edits to push. Never sent to cloud. */
     val pendingSync: Boolean = true
 )
+
+/** Measured (unit-priced) product: sold by a decimal quantity of [Item.unit]. */
+val Item.isMeasured: Boolean get() = productType == "measured"
+
+/** On-hand quantity used for badges / low-stock: the decimal [stockMeasured] for a
+ *  measured item, otherwise the integer/box unit count [stockQty]. */
+val Item.onHand: Double get() = if (isMeasured) stockMeasured else stockQty
 
 /** A COMPLETED receipt (frozen snapshot). The live cart stays in memory. */
 @Entity(

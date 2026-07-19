@@ -535,14 +535,22 @@ class PosRepository(private val db: PosDatabase) {
             for (c in cart) {
                 val item = itemDao.getById(c.itemId) ?: continue
                 if (!item.trackStock) continue
-                val remaining = (item.stockQty - c.stockUnits).coerceAtLeast(0.0)
-                itemDao.upsert(item.copy(stockQty = remaining, updatedAt = stamp, pendingSync = true))
+                // Measured items draw down the DECIMAL stockMeasured by the sold quantity
+                // and never touch the integer box/piece stockQty; everything else draws
+                // whole units (qty * boxSize) off stockQty. Both clamp at zero.
+                val measured = item.productType == "measured" || c.measured
+                val drawn = if (measured) c.qty else c.stockUnits
+                val remaining = ((if (measured) item.stockMeasured else item.stockQty) - drawn)
+                    .coerceAtLeast(0.0)
+                val updated = if (measured) item.copy(stockMeasured = remaining, updatedAt = stamp, pendingSync = true)
+                else item.copy(stockQty = remaining, updatedAt = stamp, pendingSync = true)
+                itemDao.upsert(updated)
                 movementDao.insert(
                     StockMovement(
                         businessId = businessId,
                         itemId = item.id,
                         type = "sale",
-                        delta = -c.stockUnits,
+                        delta = -drawn,
                         balanceAfter = remaining,
                         note = "Sale #$receiptNo",
                         createdBy = cashierId,
@@ -1566,6 +1574,12 @@ data class CartLine(
     val qty: Double,
     val mode: String = "retail",
     val unitsPerLine: Int = 1,
+    /** True for a measured (unit-priced) line: [qty] is a decimal quantity of
+     *  [unitLabel] and [unitPrice] is the price of one unit. Its shelf draw-down hits
+     *  the item's decimal `stockMeasured`, not the integer `stockQty`. */
+    val measured: Boolean = false,
+    /** Unit label for a measured line (kg, L, m, …); blank for non-measured lines. */
+    val unitLabel: String = "",
     /** Fixed currency amount knocked off this whole line (0 = none). Clamped to the
      *  line's gross value below, so it can never make a line go negative. */
     val lineDiscount: Double = 0.0,

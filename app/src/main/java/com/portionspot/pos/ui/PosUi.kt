@@ -26,6 +26,7 @@ import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
@@ -194,6 +195,8 @@ import com.portionspot.pos.data.Tender
 import com.portionspot.pos.data.Expense
 import com.portionspot.pos.data.Supplier
 import com.portionspot.pos.data.Item
+import com.portionspot.pos.data.isMeasured
+import com.portionspot.pos.data.onHand
 import com.portionspot.pos.data.MethodBreakdown
 import com.portionspot.pos.data.PurchaseOrderLine
 import com.portionspot.pos.data.PurchaseOrderWithLines
@@ -1968,6 +1971,7 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
     var pendingSale by remember { mutableStateOf<PendingSale?>(null) }
     var pendingQuote by remember { mutableStateOf<Pair<Double, Customer?>?>(null) }
     var priceModalItem by remember { mutableStateOf<Item?>(null) }
+    var measuredItem by remember { mutableStateOf<Item?>(null) }
     var scanning by remember { mutableStateOf(false) }
     val context = LocalContext.current
 
@@ -2057,7 +2061,12 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
             val onPick: (Item) -> Unit = { item ->
                 val hasBox = item.boxSize > 1 && item.boxPrice > 0.0
                 val hasWs = item.wholesalePrice > 0.0 && item.wholesalePrice != item.price
-                if (hasBox || hasWs) priceModalItem = item else vm.addToCart(item, "retail")
+                when {
+                    // Measured items always prompt for a decimal quantity of their unit.
+                    item.productType == "measured" -> measuredItem = item
+                    hasBox || hasWs -> priceModalItem = item
+                    else -> vm.addToCart(item, "retail")
+                }
             }
             if (listView) {
                 LazyColumn(
@@ -2134,6 +2143,14 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
             currency = currency,
             onPick = { mode -> vm.addToCart(item, mode); priceModalItem = null },
             onDismiss = { priceModalItem = null }
+        )
+    }
+    measuredItem?.let { item ->
+        MeasuredQtyDialog(
+            item = item,
+            currency = currency,
+            onConfirm = { qty -> vm.addMeasuredToCart(item, qty); measuredItem = null },
+            onDismiss = { measuredItem = null }
         )
     }
     if (showCart) {
@@ -2247,10 +2264,11 @@ private fun ProductCard(item: Item, currency: String, inCart: Int, onClick: () -
     val t = LocalPosTokens.current
     val d = LocalPosDimens.current
     val tracked = item.trackStock
-    val units = item.stockQty
-    val isOut = tracked && units <= 0.0
-    val hasBox = item.boxSize > 1 && item.boxPrice > 0.0
-    val hasWs = item.wholesalePrice > 0.0
+    val measured = item.isMeasured
+    val isOut = tracked && item.onHand <= 0.0
+    // Measured items show their per-unit price (never a box/WS price).
+    val hasBox = !measured && item.boxSize > 1 && item.boxPrice > 0.0
+    val hasWs = !measured && item.wholesalePrice > 0.0
     val heroImage = item.imageModel?.takeIf { item.showImage }
 
     Box(
@@ -2286,10 +2304,19 @@ private fun ProductCard(item: Item, currency: String, inCart: Int, onClick: () -
             } else {
                 Spacer(Modifier.height(20.dp)) // reserved band for bubble + stock badge
             }
-            Text(
-                money(item.price, currency),
-                color = t.brand.s600, fontWeight = FontWeight.Black, fontSize = d.cardPriceSize, maxLines = 1
-            )
+            Row(verticalAlignment = Alignment.Bottom) {
+                Text(
+                    money(if (measured) item.pricePerUnit else item.price, currency),
+                    color = t.brand.s600, fontWeight = FontWeight.Black, fontSize = d.cardPriceSize, maxLines = 1
+                )
+                if (measured) {
+                    Text(
+                        "/${item.unit.trim().ifBlank { "unit" }}",
+                        color = t.inkTertiary, fontSize = d.cardMetaSize, fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.padding(start = 2.dp, bottom = 1.dp)
+                    )
+                }
+            }
             Spacer(Modifier.height(4.dp))
             Text(
                 item.name,
@@ -2297,7 +2324,7 @@ private fun ProductCard(item: Item, currency: String, inCart: Int, onClick: () -
                 lineHeight = (d.cardNameSize.value * 1.25f).sp, maxLines = 2, overflow = TextOverflow.Ellipsis
             )
             Spacer(Modifier.weight(1f))
-            if (item.productType == "set" || item.productType == "piece") {
+            if (item.productType == "set" || item.productType == "piece" || measured) {
                 TypeBadge(item)
                 Spacer(Modifier.height(3.dp))
             }
@@ -2375,9 +2402,10 @@ private fun ProductListRow(item: Item, currency: String, inCart: Int, onClick: (
     val t = LocalPosTokens.current
     val d = LocalPosDimens.current
     val tracked = item.trackStock
-    val isOut = tracked && item.stockQty <= 0.0
-    val hasBox = item.boxSize > 1 && item.boxPrice > 0.0
-    val hasWs = item.wholesalePrice > 0.0
+    val measured = item.isMeasured
+    val isOut = tracked && item.onHand <= 0.0
+    val hasBox = !measured && item.boxSize > 1 && item.boxPrice > 0.0
+    val hasWs = !measured && item.wholesalePrice > 0.0
     val heroImage = item.imageModel?.takeIf { item.showImage }
 
     Row(
@@ -2417,7 +2445,7 @@ private fun ProductListRow(item: Item, currency: String, inCart: Int, onClick: (
                     fontSize = d.cardNameSize, maxLines = 1, overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f, fill = false)
                 )
-                if (item.productType == "set" || item.productType == "piece") {
+                if (item.productType == "set" || item.productType == "piece" || measured) {
                     Spacer(Modifier.width(6.dp))
                     TypeBadge(item)
                 }
@@ -2439,10 +2467,19 @@ private fun ProductListRow(item: Item, currency: String, inCart: Int, onClick: (
         }
         Spacer(Modifier.width(10.dp))
         Column(horizontalAlignment = Alignment.End) {
-            Text(
-                money(item.price, currency),
-                color = t.brand.s600, fontWeight = FontWeight.Black, fontSize = d.cardPriceSize, maxLines = 1
-            )
+            Row(verticalAlignment = Alignment.Bottom) {
+                Text(
+                    money(if (measured) item.pricePerUnit else item.price, currency),
+                    color = t.brand.s600, fontWeight = FontWeight.Black, fontSize = d.cardPriceSize, maxLines = 1
+                )
+                if (measured) {
+                    Text(
+                        "/${item.unit.trim().ifBlank { "unit" }}",
+                        color = t.inkTertiary, fontSize = d.cardMetaSize, fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.padding(start = 2.dp, bottom = 1.dp)
+                    )
+                }
+            }
             Spacer(Modifier.height(2.dp))
             StockBadge(item)
         }
@@ -2454,7 +2491,10 @@ private fun ProductListRow(item: Item, currency: String, inCart: Int, onClick: (
 private fun StockBadge(item: Item) {
     val t = LocalPosTokens.current
     if (!item.trackStock) return
-    val units = item.stockQty
+    // Measured items are counted in their decimal unit (e.g. "2.5 kg"); everything else
+    // is a whole-unit count. The low warning threshold (< 5) is unchanged.
+    val units = item.onHand
+    val suffix = if (item.isMeasured) " ${item.unit.trim().ifBlank { "unit" }}" else ""
     when {
         units <= 0.0 -> Box(
             Modifier.clip(RoundedCornerShape(6.dp)).background(t.danger.copy(alpha = 0.12f))
@@ -2463,8 +2503,8 @@ private fun StockBadge(item: Item) {
         units < 5.0 -> Box(
             Modifier.clip(RoundedCornerShape(6.dp)).background(t.warning.copy(alpha = 0.15f))
                 .padding(horizontal = 6.dp, vertical = 2.dp)
-        ) { Text(trimQty(units), color = t.warning, fontSize = 9.sp, fontWeight = FontWeight.Bold) }
-        else -> Text(trimQty(units), color = t.inkTertiary, fontSize = 9.sp)
+        ) { Text("${trimQty(units)}$suffix", color = t.warning, fontSize = 9.sp, fontWeight = FontWeight.Bold) }
+        else -> Text("${trimQty(units)}$suffix", color = t.inkTertiary, fontSize = 9.sp)
     }
 }
 
@@ -2476,6 +2516,8 @@ private fun TypeBadge(item: Item) {
     val (label, color) = when (item.productType) {
         "set" -> "Set" to t.brand.s600
         "piece" -> "Piece" to t.success
+        // Measured items badge with their unit (kg/L/m…) so the basis is obvious.
+        "measured" -> item.unit.trim().ifBlank { "Unit" } to t.accentBlue
         else -> return
     }
     Box(
@@ -2907,6 +2949,57 @@ private fun PriceModeDialog(item: Item, currency: String, onPick: (String) -> Un
     }
 }
 
+/**
+ * Decimal-quantity entry for a MEASURED (unit-priced) product. The cashier types how
+ * much of the unit they're selling (e.g. 2.35 kg); the line price previews live as
+ * quantity × pricePerUnit. Confirm adds a measured line to the cart.
+ */
+@Composable
+private fun MeasuredQtyDialog(
+    item: Item,
+    currency: String,
+    onConfirm: (Double) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val t = LocalPosTokens.current
+    val unitLabel = item.unit.trim().ifBlank { "unit" }
+    var text by remember { mutableStateOf("") }
+    val qty = text.replace(',', '.').toDoubleOrNull()
+    val valid = qty != null && qty > 0
+    val lineTotal = (qty ?: 0.0) * item.pricePerUnit
+    PosContainedForm(
+        title = item.name,
+        onDismiss = onDismiss,
+        confirmLabel = "Add to cart",
+        confirmEnabled = valid,
+        onConfirm = { onConfirm(qty ?: 0.0) }
+    ) {
+        Text(
+            "${money(item.pricePerUnit, currency)} per $unitLabel",
+            color = t.inkSecondary, fontSize = 13.sp, fontWeight = FontWeight.Medium
+        )
+        if (item.trackStock) {
+            Text(
+                "On hand: ${trimQty(item.stockMeasured)} $unitLabel",
+                color = t.inkTertiary, fontSize = 12.sp
+            )
+        }
+        PosFormCard {
+            PosField(
+                value = text,
+                onValueChange = { text = it.filter { ch -> ch.isDigit() || ch == '.' || ch == ',' } },
+                label = "Quantity ($unitLabel)",
+                keyboardType = KeyboardType.Decimal,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Text(
+                "Line total: ${money(lineTotal, currency)}",
+                color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 16.sp
+            )
+        }
+    }
+}
+
 @Composable
 private fun PriceOption(title: String, subtitle: String, price: String, accent: Color, onClick: () -> Unit) {
     val t = LocalPosTokens.current
@@ -2943,7 +3036,9 @@ private fun CartDialog(cart: List<CartLine>, currency: String, vm: PosViewModel,
                     Column(Modifier.weight(1f)) {
                         Text(line.name, fontWeight = FontWeight.SemiBold, color = t.inkPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         Text(
-                            "${modeLabel(line.mode)} · ${money(line.unitPrice, currency)}/ea",
+                            if (line.measured)
+                                "${trimQty(line.qty)} ${line.unitLabel} × ${money(line.unitPrice, currency)}"
+                            else "${modeLabel(line.mode)} · ${money(line.unitPrice, currency)}/ea",
                             color = t.inkTertiary, fontSize = 11.sp
                         )
                         // Per-item discount affordance (tap to set/edit).
@@ -4377,26 +4472,31 @@ private fun ItemsScreen(vm: PosViewModel, currency: String) {
                                             maxLines = 1, overflow = TextOverflow.Ellipsis,
                                             modifier = Modifier.weight(1f, fill = false)
                                         )
-                                        if (item.productType == "set" || item.productType == "piece") {
+                                        if (item.productType == "set" || item.productType == "piece" || item.isMeasured) {
                                             Spacer(Modifier.width(6.dp))
                                             TypeBadge(item)
                                         }
                                     }
                                     if (item.trackStock) {
-                                        val out = item.stockQty <= 0.0
+                                        // Measured items count in their decimal unit; box/piece in whole units.
+                                        val onHand = item.onHand
+                                        val out = onHand <= 0.0
                                         // Per-item reorder level wins; fall back to the global default.
                                         val threshold = if (item.reorderLevel > 0.0) item.reorderLevel else LOW_STOCK_THRESHOLD
-                                        val low = !out && item.stockQty <= threshold
+                                        val low = !out && onHand <= threshold
                                         val (label, tint) = when {
                                             out -> "Out of stock" to MaterialTheme.colorScheme.error
-                                            low -> "Low: ${trimQty(item.stockQty)} ${item.unit} left" to MaterialTheme.colorScheme.error
-                                            else -> "In stock: ${trimQty(item.stockQty)} ${item.unit}" to
+                                            low -> "Low: ${trimQty(onHand)} ${item.unit} left" to MaterialTheme.colorScheme.error
+                                            else -> "In stock: ${trimQty(onHand)} ${item.unit}" to
                                                 MaterialTheme.colorScheme.onSurfaceVariant
                                         }
                                         Text(label, color = tint, style = MaterialTheme.typography.bodySmall)
                                     }
                                 }
-                                Text(money(item.price, currency), fontWeight = FontWeight.Bold)
+                                Text(
+                                    money(if (item.isMeasured) item.pricePerUnit else item.price, currency),
+                                    fontWeight = FontWeight.Bold
+                                )
                             }
                         }
                     }
@@ -4581,6 +4681,39 @@ private fun PriceListDialog(
     }
 }
 
+/** One selectable product-type card in the item form's 2×2 type grid. */
+@Composable
+private fun RowScope.ProductTypeCell(
+    title: String,
+    desc: String,
+    selected: Boolean,
+    onSelect: () -> Unit
+) {
+    val t = LocalPosTokens.current
+    Column(
+        Modifier
+            .weight(1f)
+            .heightIn(min = 62.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(if (selected) t.brand.s50 else t.surface2)
+            .border(
+                width = if (selected) 1.5.dp else 1.dp,
+                color = if (selected) t.brand.s500 else t.surfaceBorder,
+                shape = RoundedCornerShape(12.dp)
+            )
+            .clickable(onClick = onSelect)
+            .padding(horizontal = 10.dp, vertical = 8.dp)
+    ) {
+        Text(
+            title, fontSize = 14.sp,
+            fontWeight = if (selected) FontWeight.Bold else FontWeight.SemiBold,
+            color = if (selected) t.brand.s700 else t.inkPrimary, maxLines = 1
+        )
+        Spacer(Modifier.height(3.dp))
+        Text(desc, fontSize = 10.sp, lineHeight = 12.sp, color = t.inkTertiary, maxLines = 2)
+    }
+}
+
 /**
  * Add or edit a catalogue item. When [existing] is null this creates a new item
  * via [vm].addItem; otherwise it persists edits through [vm].updateItem. Retail,
@@ -4635,6 +4768,16 @@ private fun ItemDialog(
     var reorder by remember {
         mutableStateOf(existing?.reorderLevel?.takeIf { it > 0 }?.let { trimQty(it) } ?: "")
     }
+    // ── Measured (unit-priced) product state ──
+    // Price for ONE unit, and the decimal on-hand quantity. Both apply only when
+    // productType == "measured"; the unit label reuses the existing [unit] field.
+    var pricePerUnit by remember {
+        mutableStateOf(existing?.pricePerUnit?.takeIf { it > 0 }?.let { trimQty(it) } ?: "")
+    }
+    var stockMeasured by remember {
+        mutableStateOf(existing?.takeIf { it.trackStock && it.productType == "measured" }
+            ?.let { trimQty(it.stockMeasured) } ?: "")
+    }
     var showHistory by remember { mutableStateOf(false) }
 
     // ── Product image ──
@@ -4670,39 +4813,51 @@ private fun ItemDialog(
     // Product type drives which fields apply. Only a "box" item uses the box price /
     // units-per-box and the boxes+loose stock split; a set or piece is a single count.
     val isBox = productType == "box"
+    val isMeasured = productType == "measured"
     val typeSuffix = when (productType) { "set" -> "  (per set)"; "piece" -> "  (each)"; else -> "" }
     val useBoxStock = isBox && boxSizeVal > 1
     // Cost basis is type-aware: a box's cost is entered PER BOX and the per-unit cost is
-    // derived (box cost ÷ units per box); a set/piece cost is already per sellable unit.
+    // derived (box cost ÷ units per box); a set/piece/measured cost is already per unit.
     val unitCostVal = if (isBox) boxCost.toDoubleOrNull()?.let { it / boxSizeVal }
     else cost.toDoubleOrNull()
-    // Values actually persisted: a set/piece never keeps a box size or box price.
+    // Values actually persisted: a set/piece/measured never keeps a box size or box price.
     val savedBoxSize = if (isBox) boxSizeVal else 1
     val savedBoxPrice = if (isBox) boxPriceVal else 0.0
+    // Measured pricing/stock. The unit label reuses the [unit] field; for a measured
+    // item the "retail price" stored is the per-unit price (so cards/reports read right).
+    val pricePerUnitVal = pricePerUnit.toDoubleOrNull() ?: 0.0
+    val stockMeasuredVal = stockMeasured.toDoubleOrNull() ?: 0.0
     // Total on-hand units. For a box item it's dynamically summed from boxes + loose;
-    // otherwise it's the single unit/set/piece count.
+    // otherwise it's the single unit/set/piece count. Measured tracks stock separately.
     val boxesVal = stockBoxes.toIntOrNull() ?: 0
     val looseVal = stockLoose.toDoubleOrNull() ?: 0.0
     val stockVal = if (useBoxStock) boxesVal * boxSizeVal + looseVal
     else (stock.toDoubleOrNull() ?: 0.0)
     val unitText = unit.trim().ifBlank { "pc" }
+    // The retail price persisted: a measured item stores its per-unit price here.
+    val savedPrice = if (isMeasured) pricePerUnitVal else (priceVal ?: 0.0)
+    // Save is enabled once there's a name and a usable price for the chosen type.
+    val priceReady = if (isMeasured) pricePerUnitVal > 0.0 else priceVal != null
 
     PosContainedForm(
         title = if (existing == null) "New item" else "Edit item",
         onDismiss = onClose,
         confirmLabel = "Save item",
-        confirmEnabled = name.isNotBlank() && priceVal != null,
+        confirmEnabled = name.isNotBlank() && priceReady,
         onConfirm = {
             if (existing == null) {
                 vm.addItem(
-                    name = name, price = priceVal ?: 0.0,
+                    name = name, price = savedPrice,
                     wholesalePrice = wholesaleVal, boxPrice = savedBoxPrice, boxSize = savedBoxSize,
                     productType = productType,
                     category = category.trim().ifBlank { null }, sku = sku.trim().ifBlank { null },
                     barcode = barcode.trim().ifBlank { null },
-                    taxRate = taxVal, trackStock = track, stockQty = stockVal,
+                    taxRate = taxVal, trackStock = track,
+                    stockQty = if (isMeasured) 0.0 else stockVal,
                     reorderLevel = reorder.toDoubleOrNull() ?: 0.0,
                     cost = unitCostVal, unit = unitText,
+                    pricePerUnit = if (isMeasured) pricePerUnitVal else 0.0,
+                    stockMeasured = if (isMeasured) stockMeasuredVal else 0.0,
                     imageLocalPath = imageLocalPath, showImage = showImage
                 )
             } else {
@@ -4720,7 +4875,7 @@ private fun ItemDialog(
                 vm.updateItem(
                     existing.copy(
                         name = name.trim(),
-                        price = priceVal ?: 0.0,
+                        price = savedPrice,
                         wholesalePrice = wholesaleVal,
                         boxPrice = savedBoxPrice,
                         boxSize = savedBoxSize,
@@ -4730,10 +4885,12 @@ private fun ItemDialog(
                         barcode = barcode.trim().ifBlank { null },
                         taxRate = taxVal,
                         trackStock = track,
-                        stockQty = if (track) stockVal else 0.0,
+                        stockQty = if (isMeasured) 0.0 else if (track) stockVal else 0.0,
                         reorderLevel = if (track) (reorder.toDoubleOrNull() ?: 0.0) else 0.0,
                         cost = unitCostVal,
                         unit = unitText,
+                        pricePerUnit = if (isMeasured) pricePerUnitVal else 0.0,
+                        stockMeasured = if (isMeasured && track) stockMeasuredVal else 0.0,
                         imageLocalPath = finalPath,
                         imageUrl = finalUrl,
                         imagePending = finalPending,
@@ -4794,108 +4951,149 @@ private fun ItemDialog(
             }
         }
 
-        // ── Product type (Box / Set / Piece) — drives the fields below ──
+        // ── Product type (Box / Set / Piece / Measured) — drives the fields below ──
         Column {
             PosSectionLabel("Product type")
             Spacer(Modifier.height(6.dp))
+            // 2×2 grid: four options read comfortably on a phone (a single row of four
+            // is too cramped). Each cell is a tappable card.
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf(
-                    Triple("box", "Box", "Box or loose unit"),
-                    Triple("set", "Set", "Complete set only"),
-                    Triple("piece", "Piece", "Sold individually")
-                ).forEach { (value, title, desc) ->
-                    val selected = productType == value
-                    Column(
-                        Modifier
-                            .weight(1f)
-                            .heightIn(min = 64.dp)
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(if (selected) t.brand.s50 else t.surface2)
-                            .border(
-                                width = if (selected) 1.5.dp else 1.dp,
-                                color = if (selected) t.brand.s500 else t.surfaceBorder,
-                                shape = RoundedCornerShape(12.dp)
-                            )
-                            .clickable { productType = value }
-                            .padding(horizontal = 10.dp, vertical = 8.dp)
-                    ) {
-                        Text(
-                            title, fontSize = 14.sp,
-                            fontWeight = if (selected) FontWeight.Bold else FontWeight.SemiBold,
-                            color = if (selected) t.brand.s700 else t.inkPrimary, maxLines = 1
-                        )
-                        Spacer(Modifier.height(3.dp))
-                        Text(desc, fontSize = 10.sp, lineHeight = 12.sp, color = t.inkTertiary, maxLines = 2)
-                    }
-                }
+                ProductTypeCell("Box", "Box or loose unit", productType == "box") { productType = "box" }
+                ProductTypeCell("Set", "Complete set only", productType == "set") { productType = "set" }
+            }
+            Spacer(Modifier.height(8.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                ProductTypeCell("Piece", "Sold individually", productType == "piece") { productType = "piece" }
+                ProductTypeCell("Measured", "By weight / volume", productType == "measured") { productType = "measured" }
             }
         }
 
         // ── Pricing ──
         PosFormCard {
             PosField(value = name, onValueChange = { name = it }, label = "Name", modifier = Modifier.fillMaxWidth())
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (isMeasured) {
+                // Measured items: pick a unit, then price ONE unit. No box / wholesale.
+                PosSectionLabel("Unit of measure")
+                Spacer(Modifier.height(2.dp))
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf("kg", "g", "L", "ml", "m").forEach { u ->
+                        val selected = unit.trim().equals(u, ignoreCase = true)
+                        Box(
+                            Modifier
+                                .weight(1f)
+                                .heightIn(min = 38.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(if (selected) t.brand.s600 else t.surface2)
+                                .border(
+                                    width = 1.dp,
+                                    color = if (selected) t.brand.s600 else t.surfaceBorder,
+                                    shape = RoundedCornerShape(10.dp)
+                                )
+                                .clickable { unit = u }
+                                .padding(vertical = 8.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                u, fontSize = 13.sp,
+                                fontWeight = if (selected) FontWeight.Bold else FontWeight.SemiBold,
+                                color = if (selected) t.inkOnBrand else t.inkPrimary, maxLines = 1
+                            )
+                        }
+                    }
+                }
                 PosField(
-                    value = price,
-                    onValueChange = { price = it.filter { ch -> ch.isDigit() || ch == '.' } },
-                    label = "Retail price$typeSuffix", keyboardType = KeyboardType.Decimal,
-                    modifier = Modifier.weight(1f)
+                    value = unit, onValueChange = { unit = it },
+                    label = "Custom unit (e.g. kg, L, m, roll)", modifier = Modifier.fillMaxWidth()
                 )
-                PosField(
-                    value = if (isBox) boxCost else cost,
-                    onValueChange = { v ->
-                        val f = v.filter { ch -> ch.isDigit() || ch == '.' }
-                        if (isBox) boxCost = f else cost = f
-                    },
-                    label = when (productType) {
-                        "box" -> "Cost / box"
-                        "set" -> "Cost / set"
-                        else -> "Cost / piece"
-                    },
-                    keyboardType = KeyboardType.Decimal, modifier = Modifier.weight(1f)
-                )
-            }
-            if (isBox && boxSizeVal > 1 && unitCostVal != null) {
-                Text(
-                    "Per unit ≈ ${money(unitCostVal, currency)}",
-                    style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
-                )
-            }
-            if (priceVal != null && unitCostVal != null && unitCostVal > 0.0 && priceVal > 0.0) {
-                val profit = priceVal - unitCostVal
-                val pct = if (prefs.marginFormula == "gross") profit / priceVal * 100
-                else profit / unitCostVal * 100
-                val marginLabel = if (prefs.marginFormula == "gross") "Gross margin" else "Markup"
-                Text(
-                    "$marginLabel: ${trimPct(pct)}%  (${money(profit, currency)} profit)",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (profit >= 0) t.success else MaterialTheme.colorScheme.error
-                )
-            }
-            PosField(
-                value = wholesale,
-                onValueChange = { wholesale = it.filter { ch -> ch.isDigit() || ch == '.' } },
-                label = "Wholesale price  (opt)", keyboardType = KeyboardType.Decimal,
-                modifier = Modifier.fillMaxWidth()
-            )
-            if (isBox) {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     PosField(
-                        value = boxPrice,
-                        onValueChange = { boxPrice = it.filter { ch -> ch.isDigit() || ch == '.' } },
-                        label = "Box price  (opt)", keyboardType = KeyboardType.Decimal,
+                        value = pricePerUnit,
+                        onValueChange = { pricePerUnit = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                        label = "Price / $unitText", keyboardType = KeyboardType.Decimal,
                         modifier = Modifier.weight(1f)
                     )
                     PosField(
-                        value = boxSize,
-                        onValueChange = { boxSize = it.filter { ch -> ch.isDigit() } },
-                        label = "Units / box", keyboardType = KeyboardType.Number,
+                        value = cost,
+                        onValueChange = { cost = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                        label = "Cost / $unitText  (opt)", keyboardType = KeyboardType.Decimal,
                         modifier = Modifier.weight(1f)
                     )
                 }
-                if (prefs.autoConvertUnitsToBoxes && boxSizeVal > 1 && priceVal != null) {
-                    LaunchedEffect(priceVal, boxSizeVal, prefs.autoConvertUnitsToBoxes) {
-                        boxPrice = trimQty(priceVal * boxSizeVal)
+                if (pricePerUnitVal > 0.0 && unitCostVal != null && unitCostVal > 0.0) {
+                    val profit = pricePerUnitVal - unitCostVal
+                    val pct = if (prefs.marginFormula == "gross") profit / pricePerUnitVal * 100
+                    else profit / unitCostVal * 100
+                    val marginLabel = if (prefs.marginFormula == "gross") "Gross margin" else "Markup"
+                    Text(
+                        "$marginLabel: ${trimPct(pct)}%  (${money(profit, currency)} / $unitText)",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (profit >= 0) t.success else MaterialTheme.colorScheme.error
+                    )
+                }
+            } else {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    PosField(
+                        value = price,
+                        onValueChange = { price = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                        label = "Retail price$typeSuffix", keyboardType = KeyboardType.Decimal,
+                        modifier = Modifier.weight(1f)
+                    )
+                    PosField(
+                        value = if (isBox) boxCost else cost,
+                        onValueChange = { v ->
+                            val f = v.filter { ch -> ch.isDigit() || ch == '.' }
+                            if (isBox) boxCost = f else cost = f
+                        },
+                        label = when (productType) {
+                            "box" -> "Cost / box"
+                            "set" -> "Cost / set"
+                            else -> "Cost / piece"
+                        },
+                        keyboardType = KeyboardType.Decimal, modifier = Modifier.weight(1f)
+                    )
+                }
+                if (isBox && boxSizeVal > 1 && unitCostVal != null) {
+                    Text(
+                        "Per unit ≈ ${money(unitCostVal, currency)}",
+                        style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
+                    )
+                }
+                if (priceVal != null && unitCostVal != null && unitCostVal > 0.0 && priceVal > 0.0) {
+                    val profit = priceVal - unitCostVal
+                    val pct = if (prefs.marginFormula == "gross") profit / priceVal * 100
+                    else profit / unitCostVal * 100
+                    val marginLabel = if (prefs.marginFormula == "gross") "Gross margin" else "Markup"
+                    Text(
+                        "$marginLabel: ${trimPct(pct)}%  (${money(profit, currency)} profit)",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (profit >= 0) t.success else MaterialTheme.colorScheme.error
+                    )
+                }
+                PosField(
+                    value = wholesale,
+                    onValueChange = { wholesale = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                    label = "Wholesale price  (opt)", keyboardType = KeyboardType.Decimal,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                if (isBox) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        PosField(
+                            value = boxPrice,
+                            onValueChange = { boxPrice = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                            label = "Box price  (opt)", keyboardType = KeyboardType.Decimal,
+                            modifier = Modifier.weight(1f)
+                        )
+                        PosField(
+                            value = boxSize,
+                            onValueChange = { boxSize = it.filter { ch -> ch.isDigit() } },
+                            label = "Units / box", keyboardType = KeyboardType.Number,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                    if (prefs.autoConvertUnitsToBoxes && boxSizeVal > 1 && priceVal != null) {
+                        LaunchedEffect(priceVal, boxSizeVal, prefs.autoConvertUnitsToBoxes) {
+                            boxPrice = trimQty(priceVal * boxSizeVal)
+                        }
                     }
                 }
             }
@@ -4922,7 +5120,12 @@ private fun ItemDialog(
                     value = tax, onValueChange = { tax = it.filter { ch -> ch.isDigit() || ch == '.' } },
                     label = "Tax %  (opt)", keyboardType = KeyboardType.Decimal, modifier = Modifier.weight(1f)
                 )
-                PosField(value = unit, onValueChange = { unit = it }, label = "Unit", modifier = Modifier.weight(1f))
+                // Measured items set their unit in the pricing card; others keep the plain Unit field.
+                if (!isMeasured) {
+                    PosField(value = unit, onValueChange = { unit = it }, label = "Unit", modifier = Modifier.weight(1f))
+                } else {
+                    Spacer(Modifier.weight(1f))
+                }
             }
         }
 
@@ -4933,7 +5136,21 @@ private fun ItemDialog(
                 Switch(checked = track, onCheckedChange = { track = it })
             }
             if (track) {
-                if (useBoxStock) {
+                if (isMeasured) {
+                    // Measured item: a single decimal on-hand quantity in the chosen unit.
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        PosField(
+                            value = stockMeasured,
+                            onValueChange = { stockMeasured = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                            label = if (existing == null) "Opening $unitText" else "On hand ($unitText)",
+                            keyboardType = KeyboardType.Decimal, modifier = Modifier.weight(1f)
+                        )
+                        PosField(
+                            value = reorder, onValueChange = { reorder = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                            label = "Reorder at ($unitText)", keyboardType = KeyboardType.Decimal, modifier = Modifier.weight(1f)
+                        )
+                    }
+                } else if (useBoxStock) {
                     // Box item: enter boxes + loose units; total is computed live.
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         PosField(
@@ -6903,10 +7120,10 @@ private fun DashboardScreen(vm: PosViewModel, business: Business) {
     var showZ by remember { mutableStateOf(false) }
 
     // Health figures, computed from the live catalog/ledger (like the web).
-    val outStock = items.count { it.trackStock && it.stockQty <= 0.0 }
+    val outStock = items.count { it.trackStock && it.onHand <= 0.0 }
     val lowStock = items.count {
-        it.trackStock && it.stockQty > 0.0 &&
-            it.stockQty <= (if (it.reorderLevel > 0.0) it.reorderLevel else LOW_STOCK_THRESHOLD)
+        it.trackStock && it.onHand > 0.0 &&
+            it.onHand <= (if (it.reorderLevel > 0.0) it.reorderLevel else LOW_STOCK_THRESHOLD)
     }
     val noCost = items.count { it.cost == null }
     val pendingCredit = customers.sumOf { it.balance.coerceAtLeast(0.0) }

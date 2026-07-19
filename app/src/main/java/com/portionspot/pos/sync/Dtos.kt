@@ -108,6 +108,7 @@ fun normalizeProductType(raw: String?, boxSize: Int): String = when (raw?.trim()
     "box" -> "box"
     "set" -> "set"
     "piece" -> "piece"
+    "measured" -> "measured"
     else -> if (boxSize > 1) "box" else "piece"
 }
 
@@ -120,6 +121,14 @@ fun ProductDto.toItem(businessId: String, local: Item?): Item {
     // when the remote URL is unchanged; otherwise drop it (and any pending flag) so
     // display falls back to the new remote image (Coil fetches + caches it).
     val remoteImageUnchanged = imageUrl == base.imageUrl
+    // Measured is a LOCAL-first product type: its unit/pricePerUnit/stockMeasured live
+    // only on-device (cloud has no such columns) and are carried through untouched by
+    // this base.copy. Guard the type too — if the local item is measured and the cloud
+    // row doesn't explicitly declare a product_type, keep it measured so those fields
+    // aren't stranded. An explicit cloud type (box/set/piece/measured) still wins.
+    val mergedType =
+        if (base.productType == "measured" && productType.isBlank()) "measured"
+        else normalizeProductType(productType, boxSz)
     return base.copy(
         businessId = businessId,
         name = name,
@@ -130,7 +139,7 @@ fun ProductDto.toItem(businessId: String, local: Item?): Item {
         wholesalePrice = wholesalePrice.toMoney(),
         boxPrice = boxPrice.toMoney(),
         boxSize = boxSz,
-        productType = normalizeProductType(productType, boxSz),
+        productType = mergedType,
         // cloud cost_price defaults to 0 = "unknown"; keep Android's null-means-unknown
         cost = costPrice?.toDoubleOrNull()?.takeIf { it > 0.0 },
         trackStock = true,

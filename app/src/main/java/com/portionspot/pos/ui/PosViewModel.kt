@@ -545,6 +545,37 @@ class PosViewModel(
     }
 
     /**
+     * Add a MEASURED (unit-priced) [item] to the cart at a decimal [qty] of its unit
+     * (e.g. 2.35 kg). Line price = qty × pricePerUnit. Re-tapping the same item stacks
+     * onto the existing measured line. A qty of 0 or less is ignored.
+     */
+    fun addMeasuredToCart(item: Item, qty: Double) {
+        if (qty <= 0.0) return
+        val key = "${item.id}#measured"
+        _cart.value = _cart.value.toMutableList().also { list ->
+            val idx = list.indexOfFirst { it.lineKey == key }
+            if (idx >= 0) {
+                val existing = list[idx]
+                list[idx] = existing.copy(qty = existing.qty + qty)
+            } else {
+                list.add(
+                    CartLine(
+                        itemId = item.id,
+                        name = item.name,
+                        unitPrice = item.pricePerUnit,
+                        taxRate = item.taxRate,
+                        qty = qty,
+                        mode = "measured",
+                        unitsPerLine = 1,
+                        measured = true,
+                        unitLabel = item.unit.trim().ifBlank { "unit" }
+                    )
+                )
+            }
+        }
+    }
+
+    /**
      * Look up a scanned/typed [barcode] and add the matching item to the cart.
      * [onResult] receives the item name on a hit, or null when nothing matched so
      * the UI can show "No item for that barcode".
@@ -784,6 +815,8 @@ class PosViewModel(
         reorderLevel: Double = 0.0,
         cost: Double? = null,
         unit: String = "pc",
+        pricePerUnit: Double = 0.0,
+        stockMeasured: Double = 0.0,
         imageLocalPath: String? = null,
         showImage: Boolean = true
     ) {
@@ -808,6 +841,8 @@ class PosViewModel(
                     reorderLevel = if (trackStock) reorderLevel else 0.0,
                     cost = cost,
                     unit = unit.trim().ifBlank { "pc" },
+                    pricePerUnit = pricePerUnit,
+                    stockMeasured = if (trackStock) stockMeasured else 0.0,
                     // A freshly-picked local image starts pending upload to Storage.
                     imageLocalPath = imageLocalPath,
                     imagePending = imageLocalPath != null,

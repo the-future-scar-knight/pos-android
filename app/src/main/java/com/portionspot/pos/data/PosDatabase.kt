@@ -388,6 +388,18 @@ val MIGRATION_20_21 = object : Migration(20, 21) {
     }
 }
 
+// v21 → v22: measured (unit-priced) products. Adds the two decimal LOCAL-ONLY
+// columns backing productType='measured' — price for one unit and the decimal
+// on-hand quantity. The existing `unit` TEXT column doubles as the measured unit
+// label (kg/L/m/…), so no new unit column is needed. Cloud has no matching
+// columns; these stay on-device.
+val MIGRATION_21_22 = object : Migration(21, 22) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE items ADD COLUMN pricePerUnit REAL NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE items ADD COLUMN stockMeasured REAL NOT NULL DEFAULT 0")
+    }
+}
+
 @Database(
     entities = [
         Business::class,
@@ -410,7 +422,7 @@ val MIGRATION_20_21 = object : Migration(20, 21) {
         AppNotification::class,
         AuditEntry::class
     ],
-    version = 21,
+    version = 22,
     exportSchema = false
 )
 abstract class PosDatabase : RoomDatabase() {
@@ -453,7 +465,7 @@ abstract class PosDatabase : RoomDatabase() {
                         MIGRATION_9_10, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14,
                         MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17,
                         MIGRATION_17_18, MIGRATION_18_19, MIGRATION_19_20,
-                        MIGRATION_20_21
+                        MIGRATION_20_21, MIGRATION_21_22
                     )
                     .fallbackToDestructiveMigration()
                     .build()
