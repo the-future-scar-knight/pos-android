@@ -713,11 +713,61 @@ interface SettingDao {
 
 @Dao
 interface ExpenseDao {
+    /** History feed: every real (non-template) expense, newest first. */
     @Query(
         "SELECT * FROM expenses WHERE businessId = :businessId AND deleted = 0 " +
-            "ORDER BY date DESC, createdAt DESC"
+            "AND isTemplate = 0 ORDER BY date DESC, createdAt DESC"
     )
     fun observeForBusiness(businessId: String): Flow<List<Expense>>
+
+    /** Awaiting an admin decision (submitted, not yet posted). */
+    @Query(
+        "SELECT * FROM expenses WHERE businessId = :businessId AND deleted = 0 " +
+            "AND status = 'pending' ORDER BY createdAt ASC"
+    )
+    fun observePending(businessId: String): Flow<List<Expense>>
+
+    /** Active recurring schedules (templates) for the admin to manage. */
+    @Query(
+        "SELECT * FROM expenses WHERE businessId = :businessId AND deleted = 0 " +
+            "AND isTemplate = 1 ORDER BY createdAt DESC"
+    )
+    fun observeTemplates(businessId: String): Flow<List<Expense>>
+
+    /** Sum of posted (approved, non-template) expense amounts in an epoch window —
+     *  the figure that reduces derived net profit on the dashboard. */
+    @Query(
+        "SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE businessId = :businessId " +
+            "AND deleted = 0 AND status = 'approved' AND isTemplate = 0 " +
+            "AND createdAt BETWEEN :from AND :to"
+    )
+    fun observePostedTotalBetween(businessId: String, from: Long, to: Long): Flow<Double>
+
+    /** Shop-wide accounts payable: what the shop still owes payees from short-funded,
+     *  posted expenses. (No partial-repayment mechanism yet — sum of the portions.) */
+    @Query(
+        "SELECT COALESCE(SUM(payablePortion), 0) FROM expenses WHERE businessId = :businessId " +
+            "AND deleted = 0 AND status = 'approved' AND isTemplate = 0"
+    )
+    fun observePayablesTotal(businessId: String): Flow<Double>
+
+    /** Shop-wide owner contributions: expenses the owner covered out of pocket. */
+    @Query(
+        "SELECT COALESCE(SUM(capitalPortion), 0) FROM expenses WHERE businessId = :businessId " +
+            "AND deleted = 0 AND status = 'approved' AND isTemplate = 0"
+    )
+    fun observeOwnerContributions(businessId: String): Flow<Double>
+
+    @Query("SELECT * FROM expenses WHERE id = :id LIMIT 1")
+    suspend fun getById(id: String): Expense?
+
+    /** Templates whose next charge is due (drives the auto-post worker). */
+    @Query(
+        "SELECT * FROM expenses WHERE businessId = :businessId AND deleted = 0 " +
+            "AND isTemplate = 1 AND recurrenceActive = 1 AND status = 'approved' " +
+            "AND nextRunAt IS NOT NULL AND nextRunAt <= :now"
+    )
+    suspend fun dueTemplates(businessId: String, now: Long): List<Expense>
 
     @Upsert
     suspend fun upsert(expense: Expense)
@@ -725,6 +775,30 @@ interface ExpenseDao {
     /** Soft-delete (tombstone) so the row is hidden but recoverable. */
     @Query("UPDATE expenses SET deleted = 1, updatedAt = :at WHERE id = :id")
     suspend fun softDelete(id: String, at: Long)
+}
+
+@Dao
+interface CashTxnDao {
+    /** Running cash-on-hand movements (newest first). */
+    @Query(
+        "SELECT * FROM cash_txns WHERE businessId = :businessId AND deleted = 0 " +
+            "ORDER BY createdAt DESC"
+    )
+    fun observeForBusiness(businessId: String): Flow<List<CashTxn>>
+
+    /** Net of all cash movements — added to the opening float for cash-on-hand. */
+    @Query("SELECT COALESCE(SUM(amount), 0) FROM cash_txns WHERE businessId = :businessId AND deleted = 0")
+    fun observeMovementsSum(businessId: String): Flow<Double>
+
+    /** Same net, read once (for a synchronous shortfall check at approval time). */
+    @Query("SELECT COALESCE(SUM(amount), 0) FROM cash_txns WHERE businessId = :businessId AND deleted = 0")
+    suspend fun movementsSumOnce(businessId: String): Double
+
+    @Insert
+    suspend fun insert(txn: CashTxn)
+
+    @Query("SELECT * FROM cash_txns WHERE businessId = :businessId AND deleted = 0 ORDER BY createdAt DESC LIMIT :limit")
+    suspend fun recent(businessId: String, limit: Int = 100): List<CashTxn>
 }
 
 @Dao

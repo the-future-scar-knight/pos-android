@@ -400,6 +400,71 @@ val MIGRATION_21_22 = object : Migration(21, 22) {
     }
 }
 
+/**
+ * v22 → v23: expenses become the accounting spine + a cash ledger (B3).
+ *
+ *  1. Extends `expenses` with the approval lifecycle (status/approver/postedAt), the
+ *     double-entry-lite funding split (cash/payable/capital portions), the recurring
+ *     schedule (period/active/template/next-run) and sync-ready columns (localId +
+ *     pendingSync). Every column is additive with a default, so existing expenses are
+ *     untouched. Existing rows are backfilled: localId = id, status = 'approved' (they
+ *     were already real spent costs, so they keep counting toward derived profit),
+ *     postedAt = createdAt. They deliberately get NO funding-portion backfill and NO
+ *     cash-ledger row — the cash balance starts fresh from this version, so a history
+ *     of expenses with no matching historical cash-in can't drive it negative.
+ *  2. Creates the `cash_txns` cash-on-hand ledger (append-only, sync-ready).
+ *
+ * Real migration — additive only, no data dropped.
+ */
+val MIGRATION_22_23 = object : Migration(22, 23) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        // 1. Expense: approval + funding split + recurring + sync-ready.
+        db.execSQL("ALTER TABLE expenses ADD COLUMN localId TEXT NOT NULL DEFAULT ''")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN status TEXT NOT NULL DEFAULT 'approved'")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN submittedBy TEXT")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN submittedByName TEXT")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN approvedBy TEXT")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN approvedByName TEXT")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN approvedAt INTEGER")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN postedAt INTEGER")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN cashPortion REAL NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN payablePortion REAL NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN capitalPortion REAL NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN recurring INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN recurrencePeriod TEXT")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN recurrenceActive INTEGER NOT NULL DEFAULT 1")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN isTemplate INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN templateId TEXT")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN nextRunAt INTEGER")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN lastRunAt INTEGER")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN periodStart TEXT")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN periodEnd TEXT")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN pendingSync INTEGER NOT NULL DEFAULT 1")
+        db.execSQL("UPDATE expenses SET localId = id, postedAt = createdAt")
+
+        // 2. Cash-on-hand ledger (append-only, sync-ready).
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS cash_txns (" +
+                "id TEXT NOT NULL PRIMARY KEY, " +
+                "localId TEXT NOT NULL, " +
+                "businessId TEXT NOT NULL, " +
+                "type TEXT NOT NULL, " +
+                "amount REAL NOT NULL DEFAULT 0, " +
+                "source TEXT, " +
+                "note TEXT, " +
+                "refType TEXT, " +
+                "refId TEXT, " +
+                "createdBy TEXT, " +
+                "createdByName TEXT, " +
+                "createdAt INTEGER NOT NULL, " +
+                "updatedAt INTEGER NOT NULL, " +
+                "deleted INTEGER NOT NULL DEFAULT 0, " +
+                "pendingSync INTEGER NOT NULL DEFAULT 1)"
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_cash_txns_businessId ON cash_txns (businessId)")
+    }
+}
+
 @Database(
     entities = [
         Business::class,
@@ -412,6 +477,7 @@ val MIGRATION_21_22 = object : Migration(21, 22) {
         CreditTxn::class,
         Setting::class,
         Expense::class,
+        CashTxn::class,
         Supplier::class,
         PurchaseOrder::class,
         PurchaseOrderLine::class,
@@ -422,7 +488,7 @@ val MIGRATION_21_22 = object : Migration(21, 22) {
         AppNotification::class,
         AuditEntry::class
     ],
-    version = 22,
+    version = 23,
     exportSchema = false
 )
 abstract class PosDatabase : RoomDatabase() {
@@ -435,6 +501,7 @@ abstract class PosDatabase : RoomDatabase() {
     abstract fun creditDao(): CreditDao
     abstract fun settingDao(): SettingDao
     abstract fun expenseDao(): ExpenseDao
+    abstract fun cashTxnDao(): CashTxnDao
     abstract fun supplierDao(): SupplierDao
     abstract fun purchaseOrderDao(): PurchaseOrderDao
     abstract fun refundDao(): RefundDao
@@ -465,7 +532,7 @@ abstract class PosDatabase : RoomDatabase() {
                         MIGRATION_9_10, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14,
                         MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17,
                         MIGRATION_17_18, MIGRATION_18_19, MIGRATION_19_20,
-                        MIGRATION_20_21, MIGRATION_21_22
+                        MIGRATION_20_21, MIGRATION_21_22, MIGRATION_22_23
                     )
                     .fallbackToDestructiveMigration()
                     .build()

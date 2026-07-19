@@ -518,22 +518,93 @@ data class BalanceRow(
 )
 
 /**
- * A business running cost (rent, salaries, fuel…). LOCAL-ONLY, exactly like the
- * web: the cloud schema has no `expenses` table, so these never sync (no
- * pendingSync flag). [date] is a `yyyy-MM-dd` string (matches the web) so the
- * day-bucketed preset filters need no timezone math. [deleted] tombstones a row.
+ * A business running cost (rent, salaries, fuel…) and — from B3 — the accounting
+ * spine's expense record. Anyone may SUBMIT one; it stays [status] = "pending" until
+ * an admin approves (posts) or rejects it. On posting, double-entry-lite splits the
+ * amount across the accounts that funded it: [cashPortion] (drew cash-on-hand down),
+ * [payablePortion] (the shop now owes the payee — cash ran short) and [capitalPortion]
+ * (the owner covered it out of pocket — cash untouched). The three portions sum to
+ * [amount] once approved; they stay 0 while pending/rejected.
+ *
+ * RECURRING (e.g. rent): approving a recurring submission mints a TEMPLATE row
+ * ([isTemplate] = true) — the schedule, never itself counted as a posted cost — which
+ * auto-posts a child charge each period ([nextRunAt]). Children carry [templateId] and
+ * are ordinary approved postings. The admin can PAUSE ([recurrenceActive] = false),
+ * EDIT the amount, or CANCEL (tombstone the template) at any time.
+ *
+ * [date] is a `yyyy-MM-dd` string (matches the web) so day-bucketed filters need no
+ * timezone math. LOCAL-ONLY today, but SYNC-READY: every row carries [localId],
+ * [updatedAt] and [pendingSync] so a future cloud push can adopt it unchanged.
  */
 @Entity(tableName = "expenses", indices = [Index("businessId")])
 data class Expense(
     @PrimaryKey val id: String = newId(),
+    val localId: String = id,             // sync-ready stable local key (defaults to id)
     val businessId: String,
     val category: String = "Other",
     val amount: Double = 0.0,
     val date: String,                     // yyyy-MM-dd
     val description: String? = null,
+    // ── Approval lifecycle ──
+    val status: String = "pending",       // pending | approved | rejected
+    val submittedBy: String? = null,
+    val submittedByName: String? = null,
+    val approvedBy: String? = null,
+    val approvedByName: String? = null,
+    val approvedAt: Long? = null,
+    val postedAt: Long? = null,           // when it hit the books (== approvedAt for one-offs)
+    // ── Double-entry-lite funding split (set on posting; sums to [amount]) ──
+    val cashPortion: Double = 0.0,        // reduced cash-on-hand
+    val payablePortion: Double = 0.0,     // shop owes the payee (cash ran short)
+    val capitalPortion: Double = 0.0,     // owner covered it (cash untouched)
+    // ── Recurring schedule ──
+    val recurring: Boolean = false,
+    val recurrencePeriod: String? = null, // daily | weekly | monthly
+    val recurrenceActive: Boolean = true, // admin can pause
+    val isTemplate: Boolean = false,      // true => schedule row, not a posted cost
+    val templateId: String? = null,       // set on auto-posted children
+    val nextRunAt: Long? = null,          // template: when the next child is due
+    val lastRunAt: Long? = null,          // template: when it last posted a child
+    // ── Optional time period the cost covers (informational) ──
+    val periodStart: String? = null,      // yyyy-MM-dd
+    val periodEnd: String? = null,        // yyyy-MM-dd
     val createdAt: Long = now(),
     val updatedAt: Long = now(),
-    val deleted: Boolean = false
+    val deleted: Boolean = false,
+    /** Local-only: true => has unsynced local edits to push. Never sent to cloud yet. */
+    val pendingSync: Boolean = true
+)
+
+/**
+ * One movement of physical CASH-ON-HAND (the till/drawer running balance). The
+ * accounting spine (B3): cash-on-hand = opening float (a setting) + Σ of these
+ * signed [amount]s. Cash comes IN from sales ("sale", +net cash tendered less change
+ * handed back) and goes OUT for approved expenses ("expense", −[cashPortion]) or
+ * ad-hoc payouts. Owner-capital-funded expenses create NO row here (cash untouched);
+ * the accounts-payable portion of a short-funded expense also creates no cash row —
+ * only the cash actually paid drains the drawer.
+ *
+ * Append-only and immutable: a correction is a new "adjust" row, never an edit.
+ * LOCAL-ONLY today but SYNC-READY ([localId] / [updatedAt] / [pendingSync]).
+ */
+@Entity(tableName = "cash_txns", indices = [Index("businessId")])
+data class CashTxn(
+    @PrimaryKey val id: String = newId(),
+    val localId: String = id,
+    val businessId: String,
+    val type: String,                     // sale | expense | payout | capital | adjust
+    val amount: Double = 0.0,             // signed: + into the drawer, − out of it
+    val source: String? = null,           // free note of the funding account, if useful
+    val note: String? = null,
+    val refType: String? = null,          // sale | expense | …
+    val refId: String? = null,
+    val createdBy: String? = null,
+    val createdByName: String? = null,
+    val createdAt: Long = now(),
+    val updatedAt: Long = now(),
+    val deleted: Boolean = false,
+    /** Local-only: true => has unsynced local edits to push. Never sent to cloud yet. */
+    val pendingSync: Boolean = true
 )
 
 /**

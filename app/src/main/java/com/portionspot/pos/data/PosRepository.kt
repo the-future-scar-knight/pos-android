@@ -26,6 +26,7 @@ class PosRepository(private val db: PosDatabase) {
     private val creditDao = db.creditDao()
     private val settingDao = db.settingDao()
     private val expenseDao = db.expenseDao()
+    private val cashTxnDao = db.cashTxnDao()
     private val supplierDao = db.supplierDao()
     private val poDao = db.purchaseOrderDao()
     private val refundDao = db.refundDao()
@@ -259,15 +260,371 @@ class PosRepository(private val db: PosDatabase) {
     fun totalChangeOwedFlow(businessId: String): Flow<Double> =
         creditDao.observeTotalChangeOwed(businessId)
 
-    // ---- expenses (local-only; never synced) ------------------------------
+    // ---- expenses + cash ledger (accounting spine, B3; local-only, sync-ready) ----
 
     fun expensesFlow(businessId: String): Flow<List<Expense>> =
         expenseDao.observeForBusiness(businessId)
 
-    suspend fun saveExpense(expense: Expense) =
-        expenseDao.upsert(expense.copy(updatedAt = now()))
+    fun pendingExpensesFlow(businessId: String): Flow<List<Expense>> =
+        expenseDao.observePending(businessId)
 
-    suspend fun deleteExpense(id: String) = expenseDao.softDelete(id, now())
+    fun recurringTemplatesFlow(businessId: String): Flow<List<Expense>> =
+        expenseDao.observeTemplates(businessId)
+
+    fun postedExpensesBetweenFlow(businessId: String, from: Long, to: Long): Flow<Double> =
+        expenseDao.observePostedTotalBetween(businessId, from, to)
+
+    fun payablesTotalFlow(businessId: String): Flow<Double> =
+        expenseDao.observePayablesTotal(businessId)
+
+    fun ownerContributionsFlow(businessId: String): Flow<Double> =
+        expenseDao.observeOwnerContributions(businessId)
+
+    fun cashTxnsFlow(businessId: String): Flow<List<CashTxn>> =
+        cashTxnDao.observeForBusiness(businessId)
+
+    /** Net of the cash-ledger movements (opening float is added on top in the VM). */
+    fun cashMovementsSumFlow(businessId: String): Flow<Double> =
+        cashTxnDao.observeMovementsSum(businessId)
+
+    /** Opening cash float the admin set (device-local setting), 0 if unset. */
+    suspend fun openingFloat(businessId: String): Double =
+        settingDao.get(KEY_OPENING_FLOAT)?.toDoubleOrNull() ?: 0.0
+
+    /** Cash-on-hand right now = opening float + net movements. Used for the shortfall
+     *  check the moment an expense is being posted. */
+    suspend fun cashOnHandOnce(businessId: String): Double =
+        openingFloat(businessId) + cashTxnDao.movementsSumOnce(businessId)
+
+    /**
+     * SUBMIT an expense for admin approval (prompt §9.2). Anyone may submit; the row
+     * lands as `status = 'pending'` and posts nothing until approved. A [recurring]
+     * submission carries its [recurrencePeriod]; on approval it becomes a schedule.
+     * Returns the new row so the caller can notify the admin.
+     */
+    suspend fun submitExpense(
+        businessId: String,
+        category: String,
+        amount: Double,
+        date: String,
+        description: String?,
+        recurring: Boolean = false,
+        recurrencePeriod: String? = null,
+        periodStart: String? = null,
+        periodEnd: String? = null,
+        submittedBy: String? = null,
+        submittedByName: String? = null
+    ): Expense? {
+        if (amount <= 0.0) return null
+        val e = Expense(
+            businessId = businessId, category = category, amount = amount, date = date,
+            description = description?.trim()?.ifBlank { null }, status = "pending",
+            recurring = recurring,
+            recurrencePeriod = if (recurring) (recurrencePeriod ?: "monthly") else null,
+            periodStart = periodStart, periodEnd = periodEnd,
+            submittedBy = submittedBy, submittedByName = submittedByName
+        )
+        expenseDao.upsert(e)
+        return e
+    }
+
+    /** Edit a still-PENDING submission before it's approved (kept editable; once posted
+     *  it's immutable). No-op if the row has already left the pending state. */
+    suspend fun updatePendingExpense(
+        id: String, category: String, amount: Double, date: String, description: String?,
+        recurring: Boolean, recurrencePeriod: String?
+    ) {
+        val e = expenseDao.getById(id) ?: return
+        if (e.status != "pending" || e.deleted) return
+        if (amount <= 0.0) return
+        expenseDao.upsert(
+            e.copy(
+                category = category, amount = amount, date = date,
+                description = description?.trim()?.ifBlank { null },
+                recurring = recurring,
+                recurrencePeriod = if (recurring) (recurrencePeriod ?: "monthly") else null,
+                updatedAt = now(), pendingSync = true
+            )
+        )
+    }
+
+    /** Reject a pending expense (nothing hits the books). Audited. */
+    suspend fun rejectExpense(id: String, cashierId: String? = null, cashierName: String? = null) {
+        val e = expenseDao.getById(id) ?: return
+        if (e.status != "pending") return
+        val stamp = now()
+        db.withTransaction {
+            expenseDao.upsert(e.copy(status = "rejected", updatedAt = stamp, pendingSync = true))
+            clearPendingExpenseNotice(e.businessId, e.id)
+            auditDao.insert(
+                AuditEntry(
+                    businessId = e.businessId, action = "expense_rejected", entityType = "expense",
+                    entityId = e.id, summary = "Rejected ${e.category} expense ${fmtMoney(e.amount)}",
+                    createdBy = cashierId, createdByName = cashierName
+                )
+            )
+        }
+    }
+
+    /** Tombstone the "awaiting approval" feed row once an expense is approved/rejected. */
+    private suspend fun clearPendingExpenseNotice(businessId: String, expenseId: String) {
+        notificationDao.getByKey(businessId, "expensepending:$expenseId")?.let {
+            notificationDao.tombstone(listOf(it.id))
+        }
+    }
+
+    /**
+     * APPROVE (post) a pending expense with a chosen funding [mode] — the double-entry-
+     * lite split (prompt §9.4). Modes:
+     *  - "cash"      → pay it all from cash-on-hand (cashPortion = amount, cash-out row).
+     *  - "available" → pay what cash there is, remainder → accounts payable (cash → 0).
+     *  - "capital"   → the owner covers it; cash untouched (capitalPortion = amount).
+     * A recurring submission additionally becomes a SCHEDULE (a separate template row)
+     * so future periods auto-post. Audited. All writes are atomic.
+     */
+    suspend fun approveExpense(
+        id: String, mode: String, cashierId: String? = null, cashierName: String? = null
+    ) {
+        val e = expenseDao.getById(id) ?: return
+        if (e.status != "pending" || e.deleted) return
+        val stamp = now()
+        db.withTransaction {
+            val onHand = cashOnHandOnce(e.businessId).coerceAtLeast(0.0)
+            val (cash, payable, capital) = splitFunding(e.amount, mode, onHand)
+            val posted = e.copy(
+                status = "approved", approvedBy = cashierId, approvedByName = cashierName,
+                approvedAt = stamp, postedAt = stamp,
+                cashPortion = cash, payablePortion = payable, capitalPortion = capital,
+                updatedAt = stamp, pendingSync = true
+            )
+            expenseDao.upsert(posted)
+            clearPendingExpenseNotice(e.businessId, e.id)
+            if (cash > CENT) {
+                cashTxnDao.insert(
+                    CashTxn(
+                        businessId = e.businessId, type = "expense", amount = -cash,
+                        source = fundingLabel(mode), note = "${e.category} · ${e.description ?: "expense"}",
+                        refType = "expense", refId = e.id,
+                        createdBy = cashierId, createdByName = cashierName,
+                        createdAt = stamp, updatedAt = stamp
+                    )
+                )
+            }
+            // A recurring approval spins up the schedule template (not itself a cost).
+            if (e.recurring && e.recurrencePeriod != null) {
+                expenseDao.upsert(
+                    Expense(
+                        businessId = e.businessId, category = e.category, amount = e.amount,
+                        date = e.date, description = e.description, status = "approved",
+                        recurring = true, recurrencePeriod = e.recurrencePeriod,
+                        recurrenceActive = true, isTemplate = true,
+                        approvedBy = cashierId, approvedByName = cashierName, approvedAt = stamp,
+                        nextRunAt = nextRun(stamp, e.recurrencePeriod), lastRunAt = stamp,
+                        submittedBy = e.submittedBy, submittedByName = e.submittedByName
+                    )
+                )
+            }
+            auditDao.insert(
+                AuditEntry(
+                    businessId = e.businessId, action = "expense_approved", entityType = "expense",
+                    entityId = e.id,
+                    summary = "Approved ${e.category} ${fmtMoney(e.amount)} via ${fundingLabel(mode)}" +
+                        (if (payable > CENT) " (${fmtMoney(payable)} owed)" else ""),
+                    createdBy = cashierId, createdByName = cashierName
+                )
+            )
+        }
+    }
+
+    /** Pause / resume a recurring schedule (admin). No new children post while paused. */
+    suspend fun setRecurringActive(templateId: String, active: Boolean) {
+        val t = expenseDao.getById(templateId) ?: return
+        if (!t.isTemplate) return
+        expenseDao.upsert(t.copy(recurrenceActive = active, updatedAt = now(), pendingSync = true))
+    }
+
+    /** Edit a recurring schedule's amount — affects FUTURE children only; already-posted
+     *  charges stay immutable. */
+    suspend fun editRecurringAmount(templateId: String, newAmount: Double) {
+        val t = expenseDao.getById(templateId) ?: return
+        if (!t.isTemplate || newAmount <= 0.0) return
+        expenseDao.upsert(t.copy(amount = newAmount, updatedAt = now(), pendingSync = true))
+    }
+
+    /** Cancel a recurring schedule (tombstone the template; posted history is kept). */
+    suspend fun cancelRecurring(templateId: String) = expenseDao.softDelete(templateId, now())
+
+    /** Delete a still-pending or rejected submission (posted rows stay immutable). */
+    suspend fun deleteExpense(id: String) {
+        val e = expenseDao.getById(id) ?: return
+        if (e.status == "approved" && !e.isTemplate) return   // posted costs are immutable
+        expenseDao.softDelete(id, now())
+    }
+
+    /** Set the opening cash float (device-local). Cash-on-hand = this + Σ movements. */
+    suspend fun setOpeningFloat(amount: Double) =
+        putSetting(KEY_OPENING_FLOAT, amount.coerceAtLeast(0.0).toString())
+
+    /** Record an ad-hoc cash payout / drawer adjustment (admin), audited. */
+    suspend fun recordCashAdjustment(
+        businessId: String, amount: Double, note: String,
+        cashierId: String? = null, cashierName: String? = null
+    ) {
+        if (kotlin.math.abs(amount) < CENT) return
+        val stamp = now()
+        db.withTransaction {
+            cashTxnDao.insert(
+                CashTxn(
+                    businessId = businessId, type = if (amount < 0) "payout" else "adjust",
+                    amount = amount, source = "manual", note = note.ifBlank { "Cash adjustment" },
+                    createdBy = cashierId, createdByName = cashierName,
+                    createdAt = stamp, updatedAt = stamp
+                )
+            )
+            auditDao.insert(
+                AuditEntry(
+                    businessId = businessId, action = "cash_adjust", entityType = "cash",
+                    summary = "Cash ${if (amount < 0) "payout" else "top-up"} ${fmtMoney(kotlin.math.abs(amount))} — ${note.ifBlank { "manual" }}",
+                    meta = fmtMoney(amount), createdBy = cashierId, createdByName = cashierName
+                )
+            )
+        }
+    }
+
+    /**
+     * Post every recurring child that has come due (driven by the auto-post worker,
+     * prompt §9.3). Each due template mints an approved child charge and drains cash for
+     * it, auto-applying the "take what's available" rule when cash is short (so books
+     * balance with no UI). Advances each template's next-run. Returns short summaries the
+     * caller turns into admin notifications.
+     */
+    suspend fun postDueRecurringExpenses(businessId: String): List<Pair<Expense, String>> {
+        val now = now()
+        val due = expenseDao.dueTemplates(businessId, now)
+        val posted = ArrayList<Pair<Expense, String>>()
+        for (tpl in due) {
+            db.withTransaction {
+                val onHand = cashOnHandOnce(businessId).coerceAtLeast(0.0)
+                // Default policy for unattended posting: pay from cash, remainder → payable.
+                val mode = if (onHand + CENT >= tpl.amount) "cash" else "available"
+                val (cash, payable, capital) = splitFunding(tpl.amount, mode, onHand)
+                val child = Expense(
+                    businessId = businessId, category = tpl.category, amount = tpl.amount,
+                    date = ymd(now), description = tpl.description, status = "approved",
+                    templateId = tpl.id, recurring = false, isTemplate = false,
+                    approvedAt = now, postedAt = now,
+                    cashPortion = cash, payablePortion = payable, capitalPortion = capital,
+                    approvedByName = "Auto (recurring)"
+                )
+                expenseDao.upsert(child)
+                if (cash > CENT) {
+                    cashTxnDao.insert(
+                        CashTxn(
+                            businessId = businessId, type = "expense", amount = -cash,
+                            source = "recurring", note = "${tpl.category} (recurring)",
+                            refType = "expense", refId = child.id,
+                            createdAt = now, updatedAt = now
+                        )
+                    )
+                }
+                expenseDao.upsert(
+                    tpl.copy(
+                        lastRunAt = now, nextRunAt = nextRun(now, tpl.recurrencePeriod ?: "monthly"),
+                        updatedAt = now, pendingSync = true
+                    )
+                )
+                auditDao.insert(
+                    AuditEntry(
+                        businessId = businessId, action = "expense_recurring_posted",
+                        entityType = "expense", entityId = child.id,
+                        summary = "Auto-posted ${tpl.category} ${fmtMoney(tpl.amount)}" +
+                            (if (payable > CENT) " (${fmtMoney(payable)} owed)" else ""),
+                        createdByName = "Auto (recurring)"
+                    )
+                )
+                posted += child to buildString {
+                    append("${tpl.category} ${fmtMoney(tpl.amount)} auto-posted")
+                    if (payable > CENT) append(" — ${fmtMoney(payable)} on account (cash short)")
+                }
+            }
+        }
+        return posted
+    }
+
+    /**
+     * Worker entry point (§9.3): post every due recurring charge and, for each, persist
+     * an admin-feed notification and return it for a system push. No re-approval — the
+     * admin is simply informed.
+     */
+    suspend fun runRecurringExpenseSweep(): List<AppNotification> {
+        val biz = businessDao.getOnce() ?: return emptyList()
+        val posted = postDueRecurringExpenses(biz.id)
+        if (posted.isEmpty()) return emptyList()
+        val stamp = now()
+        val out = ArrayList<AppNotification>()
+        for ((child, summary) in posted) {
+            val n = AppNotification(
+                businessId = biz.id, category = "expenses",
+                severity = if (child.payablePortion > CENT) "warn" else "info",
+                title = "Recurring expense posted", body = summary,
+                dedupeKey = "recurring:${child.id}", refType = "expense", refId = child.id,
+                eventAt = stamp, createdAt = stamp, pushedAt = stamp
+            )
+            notificationDao.upsert(n)
+            out += n
+        }
+        return out
+    }
+
+    /**
+     * Persist + return a "new expense awaiting approval" admin notification (§9.2), fired
+     * the moment a cashier submits one. Keyed per-expense so each submission is its own row.
+     */
+    suspend fun notifyExpenseSubmitted(e: Expense): AppNotification {
+        val stamp = now()
+        val n = AppNotification(
+            businessId = e.businessId, category = "expenses", severity = "warn",
+            title = "Expense to approve",
+            body = "${e.category} ${fmtMoney(e.amount)}" +
+                (e.submittedByName?.let { " · by $it" } ?: "") +
+                (if (e.recurring) " · recurring" else ""),
+            dedupeKey = "expensepending:${e.id}", refType = "expense", refId = e.id,
+            eventAt = e.createdAt, createdAt = stamp, pushedAt = stamp
+        )
+        notificationDao.upsert(n)
+        return n
+    }
+
+    /** Split a posted expense [amount] across cash / payable / capital for the chosen
+     *  funding [mode], honouring the [onHand] ceiling. Returns (cash, payable, capital). */
+    private fun splitFunding(amount: Double, mode: String, onHand: Double): Triple<Double, Double, Double> = when (mode) {
+        "capital" -> Triple(0.0, 0.0, amount)
+        "available" -> {
+            val cash = amount.coerceAtMost(onHand.coerceAtLeast(0.0))
+            Triple(cash, (amount - cash).coerceAtLeast(0.0), 0.0)
+        }
+        else -> Triple(amount, 0.0, 0.0)   // "cash"
+    }
+
+    private fun fundingLabel(mode: String): String = when (mode) {
+        "capital" -> "owner capital"
+        "available" -> "cash + payable"
+        else -> "cash"
+    }
+
+    /** Next auto-post instant for a period, from [from]. */
+    private fun nextRun(from: Long, period: String): Long {
+        val c = java.util.Calendar.getInstance().apply { timeInMillis = from }
+        when (period) {
+            "daily" -> c.add(java.util.Calendar.DAY_OF_YEAR, 1)
+            "weekly" -> c.add(java.util.Calendar.DAY_OF_YEAR, 7)
+            else -> c.add(java.util.Calendar.MONTH, 1)   // monthly
+        }
+        return c.timeInMillis
+    }
+
+    private fun ymd(epoch: Long): String =
+        java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date(epoch))
 
     // ---- suppliers (local-only; never synced) -----------------------------
 
@@ -537,6 +894,22 @@ class PosRepository(private val db: PosDatabase) {
             saleDao.insertSale(savedSale)
             saleDao.insertLines(lines)
             if (paymentRows.isNotEmpty()) paymentDao.insertAll(paymentRows)
+            // Cash-on-hand ledger (B3): only PHYSICAL cash moves the drawer. Net cash in
+            // = cash tenders received − change actually handed back. Mobile-money/card
+            // tenders don't touch cash-on-hand. Skip a zero net (e.g. a card-only sale).
+            val cashTendered = tenders.filter { it.method == "cash" }.sumOf { it.amount }
+            val netCashIn = cashTendered - changeGivenActual
+            if (kotlin.math.abs(netCashIn) > CENT) {
+                cashTxnDao.insert(
+                    CashTxn(
+                        businessId = businessId, type = "sale", amount = netCashIn,
+                        source = "cash", note = "Sale #$receiptNo",
+                        refType = "sale", refId = saleId,
+                        createdBy = cashierId, createdByName = cashierName,
+                        createdAt = stamp, updatedAt = stamp
+                    )
+                )
+            }
             // Draw down stock for any tracked items in the cart and log the movement.
             // Untracked items and ad-hoc lines (no matching item row) are left alone.
             // Clamped at zero so a mis-counted shelf never shows negative on hand.
@@ -1536,6 +1909,8 @@ class PosRepository(private val db: PosDatabase) {
         const val KEY_ADMIN_LARGE_SALE = "admin_large_sale"
         const val KEY_ESC_HOURS = "admin_escalate_hours"
         const val KEY_UNSYNCED_HOURS = "admin_unsynced_hours"
+        // Opening cash float (B3): the starting cash-on-hand the admin sets.
+        const val KEY_OPENING_FLOAT = "cash_opening_float"
     }
 
     // ---- reports: tender breakdown from actual split amounts --------------

@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.portionspot.pos.data.Business
 import com.portionspot.pos.data.CartLine
+import com.portionspot.pos.data.CashTxn
 import com.portionspot.pos.data.CreditTxn
 import com.portionspot.pos.data.Customer
 import com.portionspot.pos.data.CustomerWithBalance
@@ -203,10 +204,48 @@ class PosViewModel(
             }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
-    /** All (non-deleted) expenses for the shop, newest date first. */
+    /** All posted/history expenses for the shop (non-template), newest date first. */
     val expenses: StateFlow<List<Expense>> =
         businessId.filterNotNull()
             .flatMapLatest { repo.expensesFlow(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Submitted expenses awaiting an admin decision (B3, §9.2). */
+    val pendingExpenses: StateFlow<List<Expense>> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.pendingExpensesFlow(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Active recurring expense schedules (templates) for the admin to manage. */
+    val recurringTemplates: StateFlow<List<Expense>> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.recurringTemplatesFlow(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** The cash-on-hand running balance = opening float + Σ cash-ledger movements (B3). */
+    val cashOnHand: StateFlow<Double> =
+        businessId.filterNotNull()
+            .flatMapLatest { bid ->
+                combine(repo.cashMovementsSumFlow(bid), _openingFloat) { moved, float -> float + moved }
+            }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0.0)
+
+    /** Shop-wide accounts payable (short-funded expenses the shop still owes). */
+    val payablesTotal: StateFlow<Double> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.payablesTotalFlow(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0.0)
+
+    /** Shop-wide owner contributions (expenses the owner covered out of pocket). */
+    val ownerContributions: StateFlow<Double> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.ownerContributionsFlow(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0.0)
+
+    /** The cash ledger movements (newest first) for the admin cash view. */
+    val cashTxns: StateFlow<List<CashTxn>> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.cashTxnsFlow(it) }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     /** All (non-deleted) suppliers for the shop, A→Z by name. */
@@ -300,6 +339,14 @@ class PosViewModel(
             repo.costedRevenueFlow(bid, from, to)
         }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0.0)
 
+    /** Posted (approved, non-template) expenses in the dashboard window — subtracted from
+     *  gross profit for the "net profit after expenses" figure (B3). */
+    val dashExpenses: StateFlow<Double> =
+        dashKey.flatMapLatest { (bid, range) ->
+            val (from, to) = rangeBounds(range)
+            repo.postedExpensesBetweenFlow(bid, from, to)
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0.0)
+
     /** saleId → refunded value, for the Receipts "refunded / partial refund" badge.
      *  Presentation only: the sale row and every money aggregate are untouched. */
     val refundedBySale: StateFlow<Map<String, Double>> =
@@ -353,6 +400,12 @@ class PosViewModel(
     private val _shopPrefs = MutableStateFlow(DEFAULT_SHOP_PREFS)
     val shopPrefs: StateFlow<ShopPrefs> = _shopPrefs.asStateFlow()
 
+    // Opening cash float (B3): the starting cash-on-hand the admin sets. Device-local;
+    // combined with the cash-ledger movements to give [cashOnHand]. Declared before
+    // init{} for the same reason as _shopPrefs above.
+    private val _openingFloat = MutableStateFlow(0.0)
+    val openingFloat: StateFlow<Double> = _openingFloat.asStateFlow()
+
     init {
         viewModelScope.launch {
             businessId.value = repo.ensureSeeded()
@@ -363,6 +416,7 @@ class PosViewModel(
         }
         viewModelScope.launch { _themeChoice.value = loadTheme() }
         viewModelScope.launch { _shopPrefs.value = loadPrefs() }
+        viewModelScope.launch { businessId.filterNotNull().collect { _openingFloat.value = repo.openingFloat(it) } }
         viewModelScope.launch {
             _appMode.value = if (repo.getSetting(KEY_APP_MODE) == "cloud") AppMode.Cloud else AppMode.Local
             _onboarded.value = repo.getSetting(KEY_ONBOARDED) == "1"
@@ -1256,22 +1310,79 @@ class PosViewModel(
         }
     }
 
-    // ---- Expenses ---------------------------------------------------------
+    // ---- Expenses + cash ledger (accounting spine, B3) -------------------
 
-    /** Insert (id == null) or update an expense. No-op on a non-positive amount. */
-    fun saveExpense(id: String?, category: String, amount: Double, date: String, description: String?) {
+    /**
+     * SUBMIT an expense for admin approval (§9.2). Anyone may submit; nothing posts until
+     * an admin approves. A recurring submission carries its period. Notifies the admin.
+     */
+    fun submitExpense(
+        category: String, amount: Double, date: String, description: String?,
+        recurring: Boolean = false, recurrencePeriod: String? = null,
+        periodStart: String? = null, periodEnd: String? = null
+    ) {
         val bid = businessId.value ?: return
         if (amount <= 0) return
-        val base = Expense(
-            businessId = bid, category = category, amount = amount,
-            date = date, description = description?.trim()?.ifBlank { null }
-        )
-        val expense = if (id == null) base else base.copy(id = id)
-        viewModelScope.launch { repo.saveExpense(expense) }
+        viewModelScope.launch {
+            val e = repo.submitExpense(
+                bid, category, amount, date, description, recurring, recurrencePeriod,
+                periodStart, periodEnd, currentCashierId, currentCashierName
+            ) ?: return@launch
+            repo.notifyExpenseSubmitted(e)
+        }
+    }
+
+    /** Edit a still-pending submission before it's approved. */
+    fun updatePendingExpense(
+        id: String, category: String, amount: Double, date: String, description: String?,
+        recurring: Boolean, recurrencePeriod: String?
+    ) {
+        if (amount <= 0) return
+        viewModelScope.launch {
+            repo.updatePendingExpense(id, category, amount, date, description, recurring, recurrencePeriod)
+        }
+    }
+
+    /** Approve (post) a pending expense with the chosen funding mode: cash | available |
+     *  capital (the shortfall decision from §9.4). */
+    fun approveExpense(id: String, mode: String) {
+        viewModelScope.launch { repo.approveExpense(id, mode, currentCashierId, currentCashierName) }
+    }
+
+    /** Cash-on-hand right now (for deciding whether a shortfall dialog is needed). */
+    suspend fun cashOnHandNow(): Double = businessId.value?.let { repo.cashOnHandOnce(it) } ?: 0.0
+
+    fun rejectExpense(id: String) {
+        viewModelScope.launch { repo.rejectExpense(id, currentCashierId, currentCashierName) }
+    }
+
+    fun setRecurringActive(templateId: String, active: Boolean) {
+        viewModelScope.launch { repo.setRecurringActive(templateId, active) }
+    }
+
+    fun editRecurringAmount(templateId: String, newAmount: Double) {
+        if (newAmount <= 0) return
+        viewModelScope.launch { repo.editRecurringAmount(templateId, newAmount) }
+    }
+
+    fun cancelRecurring(templateId: String) {
+        viewModelScope.launch { repo.cancelRecurring(templateId) }
     }
 
     fun deleteExpense(id: String) {
         viewModelScope.launch { repo.deleteExpense(id) }
+    }
+
+    /** Admin: set the opening cash float (persisted device-local). */
+    fun setOpeningFloat(amount: Double) {
+        _openingFloat.value = amount.coerceAtLeast(0.0)
+        viewModelScope.launch { repo.setOpeningFloat(amount) }
+    }
+
+    /** Admin: record an ad-hoc cash top-up (+) or payout (−) against the drawer. */
+    fun recordCashAdjustment(amount: Double, note: String) {
+        val bid = businessId.value ?: return
+        viewModelScope.launch { repo.recordCashAdjustment(bid, amount, note, currentCashierId, currentCashierName) }
     }
 
     // ---- Suppliers --------------------------------------------------------

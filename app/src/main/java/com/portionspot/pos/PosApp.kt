@@ -6,6 +6,7 @@ import com.portionspot.pos.data.PosDatabase
 import com.portionspot.pos.data.PosRepository
 import com.portionspot.pos.notify.AdminNotificationWorker
 import com.portionspot.pos.notify.Notifier
+import com.portionspot.pos.notify.RecurringExpenseWorker
 import com.portionspot.pos.sync.PosSyncEngine
 import com.portionspot.pos.ui.CrashReporter
 import com.portionspot.pos.sync.SyncConfig
@@ -60,5 +61,9 @@ class PosApp : Application() {
         // unsynced device) fire even while the admin isn't looking at the app.
         AdminNotificationWorker.schedule(this)
         AdminNotificationWorker.runNow(this)
+        // Auto-post due recurring expenses (§9.3): periodic + one sweep now so a charge
+        // that came due while the app was closed lands on next launch.
+        RecurringExpenseWorker.schedule(this)
+        RecurringExpenseWorker.runNow(this)
     }
 }

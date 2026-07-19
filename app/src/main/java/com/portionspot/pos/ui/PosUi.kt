@@ -81,6 +81,12 @@ import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material.icons.filled.Print
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Receipt
+import androidx.compose.material.icons.filled.Repeat
+import androidx.compose.material.icons.filled.HourglassEmpty
+import androidx.compose.material.icons.filled.AccountBalanceWallet
+import androidx.compose.material.icons.filled.Savings
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.automirrored.filled.ReceiptLong
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Settings
@@ -1115,10 +1121,21 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
     val aging by vm.debtAging.collectAsState()
     val refunds by vm.refunds.collectAsState()
     val audit by vm.auditLog.collectAsState()
+    // Accounting spine (B3): cash position + expense approvals + recurring schedules.
+    val cashOnHand by vm.cashOnHand.collectAsState()
+    val payables by vm.payablesTotal.collectAsState()
+    val ownerContrib by vm.ownerContributions.collectAsState()
+    val openingFloat by vm.openingFloat.collectAsState()
+    val pendingExpenses by vm.pendingExpenses.collectAsState()
+    val templates by vm.recurringTemplates.collectAsState()
 
     var writeOffFor by remember { mutableStateOf<DebtAgingRow?>(null) }
     var voidFor by remember { mutableStateOf<String?>(null) }
     var countedCash by remember { mutableStateOf("") }
+    var approveFor by remember { mutableStateOf<Expense?>(null) }   // shortfall dialog target
+    var editTemplate by remember { mutableStateOf<Expense?>(null) }
+    var editFloat by remember { mutableStateOf(false) }
+    var addExpense by remember { mutableStateOf(false) }
     var showAddCashier by remember { mutableStateOf(false) }
     var resetConfirm by remember { mutableStateOf(false) }
     var dedupeConfirm by remember { mutableStateOf(false) }
@@ -1154,6 +1171,142 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
                     onClick = { vm.signOut() },
                     colors = ButtonDefaults.outlinedButtonColors(contentColor = t.danger)
                 ) { Text("Sign out") }
+            }
+        }
+
+        // ---- Cash & expenses (accounting spine, B3) ----
+        item { AdminSectionHeader("Cash & expenses") }
+        item {
+            // Cash position card: on-hand, opening float, payables, owner contributions.
+            Column(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp))
+                    .background(t.surface1).border(1.dp, t.surfaceBorder, RoundedCornerShape(14.dp)).padding(16.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Filled.AccountBalanceWallet, contentDescription = null, tint = t.brand.s500, modifier = Modifier.size(20.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("Cash on hand", color = t.inkTertiary, fontSize = 12.sp)
+                        Text(money(cashOnHand, currency), color = if (cashOnHand < 0) t.danger else t.inkPrimary,
+                            fontWeight = FontWeight.Black, fontSize = 24.sp)
+                    }
+                    TextButton(onClick = { editFloat = true }) { Text("Opening ${money(openingFloat, currency)}") }
+                }
+                Text("= opening float + cash from sales − cash paid out", color = t.inkTertiary, fontSize = 10.sp)
+                HorizontalDivider(Modifier.padding(vertical = 8.dp), color = t.surfaceBorder)
+                Row(Modifier.fillMaxWidth()) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Owed to payees", color = t.inkTertiary, fontSize = 11.sp)
+                        Text(money(payables, currency), color = if (payables > 0.005) t.warning else t.inkSecondary,
+                            fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                    }
+                    Column(Modifier.weight(1f)) {
+                        Text("Owner put in", color = t.inkTertiary, fontSize = 11.sp)
+                        Text(money(ownerContrib, currency), color = t.inkSecondary, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                    }
+                }
+            }
+        }
+        item {
+            OutlinedButton(onClick = { addExpense = true }, modifier = Modifier.fillMaxWidth()) {
+                Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp)); Text("Submit an expense")
+            }
+        }
+
+        // Pending approvals (§9.2/§9.4).
+        item {
+            Text(
+                "Awaiting approval" + if (pendingExpenses.isNotEmpty()) " (${pendingExpenses.size})" else "",
+                color = t.inkSecondary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.padding(top = 4.dp)
+            )
+        }
+        if (pendingExpenses.isEmpty()) {
+            item { Text("Nothing to approve.", color = t.inkTertiary, fontSize = 12.sp) }
+        } else {
+            items(pendingExpenses, key = { it.id }) { e ->
+                Column(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                        .background(t.surface1).border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp)).padding(12.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(e.category, color = t.inkPrimary, fontWeight = FontWeight.Bold)
+                                if (e.recurring) {
+                                    Spacer(Modifier.width(6.dp))
+                                    Icon(Icons.Filled.Repeat, contentDescription = "Recurring", tint = t.inkTertiary, modifier = Modifier.size(13.dp))
+                                    Text(" ${e.recurrencePeriod ?: ""}", color = t.inkTertiary, fontSize = 10.sp)
+                                }
+                            }
+                            Text(
+                                (e.description ?: "").ifBlank { e.date } +
+                                    (e.submittedByName?.let { " · $it" } ?: ""),
+                                color = t.inkTertiary, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        Text(money(e.amount, currency), color = t.danger, fontWeight = FontWeight.Black)
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = {
+                                // If cash covers it, post straight from cash; otherwise raise
+                                // the shortfall dialog (§9.4: available / owner / abort).
+                                if (cashOnHand + 0.005 >= e.amount) vm.approveExpense(e.id, "cash")
+                                else approveFor = e
+                            },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(Icons.Filled.Check, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp)); Text("Approve")
+                        }
+                        OutlinedButton(
+                            onClick = { vm.rejectExpense(e.id) },
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = t.danger)
+                        ) {
+                            Icon(Icons.Filled.Close, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp)); Text("Reject")
+                        }
+                    }
+                }
+            }
+        }
+
+        // Recurring schedules (§9.3) — pause / edit amount / cancel.
+        if (templates.isNotEmpty()) {
+            item {
+                Text("Recurring schedules", color = t.inkSecondary, fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 4.dp))
+            }
+            items(templates, key = { it.id }) { tpl ->
+                Row(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                        .background(t.surface1).border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp)).padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("${tpl.category} · ${money(tpl.amount, currency)}", color = t.inkPrimary, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                        Text(
+                            "${tpl.recurrencePeriod ?: "monthly"} · " +
+                                (if (tpl.recurrenceActive) "next ${tpl.nextRunAt?.let { dayFmt.format(Date(it)) } ?: "—"}" else "paused"),
+                            color = if (tpl.recurrenceActive) t.inkTertiary else t.warning, fontSize = 11.sp
+                        )
+                    }
+                    IconButton(onClick = { vm.setRecurringActive(tpl.id, !tpl.recurrenceActive) }) {
+                        Icon(
+                            if (tpl.recurrenceActive) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                            contentDescription = if (tpl.recurrenceActive) "Pause" else "Resume", tint = t.inkSecondary
+                        )
+                    }
+                    IconButton(onClick = { editTemplate = tpl }) {
+                        Icon(Icons.Filled.Edit, contentDescription = "Edit amount", tint = t.inkSecondary)
+                    }
+                    IconButton(onClick = { vm.cancelRecurring(tpl.id) }) {
+                        Icon(Icons.Filled.Delete, contentDescription = "Cancel", tint = t.danger)
+                    }
+                }
             }
         }
 
@@ -1448,6 +1601,117 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
             onDismiss = { voidFor = null }
         )
     }
+
+    // Shortfall dialog (§9.4): cash won't cover the expense being posted.
+    approveFor?.let { e ->
+        ExpenseShortfallDialog(
+            expense = e, cashOnHand = cashOnHand, currency = currency,
+            onDismiss = { approveFor = null },
+            onChoose = { mode -> vm.approveExpense(e.id, mode); approveFor = null }
+        )
+    }
+    // Opening cash float editor.
+    if (editFloat) {
+        AmountDialog(
+            title = "Opening cash float",
+            hint = "Starting cash in the drawer. Cash on hand builds from here.",
+            initial = openingFloat, currency = currency,
+            onDismiss = { editFloat = false },
+            onConfirm = { v -> vm.setOpeningFloat(v); editFloat = false }
+        )
+    }
+    // Edit a recurring schedule's future amount.
+    editTemplate?.let { tpl ->
+        AmountDialog(
+            title = "Edit ${tpl.category} amount",
+            hint = "Applies to future charges only; posted charges stay as they were.",
+            initial = tpl.amount, currency = currency,
+            onDismiss = { editTemplate = null },
+            onConfirm = { v -> vm.editRecurringAmount(tpl.id, v); editTemplate = null }
+        )
+    }
+    // Admin submits an expense (then approves it below).
+    if (addExpense) {
+        ExpenseModal(initial = null, onDismiss = { addExpense = false }) { cat, amt, date, desc, recurring, period ->
+            vm.submitExpense(cat, amt, date, desc, recurring, period); addExpense = false
+        }
+    }
+}
+
+/**
+ * The 3-way shortfall prompt (§9.4) shown when cash-on-hand can't cover an expense being
+ * posted: pay what cash there is (remainder → accounts payable), have the owner cover it
+ * (owner capital; cash untouched), or abort and write nothing.
+ */
+@Composable
+private fun ExpenseShortfallDialog(
+    expense: Expense,
+    cashOnHand: Double,
+    currency: String,
+    onDismiss: () -> Unit,
+    onChoose: (mode: String) -> Unit
+) {
+    val t = LocalPosTokens.current
+    val avail = cashOnHand.coerceAtLeast(0.0)
+    val remainder = (expense.amount - avail).coerceAtLeast(0.0)
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Not enough cash") },
+        text = {
+            Column {
+                Text(
+                    "${expense.category} costs ${money(expense.amount, currency)} but only " +
+                        "${money(avail, currency)} is in the drawer. How should it be funded?",
+                    color = t.inkSecondary, fontSize = 13.sp
+                )
+                Spacer(Modifier.height(12.dp))
+                Button(onClick = { onChoose("available") }, modifier = Modifier.fillMaxWidth()) {
+                    Text("Take ${money(avail, currency)} · owe ${money(remainder, currency)}")
+                }
+                Spacer(Modifier.height(6.dp))
+                OutlinedButton(onClick = { onChoose("capital") }, modifier = Modifier.fillMaxWidth()) {
+                    Text("Owner covers it (cash untouched)")
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Abort") } }
+    )
+}
+
+/** Minimal single-amount editor dialog (opening float, recurring amount…). */
+@Composable
+private fun AmountDialog(
+    title: String,
+    hint: String,
+    initial: Double,
+    currency: String,
+    onDismiss: () -> Unit,
+    onConfirm: (Double) -> Unit
+) {
+    val t = LocalPosTokens.current
+    var value by remember { mutableStateOf(if (initial > 0) trimQty(initial) else "") }
+    val parsed = value.replace(',', '.').toDoubleOrNull() ?: -1.0
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column {
+                Text(hint, color = t.inkTertiary, fontSize = 12.sp)
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = value, onValueChange = { value = it },
+                    label = { Text("Amount ($currency)") }, singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onConfirm(parsed) }, enabled = parsed >= 0.0) { Text("Save") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
 }
 
 @Composable
@@ -6175,6 +6439,7 @@ private fun expenseCutoff(days: Int?): String? {
 private fun ExpensesScreen(vm: PosViewModel, currency: String) {
     val t = LocalPosTokens.current
     val expenses by vm.expenses.collectAsState()
+    val pending by vm.pendingExpenses.collectAsState()
 
     // PRESETS mirror the web: Today(0d) · This Week(6d) · This Month(29d) · All.
     val presets = remember {
@@ -6193,14 +6458,37 @@ private fun ExpensesScreen(vm: PosViewModel, currency: String) {
                 (catFilter == "all" || e.category == catFilter)
         }
     }
-    val total = filtered.sumOf { it.amount }
+    // Only POSTED (approved) expenses count toward the red running total; pending/rejected
+    // submissions haven't hit the books.
+    val total = filtered.filter { it.status == "approved" }.sumOf { it.amount }
 
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
             Column(Modifier.padding(12.dp)) {
                 Text("Expenses", color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 22.sp)
-                Text("Shop overheads & running costs", color = t.inkTertiary, fontSize = 12.sp)
+                Text("Submit shop costs — an admin approves before they post", color = t.inkTertiary, fontSize = 12.sp)
                 Spacer(Modifier.height(12.dp))
+
+                // Awaiting-approval banner (informational; the admin acts in the console).
+                if (pending.isNotEmpty()) {
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(t.warning.copy(alpha = 0.12f))
+                            .border(1.dp, t.warning.copy(alpha = 0.4f), RoundedCornerShape(12.dp))
+                            .padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Filled.HourglassEmpty, contentDescription = null, tint = t.warning, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(10.dp))
+                        Text(
+                            "${pending.size} expense${if (pending.size == 1) "" else "s"} awaiting admin approval",
+                            color = t.inkPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                    Spacer(Modifier.height(12.dp))
+                }
 
                 // Preset date windows.
                 Row(
@@ -6225,7 +6513,7 @@ private fun ExpensesScreen(vm: PosViewModel, currency: String) {
                 }
                 Spacer(Modifier.height(12.dp))
 
-                // Summary bar: count + red running total.
+                // Summary bar: count + red posted total.
                 Row(
                     Modifier
                         .fillMaxWidth()
@@ -6236,8 +6524,7 @@ private fun ExpensesScreen(vm: PosViewModel, currency: String) {
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        "${filtered.size} expense" + if (filtered.size == 1) "" else "s",
-                        color = t.inkSecondary, fontSize = 13.sp, modifier = Modifier.weight(1f)
+                        "Posted this period", color = t.inkSecondary, fontSize = 13.sp, modifier = Modifier.weight(1f)
                     )
                     Text(money(total, currency), color = t.danger, fontWeight = FontWeight.Black, fontSize = 22.sp)
                 }
@@ -6260,6 +6547,7 @@ private fun ExpensesScreen(vm: PosViewModel, currency: String) {
                     contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 96.dp)
                 ) {
                     items(filtered, key = { it.id }) { e ->
+                        val editable = e.status == "pending"
                         Row(
                             Modifier
                                 .fillMaxWidth()
@@ -6267,7 +6555,7 @@ private fun ExpensesScreen(vm: PosViewModel, currency: String) {
                                 .clip(RoundedCornerShape(12.dp))
                                 .background(t.surface1)
                                 .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
-                                .clickable { editing = e }
+                                .then(if (editable) Modifier.clickable { editing = e } else Modifier)
                                 .padding(14.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
@@ -6283,17 +6571,31 @@ private fun ExpensesScreen(vm: PosViewModel, currency: String) {
                             }
                             Spacer(Modifier.width(12.dp))
                             Column(Modifier.weight(1f)) {
-                                Text(e.category, fontWeight = FontWeight.Bold, color = t.inkPrimary)
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(e.category, fontWeight = FontWeight.Bold, color = t.inkPrimary)
+                                    if (e.recurring || e.templateId != null) {
+                                        Spacer(Modifier.width(6.dp))
+                                        Icon(Icons.Filled.Repeat, contentDescription = "Recurring", tint = t.inkTertiary, modifier = Modifier.size(13.dp))
+                                    }
+                                    Spacer(Modifier.width(6.dp))
+                                    ExpenseStatusBadge(e.status)
+                                }
                                 Text(
-                                    e.date + (e.description?.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""),
+                                    e.date + (e.description?.takeIf { it.isNotBlank() }?.let { " · $it" } ?: "") +
+                                        fundingSuffix(e, currency),
                                     fontSize = 12.sp, color = t.inkTertiary,
                                     maxLines = 1, overflow = TextOverflow.Ellipsis
                                 )
                             }
-                            Text(money(e.amount, currency), fontWeight = FontWeight.Black, color = t.danger)
-                            Spacer(Modifier.width(4.dp))
-                            IconButton(onClick = { deleting = e }) {
-                                Icon(Icons.Filled.Delete, contentDescription = "Delete", tint = t.inkTertiary)
+                            Text(
+                                money(e.amount, currency), fontWeight = FontWeight.Black,
+                                color = if (e.status == "rejected") t.inkTertiary else t.danger
+                            )
+                            if (e.status != "approved") {
+                                Spacer(Modifier.width(4.dp))
+                                IconButton(onClick = { deleting = e }) {
+                                    Icon(Icons.Filled.Delete, contentDescription = "Delete", tint = t.inkTertiary)
+                                }
                             }
                         }
                     }
@@ -6307,28 +6609,28 @@ private fun ExpensesScreen(vm: PosViewModel, currency: String) {
         ) {
             Icon(Icons.Filled.Add, contentDescription = null)
             Spacer(Modifier.width(8.dp))
-            Text("Add expense")
+            Text("Submit expense")
         }
     }
 
     if (adding) {
-        ExpenseModal(initial = null, onDismiss = { adding = false }) { cat, amt, date, desc ->
-            vm.saveExpense(null, cat, amt, date, desc); adding = false
+        ExpenseModal(initial = null, onDismiss = { adding = false }) { cat, amt, date, desc, recurring, period ->
+            vm.submitExpense(cat, amt, date, desc, recurring, period); adding = false
         }
     }
     editing?.let { e ->
-        ExpenseModal(initial = e, onDismiss = { editing = null }) { cat, amt, date, desc ->
-            vm.saveExpense(e.id, cat, amt, date, desc); editing = null
+        ExpenseModal(initial = e, onDismiss = { editing = null }) { cat, amt, date, desc, recurring, period ->
+            vm.updatePendingExpense(e.id, cat, amt, date, desc, recurring, period); editing = null
         }
     }
     deleting?.let { e ->
         AlertDialog(
             onDismissRequest = { deleting = null },
-            title = { Text("Delete expense?") },
-            text = { Text("This cannot be undone.") },
+            title = { Text("Discard this expense?") },
+            text = { Text("It hasn't been posted, so nothing on the books changes.") },
             confirmButton = {
                 TextButton(onClick = { vm.deleteExpense(e.id); deleting = null }) {
-                    Text("Delete", color = t.danger)
+                    Text("Discard", color = t.danger)
                 }
             },
             dismissButton = { TextButton(onClick = { deleting = null }) { Text("Cancel") } }
@@ -6336,27 +6638,59 @@ private fun ExpensesScreen(vm: PosViewModel, currency: String) {
     }
 }
 
-/** Add/Edit sheet for one expense: category, amount, date, optional note. */
+/** Small pill for an expense's lifecycle state. */
+@Composable
+private fun ExpenseStatusBadge(status: String) {
+    val t = LocalPosTokens.current
+    val (label, color) = when (status) {
+        "approved" -> "Posted" to t.success
+        "rejected" -> "Rejected" to t.inkTertiary
+        else -> "Pending" to t.warning
+    }
+    Box(
+        Modifier.clip(RoundedCornerShape(6.dp)).background(color.copy(alpha = 0.15f))
+            .padding(horizontal = 6.dp, vertical = 1.dp)
+    ) {
+        Text(label, color = color, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+/** " · $X on account" / " · owner-funded" trailer on a posted expense's meta line. */
+private fun fundingSuffix(e: Expense, currency: String): String = when {
+    e.status != "approved" -> ""
+    e.capitalPortion > 0.005 && e.cashPortion < 0.005 -> " · owner-funded"
+    e.payablePortion > 0.005 -> " · ${money(e.payablePortion, currency)} on account"
+    else -> ""
+}
+
+/** Recurrence periods offered when submitting a recurring expense. */
+private val RECURRENCE_PERIODS = listOf("daily" to "Daily", "weekly" to "Weekly", "monthly" to "Monthly")
+
+/** Submit/Edit sheet for one expense: category, amount, date, note + recurring schedule. */
 @Composable
 private fun ExpenseModal(
     initial: Expense?,
     onDismiss: () -> Unit,
-    onSave: (category: String, amount: Double, date: String, description: String?) -> Unit
+    onSave: (category: String, amount: Double, date: String, description: String?, recurring: Boolean, period: String?) -> Unit
 ) {
     var category by remember { mutableStateOf(initial?.category ?: EXPENSE_CATEGORIES.first()) }
     var amount by remember { mutableStateOf(initial?.amount?.takeIf { it > 0 }?.let { trimQty(it) } ?: "") }
     var date by remember { mutableStateOf(initial?.date ?: expenseToday()) }
     var description by remember { mutableStateOf(initial?.description ?: "") }
+    var recurring by remember { mutableStateOf(initial?.recurring ?: false) }
+    var period by remember { mutableStateOf(initial?.recurrencePeriod ?: "monthly") }
     var catOpen by remember { mutableStateOf(false) }
 
     val parsedAmount = amount.replace(',', '.').toDoubleOrNull() ?: 0.0
 
     PosContainedForm(
-        title = if (initial == null) "New expense" else "Edit expense",
+        title = if (initial == null) "Submit expense" else "Edit expense",
         onDismiss = onDismiss,
-        confirmLabel = "Save",
+        confirmLabel = if (initial == null) "Submit" else "Save",
         confirmEnabled = parsedAmount > 0 && date.isNotBlank(),
-        onConfirm = { onSave(category, parsedAmount, date.trim(), description.trim().ifBlank { null }) }
+        onConfirm = {
+            onSave(category, parsedAmount, date.trim(), description.trim().ifBlank { null }, recurring, if (recurring) period else null)
+        }
     ) {
         val t = LocalPosTokens.current
         PosFormCard {
@@ -6378,6 +6712,25 @@ private fun ExpenseModal(
             PosField(value = amount, onValueChange = { amount = it }, label = "Amount", keyboardType = KeyboardType.Decimal, modifier = Modifier.fillMaxWidth())
             PosField(value = date, onValueChange = { date = it }, label = "Date  (yyyy-mm-dd)", modifier = Modifier.fillMaxWidth())
             PosField(value = description, onValueChange = { description = it }, label = "Description  (optional)", modifier = Modifier.fillMaxWidth())
+
+            // Recurring schedule (e.g. rent): approved once, then auto-posts each period.
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Recurring", color = t.inkPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                    Text("Auto-posts every period after the first approval", color = t.inkTertiary, fontSize = 11.sp)
+                }
+                Switch(checked = recurring, onCheckedChange = { recurring = it })
+            }
+            if (recurring) {
+                Row(
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    RECURRENCE_PERIODS.forEach { (code, label) ->
+                        FilterChip(selected = period == code, onClick = { period = code }, label = { Text(label) })
+                    }
+                }
+            }
         }
     }
 }
@@ -7210,6 +7563,8 @@ private fun DashboardScreen(vm: PosViewModel, business: Business) {
     val topProducts by vm.dashTopProducts.collectAsState()
     val grossProfit by vm.dashGrossProfit.collectAsState()
     val costedRevenue by vm.dashCostedRevenue.collectAsState()
+    val dashExpenses by vm.dashExpenses.collectAsState()
+    val cashOnHand by vm.cashOnHand.collectAsState()
     val dailyBars by vm.dashDailyBars.collectAsState()
     val items by vm.items.collectAsState()
     val customers by vm.customers.collectAsState()
@@ -7293,6 +7648,27 @@ private fun DashboardScreen(vm: PosViewModel, business: Business) {
                 Spacer(Modifier.height(6.dp))
                 Text(hint, color = t.warning, fontSize = 11.sp)
             }
+        }
+        Spacer(Modifier.height(10.dp))
+
+        // Accounting spine (B3): cash-on-hand + net profit AFTER expenses. Net profit is
+        // DERIVED — gross profit less the expenses posted in this window — never a stored
+        // pot, so recording an expense lowers it automatically.
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            DashKpiCard("Cash on hand", money(cashOnHand, currency), Modifier.weight(1f),
+                valueColor = if (cashOnHand < 0) t.danger else t.inkPrimary)
+            if (showProfit) {
+                val netProfit = grossProfit - dashExpenses
+                DashKpiCard("Net profit", money(netProfit, currency), Modifier.weight(1f),
+                    valueColor = if (netProfit < 0) t.danger else t.success)
+            } else {
+                DashKpiCard("Expenses", money(dashExpenses, currency), Modifier.weight(1f), valueColor = t.danger)
+            }
+        }
+        if (showProfit && dashExpenses > 0.0) {
+            Spacer(Modifier.height(6.dp))
+            Text("Net profit = gross profit ${money(grossProfit, currency)} − expenses ${money(dashExpenses, currency)}",
+                color = t.inkTertiary, fontSize = 11.sp)
         }
         Spacer(Modifier.height(12.dp))
 
