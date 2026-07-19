@@ -2171,12 +2171,12 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
             onPaynowInitiate = { amount, onResult -> vm.paynowInitiate(amount, onResult) },
             onPaynowPoll = { reference, onResult -> vm.paynowPoll(reference, onResult) },
             onDismiss = { showPayment = false }
-        ) { payments, discount, customer, onCredit, changeGiven ->
+        ) { payments, discount, customer, onCredit, changeGiven, tillDiscrepancy ->
             showPayment = false
             if (vm.discountNeedsApproval(discount, cart.sumOf { it.lineSubtotal })) {
-                pendingSale = PendingSale(payments, discount, customer, onCredit, changeGiven)
+                pendingSale = PendingSale(payments, discount, customer, onCredit, changeGiven, tillDiscrepancy)
             } else {
-                vm.checkout(payments, discount, customer, onCredit, changeGiven)
+                vm.checkout(payments, discount, customer, onCredit, changeGiven, tillDiscrepancy)
             }
         }
     }
@@ -2204,7 +2204,7 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
             reason = "A discount of ${money(pending.discount, currency)} needs manager approval.",
             onVerify = { pin -> vm.verifyAdminPin(pin) },
             onApproved = {
-                vm.checkout(pending.payments, pending.discount, pending.customer, pending.onCredit, pending.changeGiven)
+                vm.checkout(pending.payments, pending.discount, pending.customer, pending.onCredit, pending.changeGiven, pending.tillDiscrepancy)
                 pendingSale = null
             },
             onDismiss = { pendingSale = null }
@@ -2824,7 +2824,8 @@ private data class PendingSale(
     val discount: Double,
     val customer: Customer?,
     val onCredit: Boolean,
-    val changeGiven: Double
+    val changeGiven: Double,
+    val tillDiscrepancy: Boolean
 )
 
 /**
@@ -3340,7 +3341,7 @@ private fun PaymentDialog(
     onPaynowInitiate: (amount: Double, onResult: (PaynowInit) -> Unit) -> Unit = { _, _ -> },
     onPaynowPoll: (reference: String, onResult: (PaynowPoll) -> Unit) -> Unit = { _, _ -> },
     onDismiss: () -> Unit,
-    onConfirm: (payments: List<Tender>, discount: Double, customer: Customer?, onCredit: Boolean, changeGiven: Double) -> Unit
+    onConfirm: (payments: List<Tender>, discount: Double, customer: Customer?, onCredit: Boolean, changeGiven: Double, tillDiscrepancy: Boolean) -> Unit
 ) {
     // Tender options the owner switched on in Settings (always at least Cash).
     val methods = remember(business) {
@@ -3354,8 +3355,12 @@ private fun PaymentDialog(
     var referenceText by remember { mutableStateOf("") }
     var onCredit by remember { mutableStateOf(false) }
     // When there's overpayment change, completing opens a prompt to capture how much
-    // change was actually handed over now (the rest is recorded as change owed).
+    // change was actually handed over now (the rest is recorded as change owed, or —
+    // if the cashier over-gives — as customer debt).
     var showChangePrompt by remember { mutableStateOf(false) }
+    // Walk-in (no customer) left with a change imbalance: the cashier must choose to
+    // attach a customer or book it as a till discrepancy. Non-null => that prompt is up.
+    var walkInImbalance by remember { mutableStateOf<WalkInImbalance?>(null) }
     // Double-tap guard: the instant we hand a sale off to be completed we disable the
     // confirm control so a second tap (before the dialog recomposes away) can't fire a
     // duplicate checkout. Belt-and-suspenders alongside the ViewModel in-flight guard.
@@ -3434,7 +3439,7 @@ private fun PaymentDialog(
                 showChangePrompt = true
             } else {
                 submitting = true
-                onConfirm(tenders.toList(), discount, selected, onCredit && remaining > 0.0, 0.0)
+                onConfirm(tenders.toList(), discount, selected, onCredit && remaining > 0.0, 0.0, false)
             }
         }
     ) {
@@ -3649,8 +3654,16 @@ private fun PaymentDialog(
         }
     }
 
-    // Overpayment => capture how much change was handed over now; the remainder is
-    // recorded (and printed) as change still owed to the customer.
+    // Finalise a sale once the change has been reconciled. [cust] is who any imbalance
+    // attaches to (may be a customer chosen in the walk-in prompt); [till] books an
+    // unattached imbalance as a till discrepancy instead.
+    fun complete(given: Double, cust: Customer?, till: Boolean) {
+        submitting = true
+        onConfirm(tenders.toList(), discount, cust, onCredit && remaining > 0.0, given, till)
+    }
+
+    // Overpayment => capture how much change was actually handed back now. Under-giving
+    // leaves change owed (shop owes); over-giving leaves the customer owing the shop.
     if (showChangePrompt) {
         ChangePromptDialog(
             changeDue = overpay,
@@ -3658,23 +3671,52 @@ private fun PaymentDialog(
             onDismiss = { showChangePrompt = false },
             onConfirm = { given ->
                 showChangePrompt = false
-                submitting = true
-                onConfirm(
-                    tenders.toList(),
-                    discount,
-                    selected,
-                    onCredit && remaining > 0.0,
-                    given.coerceIn(0.0, overpay)
-                )
+                val owed = (overpay - given).coerceAtLeast(0.0)   // shop owes customer
+                val over = (given - overpay).coerceAtLeast(0.0)   // customer owes shop
+                val imbalanced = owed > 0.005 || over > 0.005
+                if (imbalanced && selected == null) {
+                    // No customer to carry it — ask the cashier to attach one or record
+                    // it as a till discrepancy.
+                    walkInImbalance = WalkInImbalance(
+                        customerOwes = over > 0.005,
+                        amount = if (over > 0.005) over else owed,
+                        changeGiven = given
+                    )
+                } else {
+                    complete(given, selected, false)
+                }
             }
+        )
+    }
+
+    // Walk-in imbalance: attach a customer (the imbalance posts to their ledger) or book
+    // it as a till shortage/overage the admin can see in the audit log.
+    walkInImbalance?.let { wi ->
+        WalkInImbalanceDialog(
+            info = wi,
+            currency = currency,
+            customers = customers,
+            onCreateCustomer = onCreateCustomer,
+            onAttach = { cust -> walkInImbalance = null; complete(wi.changeGiven, cust, false) },
+            onTill = { walkInImbalance = null; complete(wi.changeGiven, null, true) },
+            onDismiss = { walkInImbalance = null }
         )
     }
 }
 
+/** A change imbalance on a walk-in sale awaiting the cashier's attribution choice. */
+private data class WalkInImbalance(
+    val customerOwes: Boolean,   // true => cashier over-gave (customer owes); false => shop owes change
+    val amount: Double,
+    val changeGiven: Double
+)
+
 /**
- * Prompt shown when a sale overpays: it states the change due and asks how much of
- * it the cashier is handing over now (blank => 0). The parent records/prints only
- * the remainder as change owed. The entered amount can never exceed the change due.
+ * Prompt shown when a sale overpays: it states the change due and asks how much the
+ * cashier is actually handing over now (blank => 0). The entry is NOT capped at the
+ * change due — under-giving books the remainder as change owed (shop owes), and
+ * over-giving books the excess as a debt (customer owes). The parent decides where
+ * an imbalance is attributed.
  */
 @Composable
 private fun ChangePromptDialog(
@@ -3686,10 +3728,11 @@ private fun ChangePromptDialog(
     var givenText by remember { mutableStateOf("") }
     var submitting by remember { mutableStateOf(false) }
     val entered = givenText.toDoubleOrNull()
-    // Blank is valid (=> 0 given, full change owed); a typed value must be within range.
-    val valid = givenText.isBlank() || (entered != null && entered >= 0.0 && entered <= changeDue + 0.0001)
-    val given = (entered ?: 0.0).coerceIn(0.0, changeDue)
-    val owed = (changeDue - given).coerceAtLeast(0.0)
+    // Blank is valid (=> 0 given, full change owed); a typed value must be non-negative.
+    val valid = givenText.isBlank() || (entered != null && entered >= 0.0)
+    val given = (entered ?: 0.0).coerceAtLeast(0.0)
+    val owed = (changeDue - given).coerceAtLeast(0.0)   // shop owes the customer
+    val over = (given - changeDue).coerceAtLeast(0.0)   // customer owes the shop
 
     PosContainedForm(
         title = "Change to give",
@@ -3707,14 +3750,69 @@ private fun ChangePromptDialog(
             keyboardType = KeyboardType.Decimal,
             modifier = Modifier.fillMaxWidth()
         )
-        if (entered != null && entered > changeDue + 0.0001) {
+        if (owed > 0.005) {
+            TotalRow("Change owed (you owe)", money(owed, currency))
+        }
+        if (over > 0.005) {
+            TotalRow("Over-given (customer owes)", money(over, currency))
             Text(
-                "Change given can't be more than ${money(changeDue, currency)}.",
-                color = t.danger, fontSize = 12.sp
+                "You're handing back ${money(over, currency)} more than the change due — the customer will owe it back.",
+                color = t.warning, fontSize = 12.sp
             )
         }
-        if (owed > 0.0) {
-            TotalRow("Change owed", money(owed, currency))
+    }
+}
+
+/**
+ * Walk-in change imbalance: a sale with no customer left money owed one way or the
+ * other. The cashier either attaches/creates a customer (the imbalance posts to that
+ * customer's ledger) or records it as an un-attributed till shortage/overage that
+ * lands in the admin audit log.
+ */
+@Composable
+private fun WalkInImbalanceDialog(
+    info: WalkInImbalance,
+    currency: String,
+    customers: List<CustomerWithBalance>,
+    onCreateCustomer: (name: String, onCreated: (Customer) -> Unit) -> Unit,
+    onAttach: (Customer) -> Unit,
+    onTill: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val t = LocalPosTokens.current
+    var picked by remember { mutableStateOf<Customer?>(null) }
+    val tillLabel = if (info.customerOwes) "Record as till shortage" else "Record as till overage"
+
+    PosContainedForm(
+        title = "Who owes this?",
+        onDismiss = onDismiss,
+        confirmLabel = picked?.let { "Put on ${it.name}" } ?: "Attach a customer",
+        confirmEnabled = picked != null,
+        onConfirm = { picked?.let(onAttach) }
+    ) {
+        Text(
+            if (info.customerOwes)
+                "The customer owes ${money(info.amount, currency)} (you handed back more change than was due)."
+            else
+                "You still owe the customer ${money(info.amount, currency)} in change.",
+            color = t.inkPrimary
+        )
+        Text(
+            "This sale has no customer. Attach one so it's tracked, or record it against the till.",
+            color = t.inkSecondary, fontSize = 12.sp
+        )
+        // Pick or create a customer to carry the imbalance.
+        CustomerSearchField(
+            customers = customers,
+            selected = picked,
+            onSelect = { picked = it },
+            onCreate = { name -> onCreateCustomer(name) { picked = it } }
+        )
+        // Or leave it unattached as a till discrepancy the admin sees in the audit log.
+        OutlinedButton(onClick = onTill, modifier = Modifier.fillMaxWidth()) {
+            Icon(Icons.Filled.PointOfSale, contentDescription = null)
+            Spacer(Modifier.width(8.dp))
+            Text(tillLabel)
         }
     }
 }

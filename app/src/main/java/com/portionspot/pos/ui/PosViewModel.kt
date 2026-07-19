@@ -674,7 +674,8 @@ class PosViewModel(
         discount: Double = 0.0,
         customer: Customer? = null,
         onCredit: Boolean = false,
-        changeGiven: Double = 0.0
+        changeGiven: Double = 0.0,
+        tillDiscrepancy: Boolean = false
     ) {
         val bid = businessId.value ?: return
         val lines = _cart.value
@@ -689,6 +690,7 @@ class PosViewModel(
                     customer = customer,
                     onCredit = onCredit,
                     changeGiven = changeGiven,
+                    tillDiscrepancy = tillDiscrepancy,
                     vatEnabled = biz?.vatEnabled ?: false,
                     vatPercent = biz?.vatPercent ?: 0.0,
                     totalRounding = _shopPrefs.value.checkoutRounding,

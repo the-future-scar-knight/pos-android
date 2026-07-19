@@ -394,10 +394,13 @@ class PosRepository(private val db: PosDatabase) {
      * Settlement:
      *  - amountPaid = sum of tenders. If it is short of the total and [onCredit]
      *    with a [customer], the shortfall becomes a `credit_owed` ledger row.
-     *  - Overpayment is change. The cashier records how much of it was actually
-     *    handed over now ([changeGiven], stored in [SaleEntity.changeDue]); any
-     *    remainder is booked as a `change_owed` row ([SaleEntity.changeOwed]) the
-     *    shop settles later (ledgered against [customer] when one is set).
+     *  - Overpayment is change. The cashier records how much was actually handed back
+     *    ([changeGiven], stored in [SaleEntity.changeDue]). This is reconciled BOTH ways:
+     *    an under-give (given < due) books the remainder as `change_owed` (shop owes the
+     *    customer); an over-give (given > due) books the excess as `credit_owed` (the
+     *    customer owes the shop). Both attach to [customer]. For a walk-in (no customer)
+     *    with an imbalance, [tillDiscrepancy]=true instead records an un-attributed
+     *    `till_short`/`till_over` entry in the audit log.
      */
     suspend fun checkout(
         businessId: String,
@@ -408,6 +411,7 @@ class PosRepository(private val db: PosDatabase) {
         customer: Customer? = null,
         onCredit: Boolean = false,
         changeGiven: Double = 0.0,
+        tillDiscrepancy: Boolean = false,
         vatEnabled: Boolean = false,
         vatPercent: Double = 0.0,
         totalRounding: Double = 0.0,
@@ -439,12 +443,17 @@ class PosRepository(private val db: PosDatabase) {
         // Credit must be tied to a customer; the unpaid shortfall goes on account.
         val credit = onCredit && customer != null
         val owed = if (credit) (total - amountPaid).coerceAtLeast(0.0) else 0.0
-        // Overpayment is change. The cashier hands over [changeGiven] now (clamped to
-        // the change due); whatever is left over the shop still owes the customer.
+        // Overpayment is change. The cashier records how much was ACTUALLY handed back
+        // ([changeGiven]) — which is deliberately NOT clamped to the change due, because
+        // both directions of error are real and must be reconciled:
+        //  - under-given (given < due)  => the shop still owes the customer  → change_owed
+        //  - over-given  (given > due)  => the customer now owes the shop    → credit_owed
         val change = (amountPaid - total).coerceAtLeast(0.0)
-        val changeGivenActual = changeGiven.coerceIn(0.0, change)
-        val changeOwed = change - changeGivenActual
-        val ledgerChangeOwed = changeOwed > 0.0 && customer != null
+        val changeGivenActual = changeGiven.coerceAtLeast(0.0)
+        val changeOwed = (change - changeGivenActual).coerceAtLeast(0.0)   // shop owes customer
+        val overGiven = (changeGivenActual - change).coerceAtLeast(0.0)    // customer owes shop
+        val ledgerChangeOwed = changeOwed > CENT && customer != null
+        val ledgerOverGiven = overGiven > CENT && customer != null
 
         val method = when {
             tenders.size > 1 -> "split"
@@ -575,7 +584,7 @@ class PosRepository(private val db: PosDatabase) {
                     )
                 )
             }
-            // Change we couldn't hand back in full => owed to the customer.
+            // Change we couldn't hand back in full => owed to the customer (we-owe).
             if (ledgerChangeOwed) {
                 creditDao.insert(
                     CreditTxn(
@@ -590,6 +599,58 @@ class PosRepository(private val db: PosDatabase) {
                         updatedAt = stamp
                     )
                 )
+            }
+            // Cashier handed back MORE change than was due => the customer owes the shop
+            // the excess. Books as ordinary DEBT (credit_owed), noted so it's traceable.
+            if (ledgerOverGiven) {
+                creditDao.insert(
+                    CreditTxn(
+                        businessId = businessId,
+                        customerId = customer!!.id,
+                        saleId = saleId,
+                        type = "credit_owed",
+                        amount = overGiven,
+                        note = "Over-given change",
+                        createdBy = cashierId,
+                        createdByName = cashierName,
+                        createdAt = stamp,
+                        updatedAt = stamp
+                    )
+                )
+            }
+            // Walk-in (no customer) with an imbalance the cashier chose NOT to attach to
+            // anyone => record it as an un-attributed TILL discrepancy in the audit log so
+            // an admin sees it. Over-given change leaves the drawer SHORT; unclaimed change
+            // the shop kept leaves the drawer OVER. Written in the same transaction.
+            if (customer == null && tillDiscrepancy) {
+                if (overGiven > CENT) {
+                    auditDao.insert(
+                        AuditEntry(
+                            businessId = businessId,
+                            action = "till_short",
+                            entityType = "sale",
+                            entityId = saleId,
+                            summary = "Till shortage ${fmtMoney(overGiven)} — over-given change on walk-in sale #$receiptNo",
+                            meta = fmtMoney(overGiven),
+                            createdBy = cashierId,
+                            createdByName = cashierName
+                        )
+                    )
+                }
+                if (changeOwed > CENT) {
+                    auditDao.insert(
+                        AuditEntry(
+                            businessId = businessId,
+                            action = "till_over",
+                            entityType = "sale",
+                            entityId = saleId,
+                            summary = "Till overage ${fmtMoney(changeOwed)} — unclaimed change on walk-in sale #$receiptNo",
+                            meta = fmtMoney(changeOwed),
+                            createdBy = cashierId,
+                            createdByName = cashierName
+                        )
+                    )
+                }
             }
         }
         return SaleWithLines(savedSale, lines)
