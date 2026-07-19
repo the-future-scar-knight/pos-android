@@ -130,6 +130,16 @@ data class Item(
     // are never pushed and are preserved across a pull-merge.
     @ColumnInfo(defaultValue = "0") val pricePerUnit: Double = 0.0,
     @ColumnInfo(defaultValue = "0") val stockMeasured: Double = 0.0,
+    // ──── Pending (incoming) stock from a purchase order (B4) — LOCAL-ONLY ────
+    // [pendingQty] is stock that has been ORDERED from a supplier but not yet arrived:
+    // it shows as a "+N pending" badge and is NOT sellable. On arrival it moves into the
+    // real sellable stock (stockQty / stockMeasured) and this drops back to 0.
+    // [pendingNew] marks a product that was CREATED by a purchase order and has never
+    // had a confirmed arrival — it is fully blocked from sale until its first arrival is
+    // confirmed (an existing product keeps selling its current stock, unaffected). The
+    // cloud `products` table has no matching columns, so both stay on-device.
+    @ColumnInfo(defaultValue = "0") val pendingQty: Double = 0.0,
+    @ColumnInfo(defaultValue = "0") val pendingNew: Boolean = false,
     val colorHex: String? = null,        // tile colour when no image
     // ──── Product image (mirrors the cloud `products.image_url` + `show_image`) ────
     // [imageUrl] is the REMOTE Supabase Storage public URL — this is what syncs to the
@@ -154,6 +164,12 @@ val Item.isMeasured: Boolean get() = productType == "measured"
 /** On-hand quantity used for badges / low-stock: the decimal [stockMeasured] for a
  *  measured item, otherwise the integer/box unit count [stockQty]. */
 val Item.onHand: Double get() = if (isMeasured) stockMeasured else stockQty
+
+/** True when the item exists only as PENDING (incoming) stock and cannot be sold yet:
+ *  a purchase-order product whose first arrival has not been confirmed and which has no
+ *  real on-hand stock. Blocks add-to-cart until arrival (B4). An existing product with a
+ *  "+N pending" addition is NOT blocked — it keeps selling its current stock. */
+val Item.sellableBlocked: Boolean get() = pendingNew && onHand <= 0.0
 
 /** A COMPLETED receipt (frozen snapshot). The live cart stays in memory. */
 @Entity(
@@ -629,9 +645,17 @@ data class Supplier(
 /**
  * A purchase order (restock request to a [Supplier]). LOCAL-ONLY, like the web's
  * Dexie store — the cloud schema has no `purchase_orders` table, so no pendingSync.
- * Lifecycle: draft → sent → received (or cancelled). [supplierName] is denormalised
- * so deleting a supplier never orphans PO history. [ref] is the human code
- * `PO-YYMMDD-NNNN`. Receiving a PO bumps each linked item's stock (see repository).
+ * Lifecycle: draft → placed → (partial) → received (or cancelled). [supplierName] is
+ * denormalised so deleting a supplier never orphans PO history. [ref] is the human code
+ * `PO-YYMMDD-NNNN`.
+ *
+ * B4 accounting — buying stock is a CASH → INVENTORY conversion, NOT a profit-reducing
+ * expense: [cashPaid] drains the drawer via a `cash_txns` "purchase" row (never an
+ * `expenses` row, so it never hits the derived net-profit line — the goods only affect
+ * profit later through cost-of-goods-sold when they sell). [capitalPaid] is the owner
+ * funding it out of pocket (cash untouched); [payableRemainder] is the unpaid balance
+ * recorded as ACCOUNTS PAYABLE to the supplier. [eta] is the rough expected-arrival date
+ * that drives the "has it arrived?" prompt; [arrivalPromptedAt] dedupes that prompt.
  */
 @Entity(tableName = "purchase_orders", indices = [Index("businessId")])
 data class PurchaseOrder(
@@ -640,8 +664,13 @@ data class PurchaseOrder(
     val ref: String,
     val supplierId: String? = null,
     val supplierName: String = "",
-    val status: String = "draft",          // draft | sent | received | cancelled
+    val status: String = "draft",          // draft | placed | partial | received | cancelled
     val notes: String? = null,
+    val eta: Long? = null,                  // rough expected-arrival date (epoch ms)
+    val cashPaid: Double = 0.0,             // paid now from cash-on-hand (drains the drawer)
+    val capitalPaid: Double = 0.0,          // owner covered out of pocket (cash untouched)
+    val payableRemainder: Double = 0.0,     // unpaid balance → accounts payable to supplier
+    val arrivalPromptedAt: Long? = null,    // last time the arrival prompt was raised (dedupe)
     val createdAt: Long = now(),
     val sentAt: Long? = null,
     val receivedAt: Long? = null,
@@ -653,7 +682,12 @@ data class PurchaseOrder(
  * One line on a [PurchaseOrder]. [itemId] links to the catalog [Item] by UUID
  * (the Android catalog keys on UUID, not the web's sku) so receiving can find the
  * product to restock; [name]/[sku] are snapshotted for display. [qty] is ordered
- * quantity in units; [receivedQty] is filled in when the PO is received.
+ * quantity in units; [receivedQty] is filled in as the PO is received.
+ *
+ * B4: [sellPrice] is the optional intended retail price for the incoming goods (used to
+ * seed a brand-new product's price on arrival). [stockOnArrival] flags whether this line
+ * should be reflected as PENDING stock and moved into sellable stock when it arrives (a
+ * consumable / non-inventory line can be off). [productType] seeds a new product's type.
  */
 @Entity(tableName = "purchase_order_items", indices = [Index("poId")])
 data class PurchaseOrderLine(
@@ -664,6 +698,9 @@ data class PurchaseOrderLine(
     val sku: String? = null,
     val qty: Double = 1.0,
     val unitCost: Double = 0.0,
+    val sellPrice: Double? = null,
+    val stockOnArrival: Boolean = true,
+    val productType: String = "piece",
     val receivedQty: Double? = null
 )
 

@@ -87,6 +87,11 @@ interface ItemDao {
     @Query("DELETE FROM items WHERE id = :id")
     suspend fun hardDelete(id: String)
 
+    /** Soft-delete (tombstone) one item — used to drop a never-arrived pending product
+     *  when its purchase order is cancelled. */
+    @Query("UPDATE items SET deleted = 1, updatedAt = :at, pendingSync = 1 WHERE id = :id")
+    suspend fun softDelete(id: String, at: Long)
+
     // ---- sync ----
     @Query("SELECT * FROM items WHERE pendingSync = 1")
     suspend fun pending(): List<Item>
@@ -832,6 +837,20 @@ interface PurchaseOrderDao {
 
     @Query("SELECT * FROM purchase_orders WHERE id = :id LIMIT 1")
     suspend fun getById(id: String): PurchaseOrder?
+
+    /** Open (placed/partial) POs that carry an ETA — drives the "has it arrived?" sweep. */
+    @Query(
+        "SELECT * FROM purchase_orders WHERE businessId = :businessId AND deleted = 0 " +
+            "AND status IN ('placed', 'partial') AND eta IS NOT NULL"
+    )
+    suspend fun openWithEtaOnce(businessId: String): List<PurchaseOrder>
+
+    /** Shop-wide accounts payable owed to suppliers (unpaid PO balances). */
+    @Query(
+        "SELECT COALESCE(SUM(payableRemainder), 0) FROM purchase_orders " +
+            "WHERE businessId = :businessId AND deleted = 0 AND status != 'cancelled'"
+    )
+    fun observeSupplierPayables(businessId: String): Flow<Double>
 
     @Query("SELECT * FROM purchase_order_items WHERE poId = :poId")
     suspend fun linesForPo(poId: String): List<PurchaseOrderLine>

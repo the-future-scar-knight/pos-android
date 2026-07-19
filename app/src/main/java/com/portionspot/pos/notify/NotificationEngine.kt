@@ -4,6 +4,7 @@ import com.portionspot.pos.data.AppNotification
 import com.portionspot.pos.data.DebtAgingRow
 import com.portionspot.pos.data.Item
 import com.portionspot.pos.data.MobileMoneyReceipt
+import com.portionspot.pos.data.PurchaseOrder
 import com.portionspot.pos.data.Refund
 import com.portionspot.pos.data.SaleEntity
 import java.util.Locale
@@ -47,6 +48,7 @@ data class NotifSnapshot(
     val pendingPayments: List<MobileMoneyReceipt>,
     val largeSales: List<SaleEntity>,
     val agingRows: List<DebtAgingRow>,
+    val openPurchaseOrders: List<PurchaseOrder> = emptyList(),
     val pendingSyncCount: Int,
     val lastSyncAt: Long?,
     val thresholds: NotifThresholds = NotifThresholds()
@@ -143,6 +145,20 @@ object NotificationEngine {
                     "overlimit:${row.customerId}", "customer", row.customerId, s.nowMs, pushWorthy = true
                 )
             }
+        }
+
+        // ---- Purchase orders near / past their ETA — "has it arrived?" (§10.5) ----
+        // Prompt from one day before the ETA; escalate to danger once it is a day overdue.
+        for (po in s.openPurchaseOrders) {
+            val eta = po.eta ?: continue
+            if (s.nowMs < eta - DAY) continue          // still more than a day out — quiet
+            val overdue = s.nowMs > eta + DAY
+            out += NotifCandidate(
+                "inventory", if (overdue) "danger" else "warn",
+                if (overdue) "Order overdue — arrived?" else "Order arriving — confirm",
+                "${po.ref} from ${po.supplierName.ifBlank { "supplier" }} — confirm arrival to stock it.",
+                "poarrival:${po.id}", "purchase_order", po.id, eta, pushWorthy = true
+            )
         }
 
         // ---- Device hasn't synced while records are pending ----

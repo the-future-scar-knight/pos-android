@@ -260,6 +260,12 @@ class PosViewModel(
             .flatMapLatest { repo.purchaseOrdersFlow(it) }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
+    /** Shop-wide accounts payable owed to suppliers (unpaid PO balances). */
+    val supplierPayables: StateFlow<Double> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.supplierPayablesFlow(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0.0)
+
     // ---- Reports (live aggregates over the chosen date window) ----
     private val _reportRange = MutableStateFlow(ReportRange.TODAY)
     val reportRange: StateFlow<ReportRange> = _reportRange.asStateFlow()
@@ -1416,39 +1422,53 @@ class PosViewModel(
 
     // ---- Purchase orders --------------------------------------------------
 
-    /** Create a draft PO with the chosen supplier and lines. No-op with no lines. */
+    /**
+     * Place a supplier order (B4) with its lines, PENDING stock and the cash payment.
+     * [payNow] is cash paid up front; [fundingMode] is the B3-style funding choice
+     * (cash | available | capital | none). No-op with no lines.
+     */
     fun createPurchaseOrder(
         supplierId: String?,
         supplierName: String,
         notes: String?,
-        lines: List<PurchaseOrderLine>
+        eta: Long?,
+        lines: List<PurchaseOrderLine>,
+        payNow: Double,
+        fundingMode: String
     ) {
         val bid = businessId.value ?: return
         if (lines.isEmpty()) return
         viewModelScope.launch {
             repo.createPurchaseOrder(
                 bid, supplierId, supplierName.trim(),
-                notes?.trim()?.ifBlank { null }, lines
+                notes?.trim()?.ifBlank { null }, eta, lines, payNow, fundingMode,
+                currentCashierId, currentCashierName
             )
         }
     }
 
-    /** Draft → sent. */
+    /** Draft → placed. */
     fun markPoSent(poId: String) {
         viewModelScope.launch { repo.markPoSent(poId) }
     }
 
-    /** Cancel an open PO. */
+    /** Cancel an open PO (rolls back its pending stock, clears the payable). */
     fun cancelPo(poId: String) {
         viewModelScope.launch { repo.cancelPo(poId) }
     }
 
     /**
-     * Receive a PO, restocking each line. [enteredByLine] maps line id → quantity
-     * entered; [boxMode] reads those as boxes (× pack size) instead of units.
+     * Confirm arrival of a PO, moving pending stock into sellable stock. [receivedByLine]
+     * optionally supplies a per-line arrived quantity (partial arrival); null arrives the
+     * whole outstanding order.
      */
-    fun receivePurchaseOrder(poId: String, enteredByLine: Map<String, Double>, boxMode: Boolean) {
-        viewModelScope.launch { repo.receivePurchaseOrder(poId, enteredByLine, boxMode) }
+    fun confirmArrival(poId: String, receivedByLine: Map<String, Double>? = null) {
+        viewModelScope.launch { repo.confirmArrival(poId, receivedByLine, currentCashierId, currentCashierName) }
+    }
+
+    /** Settle a PO's supplier balance from cash. [mode]: cash (all) | available (what cash there is). */
+    fun recordSupplierPayment(poId: String, mode: String) {
+        viewModelScope.launch { repo.recordSupplierPayment(poId, mode, currentCashierId, currentCashierName) }
     }
 
     // ---- Cloud sync actions ----------------------------------------------

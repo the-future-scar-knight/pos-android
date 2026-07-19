@@ -203,6 +203,7 @@ import com.portionspot.pos.data.Supplier
 import com.portionspot.pos.data.Item
 import com.portionspot.pos.data.isMeasured
 import com.portionspot.pos.data.onHand
+import com.portionspot.pos.data.sellableBlocked
 import com.portionspot.pos.data.MethodBreakdown
 import com.portionspot.pos.data.PurchaseOrderLine
 import com.portionspot.pos.data.PurchaseOrderWithLines
@@ -2529,7 +2530,8 @@ private fun ProductCard(item: Item, currency: String, inCart: Int, onClick: () -
     val d = LocalPosDimens.current
     val tracked = item.trackStock
     val measured = item.isMeasured
-    val isOut = tracked && item.onHand <= 0.0
+    // A not-yet-arrived pending product is blocked from sale just like an out-of-stock item.
+    val isOut = (tracked && item.onHand <= 0.0) || item.sellableBlocked
     // Measured items show their per-unit price (never a box/WS price).
     val hasBox = !measured && item.boxSize > 1 && item.boxPrice > 0.0
     val hasWs = !measured && item.wholesalePrice > 0.0
@@ -2667,7 +2669,7 @@ private fun ProductListRow(item: Item, currency: String, inCart: Int, onClick: (
     val d = LocalPosDimens.current
     val tracked = item.trackStock
     val measured = item.isMeasured
-    val isOut = tracked && item.onHand <= 0.0
+    val isOut = (tracked && item.onHand <= 0.0) || item.sellableBlocked
     val hasBox = !measured && item.boxSize > 1 && item.boxPrice > 0.0
     val hasWs = !measured && item.wholesalePrice > 0.0
     val heroImage = item.imageModel?.takeIf { item.showImage }
@@ -2754,21 +2756,37 @@ private fun ProductListRow(item: Item, currency: String, inCart: Int, onClick: (
 @Composable
 private fun StockBadge(item: Item) {
     val t = LocalPosTokens.current
-    if (!item.trackStock) return
+    if (!item.trackStock && item.pendingQty <= 0.0) return
     // Measured items are counted in their decimal unit (e.g. "2.5 kg"); everything else
     // is a whole-unit count. The low warning threshold (< 5) is unchanged.
     val units = item.onHand
     val suffix = if (item.isMeasured) " ${item.unit.trim().ifBlank { "unit" }}" else ""
-    when {
-        units <= 0.0 -> Box(
-            Modifier.clip(RoundedCornerShape(6.dp)).background(t.danger.copy(alpha = 0.12f))
-                .padding(horizontal = 6.dp, vertical = 2.dp)
-        ) { Text("Out", color = t.danger, fontSize = 9.sp, fontWeight = FontWeight.Bold) }
-        units < 5.0 -> Box(
-            Modifier.clip(RoundedCornerShape(6.dp)).background(t.warning.copy(alpha = 0.15f))
-                .padding(horizontal = 6.dp, vertical = 2.dp)
-        ) { Text("${trimQty(units)}$suffix", color = t.warning, fontSize = 9.sp, fontWeight = FontWeight.Bold) }
-        else -> Text("${trimQty(units)}$suffix", color = t.inkTertiary, fontSize = 9.sp)
+    Column(horizontalAlignment = Alignment.End) {
+        when {
+            // A brand-new PO product with no arrived stock yet: not sellable — say so.
+            item.pendingNew && units <= 0.0 -> Box(
+                Modifier.clip(RoundedCornerShape(6.dp)).background(t.accentBlue.copy(alpha = 0.14f))
+                    .padding(horizontal = 6.dp, vertical = 2.dp)
+            ) { Text("Pending", color = t.accentBlue, fontSize = 9.sp, fontWeight = FontWeight.Bold) }
+            !item.trackStock -> { /* untracked item with a pending addition: badge below only */ }
+            units <= 0.0 -> Box(
+                Modifier.clip(RoundedCornerShape(6.dp)).background(t.danger.copy(alpha = 0.12f))
+                    .padding(horizontal = 6.dp, vertical = 2.dp)
+            ) { Text("Out", color = t.danger, fontSize = 9.sp, fontWeight = FontWeight.Bold) }
+            units < 5.0 -> Box(
+                Modifier.clip(RoundedCornerShape(6.dp)).background(t.warning.copy(alpha = 0.15f))
+                    .padding(horizontal = 6.dp, vertical = 2.dp)
+            ) { Text("${trimQty(units)}$suffix", color = t.warning, fontSize = 9.sp, fontWeight = FontWeight.Bold) }
+            else -> Text("${trimQty(units)}$suffix", color = t.inkTertiary, fontSize = 9.sp)
+        }
+        // Incoming (ordered, not yet arrived) stock: "+N pending" hint (never sellable).
+        if (item.pendingQty > 0.0 && !(item.pendingNew && units <= 0.0)) {
+            Spacer(Modifier.height(2.dp))
+            Box(
+                Modifier.clip(RoundedCornerShape(6.dp)).background(t.accentBlue.copy(alpha = 0.14f))
+                    .padding(horizontal = 6.dp, vertical = 2.dp)
+            ) { Text("+${trimQty(item.pendingQty)} pending", color = t.accentBlue, fontSize = 9.sp, fontWeight = FontWeight.Bold) }
+        }
     }
 }
 
@@ -6903,17 +6921,22 @@ private fun SupplierModal(
 
 // ───────────────────────── PURCHASE ORDERS ─────────────────────────
 
-private val PO_FILTERS = listOf("all", "draft", "sent", "received", "cancelled")
+private val PO_FILTERS = listOf("all", "placed", "partial", "received", "cancelled")
 
-/** Small status pill (draft=grey, sent=blue, received=green, cancelled=red). */
+/** Small status pill (placed=blue, partial=amber, received=green, cancelled=red, draft=grey). */
 @Composable
 private fun PoStatusBadge(status: String) {
     val t = LocalPosTokens.current
     val color = when (status) {
-        "sent" -> t.accentBlue
+        "placed", "sent" -> t.accentBlue
+        "partial" -> t.warning
         "received" -> t.success
         "cancelled" -> t.danger
         else -> t.inkTertiary           // draft
+    }
+    val label = when (status) {
+        "sent" -> "Placed"
+        else -> status.replaceFirstChar { it.uppercase() }
     }
     Box(
         Modifier.clip(RoundedCornerShape(6.dp))
@@ -6921,7 +6944,7 @@ private fun PoStatusBadge(status: String) {
             .padding(horizontal = 8.dp, vertical = 2.dp)
     ) {
         Text(
-            status.replaceFirstChar { it.uppercase() },
+            label,
             color = color, fontSize = 11.sp, fontWeight = FontWeight.Bold
         )
     }
@@ -6939,6 +6962,8 @@ private fun PoStatusBadge(status: String) {
 private fun PurchaseOrdersScreen(vm: PosViewModel, currency: String) {
     val t = LocalPosTokens.current
     val pos by vm.purchaseOrders.collectAsState()
+    val payables by vm.supplierPayables.collectAsState()
+    val nowMs = remember { System.currentTimeMillis() }
 
     var statusFilter by remember { mutableStateOf("all") }
     var creating by remember { mutableStateOf(false) }
@@ -6948,14 +6973,26 @@ private fun PurchaseOrdersScreen(vm: PosViewModel, currency: String) {
     val counts = remember(pos) {
         mapOf(
             "all" to pos.size,
-            "draft" to pos.count { it.po.status == "draft" },
-            "sent" to pos.count { it.po.status == "sent" },
+            "placed" to pos.count { it.po.status == "placed" || it.po.status == "sent" },
+            "partial" to pos.count { it.po.status == "partial" },
             "received" to pos.count { it.po.status == "received" },
             "cancelled" to pos.count { it.po.status == "cancelled" }
         )
     }
     val filtered = remember(pos, statusFilter) {
-        if (statusFilter == "all") pos else pos.filter { it.po.status == statusFilter }
+        when (statusFilter) {
+            "all" -> pos
+            "placed" -> pos.filter { it.po.status == "placed" || it.po.status == "sent" }
+            else -> pos.filter { it.po.status == statusFilter }
+        }
+    }
+    // Orders near / past their ETA that still have pending lines — the visible "arrived?"
+    // prompt (mirrors the admin notification the sweep raises).
+    val arrivalsDue = remember(pos, nowMs) {
+        pos.filter { pwl ->
+            (pwl.po.status == "placed" || pwl.po.status == "sent" || pwl.po.status == "partial") &&
+                pwl.po.eta?.let { nowMs >= it - 86_400_000L } == true
+        }
     }
 
     Box(Modifier.fillMaxSize()) {
@@ -6963,6 +7000,13 @@ private fun PurchaseOrdersScreen(vm: PosViewModel, currency: String) {
             Column(Modifier.padding(12.dp)) {
                 Text("Purchase Orders", color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 22.sp)
                 Text("Restock requests to suppliers", color = t.inkTertiary, fontSize = 12.sp)
+                if (payables > 0.005) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "Owed to suppliers: ${money(payables, currency)}",
+                        color = t.danger, fontSize = 12.sp, fontWeight = FontWeight.Bold
+                    )
+                }
                 Spacer(Modifier.height(12.dp))
                 Row(
                     Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
@@ -6972,6 +7016,40 @@ private fun PurchaseOrdersScreen(vm: PosViewModel, currency: String) {
                         val label = (if (s == "all") "All" else s.replaceFirstChar { it.uppercase() }) +
                             "  (${counts[s] ?: 0})"
                         FilterChip(selected = statusFilter == s, onClick = { statusFilter = s }, label = { Text(label) })
+                    }
+                }
+                // Arrival prompt banner: tap an order to confirm what arrived.
+                if (arrivalsDue.isNotEmpty()) {
+                    Spacer(Modifier.height(10.dp))
+                    Column(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                            .background(t.warning.copy(alpha = 0.12f))
+                            .border(1.dp, t.warning.copy(alpha = 0.4f), RoundedCornerShape(12.dp))
+                            .padding(12.dp)
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Filled.Notifications, contentDescription = null, tint = t.warning, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                "${arrivalsDue.size} order${if (arrivalsDue.size == 1) "" else "s"} due — confirm arrival to stock the goods",
+                                color = t.inkSecondary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                        arrivalsDue.take(3).forEach { pwl ->
+                            Spacer(Modifier.height(6.dp))
+                            Row(
+                                Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
+                                    .clickable { detail = pwl }.padding(vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    "${pwl.po.ref} · ${pwl.po.supplierName.ifBlank { "supplier" }}",
+                                    color = t.inkPrimary, fontSize = 12.sp, modifier = Modifier.weight(1f),
+                                    maxLines = 1, overflow = TextOverflow.Ellipsis
+                                )
+                                Text("Review", color = t.brand.s600, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
                     }
                 }
             }
@@ -7032,9 +7110,16 @@ private fun PurchaseOrdersScreen(vm: PosViewModel, currency: String) {
                                 )
                                 Text(
                                     "${pwl.lines.size} item" + (if (pwl.lines.size == 1) "" else "s") +
-                                        " · " + dashTime(po.createdAt),
+                                        " · " + dashTime(po.createdAt) +
+                                        (po.eta?.let { " · ETA " + dashDate(it) } ?: ""),
                                     fontSize = 12.sp, color = t.inkTertiary
                                 )
+                                if (po.payableRemainder > 0.005) {
+                                    Text(
+                                        "Owed ${money(po.payableRemainder, currency)}",
+                                        fontSize = 11.sp, color = t.danger, fontWeight = FontWeight.Bold
+                                    )
+                                }
                             }
                             Text(money(total, currency), fontWeight = FontWeight.Black, color = t.inkPrimary)
                             Icon(Icons.Filled.ChevronRight, contentDescription = null, tint = t.inkTertiary)
@@ -7061,92 +7146,156 @@ private fun PurchaseOrdersScreen(vm: PosViewModel, currency: String) {
         PoDetailDialog(
             pwl, currency,
             onDismiss = { detail = null },
-            onMarkSent = { vm.markPoSent(pwl.po.id); detail = null },
-            onCancel = { vm.cancelPo(pwl.po.id); detail = null },
-            onReceive = { detail = null; receiving = pwl }
+            onConfirmAll = { vm.confirmArrival(pwl.po.id); detail = null },
+            onReceivePartial = { detail = null; receiving = pwl },
+            onSettle = { mode -> vm.recordSupplierPayment(pwl.po.id, mode); detail = null },
+            onCancel = { vm.cancelPo(pwl.po.id); detail = null }
         )
     }
     receiving?.let { pwl ->
-        PoReceiveDialog(
-            pwl, currency,
+        PoArrivalDialog(
+            pwl,
             onDismiss = { receiving = null },
-            onConfirm = { entered, boxMode ->
-                vm.receivePurchaseOrder(pwl.po.id, entered, boxMode); receiving = null
-            }
+            onConfirm = { received -> vm.confirmArrival(pwl.po.id, received); receiving = null }
         )
     }
 }
 
-/** One editable line in the create sheet: name, unit-cost field, qty stepper, remove. */
+/** One editable line in the create sheet: name, unit-cost + optional sell-price fields,
+ *  qty stepper, a "stock on arrival" toggle, remove. A line with no linked item is a
+ *  brand-new product (tag shown). */
 @Composable
 private fun PoLineRow(
     line: PurchaseOrderLine,
     onQty: (Double) -> Unit,
     onCost: (Double) -> Unit,
+    onSell: (Double?) -> Unit,
+    onStockToggle: (Boolean) -> Unit,
     onRemove: () -> Unit
 ) {
     val t = LocalPosTokens.current
     var costText by remember(line.id) {
         mutableStateOf(if (line.unitCost > 0) trimQty(line.unitCost) else "")
     }
-    Row(
-        Modifier.fillMaxWidth().padding(vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically
+    var sellText by remember(line.id) {
+        mutableStateOf(line.sellPrice?.let { trimQty(it) } ?: "")
+    }
+    val isNew = line.itemId == null
+    Column(
+        Modifier.fillMaxWidth().padding(vertical = 6.dp)
     ) {
-        Column(Modifier.weight(1f)) {
-            Text(line.name, fontWeight = FontWeight.SemiBold, color = t.inkPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(line.name, fontWeight = FontWeight.SemiBold, color = t.inkPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    if (isNew) {
+                        Spacer(Modifier.width(6.dp))
+                        Box(
+                            Modifier.clip(RoundedCornerShape(6.dp)).background(t.success.copy(alpha = 0.14f))
+                                .padding(horizontal = 6.dp, vertical = 1.dp)
+                        ) { Text("New", color = t.success, fontSize = 9.sp, fontWeight = FontWeight.Bold) }
+                    }
+                }
+            }
+            IconButton(onClick = { onQty((line.qty - 1).coerceAtLeast(1.0)) }) {
+                Icon(Icons.Filled.Remove, contentDescription = "Less")
+            }
+            Text(trimQty(line.qty), fontWeight = FontWeight.Bold, color = t.inkPrimary)
+            IconButton(onClick = { onQty(line.qty + 1) }) {
+                Icon(Icons.Filled.Add, contentDescription = "More")
+            }
+            IconButton(onClick = onRemove) {
+                Icon(Icons.Filled.Delete, contentDescription = "Remove", tint = t.inkTertiary)
+            }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedTextField(
                 value = costText,
                 onValueChange = { costText = it; onCost(it.replace(',', '.').toDoubleOrNull() ?: 0.0) },
                 label = { Text("Unit cost") }, singleLine = true,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.weight(1f)
+            )
+            OutlinedTextField(
+                value = sellText,
+                onValueChange = { sellText = it; onSell(it.replace(',', '.').toDoubleOrNull()) },
+                label = { Text("Sell price") }, singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                modifier = Modifier.weight(1f)
             )
         }
-        IconButton(onClick = { onQty((line.qty - 1).coerceAtLeast(1.0)) }) {
-            Icon(Icons.Filled.Remove, contentDescription = "Less")
-        }
-        Text(trimQty(line.qty), fontWeight = FontWeight.Bold, color = t.inkPrimary)
-        IconButton(onClick = { onQty(line.qty + 1) }) {
-            Icon(Icons.Filled.Add, contentDescription = "More")
-        }
-        IconButton(onClick = onRemove) {
-            Icon(Icons.Filled.Delete, contentDescription = "Remove", tint = t.inkTertiary)
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 2.dp)) {
+            Switch(checked = line.stockOnArrival, onCheckedChange = onStockToggle)
+            Spacer(Modifier.width(8.dp))
+            Text(
+                "Add to stock on arrival",
+                color = t.inkSecondary, style = MaterialTheme.typography.bodySmall
+            )
         }
     }
 }
 
-/** Create sheet: pick a supplier, search the catalog to add lines, set qty/cost, notes. */
+/** ETA quick-pick options: label → day offset from today. */
+private val PO_ETA_CHOICES = listOf(
+    "Today" to 0, "Tomorrow" to 1, "3 days" to 3, "1 week" to 7, "2 weeks" to 14
+)
+
+/**
+ * Create sheet (B4): pick / create a supplier, add catalog OR brand-new-product lines
+ * (each with qty, unit cost, optional sell price, and a "stock on arrival" flag), choose
+ * a rough ETA, then pay now via the cash ledger. Paying more than the drawer holds raises
+ * the same 3-option shortfall as B3 (take available → owe the supplier, owner covers, or
+ * abort). The unpaid balance becomes accounts payable to the supplier.
+ */
 @Composable
 private fun PoCreateDialog(vm: PosViewModel, currency: String, onDismiss: () -> Unit) {
     val t = LocalPosTokens.current
     val suppliers by vm.suppliers.collectAsState()
     val catalog by vm.items.collectAsState()
+    val cashOnHand by vm.cashOnHand.collectAsState()
 
     var supplierId by remember { mutableStateOf<String?>(null) }
     var supplierName by remember { mutableStateOf("") }
     var supplierOpen by remember { mutableStateOf(false) }
+    var newSupplier by remember { mutableStateOf(false) }
     var notes by remember { mutableStateOf("") }
     var search by remember { mutableStateOf("") }
+    var etaDays by remember { mutableStateOf<Int?>(3) }        // default rough ETA
     val lines = remember { mutableStateListOf<PurchaseOrderLine>() }
 
-    val matches = remember(catalog, search) {
+    val orderTotal = lines.sumOf { it.qty * it.unitCost }
+    var payText by remember { mutableStateOf("") }
+    // Default pay-now to the full order total whenever the total changes and the field is
+    // untouched-blank; the owner can lower it to buy (partly) on account.
+    val payNow = payText.replace(',', '.').toDoubleOrNull() ?: orderTotal
+    var shortfall by remember { mutableStateOf(false) }
+
+    val matches = remember(catalog, search, lines.size) {
         val q = search.trim().lowercase()
         if (q.isEmpty()) emptyList()
         else catalog.filter {
             it.name.lowercase().contains(q) || (it.sku?.lowercase()?.contains(q) == true)
         }.take(20)
     }
-    val orderTotal = lines.sumOf { it.qty * it.unitCost }
+    val exactMatch = matches.any { it.name.equals(search.trim(), ignoreCase = true) }
+
+    fun submit(mode: String) {
+        val eta = etaDays?.let { System.currentTimeMillis() + it * 86_400_000L }
+        vm.createPurchaseOrder(supplierId, supplierName, notes, eta, lines.toList(), payNow, mode)
+        onDismiss()
+    }
 
     PosContainedForm(
         title = "New purchase order",
         onDismiss = onDismiss,
-        confirmLabel = "Save draft",
+        confirmLabel = "Place order",
         confirmEnabled = lines.isNotEmpty(),
-        onConfirm = { vm.createPurchaseOrder(supplierId, supplierName, notes, lines.toList()); onDismiss() }
+        onConfirm = {
+            // Shortfall only when paying more cash than the drawer holds.
+            if (payNow.coerceAtMost(orderTotal) > cashOnHand + 0.005) shortfall = true else submit("cash")
+        }
     ) {
-        // Supplier picker.
+        // Supplier picker (with create-on-the-fly).
         Box(Modifier.fillMaxWidth()) {
             OutlinedButton(onClick = { supplierOpen = true }, modifier = Modifier.fillMaxWidth()) {
                 Text(supplierName.ifBlank { "Select supplier  (optional)" }, modifier = Modifier.weight(1f))
@@ -7157,6 +7306,10 @@ private fun PoCreateDialog(vm: PosViewModel, currency: String, onDismiss: () -> 
                     text = { Text("— No supplier —") },
                     onClick = { supplierId = null; supplierName = ""; supplierOpen = false }
                 )
+                DropdownMenuItem(
+                    text = { Text("+ New supplier…", color = t.brand.s600) },
+                    onClick = { supplierOpen = false; newSupplier = true }
+                )
                 suppliers.forEach { s ->
                     DropdownMenuItem(
                         text = { Text(s.name) },
@@ -7166,85 +7319,178 @@ private fun PoCreateDialog(vm: PosViewModel, currency: String, onDismiss: () -> 
             }
         }
 
-        // Product search → tap a result to add a line.
+        // Product search → tap a result to add a line, or add it as a brand-new product.
         PosField(
             value = search, onValueChange = { search = it },
             label = "Add product (name / SKU)", modifier = Modifier.fillMaxWidth()
         )
-        run {
-            matches.forEach { item ->
-                    val already = lines.any { it.itemId == item.id }
-                    Row(
-                        Modifier.fillMaxWidth()
-                            .clickable(enabled = !already) {
-                                lines.add(
-                                    PurchaseOrderLine(
-                                        poId = "", itemId = item.id, name = item.name,
-                                        sku = item.sku, qty = 1.0, unitCost = item.cost ?: 0.0
-                                    )
-                                )
-                                search = ""
-                            }
-                            .padding(vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(Modifier.weight(1f)) {
-                            Text(item.name, color = if (already) t.inkTertiary else t.inkPrimary)
-                            item.sku?.takeIf { it.isNotBlank() }?.let {
-                                Text(it, style = MaterialTheme.typography.bodySmall, color = t.inkTertiary)
-                            }
-                        }
-                        Text(money(item.cost ?: 0.0, currency), style = MaterialTheme.typography.bodySmall, color = t.inkTertiary)
-                        Spacer(Modifier.width(8.dp))
-                        Icon(
-                            if (already) Icons.Filled.Check else Icons.Filled.Add,
-                            contentDescription = null,
-                            tint = if (already) t.success else t.brand.s600
+        matches.forEach { item ->
+            val already = lines.any { it.itemId == item.id }
+            Row(
+                Modifier.fillMaxWidth()
+                    .clickable(enabled = !already) {
+                        lines.add(
+                            PurchaseOrderLine(
+                                poId = "", itemId = item.id, name = item.name,
+                                sku = item.sku, qty = 1.0, unitCost = item.cost ?: 0.0,
+                                sellPrice = item.price.takeIf { it > 0 },
+                                productType = item.productType
+                            )
                         )
+                        search = ""
+                    }
+                    .padding(vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(item.name, color = if (already) t.inkTertiary else t.inkPrimary)
+                    item.sku?.takeIf { it.isNotBlank() }?.let {
+                        Text(it, style = MaterialTheme.typography.bodySmall, color = t.inkTertiary)
                     }
                 }
+                Text(money(item.cost ?: 0.0, currency), style = MaterialTheme.typography.bodySmall, color = t.inkTertiary)
+                Spacer(Modifier.width(8.dp))
+                Icon(
+                    if (already) Icons.Filled.Check else Icons.Filled.Add,
+                    contentDescription = null,
+                    tint = if (already) t.success else t.brand.s600
+                )
+            }
+        }
+        // Offer to add the typed name as a brand-new product (no catalog match).
+        if (search.trim().length >= 2 && !exactMatch) {
+            Row(
+                Modifier.fillMaxWidth()
+                    .clickable {
+                        lines.add(PurchaseOrderLine(poId = "", itemId = null, name = search.trim(), qty = 1.0))
+                        search = ""
+                    }
+                    .padding(vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(Icons.Filled.Add, contentDescription = null, tint = t.brand.s600)
+                Spacer(Modifier.width(8.dp))
+                Text("Add \"${search.trim()}\" as a new product", color = t.brand.s600, fontWeight = FontWeight.SemiBold)
+            }
+        }
 
-                // Chosen lines.
-                if (lines.isNotEmpty()) {
-                    Spacer(Modifier.height(10.dp))
-                    Text("Order items", fontWeight = FontWeight.Bold, color = t.inkSecondary)
-                    lines.forEachIndexed { idx, line ->
-                        PoLineRow(
-                            line,
-                            onQty = { lines[idx] = line.copy(qty = it) },
-                            onCost = { lines[idx] = line.copy(unitCost = it) },
-                            onRemove = { lines.removeAt(idx) }
-                        )
+        // Chosen lines.
+        if (lines.isNotEmpty()) {
+            Spacer(Modifier.height(10.dp))
+            Text("Order items", fontWeight = FontWeight.Bold, color = t.inkSecondary)
+            lines.forEachIndexed { idx, line ->
+                PoLineRow(
+                    line,
+                    onQty = { lines[idx] = line.copy(qty = it) },
+                    onCost = { lines[idx] = line.copy(unitCost = it) },
+                    onSell = { lines[idx] = line.copy(sellPrice = it) },
+                    onStockToggle = { lines[idx] = line.copy(stockOnArrival = it) },
+                    onRemove = { lines.removeAt(idx) }
+                )
+                HorizontalDivider(color = t.surfaceBorder)
+            }
+            Spacer(Modifier.height(6.dp))
+            Row(Modifier.fillMaxWidth()) {
+                Text("Order total", color = t.inkSecondary, modifier = Modifier.weight(1f))
+                Text(money(orderTotal, currency), fontWeight = FontWeight.Black, color = t.inkPrimary)
+            }
+        }
+
+        // Expected arrival (rough) — quick chips offset from today.
+        Spacer(Modifier.height(8.dp))
+        Text("Expected arrival", fontWeight = FontWeight.Bold, color = t.inkSecondary)
+        Row(
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            FilterChip(selected = etaDays == null, onClick = { etaDays = null }, label = { Text("None") })
+            PO_ETA_CHOICES.forEach { (label, days) ->
+                FilterChip(selected = etaDays == days, onClick = { etaDays = days }, label = { Text(label) })
+            }
+        }
+
+        // Payment now (cash ledger). Blank = pay the full total.
+        Spacer(Modifier.height(8.dp))
+        Text("Pay now (cash)", fontWeight = FontWeight.Bold, color = t.inkSecondary)
+        Text(
+            "Cash on hand ${money(cashOnHand, currency)} · buying stock moves cash into inventory (not an expense).",
+            color = t.inkTertiary, fontSize = 11.sp
+        )
+        OutlinedTextField(
+            value = payText, onValueChange = { payText = it },
+            label = { Text("Amount  (blank = full ${money(orderTotal, currency)})") }, singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+            modifier = Modifier.fillMaxWidth()
+        )
+        val payableNow = (orderTotal - payNow.coerceIn(0.0, orderTotal)).coerceAtLeast(0.0)
+        if (payableNow > 0.005) {
+            Text("Owed to supplier: ${money(payableNow, currency)}", color = t.danger, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        }
+
+        PosField(
+            value = notes, onValueChange = { notes = it },
+            label = "Notes  (optional)", modifier = Modifier.fillMaxWidth()
+        )
+    }
+
+    if (newSupplier) {
+        SupplierModal(initial = null, onDismiss = { newSupplier = false }) { name, phone, email, address, snotes ->
+            val id = java.util.UUID.randomUUID().toString()
+            vm.saveSupplier(id, name, phone, email, address, snotes)
+            supplierId = id; supplierName = name; newSupplier = false
+        }
+    }
+    if (shortfall) {
+        val avail = cashOnHand.coerceAtLeast(0.0)
+        val want = payNow.coerceAtMost(orderTotal)
+        val remainder = (want - avail).coerceAtLeast(0.0)
+        AlertDialog(
+            onDismissRequest = { shortfall = false },
+            title = { Text("Not enough cash") },
+            text = {
+                Column {
+                    Text(
+                        "Paying ${money(want, currency)} but only ${money(avail, currency)} is in the drawer. How should it be funded?",
+                        color = t.inkSecondary, fontSize = 13.sp
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    Button(onClick = { shortfall = false; submit("available") }, modifier = Modifier.fillMaxWidth()) {
+                        Text("Take ${money(avail, currency)} · owe ${money(remainder, currency)}")
                     }
                     Spacer(Modifier.height(6.dp))
-                    Row(Modifier.fillMaxWidth()) {
-                        Text("Order total", color = t.inkSecondary, modifier = Modifier.weight(1f))
-                        Text(money(orderTotal, currency), fontWeight = FontWeight.Black, color = t.inkPrimary)
+                    OutlinedButton(onClick = { shortfall = false; submit("capital") }, modifier = Modifier.fillMaxWidth()) {
+                        Text("Owner covers it (cash untouched)")
                     }
                 }
-
-                PosField(
-                    value = notes, onValueChange = { notes = it },
-                    label = "Notes  (optional)", modifier = Modifier.fillMaxWidth()
-                )
-        }
+            },
+            confirmButton = {},
+            dismissButton = { TextButton(onClick = { shortfall = false }) { Text("Abort") } }
+        )
     }
 }
 
-/** Read-only detail sheet + lifecycle actions (mark sent / receive / cancel). */
+/**
+ * Read-only detail sheet + lifecycle actions (B4). Shows the ETA, the payment split
+ * (cash paid / owner-covered / still owed) and, for an open order, the arrival actions:
+ * "Confirm arrival (all)" stocks every pending line at once, "Receive part…" opens the
+ * per-line arrival sheet. A supplier balance can be settled from cash.
+ */
 @Composable
 private fun PoDetailDialog(
     pwl: PurchaseOrderWithLines,
     currency: String,
     onDismiss: () -> Unit,
-    onMarkSent: () -> Unit,
-    onCancel: () -> Unit,
-    onReceive: () -> Unit
+    onConfirmAll: () -> Unit,
+    onReceivePartial: () -> Unit,
+    onSettle: (mode: String) -> Unit,
+    onCancel: () -> Unit
 ) {
     val t = LocalPosTokens.current
     val po = pwl.po
     val total = pwl.lines.sumOf { it.qty * it.unitCost }
-    val open = po.status == "draft" || po.status == "sent"
+    val open = po.status == "placed" || po.status == "sent" || po.status == "partial" || po.status == "draft"
+    val canReceive = po.status == "placed" || po.status == "sent" || po.status == "partial"
+    var settleShort by remember { mutableStateOf(false) }
 
     PosDialog(title = po.ref, onDismiss = onDismiss) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -7252,15 +7498,28 @@ private fun PoDetailDialog(
             Spacer(Modifier.width(8.dp))
             Text(po.supplierName.ifBlank { "No supplier" }, color = t.inkSecondary)
         }
-        Text(dashTime(po.createdAt), style = MaterialTheme.typography.bodySmall, color = t.inkTertiary)
+        Text(
+            dashTime(po.createdAt) + (po.eta?.let { " · ETA " + dashDate(it) } ?: ""),
+            style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
+        )
         PosFormCard {
             pwl.lines.forEach { l ->
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
-                        Text(l.name, color = t.inkPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(l.name, color = t.inkPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            if (l.itemId == null) {
+                                Spacer(Modifier.width(6.dp))
+                                Text("(new)", color = t.success, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                        val recvd = l.receivedQty ?: 0.0
+                        val pending = (l.qty - recvd).coerceAtLeast(0.0)
                         Text(
                             "${trimQty(l.qty)} × ${money(l.unitCost, currency)}" +
-                                (l.receivedQty?.let { " · recv ${trimQty(it)}" } ?: ""),
+                                (if (recvd > 0.0) " · received ${trimQty(recvd)}" else "") +
+                                (if (l.stockOnArrival && pending > 0.0) " · ${trimQty(pending)} pending" else "") +
+                                (if (!l.stockOnArrival) " · not stocked" else ""),
                             style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
                         )
                     }
@@ -7272,20 +7531,35 @@ private fun PoDetailDialog(
                 Text(money(total, currency), fontWeight = FontWeight.Black, color = t.inkPrimary)
             }
         }
+        // Payment split.
+        PosFormCard {
+            if (po.cashPaid > 0.005) DetailMoneyRow("Paid (cash)", po.cashPaid, currency, t.inkSecondary)
+            if (po.capitalPaid > 0.005) DetailMoneyRow("Owner covered", po.capitalPaid, currency, t.inkSecondary)
+            if (po.payableRemainder > 0.005) DetailMoneyRow("Owed to supplier", po.payableRemainder, currency, t.danger)
+            if (po.cashPaid <= 0.005 && po.capitalPaid <= 0.005 && po.payableRemainder <= 0.005) {
+                Text("Fully settled.", color = t.inkTertiary, style = MaterialTheme.typography.bodySmall)
+            }
+        }
         po.notes?.takeIf { it.isNotBlank() }?.let {
             Text("Notes", fontWeight = FontWeight.Bold, color = t.inkSecondary)
             Text(it, style = MaterialTheme.typography.bodySmall, color = t.inkTertiary)
         }
-        // Lifecycle actions.
-        when (po.status) {
-            "draft" -> Button(
-                onClick = onMarkSent, modifier = Modifier.fillMaxWidth(),
+        // Arrival actions.
+        if (canReceive) {
+            Button(
+                onClick = onConfirmAll, modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(containerColor = t.brand.s600, contentColor = t.inkOnBrand)
-            ) { Text("Mark as sent") }
-            "sent" -> Button(
-                onClick = onReceive, modifier = Modifier.fillMaxWidth(),
-                colors = ButtonDefaults.buttonColors(containerColor = t.brand.s600, contentColor = t.inkOnBrand)
-            ) { Text("Receive stock") }
+            ) { Text("Confirm arrival (all)") }
+            OutlinedButton(onClick = onReceivePartial, modifier = Modifier.fillMaxWidth()) {
+                Text("Receive part…")
+            }
+        }
+        // Settle a supplier balance from cash.
+        if (po.payableRemainder > 0.005 && po.status != "cancelled") {
+            Button(
+                onClick = { settleShort = true }, modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = t.surface2, contentColor = t.inkPrimary)
+            ) { Text("Pay supplier ${money(po.payableRemainder, currency)}") }
         }
         if (open) {
             OutlinedButton(onClick = onCancel, modifier = Modifier.fillMaxWidth()) {
@@ -7293,54 +7567,88 @@ private fun PoDetailDialog(
             }
         }
     }
+
+    if (settleShort) {
+        AlertDialog(
+            onDismissRequest = { settleShort = false },
+            title = { Text("Pay supplier balance") },
+            text = {
+                Text(
+                    "Pay ${money(po.payableRemainder, currency)} to ${po.supplierName.ifBlank { "the supplier" }} from cash on hand. If the drawer is short, pay what's there and keep the rest owed.",
+                    color = t.inkSecondary, fontSize = 13.sp
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { settleShort = false; onSettle("cash") }) { Text("Pay in full") }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = { settleShort = false; onSettle("available") }) { Text("Pay available") }
+                    TextButton(onClick = { settleShort = false }) { Text("Cancel") }
+                }
+            }
+        )
+    }
 }
 
-/** Receive sheet: per-line quantity (defaults to ordered), optional box→unit mode. */
+/** One label/amount row in the PO detail payment card. */
 @Composable
-private fun PoReceiveDialog(
+private fun DetailMoneyRow(label: String, amount: Double, currency: String, valueColor: Color) {
+    val t = LocalPosTokens.current
+    Row(Modifier.fillMaxWidth()) {
+        Text(label, color = t.inkSecondary, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+        Text(money(amount, currency), color = valueColor, fontWeight = FontWeight.Bold)
+    }
+}
+
+/**
+ * Arrival sheet (§10.5): per-line quantity that has ARRIVED, defaulting to the still-
+ * outstanding quantity so a full arrival is one tap. Confirming moves the entered
+ * quantity from pending into real sellable stock.
+ */
+@Composable
+private fun PoArrivalDialog(
     pwl: PurchaseOrderWithLines,
-    currency: String,
     onDismiss: () -> Unit,
-    onConfirm: (entered: Map<String, Double>, boxMode: Boolean) -> Unit
+    onConfirm: (received: Map<String, Double>) -> Unit
 ) {
     val t = LocalPosTokens.current
-    var boxMode by remember { mutableStateOf(false) }
-    // Plain map (read only at confirm); each row owns its text state below.
+    // Only lines still awaiting stock are actionable.
+    val open = pwl.lines.filter { it.stockOnArrival && (it.qty - (it.receivedQty ?: 0.0)) > 0.0 }
     val entered = remember {
-        mutableMapOf<String, String>().apply { pwl.lines.forEach { put(it.id, trimQty(it.qty)) } }
+        mutableMapOf<String, String>().apply {
+            open.forEach { put(it.id, trimQty((it.qty - (it.receivedQty ?: 0.0)).coerceAtLeast(0.0))) }
+        }
     }
 
     PosContainedForm(
-        title = "Receive ${pwl.po.ref}",
+        title = "Arrival — ${pwl.po.ref}",
         onDismiss = onDismiss,
-        confirmLabel = "Confirm receive",
+        confirmLabel = "Confirm arrival",
         onConfirm = {
             val parsed = entered.mapValues { (_, v) -> v.replace(',', '.').toDoubleOrNull() ?: 0.0 }
-            onConfirm(parsed, boxMode)
+            onConfirm(parsed)
         }
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Switch(checked = boxMode, onCheckedChange = { boxMode = it })
-            Spacer(Modifier.width(8.dp))
-            Text(
-                "Quantities are in boxes (× pack size)",
-                color = t.inkSecondary, style = MaterialTheme.typography.bodySmall
-            )
-        }
-        pwl.lines.forEach { l ->
-            var qtyText by remember(l.id) { mutableStateOf(entered[l.id] ?: trimQty(l.qty)) }
+        Text(
+            "Enter what has arrived. It moves from pending into sellable stock.",
+            color = t.inkTertiary, style = MaterialTheme.typography.bodySmall
+        )
+        open.forEach { l ->
+            val outstanding = (l.qty - (l.receivedQty ?: 0.0)).coerceAtLeast(0.0)
+            var qtyText by remember(l.id) { mutableStateOf(entered[l.id] ?: trimQty(outstanding)) }
             Row(
                 Modifier.fillMaxWidth().padding(vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Column(Modifier.weight(1f)) {
                     Text(l.name, color = t.inkPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Text("ordered ${trimQty(l.qty)}", style = MaterialTheme.typography.bodySmall, color = t.inkTertiary)
+                    Text("pending ${trimQty(outstanding)}", style = MaterialTheme.typography.bodySmall, color = t.inkTertiary)
                 }
                 PosField(
                     value = qtyText,
                     onValueChange = { qtyText = it; entered[l.id] = it },
-                    label = if (boxMode) "Boxes" else "Units",
+                    label = "Arrived",
                     keyboardType = KeyboardType.Decimal,
                     modifier = Modifier.width(120.dp)
                 )
@@ -7893,6 +8201,10 @@ private fun startOfTodayMs(): Long {
 
 private fun dashTime(ms: Long): String =
     SimpleDateFormat("d MMM, h:mm a", Locale.getDefault()).format(Date(ms))
+
+/** Date-only formatter (e.g. an order ETA — no time component). */
+private fun dashDate(ms: Long): String =
+    SimpleDateFormat("d MMM yyyy", Locale.getDefault()).format(Date(ms))
 
 // ───────────────────────── REPORTS ─────────────────────────
 

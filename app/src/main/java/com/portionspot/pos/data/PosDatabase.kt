@@ -465,6 +465,38 @@ val MIGRATION_22_23 = object : Migration(22, 23) {
     }
 }
 
+/**
+ * v23 → v24: supplier orders + pending stock (B4).
+ *
+ *  1. `items` gains two LOCAL-ONLY columns backing incoming (pending) stock: `pendingQty`
+ *     (ordered-but-not-arrived units, shown as a "+N pending" badge and NOT sellable) and
+ *     `pendingNew` (a product created by a PO whose first arrival hasn't been confirmed —
+ *     fully blocked from sale until arrival). The cloud `products` table has no matching
+ *     columns, so these stay on-device.
+ *  2. `purchase_orders` gains the ETA + payment split: `eta`, `cashPaid`, `capitalPaid`,
+ *     `payableRemainder`, `arrivalPromptedAt`. Paying for a PO drains cash via a
+ *     `cash_txns` "purchase" row (NOT an expense — a cash→inventory asset purchase), and
+ *     any unpaid balance is accounts payable to the supplier.
+ *  3. `purchase_order_items` gains `sellPrice`, `stockOnArrival`, `productType` so a line
+ *     can seed a brand-new product and be flagged to auto-stock on arrival.
+ *
+ * Real migration — additive with defaults, no data dropped.
+ */
+val MIGRATION_23_24 = object : Migration(23, 24) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE items ADD COLUMN pendingQty REAL NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE items ADD COLUMN pendingNew INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE purchase_orders ADD COLUMN eta INTEGER")
+        db.execSQL("ALTER TABLE purchase_orders ADD COLUMN cashPaid REAL NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE purchase_orders ADD COLUMN capitalPaid REAL NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE purchase_orders ADD COLUMN payableRemainder REAL NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE purchase_orders ADD COLUMN arrivalPromptedAt INTEGER")
+        db.execSQL("ALTER TABLE purchase_order_items ADD COLUMN sellPrice REAL")
+        db.execSQL("ALTER TABLE purchase_order_items ADD COLUMN stockOnArrival INTEGER NOT NULL DEFAULT 1")
+        db.execSQL("ALTER TABLE purchase_order_items ADD COLUMN productType TEXT NOT NULL DEFAULT 'piece'")
+    }
+}
+
 @Database(
     entities = [
         Business::class,
@@ -488,7 +520,7 @@ val MIGRATION_22_23 = object : Migration(22, 23) {
         AppNotification::class,
         AuditEntry::class
     ],
-    version = 23,
+    version = 24,
     exportSchema = false
 )
 abstract class PosDatabase : RoomDatabase() {
@@ -532,7 +564,8 @@ abstract class PosDatabase : RoomDatabase() {
                         MIGRATION_9_10, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14,
                         MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17,
                         MIGRATION_17_18, MIGRATION_18_19, MIGRATION_19_20,
-                        MIGRATION_20_21, MIGRATION_21_22, MIGRATION_22_23
+                        MIGRATION_20_21, MIGRATION_21_22, MIGRATION_22_23,
+                        MIGRATION_23_24
                     )
                     .fallbackToDestructiveMigration()
                     .build()

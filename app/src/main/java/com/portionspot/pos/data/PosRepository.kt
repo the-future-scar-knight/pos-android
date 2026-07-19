@@ -641,81 +641,285 @@ class PosRepository(private val db: PosDatabase) {
     fun purchaseOrdersFlow(businessId: String): Flow<List<PurchaseOrderWithLines>> =
         poDao.observeWithLines(businessId)
 
+    /** Shop-wide accounts payable owed to suppliers (sum of unpaid PO balances). */
+    fun supplierPayablesFlow(businessId: String): Flow<Double> =
+        poDao.observeSupplierPayables(businessId)
+
     /**
-     * Create a draft PO with its lines in one atomic write. The [lines] arrive
-     * without a parent id; we stamp the freshly minted PO id onto each. Returns
-     * the new PO id. [ref] is the human code `PO-YYMMDD-NNNN`.
+     * Place a supplier order (B4) with its lines, PENDING stock, and the cash payment —
+     * all in one atomic write. Returns the new PO id.
+     *
+     * PENDING STOCK (§10.4): every line flagged [PurchaseOrderLine.stockOnArrival] is
+     * reflected as incoming stock that is NOT yet sellable. A line with no [itemId] mints
+     * a brand-new catalog product marked `pendingNew` (blocked from sale) carrying the
+     * incoming quantity; a line that links an existing item bumps that item's `pendingQty`
+     * (a "+N pending" badge) while its current sellable stock is untouched.
+     *
+     * PAYMENT (§10.3) — buying stock is a CASH → INVENTORY asset purchase, NOT an expense:
+     * [payNow] cash drains the drawer through a `cash_txns` "purchase" row (never an
+     * `expenses` row, so it never reduces derived net profit — the goods only affect profit
+     * later via cost-of-goods-sold when sold). [fundingMode] mirrors B3's shortfall choice:
+     *  - "cash"      → pay [payNow] fully from cash.
+     *  - "available" → pay what cash there is, remainder → supplier accounts payable.
+     *  - "capital"   → owner covers [payNow] out of pocket (cash untouched).
+     * Whatever of the order total isn't covered becomes `payableRemainder` (money owed to
+     * the supplier).
      */
     suspend fun createPurchaseOrder(
         businessId: String,
         supplierId: String?,
         supplierName: String,
         notes: String?,
-        lines: List<PurchaseOrderLine>
+        eta: Long?,
+        lines: List<PurchaseOrderLine>,
+        payNow: Double,
+        fundingMode: String,
+        cashierId: String? = null,
+        cashierName: String? = null
     ): String {
+        val stamp = now()
+        val total = lines.sumOf { it.qty * it.unitCost }
         val po = PurchaseOrder(
             businessId = businessId,
             ref = genRef("PO"),
             supplierId = supplierId,
             supplierName = supplierName,
-            status = "draft",
-            notes = notes
+            status = "placed",
+            notes = notes,
+            eta = eta,
+            createdAt = stamp,
+            sentAt = stamp,
+            updatedAt = stamp
         )
         db.withTransaction {
-            poDao.insert(po)
-            poDao.insertLines(lines.map { it.copy(poId = po.id) })
+            val onHand = cashOnHandOnce(businessId).coerceAtLeast(0.0)
+            val want = payNow.coerceIn(0.0, total)
+            val cash: Double
+            val capital: Double
+            when (fundingMode) {
+                "capital" -> { cash = 0.0; capital = want }
+                "available" -> { cash = want.coerceAtMost(onHand); capital = 0.0 }
+                "none" -> { cash = 0.0; capital = 0.0 }
+                else -> { cash = want; capital = 0.0 }   // "cash"
+            }
+            val payable = (total - cash - capital).coerceAtLeast(0.0)
+
+            // Persist the header + its lines (stamping the new PO id), pre-creating /
+            // bumping PENDING stock for every line flagged to stock on arrival.
+            val savedLines = ArrayList<PurchaseOrderLine>(lines.size)
+            for (raw in lines) {
+                var line = raw.copy(poId = po.id)
+                if (line.stockOnArrival) {
+                    val existing = line.itemId?.let { itemDao.getById(it) }
+                    if (existing != null) {
+                        // Existing product: show the incoming qty as a pending addition;
+                        // current sellable stock stays exactly as it is.
+                        itemDao.upsert(
+                            existing.copy(
+                                pendingQty = existing.pendingQty + line.qty,
+                                updatedAt = stamp, pendingSync = true
+                            )
+                        )
+                    } else if (line.name.isNotBlank()) {
+                        // Brand-new product: create it PENDING (not sellable) with the
+                        // incoming qty; sell price / cost / type seed the catalog row.
+                        val measured = line.productType == "measured"
+                        val newItem = Item(
+                            businessId = businessId,
+                            name = line.name.trim(),
+                            sku = line.sku?.trim()?.ifBlank { null },
+                            productType = line.productType,
+                            price = line.sellPrice ?: 0.0,
+                            pricePerUnit = if (measured) (line.sellPrice ?: 0.0) else 0.0,
+                            cost = line.unitCost,
+                            trackStock = true,
+                            stockQty = 0.0,
+                            pendingQty = line.qty,
+                            pendingNew = true,
+                            updatedAt = stamp
+                        )
+                        itemDao.upsert(newItem)
+                        line = line.copy(itemId = newItem.id)
+                    }
+                }
+                savedLines += line
+            }
+            poDao.insert(
+                po.copy(cashPaid = cash, capitalPaid = capital, payableRemainder = payable)
+            )
+            poDao.insertLines(savedLines)
+
+            if (cash > CENT) {
+                cashTxnDao.insert(
+                    CashTxn(
+                        businessId = businessId, type = "purchase", amount = -cash,
+                        source = fundingLabel(fundingMode),
+                        note = "PO ${po.ref} · ${supplierName.ifBlank { "supplier" }}",
+                        refType = "purchase_order", refId = po.id,
+                        createdBy = cashierId, createdByName = cashierName,
+                        createdAt = stamp, updatedAt = stamp
+                    )
+                )
+            }
+            auditDao.insert(
+                AuditEntry(
+                    businessId = businessId, action = "purchase_created",
+                    entityType = "purchase_order", entityId = po.id,
+                    summary = "Placed ${po.ref} ${fmtMoney(total)}" +
+                        (if (cash > CENT) " · paid ${fmtMoney(cash)} cash" else "") +
+                        (if (capital > CENT) " · ${fmtMoney(capital)} owner" else "") +
+                        (if (payable > CENT) " · ${fmtMoney(payable)} owed" else ""),
+                    createdBy = cashierId, createdByName = cashierName
+                )
+            )
         }
         return po.id
     }
 
-    /** Draft → sent. Stamps sentAt. */
+    /** Draft → placed. Stamps sentAt. (New orders are created already "placed".) */
     suspend fun markPoSent(poId: String) {
         val po = poDao.getById(poId) ?: return
         val stamp = now()
-        poDao.upsert(po.copy(status = "sent", sentAt = stamp, updatedAt = stamp))
-    }
-
-    /** Any open state → cancelled. */
-    suspend fun cancelPo(poId: String) {
-        val po = poDao.getById(poId) ?: return
-        poDao.upsert(po.copy(status = "cancelled", updatedAt = now()))
+        poDao.upsert(po.copy(status = "placed", sentAt = stamp, updatedAt = stamp))
     }
 
     /**
-     * Receive a PO: for every line with a received quantity > 0, add the goods to
-     * the linked catalog item's stock and record what was received, then close the
-     * PO. [enteredByLine] maps a line id to the quantity entered in the receive
-     * dialog; when [boxMode] is on, that quantity is read as BOXES and multiplied
-     * by the item's pack size to get units. All of it commits atomically so a crash
-     * can't restock without closing the PO (or vice-versa).
+     * Cancel an open PO: clears any PENDING stock it created (a brand-new pending product
+     * is tombstoned; an existing item's pending addition is rolled back) and zeroes the
+     * supplier payable. Cash already paid is deliberately left spent (historical). Atomic.
      */
-    suspend fun receivePurchaseOrder(
-        poId: String,
-        enteredByLine: Map<String, Double>,
-        boxMode: Boolean
-    ) {
+    suspend fun cancelPo(poId: String) {
         val po = poDao.getById(poId) ?: return
         val stamp = now()
         db.withTransaction {
             for (line in poDao.linesForPo(poId)) {
-                val entered = enteredByLine[line.id] ?: 0.0
-                val item = line.itemId?.let { itemDao.getById(it) }
-                // Boxes → units using the item's pack size (ad-hoc lines stay 1:1).
-                val units =
-                    if (boxMode && item != null && item.boxSize > 1) entered * item.boxSize
-                    else entered
-                if (units > 0.0 && item != null) {
+                if (!line.stockOnArrival) continue
+                val outstanding = (line.qty - (line.receivedQty ?: 0.0)).coerceAtLeast(0.0)
+                if (outstanding <= 0.0) continue
+                val item = line.itemId?.let { itemDao.getById(it) } ?: continue
+                if (item.pendingNew && (line.receivedQty ?: 0.0) <= 0.0) {
+                    // Never arrived and exists only for this PO → remove the pending product.
+                    itemDao.softDelete(item.id, stamp)
+                } else {
                     itemDao.upsert(
                         item.copy(
-                            stockQty = item.stockQty + units,
-                            updatedAt = stamp,
-                            pendingSync = true
+                            pendingQty = (item.pendingQty - outstanding).coerceAtLeast(0.0),
+                            updatedAt = stamp, pendingSync = true
                         )
                     )
                 }
-                poDao.upsertLine(line.copy(receivedQty = units))
             }
-            poDao.upsert(po.copy(status = "received", receivedAt = stamp, updatedAt = stamp))
+            poDao.upsert(po.copy(status = "cancelled", payableRemainder = 0.0, updatedAt = stamp))
+        }
+    }
+
+    /**
+     * Confirm ARRIVAL of a PO (§10.5), moving each line's still-pending quantity into real
+     * sellable stock: increments the linked item's on-hand (measured or unit), draws its
+     * `pendingQty` back down, and clears the `pendingNew` block so a new product becomes
+     * sellable. [receivedByLine] optionally supplies a per-line arrived quantity (partial
+     * arrival); a null/absent entry arrives the whole outstanding quantity. Recomputes the
+     * PO status to `partial` or `received`. Atomic.
+     */
+    suspend fun confirmArrival(
+        poId: String,
+        receivedByLine: Map<String, Double>? = null,
+        cashierId: String? = null,
+        cashierName: String? = null
+    ) {
+        val po = poDao.getById(poId) ?: return
+        if (po.status == "received" || po.status == "cancelled") return
+        val stamp = now()
+        db.withTransaction {
+            val lines = poDao.linesForPo(poId)
+            var allDone = true
+            for (line in lines) {
+                val already = line.receivedQty ?: 0.0
+                val outstanding = (line.qty - already).coerceAtLeast(0.0)
+                if (outstanding <= 0.0) continue
+                // Default: arrive everything still outstanding on this line.
+                val recv = (receivedByLine?.get(line.id) ?: outstanding)
+                    .coerceIn(0.0, outstanding)
+                if (recv <= 0.0) { allDone = false; continue }
+
+                if (line.stockOnArrival && line.itemId != null) {
+                    val item = itemDao.getById(line.itemId)
+                    if (item != null) {
+                        val measured = item.isMeasured
+                        itemDao.upsert(
+                            item.copy(
+                                stockQty = if (measured) item.stockQty else item.stockQty + recv,
+                                stockMeasured = if (measured) item.stockMeasured + recv else item.stockMeasured,
+                                pendingQty = (item.pendingQty - recv).coerceAtLeast(0.0),
+                                pendingNew = false,          // first arrival makes it sellable
+                                updatedAt = stamp, pendingSync = true
+                            )
+                        )
+                    }
+                }
+                val newReceived = already + recv
+                poDao.upsertLine(line.copy(receivedQty = newReceived))
+                if (newReceived + CENT < line.qty) allDone = false
+            }
+            poDao.upsert(
+                po.copy(
+                    status = if (allDone) "received" else "partial",
+                    receivedAt = if (allDone) stamp else po.receivedAt,
+                    updatedAt = stamp
+                )
+            )
+            auditDao.insert(
+                AuditEntry(
+                    businessId = po.businessId, action = "purchase_received",
+                    entityType = "purchase_order", entityId = po.id,
+                    summary = (if (allDone) "Received ${po.ref}" else "Partly received ${po.ref}"),
+                    createdBy = cashierId, createdByName = cashierName
+                )
+            )
+        }
+    }
+
+    /**
+     * Settle (part of) a supplier's accounts payable on a PO from cash-on-hand. [mode]:
+     * "cash" pays the whole remaining balance; "available" pays only what cash there is
+     * (the rest stays owed). Drains the drawer via a `cash_txns` "purchase" row (still an
+     * asset purchase, never an expense). Atomic. No-op if nothing is owed / no cash.
+     */
+    suspend fun recordSupplierPayment(
+        poId: String, mode: String, cashierId: String? = null, cashierName: String? = null
+    ) {
+        val po = poDao.getById(poId) ?: return
+        val remainder = po.payableRemainder
+        if (remainder <= CENT) return
+        val stamp = now()
+        db.withTransaction {
+            val onHand = cashOnHandOnce(po.businessId).coerceAtLeast(0.0)
+            val pay = if (mode == "available") remainder.coerceAtMost(onHand) else remainder
+            if (pay <= CENT) return@withTransaction
+            cashTxnDao.insert(
+                CashTxn(
+                    businessId = po.businessId, type = "purchase", amount = -pay,
+                    source = "supplier payment", note = "PO ${po.ref} balance",
+                    refType = "purchase_order", refId = po.id,
+                    createdBy = cashierId, createdByName = cashierName,
+                    createdAt = stamp, updatedAt = stamp
+                )
+            )
+            poDao.upsert(
+                po.copy(
+                    cashPaid = po.cashPaid + pay,
+                    payableRemainder = (remainder - pay).coerceAtLeast(0.0),
+                    updatedAt = stamp
+                )
+            )
+            auditDao.insert(
+                AuditEntry(
+                    businessId = po.businessId, action = "purchase_payment",
+                    entityType = "purchase_order", entityId = po.id,
+                    summary = "Paid ${fmtMoney(pay)} to ${po.supplierName.ifBlank { "supplier" }} on ${po.ref}",
+                    createdBy = cashierId, createdByName = cashierName
+                )
+            )
         }
     }
 
@@ -1738,6 +1942,7 @@ class PosRepository(private val db: PosDatabase) {
                     custs.associate { it.id to it.creditLimit },
                 )
             },
+            openPurchaseOrders = poDao.openWithEtaOnce(businessId),
             pendingSyncCount = pendingSyncCount,
             lastSyncAt = lastSyncAt,
             thresholds = thresholds
