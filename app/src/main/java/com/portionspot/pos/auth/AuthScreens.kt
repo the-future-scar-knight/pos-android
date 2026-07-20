@@ -153,12 +153,19 @@ internal fun AuthScaffold(
                     Box(
                         Modifier
                             .fillMaxWidth()
-                            .heightIn(min = viewportHeight)
-                            .padding(horizontal = 24.dp, vertical = 24.dp),
+                            .heightIn(min = viewportHeight),
                         contentAlignment = Alignment.Center,
                     ) {
+                        // Padding lives on the INNER column, never on the min-height Box.
+                        // Applied outside, it added 48dp on top of the viewport height, so
+                        // the form was permanently 48dp scrollable even when it all fitted —
+                        // and scrolling up slid the title under the top edge ("whatever
+                        // reaches that point gets hidden"). Inside, the box is exactly the
+                        // viewport when the content fits, so there is nothing to scroll.
                         Column(
-                            Modifier.wrapContentHeight(),
+                            Modifier
+                                .wrapContentHeight()
+                                .padding(horizontal = 24.dp, vertical = 24.dp),
                             horizontalAlignment = Alignment.CenterHorizontally,
                         ) {
                             Box(
