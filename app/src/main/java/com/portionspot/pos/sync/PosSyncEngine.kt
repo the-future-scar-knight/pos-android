@@ -19,6 +19,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
+import kotlin.math.abs
 
 /** Outcome of one sync pass, surfaced to the UI. */
 sealed class SyncOutcome {
@@ -354,6 +355,9 @@ class PosSyncEngine(
         n += pullProducts(api, bid)
         n += pullCustomers(api, bid)
         n += pullSales(api, bid)
+        // Runs every pass, not just when sales came down: devices that already
+        // double-counted need the repair even once their cursor is past those rows.
+        healDuplicateSales(bid)
         n += pullCredit(api, bid)
         n += pullMobileMoney(api, bid)
         // Accounting spine + supplier orders. Same last-write-wins-by-updated_at rule,
@@ -606,7 +610,15 @@ class PosSyncEngine(
         var applied = 0
         for (dto in rows) {
             if (dto.type != "sale") continue
+            val ref = dto.ref ?: dto.id
+            // IDENTITY: the push side keys cloud sales by REF (see buildSalePush), so a
+            // sale THIS device made returns with id = "0012" while it lives locally under
+            // a UUID. Matching on id alone missed that and inserted a second local row —
+            // the dashboard then counted every till sale twice. Match on id OR receiptNo.
+            // A sale that genuinely originated elsewhere (web POS, ref "PSM-260526-6315")
+            // matches neither and still imports normally.
             if (saleDao.getSaleById(dto.id) != null) continue
+            if (saleDao.getSaleByReceiptNo(bid, ref) != null) continue
             saleDao.upsertSale(dto.toSaleEntity(bid))
             val lines = dto.toSaleLines(bid) { sku -> sku?.lowercase()?.let { skuToId[it] } }
             if (lines.isNotEmpty()) saleDao.upsertLines(lines)
@@ -614,6 +626,32 @@ class PosSyncEngine(
         }
         config.setCursor("sales", rows.maxOf { it.cursorStamp() })
         return applied
+    }
+
+    /**
+     * Collapse local sales that are two copies of ONE receipt — the locally-created row
+     * (id = UUID, owns the lines/tenders) plus the twin pulled back down under its ref.
+     * The UUID row survives; only a row whose id IS its own receiptNo (i.e. cloud-shaped)
+     * is ever removed, and only when its total matches the survivor's to the cent, so two
+     * unrelated rows can never be merged. The duplicate's orphaned lines and tenders go
+     * with it. Hard-delete, local only — never tombstoned, never synced (same convention
+     * as [healDuplicateItems]) since the cloud row is the legitimate single copy.
+     * Idempotent: a no-op once each receipt has one row.
+     */
+    private suspend fun healDuplicateSales(bid: String) {
+        val groups = saleDao.salesWithReceiptOnce(bid).groupBy { it.receiptNo!!.trim() }
+        for ((ref, group) in groups) {
+            if (group.size < 2) continue
+            // Survivor = a locally-created row (id != ref); newest wins if several.
+            val survivor = group.filter { it.id != ref }.maxByOrNull { it.updatedAt } ?: continue
+            for (dup in group) {
+                if (dup.id != ref) continue                       // never drop a local row
+                if (abs(dup.total - survivor.total) > 0.005) continue  // same money only
+                saleDao.hardDeleteLines(dup.id)
+                saleDao.hardDeletePayments(dup.id)
+                saleDao.hardDeleteSale(dup.id)
+            }
+        }
     }
 
     companion object {

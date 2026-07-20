@@ -301,6 +301,23 @@ interface SaleDao {
     @Query("SELECT * FROM sales WHERE id = :id LIMIT 1")
     suspend fun getSaleById(id: String): SaleEntity?
 
+    /**
+     * Find a sale by its receipt reference. The cloud keys `sales` rows by REF (not by
+     * our local UUID), so a sale this device made comes back down under an id we've
+     * never seen — only the receiptNo identifies it. Prefers the locally-created row
+     * (id != receiptNo, i.e. the UUID one that owns the lines/payments) if a pulled
+     * twin is also present.
+     */
+    @Query(
+        "SELECT * FROM sales WHERE businessId = :businessId AND receiptNo = :receiptNo " +
+            "ORDER BY (id <> :receiptNo) DESC LIMIT 1"
+    )
+    suspend fun getSaleByReceiptNo(businessId: String, receiptNo: String): SaleEntity?
+
+    /** Every sale carrying a receipt ref (incl. tombstoned) — input to the duplicate heal. */
+    @Query("SELECT * FROM sales WHERE businessId = :businessId AND receiptNo IS NOT NULL")
+    suspend fun salesWithReceiptOnce(businessId: String): List<SaleEntity>
+
     @Query("UPDATE sales SET synced = 1 WHERE id = :id")
     suspend fun markSaleSynced(id: String)
 
