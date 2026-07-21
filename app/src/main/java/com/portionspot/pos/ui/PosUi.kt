@@ -158,6 +158,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.IntOffset
+import kotlin.math.abs
 import kotlin.math.roundToInt
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.filled.ChevronRight
@@ -3972,6 +3973,20 @@ private fun PaymentDialog(
             }
         }
 
+        // ── Exact payment: opt-in "I gave change anyway" ──
+        // No change is due, so the change prompt never opens on its own and the normal
+        // exact-payment sale still completes in one tap. If the cashier DID hand money
+        // back by mistake, this opens the same prompt with a change due of zero —
+        // whatever is entered books as "over-given (customer owes)".
+        if (tenders.isNotEmpty() && fullyPaid && overpay <= 0.005) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                TextButton(
+                    onClick = { showChangePrompt = true },
+                    colors = ButtonDefaults.textButtonColors(contentColor = t.brand.s600)
+                ) { Text("Record change given") }
+            }
+        }
+
         // ── Add a tender (hidden once the total is fully covered) ──
         if (remaining > 0 || tenders.isEmpty()) {
             PosSectionLabel(if (tenders.isEmpty()) "Payment" else "Add another payment")
@@ -4145,7 +4160,9 @@ private data class WalkInImbalance(
 )
 
 /**
- * Prompt shown when a sale overpays: it states the change due and asks how much the
+ * Prompt shown when a sale overpays — or opened by hand on an exact-payment sale, in
+ * which case [changeDue] is 0 and anything entered is over-given. It states the change
+ * due and asks how much the
  * cashier is actually handing over now (blank => 0). The entry is NOT capped at the
  * change due — under-giving books the remainder as change owed (shop owes), and
  * over-giving books the excess as a debt (customer owes). The parent decides where
@@ -4168,7 +4185,9 @@ private fun ChangePromptDialog(
     val over = (given - changeDue).coerceAtLeast(0.0)   // customer owes the shop
 
     PosContainedForm(
-        title = "Change to give",
+        // changeDue == 0 => the cashier opened this deliberately on an exact-payment
+        // sale to record money handed back; title it for what they're doing.
+        title = if (changeDue > 0.005) "Change to give" else "Record change given",
         onDismiss = onDismiss,
         confirmLabel = "Complete sale",
         confirmEnabled = valid && !submitting,
@@ -6202,29 +6221,41 @@ private fun CustomerDetailDialog(
         }
 
         // ───── CREDIT & CHANGE tab ─────
-        // Balance summary + primary action.
-        val balAccent = when {
-            balance > 0 -> t.danger
-            changeOwed > 0 -> t.brand.s600
-            else -> t.success
+        // Two independent derived balances: DEBT (credit_owed − credit_paid) and
+        // WE-OWE (change/refund owed − paid). The headline is the NET of the two, so a
+        // customer who owes 5 while you owe them 3 reads as "owes you 2"; the breakdown
+        // underneath keeps both ledgers visible (that's what makes this auditable).
+        val net = balance - changeOwed
+        val settled = abs(net) <= 0.005
+        val netAccent = when {
+            settled -> t.success
+            net > 0 -> t.danger
+            else -> t.brand.s600
         }
-        val balLabel = when {
-            balance > 0 -> "Balance owed"
-            changeOwed > 0 -> "You owe (change)"
-            else -> "Settled"
+        PosMetricCard(
+            label = when {
+                settled -> "Net position"
+                net > 0 -> "Net: owes you"
+                else -> "Net: you owe"
+            },
+            value = if (settled) "Settled" else money(abs(net), currency),
+            modifier = Modifier.fillMaxWidth(),
+            accent = netAccent,
+            sub = "credit owed minus change owed"
+        )
+        PosFormCard {
+            TotalRow("Owes you (credit)", money(balance.coerceAtLeast(0.0), currency))
+            TotalRow("You owe (change/refund)", money(changeOwed.coerceAtLeast(0.0), currency))
         }
-        val balValue = when {
-            balance > 0 -> money(balance, currency)
-            changeOwed > 0 -> money(changeOwed, currency)
-            else -> money(0.0, currency)
-        }
-        PosMetricCard(balLabel, balValue, Modifier.fillMaxWidth(), accent = balAccent)
-        when {
-            balance > 0 -> Button(
+        // Both actions can be live at once — a customer may owe you AND be owed change.
+        if (balance > 0.005) {
+            Button(
                 onClick = { showPay = true }, modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(containerColor = t.brand.s600, contentColor = t.inkOnBrand)
             ) { Text("Record payment") }
-            changeOwed > 0 -> Button(
+        }
+        if (changeOwed > 0.005) {
+            Button(
                 onClick = { showPayout = true }, modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(containerColor = t.brand.s600, contentColor = t.inkOnBrand)
             ) { Text("Pay out change") }
@@ -8002,6 +8033,27 @@ private fun ChangeCreditScreen(vm: PosViewModel, currency: String) {
                             val sub = if (a.lastRef != null) "From sale #${a.lastRef} · ${dashTime(a.lastAt)}"
                             else dashTime(a.lastAt)
                             Text(sub, style = MaterialTheme.typography.bodySmall, color = t.inkTertiary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            // Both ledgers running at once → say where they net out, so
+                            // the number on the right isn't read as the whole story.
+                            if (a.creditBal > 0.005 && a.changeBal > 0.005) {
+                                val netBal = a.creditBal - a.changeBal
+                                val netSettled = abs(netBal) <= 0.005
+                                Text(
+                                    when {
+                                        netSettled -> "Net: settled"
+                                        netBal > 0 -> "Net: owes you ${money(netBal, currency)}"
+                                        else -> "Net: you owe ${money(-netBal, currency)}"
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontWeight = FontWeight.Medium,
+                                    color = when {
+                                        netSettled -> t.success
+                                        netBal > 0 -> t.danger
+                                        else -> t.brand.s600
+                                    },
+                                    maxLines = 1, overflow = TextOverflow.Ellipsis
+                                )
+                            }
                         }
                         Spacer(Modifier.width(8.dp))
                         if (settledView) {
