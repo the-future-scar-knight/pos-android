@@ -2427,6 +2427,12 @@ class PosRepository(private val db: PosDatabase) {
         const val KEY_UNSYNCED_HOURS = "admin_unsynced_hours"
         // Opening cash float (B3): the starting cash-on-hand the admin sets.
         const val KEY_OPENING_FLOAT = "cash_opening_float"
+
+        /** Permanent per-device receipt prefix (see [deviceCode]). Write-once. */
+        const val KEY_DEVICE_CODE = "device_receipt_code"
+        /** Confusable-free alphabet — no I, O, 0 or 1, so a code is safe to read aloud. */
+        private const val DEVICE_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+        private const val DEVICE_CODE_LEN = 3
     }
 
     // ---- reports: tender breakdown from actual split amounts --------------
@@ -2454,15 +2460,46 @@ class PosRepository(private val db: PosDatabase) {
     }
 
     /**
-     * Per-business sequential receipt number. Stored as a counter in the local
-     * settings table; called inside the checkout transaction so it never skips or
-     * collides. Zero-padded to four digits ("0001", "0002", …).
+     * This device's permanent short code — the thing that makes receipt refs unique
+     * ACROSS phones. Three characters from a confusable-free alphabet (no I/O/0/1),
+     * drawn once from a secure random source and then written to the local settings
+     * table forever. Never regenerated: it survives restarts, sign-outs and account
+     * switches, because renaming a device mid-life would let an old ref repeat.
+     *
+     * Not derived from ANDROID_ID on purpose — that needs a Context down here and is
+     * per-app-signing-key anyway; 32^3 random codes are ample for the handful of tills
+     * one shop runs.
+     */
+    private suspend fun deviceCode(): String {
+        settingDao.get(KEY_DEVICE_CODE)?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+        val rnd = java.security.SecureRandom()
+        val code = (1..DEVICE_CODE_LEN)
+            .map { DEVICE_CODE_ALPHABET[rnd.nextInt(DEVICE_CODE_ALPHABET.length)] }
+            .joinToString("")
+        settingDao.put(Setting(KEY_DEVICE_CODE, code))
+        return code
+    }
+
+    /**
+     * Receipt reference for a new sale: `<deviceCode>-NNNN`, e.g. `K7Q-0013`.
+     *
+     * The NNNN half is the old per-business counter in the local settings table —
+     * kept because cashiers read it aloud and it stays small and sequential per till.
+     * The device-code half is what fixes the multi-device data loss: the cloud keys
+     * `sales` rows BY REF (see [buildSalePush]) and pushes fresh sales with
+     * ignore-duplicates, so before this, two phones both minting "0013" meant the
+     * second phone's sale was silently dropped on push and skipped on pull. Different
+     * codes mean the refs can no longer collide.
+     *
+     * Existing sales keep whatever ref they already have — nothing renumbers history,
+     * and nothing anywhere parses a ref as a number (the web POS already ships refs
+     * like `PSM-260526-6315`, so a mixed-format ref column is normal).
      */
     private suspend fun nextReceiptNo(businessId: String): String {
         val key = "receiptSeq:$businessId"
         val next = (settingDao.get(key)?.toIntOrNull() ?: 0) + 1
         settingDao.put(Setting(key, next.toString()))
-        return next.toString().padStart(4, '0')
+        return "${deviceCode()}-${next.toString().padStart(4, '0')}"
     }
 
     /**

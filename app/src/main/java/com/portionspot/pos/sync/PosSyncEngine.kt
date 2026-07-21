@@ -267,6 +267,26 @@ class PosSyncEngine(
                     "id", ignoreDuplicates = false
                 )
             }
+            // Defence in depth: ignore-duplicates returns 201 even when the server
+            // DROPPED a row because that id already existed, so a successful HTTP call
+            // is not proof the money landed. Read the ids back once for the whole batch
+            // (one extra GET per sync, not per sale) and warn loudly if any is missing —
+            // that would mean a ref collision, which the device-coded ref format
+            // (`K7Q-0013`) exists to prevent.
+            if (fresh.isNotEmpty() && fresh.size <= VERIFY_MAX) {
+                val wanted = fresh.map { it.receiptNo ?: it.id }
+                val present = syncJson
+                    .decodeFromString<List<IdRow>>(api.selectIdsIn("sales", wanted))
+                    .map { it.id }
+                    .toSet()
+                val missing = wanted.filterNot { it in present }
+                if (missing.isNotEmpty()) {
+                    errors.add(
+                        "sales: ${missing.size} sale(s) did not land in the cloud " +
+                            "(${missing.take(3).joinToString()}) — receipt reference already taken"
+                    )
+                }
+            }
             sales.forEach { saleDao.markSaleSynced(it.id) }
             sales.size
         }
@@ -657,6 +677,9 @@ class PosSyncEngine(
     companion object {
         /** Rows per pull. A single till changes far fewer than this between syncs. */
         private const val PAGE = 1000
+
+        /** Skip the post-push read-back above this batch size (URL length / cost). */
+        private const val VERIFY_MAX = 200
     }
 }
 

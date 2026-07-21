@@ -526,6 +526,10 @@ private fun SaleLine.toItemJson(sku: String?): SaleItemJson = SaleItemJson(
     boxSize = if (mode == "box") unitsPerLine else null,
 )
 
+/** Just an `id`, for read-back verification of a push (see SupabaseRest.selectIdsIn). */
+@Serializable
+data class IdRow(val id: String)
+
 /** A completed sale + its lines/tenders → the web `sales` row shape (type='sale'). */
 fun buildSalePush(
     sale: SaleEntity,

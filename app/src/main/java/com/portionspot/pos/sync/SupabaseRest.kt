@@ -100,6 +100,26 @@ class SupabaseRest(
         }
     }
 
+    /**
+     * GET just the `id` column for the rows of [table] whose id is one of [ids].
+     * One round-trip for the whole batch — used to confirm an ignore-duplicates push
+     * actually landed (that resolution returns 201 even when the server dropped the
+     * row as a duplicate, so the HTTP status alone proves nothing).
+     */
+    fun selectIdsIn(table: String, ids: List<String>): String {
+        val list = ids.joinToString(",") { "\"" + it.replace("\"", "") + "\"" }
+        val url = (rest(table).toHttpUrlOrNull() ?: throw IOException("Bad URL"))
+            .newBuilder()
+            .addQueryParameter("select", "id")
+            .addQueryParameter("id", "in.($list)")
+            .build()
+        client.newCall(Request.Builder().url(url).get().authed().build()).execute().use { resp ->
+            val body = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) throw IOException("verify $table: HTTP ${resp.code} $body")
+            return body
+        }
+    }
+
     fun upsert(table: String, jsonArray: String, onConflict: String, ignoreDuplicates: Boolean = false) {
         val url = (rest(table).toHttpUrlOrNull() ?: throw IOException("Bad URL"))
             .newBuilder()
