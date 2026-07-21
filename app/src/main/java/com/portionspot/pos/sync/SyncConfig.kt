@@ -87,7 +87,10 @@ class SyncConfig(private val dao: SettingDao) {
             "expenses", "cash_txns", "suppliers", "purchase_orders", "purchase_order_items",
             // Admin alert feed — so a condition a cashier phone notices reaches the
             // owner's admin phone (upserts on the composite business_id,dedupe_key).
-            "notifications"
+            "notifications",
+            // Append-only audit trail — receipt edits, till shortages/overages and
+            // voids recorded on a cashier phone become visible on the admin phone.
+            "audit_log"
         )
 
         private fun cursorKey(table: String) = "cursor_$table"

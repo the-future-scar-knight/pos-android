@@ -851,8 +851,16 @@ data class AppNotification(
 /**
  * One immutable audit-trail entry (prompt §8 "full audit log"). Written whenever an
  * admin/cashier performs a sensitive action — voiding a refund, adjusting stock,
- * overriding a price, locking a payment method, writing off a debt. Append-only and
- * local-only. Attribution ([createdBy]/[createdByName]) is stamped at write time.
+ * overriding a price, locking a payment method, writing off a debt. Append-only.
+ * Attribution ([createdBy]/[createdByName]) is stamped at write time.
+ *
+ * SYNCED (one-way in effect): the trail is mirrored to the cloud `audit_log` so the
+ * owner's admin phone sees receipt edits, till shortages/overages and voids recorded
+ * on the cashier phones. Because the cloud table has SELECT/INSERT/DELETE policies but
+ * deliberately NO UPDATE policy (an audit trail must not be rewritable), the push uses
+ * ignore-duplicates and a pulled row that already exists locally is skipped, never
+ * overwritten. [updatedAt] exists only to feed the `updated_at=gt.<cursor>` pull cursor
+ * and always equals [createdAt] for a row this device wrote.
  */
 @Entity(tableName = "audit_log", indices = [Index("businessId")])
 data class AuditEntry(
@@ -865,7 +873,11 @@ data class AuditEntry(
     val meta: String? = null,
     val createdBy: String? = null,
     val createdByName: String? = null,
-    val createdAt: Long = now()
+    val createdAt: Long = now(),
+    /** Mirrors [createdAt] — the row is immutable; this only drives the pull cursor. */
+    val updatedAt: Long = createdAt,
+    /** Local-only: true => still waiting to go up. */
+    val pendingSync: Boolean = true
 )
 
 /**

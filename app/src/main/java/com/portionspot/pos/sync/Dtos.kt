@@ -1,6 +1,7 @@
 package com.portionspot.pos.sync
 
 import com.portionspot.pos.data.AppNotification
+import com.portionspot.pos.data.AuditEntry
 import com.portionspot.pos.data.CashTxn
 import com.portionspot.pos.data.CreditTxn
 import com.portionspot.pos.data.Customer
@@ -1270,4 +1271,92 @@ fun AppNotification.toNotificationPush() = NotificationPushDto(
     createdAt = IsoTime.toIso(createdAt),
     updatedAt = IsoTime.toIso(updatedAt),
     deleted = deleted,
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// audit_log — the append-only trail (receipt edits, till shortages/overages, voids,
+// write-offs) recorded on whichever phone performed the action, mirrored so the
+// owner's admin phone can see all of them.
+//
+// UPSERT KEY IS `local_id` (UNIQUE in the cloud) with IGNORE-DUPLICATES. The cloud
+// table has SELECT/INSERT/DELETE policies but deliberately NO UPDATE policy — an audit
+// trail must not be rewritable after the fact — so a merge-duplicates upsert would be
+// rejected by RLS on every re-push. Insert-once is also semantically right: the row is
+// immutable, so there is never anything to update.
+//
+// TYPE RULES:
+//   • created_at / updated_at are TIMESTAMPTZ -> fixed-format UTC ISO via [IsoTime]
+//     (the `updated_at=gt.<cursor>` pull depends on it).
+//   • `action` is NOT NULL in the cloud — never send a blank/absent value.
+//   • `details` (jsonb) is NOT ours: other writers own it. It is not in either DTO, so
+//     a push leaves it NULL and a pull ignores it.
+// ─────────────────────────────────────────────────────────────────────────────
+@Serializable
+data class AuditDto(
+    @SerialName("local_id") val localId: String? = null,
+    @SerialName("business_id") val businessId: String? = null,
+    val action: String = "",
+    @SerialName("entity_type") val entityType: String? = null,
+    @SerialName("entity_id") val entityId: String? = null,
+    val summary: String? = null,
+    val meta: String? = null,
+    @SerialName("user_id") val userId: String? = null,
+    @SerialName("user_name") val userName: String? = null,
+    @SerialName("created_at") val createdAt: String? = null,
+    @SerialName("updated_at") val updatedAt: String? = null,
+) {
+    fun cursorStamp(): String = updatedAt ?: createdAt ?: IsoTime.EPOCH
+}
+
+/**
+ * Build the local row for an incoming cloud entry. Only ever called for an id this
+ * device does NOT already hold (see PosSyncEngine.pullAudit) — an existing local entry
+ * is skipped, never merged. `pendingSync = false`: it came FROM the cloud.
+ */
+fun AuditDto.toAudit(businessId: String, id: String): AuditEntry {
+    val created = IsoTime.toMillis(createdAt).takeIf { it > 0 } ?: System.currentTimeMillis()
+    return AuditEntry(
+        id = id,
+        businessId = businessId,
+        action = action.ifBlank { "unknown" },
+        entityType = entityType,
+        entityId = entityId,
+        summary = summary.orEmpty(),
+        meta = meta,
+        createdBy = userId,
+        createdByName = userName,
+        createdAt = created,
+        updatedAt = IsoTime.toMillis(updatedAt).takeIf { it > 0 } ?: created,
+        pendingSync = false,
+    )
+}
+
+@Serializable
+data class AuditPushDto(
+    @SerialName("local_id") val localId: String,
+    @SerialName("business_id") val businessId: String,
+    val action: String,
+    @SerialName("entity_type") val entityType: String? = null,
+    @SerialName("entity_id") val entityId: String? = null,
+    val summary: String? = null,
+    val meta: String? = null,
+    @SerialName("user_id") val userId: String? = null,
+    @SerialName("user_name") val userName: String? = null,
+    @SerialName("created_at") val createdAt: String,
+    @SerialName("updated_at") val updatedAt: String,
+)
+
+/** NOTE: no `details` — see the header. `action` falls back rather than going NULL. */
+fun AuditEntry.toAuditPush() = AuditPushDto(
+    localId = id,
+    businessId = businessId,
+    action = action.ifBlank { "unknown" },
+    entityType = entityType,
+    entityId = entityId,
+    summary = summary,
+    meta = meta,
+    userId = createdBy,
+    userName = createdByName,
+    createdAt = IsoTime.toIso(createdAt),
+    updatedAt = IsoTime.toIso(updatedAt),
 )

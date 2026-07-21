@@ -50,6 +50,18 @@ class PosRepository(private val db: PosDatabase) {
         runCatching { onSyncWorthyChange?.invoke(reason) }
     }
 
+    /**
+     * The ONLY way an audit entry is written. The row is born `pendingSync = true`
+     * (entity default), so it queues for upload, and the write nudges a debounced sync
+     * so the owner's admin phone sees a cashier's receipt edit / till discrepancy /
+     * void in seconds instead of on the ~15-minute worker cycle. Append-only: entries
+     * are never updated or deleted after this point.
+     */
+    private suspend fun logAudit(entry: AuditEntry) {
+        auditDao.insert(entry)
+        nudgeSync("audit")
+    }
+
     // ---- Local key/value settings (theme, etc. — never synced) -------------
 
     suspend fun getSetting(key: String): String? = settingDao.get(key)
@@ -372,7 +384,7 @@ class PosRepository(private val db: PosDatabase) {
         db.withTransaction {
             expenseDao.upsert(e.copy(status = "rejected", updatedAt = stamp, pendingSync = true))
             clearPendingExpenseNotice(e.businessId, e.id)
-            auditDao.insert(
+            logAudit(
                 AuditEntry(
                     businessId = e.businessId, action = "expense_rejected", entityType = "expense",
                     entityId = e.id, summary = "Rejected ${e.category} expense ${fmtMoney(e.amount)}",
@@ -440,7 +452,7 @@ class PosRepository(private val db: PosDatabase) {
                     )
                 )
             }
-            auditDao.insert(
+            logAudit(
                 AuditEntry(
                     businessId = e.businessId, action = "expense_approved", entityType = "expense",
                     entityId = e.id,
@@ -497,7 +509,7 @@ class PosRepository(private val db: PosDatabase) {
                     createdAt = stamp, updatedAt = stamp
                 )
             )
-            auditDao.insert(
+            logAudit(
                 AuditEntry(
                     businessId = businessId, action = "cash_adjust", entityType = "cash",
                     summary = "Cash ${if (amount < 0) "payout" else "top-up"} ${fmtMoney(kotlin.math.abs(amount))} — ${note.ifBlank { "manual" }}",
@@ -549,7 +561,7 @@ class PosRepository(private val db: PosDatabase) {
                         updatedAt = now, pendingSync = true
                     )
                 )
-                auditDao.insert(
+                logAudit(
                     AuditEntry(
                         businessId = businessId, action = "expense_recurring_posted",
                         entityType = "expense", entityId = child.id,
@@ -780,7 +792,7 @@ class PosRepository(private val db: PosDatabase) {
                     )
                 )
             }
-            auditDao.insert(
+            logAudit(
                 AuditEntry(
                     businessId = businessId, action = "purchase_created",
                     entityType = "purchase_order", entityId = po.id,
@@ -892,7 +904,7 @@ class PosRepository(private val db: PosDatabase) {
                     updatedAt = stamp, pendingSync = true
                 )
             )
-            auditDao.insert(
+            logAudit(
                 AuditEntry(
                     businessId = po.businessId, action = "purchase_received",
                     entityType = "purchase_order", entityId = po.id,
@@ -936,7 +948,7 @@ class PosRepository(private val db: PosDatabase) {
                     updatedAt = stamp, pendingSync = true
                 )
             )
-            auditDao.insert(
+            logAudit(
                 AuditEntry(
                     businessId = po.businessId, action = "purchase_payment",
                     entityType = "purchase_order", entityId = po.id,
@@ -1225,7 +1237,7 @@ class PosRepository(private val db: PosDatabase) {
             // the shop kept leaves the drawer OVER. Written in the same transaction.
             if (customer == null && tillDiscrepancy) {
                 if (overGiven > CENT) {
-                    auditDao.insert(
+                    logAudit(
                         AuditEntry(
                             businessId = businessId,
                             action = "till_short",
@@ -1239,7 +1251,7 @@ class PosRepository(private val db: PosDatabase) {
                     )
                 }
                 if (changeOwed > CENT) {
-                    auditDao.insert(
+                    logAudit(
                         AuditEntry(
                             businessId = businessId,
                             action = "till_over",
@@ -1464,7 +1476,7 @@ class PosRepository(private val db: PosDatabase) {
                 } else {
                     // Walk-in: no account to carry it. Record the till imbalance so an
                     // admin sees the money that didn't reconcile.
-                    auditDao.insert(
+                    logAudit(
                         AuditEntry(
                             businessId = businessId,
                             action = if (delta > 0) "till_short" else "till_over",
@@ -1485,7 +1497,7 @@ class PosRepository(private val db: PosDatabase) {
 
             // Append-only history: one row per line change, then the totals summary.
             for (d in diffs) {
-                auditDao.insert(
+                logAudit(
                     AuditEntry(
                         businessId = businessId,
                         action = "sale_edit_line",
@@ -1499,7 +1511,7 @@ class PosRepository(private val db: PosDatabase) {
                     )
                 )
             }
-            auditDao.insert(
+            logAudit(
                 AuditEntry(
                     businessId = businessId,
                     action = "sale_edit",
@@ -2369,7 +2381,7 @@ class PosRepository(private val db: PosDatabase) {
         cashierId: String? = null,
         cashierName: String? = null
     ) {
-        auditDao.insert(
+        logAudit(
             AuditEntry(
                 businessId = businessId, action = action, entityType = entityType,
                 entityId = entityId, summary = summary, meta = meta,
@@ -2430,7 +2442,7 @@ class PosRepository(private val db: PosDatabase) {
                 )
             }
             refundDao.softDelete(refundId, stamp)
-            auditDao.insert(
+            logAudit(
                 AuditEntry(
                     businessId = r.businessId, action = "void_refund", entityType = "refund",
                     entityId = refundId,
@@ -2460,7 +2472,7 @@ class PosRepository(private val db: PosDatabase) {
                     createdBy = cashierId, createdByName = cashierName
                 )
             )
-            auditDao.insert(
+            logAudit(
                 AuditEntry(
                     businessId = businessId, action = "debt_writeoff", entityType = "customer",
                     entityId = customerId, summary = "Wrote off ${fmtMoney(amount)}",

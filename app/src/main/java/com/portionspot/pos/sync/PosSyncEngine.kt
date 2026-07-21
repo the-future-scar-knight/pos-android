@@ -1,5 +1,6 @@
 package com.portionspot.pos.sync
 
+import com.portionspot.pos.data.AuditDao
 import com.portionspot.pos.data.BusinessDao
 import com.portionspot.pos.data.CashTxnDao
 import com.portionspot.pos.data.CreditDao
@@ -66,6 +67,7 @@ class PosSyncEngine(
     private val supplierDao: SupplierDao,
     private val poDao: PurchaseOrderDao,
     private val notificationDao: NotificationDao,
+    private val auditDao: AuditDao,
     private val config: SyncConfig,
     /** Current signed-in user's JWT for RLS; null falls back to anon (denied). */
     private val accessToken: () -> String? = { null },
@@ -112,7 +114,8 @@ class PosSyncEngine(
             supplierDao.pending().size +
             poDao.pending().size +
             poDao.pendingLines().size +
-            notificationDao.pending().size
+            notificationDao.pending().size +
+            auditDao.pending().size
     }
 
     // ── push (Stage 2) ──────────────────────────────────────────────────────
@@ -383,6 +386,25 @@ class PosSyncEngine(
             rows.size
         }
 
+        // audit_log — the append-only trail (receipt edits, till shortages/overages,
+        // voids) so the admin phone sees what happened on the cashier phones.
+        // IGNORE-DUPLICATES on `local_id`, exactly like sales: the cloud table has NO
+        // UPDATE policy (an audit trail must not be rewritable after the fact), so a
+        // merge-duplicates upsert would be rejected by RLS and surface as a per-table
+        // failure every cycle. The rows are immutable anyway — insert-once is correct.
+        pushTable("audit_log") {
+            val rows = auditDao.pending()
+            if (rows.isEmpty()) return@pushTable 0
+            api.upsert(
+                "audit_log",
+                syncJson.encodeToString(rows.map { it.toAuditPush() }),
+                "local_id",
+                ignoreDuplicates = true
+            )
+            auditDao.markSynced(rows.map { it.id })
+            rows.size
+        }
+
         return PushResult(n, errors)
     }
 
@@ -408,7 +430,39 @@ class PosSyncEngine(
         n += pullPurchaseOrders(api, bid)
         n += pullPurchaseOrderLines(api)
         n += pullNotifications(api, bid)
+        n += pullAudit(api, bid)
         return n
+    }
+
+    /**
+     * audit_log → the local trail. APPEND-ONLY, so this is insert-the-missing and
+     * nothing else: an entry whose `local_id` already exists locally is SKIPPED, never
+     * overwritten — that is the whole point of an audit log, and it also means a
+     * re-pull after a cursor reset is a no-op instead of a rewrite. Inserted rows land
+     * with `pendingSync = false` so they are not bounced straight back up.
+     */
+    private suspend fun pullAudit(api: SupabaseRest, bid: String): Int {
+        val rows = syncJson.decodeFromString<List<AuditDto>>(
+            api.selectSince("audit_log", config.cursor("audit_log"), PAGE)
+        )
+        if (rows.isEmpty()) return 0
+        // One row per local_id (defensive: the column is unique, but a legacy/foreign
+        // writer could still leave the field blank — those carry no local identity).
+        val byId = rows.mapNotNull { dto ->
+            dto.localId?.trim()?.takeIf { it.isNotBlank() }?.let { it to dto }
+        }.toMap()
+        var applied = 0
+        if (byId.isNotEmpty()) {
+            val existing = auditDao.existingIds(byId.keys.toList()).toSet()
+            val fresh = byId.filterKeys { it !in existing }
+                .map { (id, dto) -> dto.toAudit(bid, id) }
+            if (fresh.isNotEmpty()) {
+                auditDao.insertAll(fresh)
+                applied = fresh.size
+            }
+        }
+        config.setCursor("audit_log", rows.maxOf { it.cursorStamp() })
+        return applied
     }
 
     /**

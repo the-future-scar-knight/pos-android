@@ -755,6 +755,25 @@ interface AuditDao {
     @Query("SELECT * FROM audit_log WHERE entityId = :entityId ORDER BY createdAt DESC")
     fun observeForEntity(entityId: String): Flow<List<AuditEntry>>
 
+    /** Rows still waiting to go up — the upload queue. */
+    @Query("SELECT * FROM audit_log WHERE pendingSync = 1")
+    suspend fun pending(): List<AuditEntry>
+
+    @Query("UPDATE audit_log SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun markSynced(ids: List<String>)
+
+    /**
+     * Pull guard: the cloud row's `local_id` IS the local `id`, so a hit here means we
+     * already hold that entry and the incoming copy must be SKIPPED — an audit row is
+     * never overwritten after the fact.
+     */
+    @Query("SELECT id FROM audit_log WHERE id IN (:ids)")
+    suspend fun existingIds(ids: List<String>): List<String>
+
+    /** Pull insert. IGNORE, not REPLACE — a race can never clobber a local row. */
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertAll(entries: List<AuditEntry>)
+
     @Query("DELETE FROM audit_log WHERE businessId = :businessId")
     suspend fun wipe(businessId: String)
 }

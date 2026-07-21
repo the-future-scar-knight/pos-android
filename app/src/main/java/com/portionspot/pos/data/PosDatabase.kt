@@ -573,6 +573,26 @@ val MIGRATION_26_27 = object : Migration(26, 27) {
     }
 }
 
+/**
+ * v27 → v28 — AUDIT LOG SYNC. The append-only trail gains the two sync columns every
+ * other synced table already has: `updatedAt` (feeds the `updated_at=gt.<cursor>` pull
+ * cursor; for an immutable row it simply mirrors `createdAt`) and `pendingSync` (the
+ * upload queue).
+ *
+ * BACKFILL: existing rows get `updatedAt = createdAt` and `pendingSync = 1`, so the
+ * history this device already holds uploads ONCE on the next pass instead of staying
+ * invisible to the admin phone. The cloud side has no UPDATE policy, so that one upload
+ * is insert-or-skip and re-running it can never rewrite a shared row.
+ */
+val MIGRATION_27_28 = object : Migration(27, 28) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE audit_log ADD COLUMN updatedAt INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE audit_log ADD COLUMN pendingSync INTEGER NOT NULL DEFAULT 1")
+        db.execSQL("UPDATE audit_log SET updatedAt = createdAt WHERE updatedAt = 0")
+        db.execSQL("UPDATE audit_log SET pendingSync = 1")
+    }
+}
+
 @Database(
     entities = [
         Business::class,
@@ -596,7 +616,7 @@ val MIGRATION_26_27 = object : Migration(26, 27) {
         AppNotification::class,
         AuditEntry::class
     ],
-    version = 27,
+    version = 28,
     exportSchema = false
 )
 abstract class PosDatabase : RoomDatabase() {
@@ -642,7 +662,7 @@ abstract class PosDatabase : RoomDatabase() {
                         MIGRATION_17_18, MIGRATION_18_19, MIGRATION_19_20,
                         MIGRATION_20_21, MIGRATION_21_22, MIGRATION_22_23,
                         MIGRATION_23_24, MIGRATION_24_25, MIGRATION_25_26,
-                        MIGRATION_26_27
+                        MIGRATION_26_27, MIGRATION_27_28
                     )
                     .fallbackToDestructiveMigration()
                     .build()
