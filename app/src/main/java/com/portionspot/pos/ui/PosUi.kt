@@ -6355,10 +6355,15 @@ private fun CustomerDetailDialog(
             title = "Pay out change",
             owedLabel = "We owe",
             actionLabel = "Pay out",
+            allowOverpay = true,
+            overWarning = { over ->
+                "You're handing back ${money(over, currency)} more than we owe — the customer will owe it back."
+            },
             onDismiss = { showPayout = false }
         ) { amount, note ->
-            // Never pay out more than we owe (that would flip the balance negative).
-            vm.recordChangePayment(customer.id, amount.coerceAtMost(changeOwed), note.ifBlank { null })
+            // Paying out MORE than we owe is allowed: the repository settles what we owe
+            // and books the excess as customer debt ("Over-paid change") — never dropped.
+            vm.recordChangePayment(customer.id, amount, note.ifBlank { null })
             showPayout = false
         }
     }
@@ -6537,6 +6542,12 @@ private fun creditRowMeta(type: String): CreditRowMeta = when (type) {
     else -> CreditRowMeta("Payment", positive = false, weOwe = false)
 }
 
+/**
+ * Shared money-in/money-out dialog. [allowOverpay] is opt-in: when true the typed
+ * amount may EXCEED [maxAmount] and the excess is surfaced before confirming (the
+ * caller books it — see the change-payout path). Left false, behaviour is unchanged
+ * for every other caller.
+ */
 @Composable
 private fun RecordPaymentDialog(
     maxAmount: Double,
@@ -6544,6 +6555,9 @@ private fun RecordPaymentDialog(
     title: String = "Record payment",
     owedLabel: String = "Owed",
     actionLabel: String = "Record",
+    allowOverpay: Boolean = false,
+    overLabel: String = "Over-paid (customer owes)",
+    overWarning: (Double) -> String = { "" },
     onDismiss: () -> Unit,
     onConfirm: (Double, String) -> Unit
 ) {
@@ -6551,6 +6565,7 @@ private fun RecordPaymentDialog(
     var note by remember { mutableStateOf("") }
     val amount = amountText.toDoubleOrNull()
     val valid = amount != null && amount > 0
+    val over = if (allowOverpay) ((amount ?: 0.0) - maxAmount).coerceAtLeast(0.0) else 0.0
     PosContainedForm(
         title = title,
         onDismiss = onDismiss,
@@ -6567,6 +6582,10 @@ private fun RecordPaymentDialog(
                 label = "Amount received", keyboardType = KeyboardType.Decimal, modifier = Modifier.fillMaxWidth()
             )
             PosField(value = note, onValueChange = { note = it }, label = "Note  (optional)", modifier = Modifier.fillMaxWidth())
+        }
+        if (over > 0.005) {
+            TotalRow(overLabel, money(over, currency))
+            Text(overWarning(over), color = t.warning, fontSize = 12.sp)
         }
     }
 }

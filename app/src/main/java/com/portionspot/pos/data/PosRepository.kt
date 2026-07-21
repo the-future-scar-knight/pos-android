@@ -1759,7 +1759,14 @@ class PosRepository(private val db: PosDatabase) {
     fun changeBalanceFlow(customerId: String): Flow<Double> =
         creditDao.observeChangeBalance(customerId)
 
-    /** Shop hands over change it previously owed a customer (writes change_paid). */
+    /**
+     * Shop hands over change it previously owed a customer (writes `change_paid`).
+     *
+     * If the cashier pays out MORE than is owed, the excess is NOT discarded (that
+     * silently lost money): the owed part settles as `change_paid` and the remainder
+     * becomes customer DEBT — a `credit_owed` row noted "Over-paid change" — exactly
+     * mirroring the over-given-change branch of [checkout]. Both rows commit together.
+     */
     suspend fun recordChangePayment(
         businessId: String,
         customerId: String,
@@ -1769,17 +1776,42 @@ class PosRepository(private val db: PosDatabase) {
         cashierName: String? = null
     ) {
         if (amount <= 0) return
-        creditDao.insert(
-            CreditTxn(
-                businessId = businessId,
-                customerId = customerId,
-                type = "change_paid",
-                amount = amount,
-                note = note,
-                createdBy = cashierId,
-                createdByName = cashierName
-            )
-        )
+        val weOwe = creditDao.changeBalanceOnce(customerId).coerceAtLeast(0.0)
+        val settled = minOf(amount, weOwe)      // never past zero: we-owe won't go negative
+        val over = (amount - settled).coerceAtLeast(0.0)   // customer now owes this back
+        val stamp = now()
+        db.withTransaction {
+            if (settled > CENT) {
+                creditDao.insert(
+                    CreditTxn(
+                        businessId = businessId,
+                        customerId = customerId,
+                        type = "change_paid",
+                        amount = settled,
+                        note = note,
+                        createdBy = cashierId,
+                        createdByName = cashierName,
+                        createdAt = stamp,
+                        updatedAt = stamp
+                    )
+                )
+            }
+            if (over > CENT) {
+                creditDao.insert(
+                    CreditTxn(
+                        businessId = businessId,
+                        customerId = customerId,
+                        type = "credit_owed",
+                        amount = over,
+                        note = if (settled > CENT) "Over-paid change" else note ?: "Over-paid change",
+                        createdBy = cashierId,
+                        createdByName = cashierName,
+                        createdAt = stamp,
+                        updatedAt = stamp
+                    )
+                )
+            }
+        }
     }
 
     // ---- refunds & returns (prompt §11) ----------------------------------

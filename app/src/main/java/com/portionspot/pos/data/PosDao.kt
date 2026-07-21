@@ -459,6 +459,15 @@ interface CreditDao {
     )
     suspend fun balanceOnce(customerId: String): Double
 
+    /** One-shot WE-OWE balance (change/refund owed − paid). Used to split an over-payout:
+     *  paying out more than we owe settles it and books the excess as customer debt. */
+    @Query(
+        "SELECT COALESCE(SUM(CASE WHEN type IN ('change_owed', 'refund_owed') THEN amount " +
+            "WHEN type IN ('change_paid', 'refund_paid') THEN -amount ELSE 0 END), 0) " +
+            "FROM credit_transactions WHERE customerId = :customerId AND deleted = 0"
+    )
+    suspend fun changeBalanceOnce(customerId: String): Double
+
     /** Shop-wide money owed BACK to customers (change + unpaid refunds), net of payouts.
      *  Powers the "You owe customers" summary on the Change & Credit screen. */
     @Query(
