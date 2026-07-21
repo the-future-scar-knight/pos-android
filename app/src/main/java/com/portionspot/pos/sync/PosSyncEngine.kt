@@ -8,6 +8,7 @@ import com.portionspot.pos.data.ExpenseDao
 import com.portionspot.pos.data.Item
 import com.portionspot.pos.data.ItemDao
 import com.portionspot.pos.data.MobileMoneyDao
+import com.portionspot.pos.data.NotificationDao
 import com.portionspot.pos.data.PurchaseOrderDao
 import com.portionspot.pos.data.RefundDao
 import com.portionspot.pos.data.SaleDao
@@ -64,6 +65,7 @@ class PosSyncEngine(
     private val cashTxnDao: CashTxnDao,
     private val supplierDao: SupplierDao,
     private val poDao: PurchaseOrderDao,
+    private val notificationDao: NotificationDao,
     private val config: SyncConfig,
     /** Current signed-in user's JWT for RLS; null falls back to anon (denied). */
     private val accessToken: () -> String? = { null },
@@ -109,7 +111,8 @@ class PosSyncEngine(
             cashTxnDao.pending().size +
             supplierDao.pending().size +
             poDao.pending().size +
-            poDao.pendingLines().size
+            poDao.pendingLines().size +
+            notificationDao.pending().size
     }
 
     // ── push (Stage 2) ──────────────────────────────────────────────────────
@@ -363,6 +366,23 @@ class PosSyncEngine(
             rows.size
         }
 
+        // notifications — the admin alert feed. THE ONLY TABLE THAT DOES NOT CONFLICT
+        // ON local_id: the cloud unique constraint is (business_id, dedupe_key), so two
+        // phones that independently compute "low stock: rice" converge on ONE cloud row
+        // that gets updated, instead of one duplicate row per device. pushed_at is not
+        // in the DTO at all — it is device-local heads-up state.
+        pushTable("notifications") {
+            val rows = notificationDao.pending()
+            if (rows.isEmpty()) return@pushTable 0
+            api.upsert(
+                "notifications",
+                syncJson.encodeToString(rows.map { it.toNotificationPush() }),
+                "business_id,dedupe_key"
+            )
+            notificationDao.markSynced(rows.map { it.id })
+            rows.size
+        }
+
         return PushResult(n, errors)
     }
 
@@ -387,7 +407,32 @@ class PosSyncEngine(
         n += pullSuppliers(api, bid)
         n += pullPurchaseOrders(api, bid)
         n += pullPurchaseOrderLines(api)
+        n += pullNotifications(api, bid)
         return n
+    }
+
+    /**
+     * notifications → the local admin feed, matched by `(businessId, dedupeKey)` — NOT
+     * by id, because every device mints its own row id for the same condition. A match
+     * is updated in place (the local `id` and the device-local `pushedAt` survive); a
+     * miss is inserted. Last-write-wins on `updated_at`, same as every other table.
+     */
+    private suspend fun pullNotifications(api: SupabaseRest, bid: String): Int {
+        val rows = syncJson.decodeFromString<List<NotificationDto>>(
+            api.selectSince("notifications", config.cursor("notifications"), PAGE)
+        )
+        if (rows.isEmpty()) return 0
+        var applied = 0
+        for (dto in rows) {
+            if (dto.dedupeKey.isBlank()) continue
+            val local = notificationDao.getByDedupeKey(bid, dto.dedupeKey)
+            if (local == null || IsoTime.toMillis(dto.updatedAt) > local.updatedAt) {
+                notificationDao.upsert(dto.toNotification(bid, local))
+                applied++
+            }
+        }
+        config.setCursor("notifications", rows.maxOf { it.cursorStamp() })
+        return applied
     }
 
     /** expenses → local expenses, bridged by local_id. */

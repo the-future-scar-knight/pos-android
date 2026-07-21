@@ -1,5 +1,6 @@
 package com.portionspot.pos.sync
 
+import com.portionspot.pos.data.AppNotification
 import com.portionspot.pos.data.CashTxn
 import com.portionspot.pos.data.CreditTxn
 import com.portionspot.pos.data.Customer
@@ -1163,4 +1164,110 @@ fun PurchaseOrderLine.toPurchaseOrderLinePush(stamp: Long) = PurchaseOrderLinePu
     receivedQty = receivedQty,
     createdAt = IsoTime.toIso(stamp),
     updatedAt = IsoTime.toIso(stamp),
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// notifications — the admin alert feed, shared across the cashier phones and the
+// admin phone.
+//
+// UPSERT KEY IS COMPOSITE: `business_id,dedupe_key`, NOT `local_id`. Two devices
+// computing the same condition (the same low-stock item, the same owed refund) mint
+// DIFFERENT local ids but the SAME dedupeKey; conflicting on local_id would leave one
+// cloud row per device. `local_id` is still sent (it is this device's row id, useful
+// for tracing) but the cloud column is deliberately non-unique.
+//
+// TYPE RULES:
+//   • created_at / updated_at are TIMESTAMPTZ -> fixed-format UTC ISO via [IsoTime]
+//     (the `updated_at=gt.<cursor>` pull depends on it).
+//   • event_at / read_at are plain BIGINT epoch ms -> send the Long as-is.
+//   • pushedAt is NOT in the contract at all: it is device-local state recording
+//     whether THIS phone already fired its own heads-up notification. It is never
+//     sent, and a pull must preserve the local value.
+// ─────────────────────────────────────────────────────────────────────────────
+@Serializable
+data class NotificationDto(
+    @SerialName("local_id") val localId: String? = null,
+    @SerialName("business_id") val businessId: String? = null,
+    val category: String = "system",
+    val severity: String = "info",
+    val title: String = "",
+    val body: String = "",
+    @SerialName("dedupe_key") val dedupeKey: String = "",
+    @SerialName("ref_type") val refType: String? = null,
+    @SerialName("ref_id") val refId: String? = null,
+    @SerialName("event_at") val eventAt: Long? = null,
+    @SerialName("read_at") val readAt: Long? = null,
+    @SerialName("created_at") val createdAt: String? = null,
+    @SerialName("updated_at") val updatedAt: String? = null,
+    val deleted: Boolean = false,
+) {
+    fun bridgeId(): String = localId?.ifBlank { null } ?: "notif-${newId()}"
+    fun cursorStamp(): String = updatedAt ?: createdAt ?: IsoTime.EPOCH
+}
+
+/**
+ * Merge an incoming cloud row onto [local] (matched by `(businessId, dedupeKey)`, never
+ * by id). The local row's `id` and `pushedAt` survive untouched, so this device keeps
+ * its own record of whether it has already raised a heads-up for the alert.
+ */
+fun NotificationDto.toNotification(businessId: String, local: AppNotification?): AppNotification {
+    val bid = local?.id ?: bridgeId()
+    val base = local ?: AppNotification(
+        id = bid, businessId = businessId, category = category,
+        title = title, body = body, dedupeKey = dedupeKey
+    )
+    return base.copy(
+        id = bid,                       // keep THIS device's row id
+        businessId = businessId,
+        category = category,
+        severity = severity,
+        title = title,
+        body = body,
+        dedupeKey = dedupeKey.ifBlank { base.dedupeKey },
+        refType = refType,
+        refId = refId,
+        eventAt = eventAt ?: base.eventAt,
+        readAt = readAt,                // read-state IS shared
+        pushedAt = base.pushedAt,       // device-local: never overwritten by a pull
+        createdAt = IsoTime.toMillis(createdAt).takeIf { it > 0 } ?: base.createdAt,
+        updatedAt = IsoTime.toMillis(updatedAt),
+        deleted = deleted,
+        pendingSync = false,
+    )
+}
+
+@Serializable
+data class NotificationPushDto(
+    @SerialName("local_id") val localId: String,
+    @SerialName("business_id") val businessId: String,
+    val category: String,
+    val severity: String,
+    val title: String,
+    val body: String,
+    @SerialName("dedupe_key") val dedupeKey: String,
+    @SerialName("ref_type") val refType: String? = null,
+    @SerialName("ref_id") val refId: String? = null,
+    @SerialName("event_at") val eventAt: Long,
+    @SerialName("read_at") val readAt: Long? = null,
+    @SerialName("created_at") val createdAt: String,
+    @SerialName("updated_at") val updatedAt: String,
+    val deleted: Boolean = false,
+)
+
+/** NOTE: no `pushed_at` — see the header. */
+fun AppNotification.toNotificationPush() = NotificationPushDto(
+    localId = id,
+    businessId = businessId,
+    category = category,
+    severity = severity,
+    title = title,
+    body = body,
+    dedupeKey = dedupeKey,
+    refType = refType,
+    refId = refId,
+    eventAt = eventAt,
+    readAt = readAt,
+    createdAt = IsoTime.toIso(createdAt),
+    updatedAt = IsoTime.toIso(updatedAt),
+    deleted = deleted,
 )

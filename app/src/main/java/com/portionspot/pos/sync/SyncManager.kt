@@ -46,6 +46,15 @@ class SyncManager(
      *  so a burst of edits collapses into ONE sync. */
     private var debounceJob: Job? = null
 
+    /** The foreground adaptive-poll loop (null = not polling, i.e. app backgrounded). */
+    private var pollJob: Job? = null
+
+    /** When a pass last STARTED (any trigger: debounce, poll, pull-on-open, manual).
+     *  Every automatic trigger coalesces against this so push-on-change and the poll
+     *  loop can never double-fire within [MIN_GAP_MS]. */
+    @Volatile
+    private var lastAttemptAt: Long = 0L
+
     init {
         // Flush the moment the device comes back online (offline→online) if anything is
         // queued. Seeded emit is the current state, so we only act on a real transition.
@@ -92,6 +101,7 @@ class SyncManager(
         if (!config.isConfigured()) return
         // Nothing queued → don't hit the network on every keystroke-sized change.
         if (engine.pendingUploadCount() <= 0) return
+        lastAttemptAt = System.currentTimeMillis()
         if (ConnectivityObserver.currentlyOnline(appContext)) {
             val outcome = runNow()
             // If the live pass failed mid-flight (network dropped), fall back to the
@@ -100,6 +110,68 @@ class SyncManager(
         } else {
             // Offline: hand it to WorkManager, which holds the job until CONNECTED.
             SyncWorker.syncNow(appContext)
+        }
+    }
+
+    // ── adaptive pull (foreground polling) ──────────────────────────────────
+    /**
+     * Foreground/background switch, driven by `ProcessLifecycleOwner` in [com.portionspot.pos.PosApp].
+     *
+     * FOREGROUND: poll roughly every [POLL_MS] while online, so a second phone (the
+     * admin's) sees a cashier's activity within about a minute instead of waiting for
+     * the ~15-minute WorkManager cycle. A pull with no changes is a tiny conditional
+     * request — every table carries an `updated_at=gt.<cursor>` — so this stays cheap
+     * on mobile data. No websockets/Realtime: no persistent connection, no idle drain.
+     *
+     * BACKGROUND: the loop stops entirely and the existing periodic [SyncWorker]
+     * (unchanged, ~15 min, CONNECTED-constrained) is the only cadence.
+     */
+    fun setForeground(foreground: Boolean) {
+        synchronized(this) {
+            if (!foreground) {
+                pollJob?.cancel()
+                pollJob = null
+                return
+            }
+            if (pollJob?.isActive == true) return
+            pollJob = scope.launch {
+                // Come back to the app → catch up immediately (coalesced), then settle
+                // into the steady cadence.
+                pollOnce("foreground")
+                while (true) {
+                    delay(POLL_MS)
+                    pollOnce("poll")
+                }
+            }
+        }
+    }
+
+    /**
+     * Pull NOW for an admin-facing screen that just opened (admin dashboard, alerts):
+     * opening it should show current data rather than whatever the last cycle left.
+     * Coalesced by [MIN_GAP_MS], so flipping between admin tabs costs nothing.
+     */
+    fun requestPullNow(reason: String = "screen-open") {
+        scope.launch { pollOnce(reason) }
+    }
+
+    /**
+     * One adaptive pass: skipped when unconfigured, offline, or when a pass already ran
+     * inside [MIN_GAP_MS] (the coalescing rule that keeps push-on-change and the poll
+     * loop from doubling up). Runs quietly — a transient poll failure must not paint the
+     * Settings screen red, so only successes update the visible status.
+     */
+    private suspend fun pollOnce(reason: String) {
+        if (!config.isConfigured()) return
+        val now = System.currentTimeMillis()
+        if (now - lastAttemptAt < MIN_GAP_MS) return
+        if (!ConnectivityObserver.currentlyOnline(appContext)) return
+        lastAttemptAt = now
+        val outcome = engine.sync()
+        if (outcome is SyncOutcome.Success) {
+            _status.value = SyncStatus.Done(
+                outcome.pushed, outcome.pulled, System.currentTimeMillis(), outcome.pushErrors
+            )
         }
     }
 
@@ -126,6 +198,7 @@ class SyncManager(
 
     /** Foreground sync (the "Sync now" button and on-connect), with live status. */
     suspend fun runNow(): SyncOutcome {
+        lastAttemptAt = System.currentTimeMillis()
         _status.value = SyncStatus.Syncing
         val outcome = engine.sync()
         _status.value = when (outcome) {
@@ -145,5 +218,13 @@ class SyncManager(
     private companion object {
         /** Coalescing window: 5 rapid edits within this land as one sync. */
         const val DEBOUNCE_MS = 2_500L
+
+        /** Foreground poll cadence (~45s): fast enough that an admin phone feels live,
+         *  slow enough to stay cheap on 4G. Background stays on the ~15-min worker. */
+        const val POLL_MS = 45_000L
+
+        /** Minimum gap between any two automatic passes. Anything triggered inside this
+         *  window is dropped, so push-on-change + poll + pull-on-open never stack. */
+        const val MIN_GAP_MS = 20_000L
     }
 }

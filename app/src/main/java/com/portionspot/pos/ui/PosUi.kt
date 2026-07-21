@@ -938,6 +938,13 @@ fun AdminRoot(
 
     // Keep the persisted feed fresh whenever the admin is in the shell.
     LaunchedEffect(Unit) { vm.sweepNotifications() }
+    // Pull-on-open: entering the admin shell fetches what the cashier phones have done
+    // instead of waiting for the poll cadence (coalesced inside SyncManager).
+    LaunchedEffect(Unit) { vm.refreshFromCloud("admin-open") }
+    // Re-pull when the admin lands on a data-heavy tab.
+    LaunchedEffect(tab) {
+        if (tab == AdminTab.Dashboard || tab == AdminTab.Alerts) vm.refreshFromCloud("admin-$tab")
+    }
     // Deep-link from an admin notification → jump to the Alerts tab.
     LaunchedEffect(openAlerts) { if (openAlerts) { tab = AdminTab.Alerts; onOpenConsumed() } }
 

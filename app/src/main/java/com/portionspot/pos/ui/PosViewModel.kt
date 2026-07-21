@@ -1627,6 +1627,17 @@ class PosViewModel(
         refreshPendingUpload()
     }
 
+    /**
+     * Pull-on-open for the admin-facing screens (admin shell / alerts). Opening them
+     * should show what the OTHER phones have done, not the last ~15-minute cycle's
+     * snapshot. Coalesced inside [SyncManager] (a pass that ran seconds ago is reused),
+     * so switching admin tabs costs no extra data.
+     */
+    fun refreshFromCloud(reason: String = "admin-open") {
+        sync.requestPullNow(reason)
+        refreshPendingUpload()
+    }
+
     /** Turn cloud PUSH on/off (Stage 2). Off by default; only enable after the pull
      *  is verified and any local test data has been cleared. */
     fun setCloudPushEnabled(on: Boolean) {

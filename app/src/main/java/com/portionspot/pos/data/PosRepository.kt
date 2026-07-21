@@ -11,6 +11,10 @@ import kotlinx.coroutines.flow.Flow
 /** Half-a-cent tolerance for money comparisons (guards Double rounding on totals). */
 private const val CENT = 0.005
 
+/** Categories [NotificationEngine] computes and therefore owns the lifecycle of. Rows
+ *  in any other category (e.g. "expenses") are written directly and are never swept. */
+private val ENGINE_CATEGORIES = setOf("inventory", "sales", "system", "payments", "refunds")
+
 /**
  * The single gateway between the UI and Room. (Supabase sync will be added
  * here in a later milestone — push dirty rows where updatedAt > cursor.)
@@ -33,6 +37,18 @@ class PosRepository(private val db: PosDatabase) {
     private val mobileMoneyDao = db.mobileMoneyDao()
     private val notificationDao = db.notificationDao()
     private val auditDao = db.auditDao()
+
+    /**
+     * Fire-and-forget hook the DI container points at [com.portionspot.pos.sync.SyncManager.requestSync],
+     * so a freshly-created/updated admin notification reaches the OTHER phones in seconds
+     * instead of on the ~15-minute worker cycle. Debounced inside the SyncManager, so
+     * calling it per sweep is safe. Null in tests / before wiring — never required.
+     */
+    var onSyncWorthyChange: ((String) -> Unit)? = null
+
+    private fun nudgeSync(reason: String) {
+        runCatching { onSyncWorthyChange?.invoke(reason) }
+    }
 
     // ---- Local key/value settings (theme, etc. — never synced) -------------
 
@@ -369,7 +385,7 @@ class PosRepository(private val db: PosDatabase) {
     /** Tombstone the "awaiting approval" feed row once an expense is approved/rejected. */
     private suspend fun clearPendingExpenseNotice(businessId: String, expenseId: String) {
         notificationDao.getByKey(businessId, "expensepending:$expenseId")?.let {
-            notificationDao.tombstone(listOf(it.id))
+            notificationDao.tombstone(listOf(it.id), now())
         }
     }
 
@@ -568,11 +584,12 @@ class PosRepository(private val db: PosDatabase) {
                 severity = if (child.payablePortion > CENT) "warn" else "info",
                 title = "Recurring expense posted", body = summary,
                 dedupeKey = "recurring:${child.id}", refType = "expense", refId = child.id,
-                eventAt = stamp, createdAt = stamp, pushedAt = stamp
+                eventAt = stamp, createdAt = stamp, pushedAt = stamp,
+                updatedAt = stamp, pendingSync = true
             )
-            notificationDao.upsert(n)
-            out += n
+            out += upsertNotificationByKey(n)
         }
+        nudgeSync("notifications")
         return out
     }
 
@@ -589,10 +606,12 @@ class PosRepository(private val db: PosDatabase) {
                 (e.submittedByName?.let { " · by $it" } ?: "") +
                 (if (e.recurring) " · recurring" else ""),
             dedupeKey = "expensepending:${e.id}", refType = "expense", refId = e.id,
-            eventAt = e.createdAt, createdAt = stamp, pushedAt = stamp
+            eventAt = e.createdAt, createdAt = stamp, pushedAt = stamp,
+            updatedAt = stamp, pendingSync = true
         )
-        notificationDao.upsert(n)
-        return n
+        val row = upsertNotificationByKey(n)
+        nudgeSync("notifications")
+        return row
     }
 
     /** Split a posted expense [amount] across cash / payable / capital for the chosen
@@ -2206,16 +2225,40 @@ class PosRepository(private val db: PosDatabase) {
 
     // ---- admin: notifications backend (Phase 7, §8) ----------------------
 
+    /**
+     * Insert-or-update keyed by `(businessId, dedupeKey)` — the same natural key the
+     * cloud upserts on, and the local UNIQUE index. Never mint a second row for a key
+     * that already exists (a tombstoned alert that recurs, or a row that arrived from
+     * another phone via a pull): reuse its `id` and its device-local `pushedAt`.
+     */
+    private suspend fun upsertNotificationByKey(n: AppNotification): AppNotification {
+        val prev = notificationDao.getByDedupeKey(n.businessId, n.dedupeKey)
+        val row = if (prev == null) n else n.copy(
+            id = prev.id,
+            createdAt = prev.createdAt,
+            pushedAt = n.pushedAt ?: prev.pushedAt
+        )
+        notificationDao.upsert(row)
+        return row
+    }
+
     fun notificationsFlow(businessId: String): Flow<List<AppNotification>> =
         notificationDao.observeForBusiness(businessId)
 
     fun unreadNotificationCountFlow(businessId: String): Flow<Int> =
         notificationDao.observeUnreadCount(businessId)
 
-    suspend fun markNotificationRead(id: String) = notificationDao.markRead(id, now())
+    /** Read-state is SHARED: marking read here re-queues the row so every other phone
+     *  sees it read too. */
+    suspend fun markNotificationRead(id: String) {
+        notificationDao.markRead(id, now())
+        nudgeSync("notification-read")
+    }
 
-    suspend fun markAllNotificationsRead(businessId: String) =
+    suspend fun markAllNotificationsRead(businessId: String) {
         notificationDao.markAllRead(businessId, now())
+        nudgeSync("notification-read")
+    }
 
     /**
      * Recompute the whole alert state and reconcile it into the `notifications` table
@@ -2258,6 +2301,7 @@ class PosRepository(private val db: PosDatabase) {
         val seen = HashSet<String>()
         val toPush = ArrayList<AppNotification>()
         val stamp = now()
+        var changed = false
         for (c in candidates) {
             seen += c.dedupeKey
             val prev = existing[c.dedupeKey]
@@ -2265,22 +2309,49 @@ class PosRepository(private val db: PosDatabase) {
                 var n = AppNotification(
                     businessId = businessId, category = c.category, severity = c.severity,
                     title = c.title, body = c.body, dedupeKey = c.dedupeKey,
-                    refType = c.refType, refId = c.refId, eventAt = c.eventAt, createdAt = stamp
+                    refType = c.refType, refId = c.refId, eventAt = c.eventAt,
+                    createdAt = stamp, updatedAt = stamp, pendingSync = true
                 )
-                if (c.pushWorthy) { n = n.copy(pushedAt = stamp); toPush += n }
-                notificationDao.upsert(n)
+                // pushedAt is DEVICE-LOCAL: this phone raising its own heads-up must not
+                // dirty the shared row, so it is set without touching pendingSync/updatedAt.
+                if (c.pushWorthy) { n = n.copy(pushedAt = stamp) }
+                // Reuse any tombstoned / pulled-in row that already owns this dedupeKey
+                // rather than colliding with the (businessId, dedupeKey) unique index.
+                val row = upsertNotificationByKey(n)
+                if (c.pushWorthy && row.pushedAt == stamp) toPush += row
+                changed = true
             } else {
+                // Only re-queue for upload when the CONTENT actually moved — a sweep that
+                // recomputes an unchanged alert must not churn the cloud row every cycle.
+                val contentChanged = prev.category != c.category || prev.severity != c.severity ||
+                    prev.title != c.title || prev.body != c.body || prev.eventAt != c.eventAt ||
+                    prev.refType != c.refType || prev.refId != c.refId || prev.deleted
                 var n = prev.copy(
                     category = c.category, severity = c.severity, title = c.title,
-                    body = c.body, eventAt = c.eventAt, refType = c.refType, refId = c.refId
+                    body = c.body, eventAt = c.eventAt, refType = c.refType, refId = c.refId,
+                    deleted = false
                 )
+                if (contentChanged) {
+                    n = n.copy(updatedAt = stamp, pendingSync = true)
+                    changed = true
+                }
+                // Each device fires its own heads-up for a newly-arrived alert; the flag
+                // is local, so it never re-uploads the row.
                 if (c.pushWorthy && prev.pushedAt == null) { n = n.copy(pushedAt = stamp); toPush += n }
                 notificationDao.upsert(n)
             }
         }
         // Tombstone rows whose condition has cleared (resolved low stock, settled refund).
-        val cleared = existing.values.filter { it.dedupeKey !in seen }.map { it.id }
-        if (cleared.isNotEmpty()) notificationDao.tombstone(cleared)
+        // Only tombstone rows the ENGINE owns. Alerts written directly (expense
+        // submissions, recurring postings — category "expenses") are not candidates, so a
+        // blanket sweep would clear them; now that tombstones sync, that would wipe them
+        // off every phone too.
+        val cleared = existing.values
+            .filter { it.category in ENGINE_CATEGORIES && it.dedupeKey !in seen }
+            .map { it.id }
+        if (cleared.isNotEmpty()) { notificationDao.tombstone(cleared, stamp); changed = true }
+        // Only touch the network when the feed actually moved.
+        if (changed) nudgeSync("notifications")
         return toPush
     }
 

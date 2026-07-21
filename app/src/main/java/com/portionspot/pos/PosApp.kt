@@ -1,6 +1,9 @@
 package com.portionspot.pos
 
 import android.app.Application
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.ProcessLifecycleOwner
 import com.portionspot.pos.auth.AuthManager
 import com.portionspot.pos.data.PosDatabase
 import com.portionspot.pos.data.PosRepository
@@ -35,11 +38,18 @@ class AppContainer(app: Application) {
         database.salePaymentDao(), database.customerDao(), database.creditDao(),
         database.refundDao(), database.mobileMoneyDao(),
         database.expenseDao(), database.cashTxnDao(),
-        database.supplierDao(), database.purchaseOrderDao(), syncConfig,
+        database.supplierDao(), database.purchaseOrderDao(),
+        database.notificationDao(), syncConfig,
         accessToken = authManager::accessTokenOrNull,
         ensureFreshToken = { authManager.refreshIfNeeded() }
     )
     val syncManager: SyncManager = SyncManager(app.applicationContext, syncConfig, syncEngine)
+
+    init {
+        // A new/updated admin alert (or a read-state change) nudges a debounced sync so
+        // it lands on the OTHER phones in seconds, not on the ~15-minute worker cycle.
+        repository.onSyncWorthyChange = { reason -> syncManager.requestSync(reason) }
+    }
 }
 
 class PosApp : Application() {
@@ -67,5 +77,21 @@ class PosApp : Application() {
         // that came due while the app was closed lands on next launch.
         RecurringExpenseWorker.schedule(this)
         RecurringExpenseWorker.runNow(this)
+
+        // ---- Adaptive pull -------------------------------------------------
+        // While the app is on screen, poll for cloud changes on a short cadence so a
+        // second phone (the owner's admin handset) sees a cashier's sale/alert within
+        // about a minute. The moment the app goes to background the loop stops and the
+        // existing ~15-minute periodic SyncWorker is the only cadence again — no
+        // websockets, no idle battery/data drain.
+        ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
+            override fun onStart(owner: LifecycleOwner) {
+                container.syncManager.setForeground(true)
+            }
+
+            override fun onStop(owner: LifecycleOwner) {
+                container.syncManager.setForeground(false)
+            }
+        })
     }
 }

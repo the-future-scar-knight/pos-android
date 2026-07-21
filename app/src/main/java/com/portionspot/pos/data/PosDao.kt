@@ -702,18 +702,39 @@ interface NotificationDao {
     @Query("SELECT * FROM notifications WHERE businessId = :businessId AND dedupeKey = :key LIMIT 1")
     suspend fun getByKey(businessId: String, key: String): AppNotification?
 
+    /**
+     * Pull-merge lookup: the cloud row's identity is `(business_id, dedupe_key)`, NOT the
+     * id (ids are minted per device), so an incoming row is matched here and updated in
+     * place — keeping this device's local `id` and its device-local `pushedAt`.
+     * Includes tombstoned rows so a cleared-then-recurring condition reuses one row.
+     */
+    @Query("SELECT * FROM notifications WHERE businessId = :businessId AND dedupeKey = :dedupeKey LIMIT 1")
+    suspend fun getByDedupeKey(businessId: String, dedupeKey: String): AppNotification?
+
+    /** Rows with unsynced local edits — the upload queue. */
+    @Query("SELECT * FROM notifications WHERE pendingSync = 1")
+    suspend fun pending(): List<AppNotification>
+
+    @Query("UPDATE notifications SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun markSynced(ids: List<String>)
+
     @Upsert
     suspend fun upsert(notification: AppNotification)
 
-    @Query("UPDATE notifications SET readAt = :at WHERE id = :id")
+    /** Read-state IS synced, so marking read re-queues the row for upload. */
+    @Query("UPDATE notifications SET readAt = :at, updatedAt = :at, pendingSync = 1 WHERE id = :id")
     suspend fun markRead(id: String, at: Long)
 
-    @Query("UPDATE notifications SET readAt = :at WHERE businessId = :businessId AND readAt IS NULL AND deleted = 0")
+    @Query(
+        "UPDATE notifications SET readAt = :at, updatedAt = :at, pendingSync = 1 " +
+            "WHERE businessId = :businessId AND readAt IS NULL AND deleted = 0"
+    )
     suspend fun markAllRead(businessId: String, at: Long)
 
-    /** Tombstone rows whose condition has cleared (resolved low stock, settled refund). */
-    @Query("UPDATE notifications SET deleted = 1 WHERE id IN (:ids)")
-    suspend fun tombstone(ids: List<String>)
+    /** Tombstone rows whose condition has cleared (resolved low stock, settled refund).
+     *  Tombstones sync too, so the alert clears on every phone, not just this one. */
+    @Query("UPDATE notifications SET deleted = 1, updatedAt = :at, pendingSync = 1 WHERE id IN (:ids)")
+    suspend fun tombstone(ids: List<String>, at: Long)
 
     @Query("DELETE FROM notifications WHERE businessId = :businessId")
     suspend fun wipe(businessId: String)

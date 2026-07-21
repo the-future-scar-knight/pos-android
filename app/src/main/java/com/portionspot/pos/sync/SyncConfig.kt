@@ -84,7 +84,10 @@ class SyncConfig(private val dao: SettingDao) {
         val TABLES = listOf(
             "products", "customers", "sales", "credit_transactions", "mobile_money_receipts",
             // Accounting spine + supplier orders (owner-approved for cloud sync).
-            "expenses", "cash_txns", "suppliers", "purchase_orders", "purchase_order_items"
+            "expenses", "cash_txns", "suppliers", "purchase_orders", "purchase_order_items",
+            // Admin alert feed — so a condition a cashier phone notices reaches the
+            // owner's admin phone (upserts on the composite business_id,dedupe_key).
+            "notifications"
         )
 
         private fun cursorKey(table: String) = "cursor_$table"

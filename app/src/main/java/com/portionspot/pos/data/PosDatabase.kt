@@ -550,6 +550,29 @@ val MIGRATION_25_26 = object : Migration(25, 26) {
     }
 }
 
+/**
+ * v26 → v27: admin notifications become CLOUD-SYNCED (multi-device).
+ *
+ * Alerts were local-only, so a condition a cashier's phone noticed never reached the
+ * owner's admin phone. The cloud `notifications` table upserts on the composite key
+ * `(business_id, dedupe_key)`, so the row needs the two sync columns every other synced
+ * entity carries: `updatedAt` (last-write-wins + the `updated_at=gt.<cursor>` pull) and
+ * `pendingSync` (the upload queue).
+ *
+ * BACKFILL: existing rows get `updatedAt = createdAt` and `pendingSync = 1` so the whole
+ * feed this device already holds uploads once on the next pass instead of staying
+ * invisible to the other phones. `pushedAt` is deliberately untouched — it is
+ * device-local state about THIS phone's heads-up notifications.
+ */
+val MIGRATION_26_27 = object : Migration(26, 27) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE notifications ADD COLUMN updatedAt INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE notifications ADD COLUMN pendingSync INTEGER NOT NULL DEFAULT 1")
+        db.execSQL("UPDATE notifications SET updatedAt = createdAt WHERE updatedAt = 0")
+        db.execSQL("UPDATE notifications SET pendingSync = 1")
+    }
+}
+
 @Database(
     entities = [
         Business::class,
@@ -573,7 +596,7 @@ val MIGRATION_25_26 = object : Migration(25, 26) {
         AppNotification::class,
         AuditEntry::class
     ],
-    version = 26,
+    version = 27,
     exportSchema = false
 )
 abstract class PosDatabase : RoomDatabase() {
@@ -618,7 +641,8 @@ abstract class PosDatabase : RoomDatabase() {
                         MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17,
                         MIGRATION_17_18, MIGRATION_18_19, MIGRATION_19_20,
                         MIGRATION_20_21, MIGRATION_21_22, MIGRATION_22_23,
-                        MIGRATION_23_24, MIGRATION_24_25, MIGRATION_25_26
+                        MIGRATION_23_24, MIGRATION_24_25, MIGRATION_25_26,
+                        MIGRATION_26_27
                     )
                     .fallbackToDestructiveMigration()
                     .build()

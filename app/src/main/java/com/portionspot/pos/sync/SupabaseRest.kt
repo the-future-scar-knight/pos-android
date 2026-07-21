@@ -120,10 +120,22 @@ class SupabaseRest(
         }
     }
 
+    /**
+     * [onConflict] names the cloud UNIQUE constraint to resolve against. It may be a
+     * SINGLE column ("local_id", "sku") or a COMPOSITE key given as comma-separated
+     * columns ("business_id,dedupe_key" — the `notifications` table, where two devices
+     * computing the same alert must converge on ONE row). Whitespace around the commas
+     * is stripped and the joined value is passed through as one `on_conflict` query
+     * param, which is exactly the shape PostgREST expects.
+     */
     fun upsert(table: String, jsonArray: String, onConflict: String, ignoreDuplicates: Boolean = false) {
+        val conflictKey = onConflict.split(",")
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .joinToString(",")
         val url = (rest(table).toHttpUrlOrNull() ?: throw IOException("Bad URL"))
             .newBuilder()
-            .addQueryParameter("on_conflict", onConflict)
+            .addQueryParameter("on_conflict", conflictKey)
             .build()
         val resolution = if (ignoreDuplicates) "ignore-duplicates" else "merge-duplicates"
         val req = Request.Builder().url(url)

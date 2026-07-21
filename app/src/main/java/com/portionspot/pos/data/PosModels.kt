@@ -812,7 +812,15 @@ data class MobileMoneyReceipt(
  * unread badges; [pushedAt] stops a system notification firing twice for the same
  * escalation. [eventAt] is the UNDERLYING event time (a refund's creation, a payment's
  * arrival) so the N-hour escalation in §8 is measured from when it really happened,
- * not from when the engine noticed. Local-only — never synced.
+ * not from when the engine noticed.
+ *
+ * SYNCED (multi-device): a cashier phone's alert must reach the admin's phone, so rows
+ * upsert to the cloud `notifications` table on the COMPOSITE key
+ * `(business_id, dedupe_key)` — never on id, because two devices computing the same
+ * condition mint different local ids but the SAME dedupeKey and must converge on one
+ * cloud row. [readAt] is synced (read on one device = read everywhere).
+ * [pushedAt] is DEVICE-LOCAL and never sent or overwritten by a pull: it records
+ * whether THIS phone already fired its own heads-up notification.
  */
 @Entity(
     tableName = "notifications",
@@ -830,9 +838,14 @@ data class AppNotification(
     val refId: String? = null,
     val eventAt: Long = now(),            // underlying event time (drives escalation age)
     val createdAt: Long = now(),          // first seen
-    val readAt: Long? = null,             // null => unread
-    val pushedAt: Long? = null,           // when a system notification was last fired for it
-    val deleted: Boolean = false
+    val readAt: Long? = null,             // null => unread (SYNCED)
+    /** DEVICE-LOCAL: when THIS phone last fired a system notification for the row.
+     *  Never pushed, never overwritten by a pull — each device pushes for itself. */
+    val pushedAt: Long? = null,
+    val updatedAt: Long = now(),          // last local edit; drives last-write-wins
+    val deleted: Boolean = false,
+    /** Local-only: true => has unsynced local edits to push. */
+    val pendingSync: Boolean = true
 )
 
 /**
