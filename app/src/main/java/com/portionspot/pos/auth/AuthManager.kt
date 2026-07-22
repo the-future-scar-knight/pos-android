@@ -17,6 +17,8 @@ data class PosUser(
     val email: String,
     val role: String,
     val displayName: String,
+    /** Per-person capability grants (see [can]). Admins are never gated regardless. */
+    val permissions: Permissions = Permissions.EMPTY,
 ) {
     val isAdmin: Boolean get() = role == "admin"
 }
@@ -168,6 +170,7 @@ class AuthManager(
                         accessToken = session.accessToken,
                         refreshToken = session.refreshToken,
                         expiresAt = session.expiryEpochSeconds(),
+                        permissions = Permissions.jsonToKeyMap(profile.permissions),
                     )
                     vault.upsertSession(cached, makeActive = true)
                     vault.resetPinFailures(userId)
@@ -317,7 +320,37 @@ class AuthManager(
         _state.value = if (vault.hasAnyAccount()) AuthState.AddAccount else AuthState.LoggedOut
     }
 
-    private fun CachedAuth.toUser() = PosUser(userId, email, role, displayName)
+    /**
+     * Re-fetch the ACTIVE account's own `pos_staff` row and update its cached role +
+     * permissions, so an admin's change to a cashier's grants reaches that cashier's
+     * device. Offline (fetch throws) or a not-found row ⇒ keep whatever is cached; we
+     * never sign the user out or clear grants from a transient failure. If the live
+     * [AuthState.Active] is this user, re-emit it so the UI (and [PosUser.permissions])
+     * refresh.
+     */
+    suspend fun refreshCurrentPermissions() = withContext(Dispatchers.IO) {
+        val userId = activeUserId ?: return@withContext
+        val token = currentAccessToken ?: return@withContext
+        val profile = try {
+            api.fetchStaffProfile(token, userId)
+        } catch (_: Exception) {
+            return@withContext // offline / transient — keep cached grants
+        } ?: return@withContext
+        val cached = vault.sessionFor(userId) ?: return@withContext
+        val updated = cached.copy(
+            role = profile.role,
+            displayName = profile.displayName.ifBlank { cached.displayName },
+            permissions = Permissions.jsonToKeyMap(profile.permissions),
+        )
+        vault.updateSession(userId, updated)
+        val s = _state.value
+        if (s is AuthState.Active && s.user.id == userId) {
+            _state.value = AuthState.Active(updated.toUser())
+        }
+    }
+
+    private fun CachedAuth.toUser() =
+        PosUser(userId, email, role, displayName, Permissions.fromKeyMap(permissions))
 
     private companion object {
         const val MAX_PIN_ATTEMPTS = 5

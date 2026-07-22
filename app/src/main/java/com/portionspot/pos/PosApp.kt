@@ -87,6 +87,11 @@ class PosApp : Application() {
         ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
             override fun onStart(owner: LifecycleOwner) {
                 container.syncManager.setForeground(true)
+                // Refresh the signed-in user's own permission grants each time the app
+                // comes to the foreground, so an admin's change reaches the device.
+                CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+                    container.authManager.refreshCurrentPermissions()
+                }
             }
 
             override fun onStop(owner: LifecycleOwner) {

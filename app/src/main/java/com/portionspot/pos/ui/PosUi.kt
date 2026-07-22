@@ -165,6 +165,7 @@ import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.LocalShipping
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Logout
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.MoreHoriz
@@ -271,6 +272,17 @@ private enum class Screen(val label: String, val short: String) {
     Refunds("Refunds", "Refunds"),
     MobileMoney("Mobile Money", "MoMo"),
     Settings("Settings", "Settings"),
+}
+
+/**
+ * The capability a CASHIER must hold to even SEE this screen (null = always visible).
+ * Action-level gates (add item, submit expense, refund, discount, …) live at each
+ * control; this only hides whole screens whose entire purpose is gated — the reports
+ * surfaces. Admins hold every capability, so nothing is hidden for them.
+ */
+private fun Screen.viewCap(): com.portionspot.pos.auth.Capability? = when (this) {
+    Screen.Dashboard, Screen.Reports -> com.portionspot.pos.auth.Capability.VIEW_REPORTS
+    else -> null
 }
 
 /** Bottom-nav pinned set (matches web PINNED_IDS: pos, sales, sync, inventory). */
@@ -490,6 +502,12 @@ fun AppRoot(
     var moreOpen by remember { mutableStateOf(false) }
     val printer = rememberPrinterUi { vm.shopPrefs.value }
 
+    // Per-person permissions: hide whole screens a cashier can't view (reports), and
+    // steer off one if the admin revokes access while it's open.
+    val caps by vm.allowedCaps.collectAsState()
+    val screenVisible: (Screen) -> Boolean = { s -> s.viewCap()?.let { it in caps } ?: true }
+    LaunchedEffect(caps) { if (!screenVisible(screen)) screen = Screen.Sell }
+
     LaunchedEffect(openMobileMoney) {
         if (openMobileMoney) { screen = Screen.MobileMoney; onOpenConsumed() }
     }
@@ -521,7 +539,8 @@ fun AppRoot(
                     moreOpen = moreOpen,
                     onSelect = { screen = it; moreOpen = false },
                     onMore = { moreOpen = !moreOpen },
-                    moreBadge = mmPending
+                    moreBadge = mmPending,
+                    visible = screenVisible
                 )
             }
         ) { padding ->
@@ -530,6 +549,8 @@ fun AppRoot(
                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         CircularProgressIndicator()
                     }
+                } else if (!screenVisible(screen)) {
+                    NoPermissionScreen()
                 } else when (screen) {
                     Screen.Sell -> SellScreen(vm, business!!, printer)
                     Screen.Dashboard -> DashboardScreen(vm, business!!)
@@ -566,7 +587,8 @@ fun AppRoot(
             MoreSheet(
                 current = screen,
                 onSelect = { screen = it; moreOpen = false },
-                onDismiss = { moreOpen = false }
+                onDismiss = { moreOpen = false },
+                visible = screenVisible
             )
         }
         if (drawerOpen) {
@@ -577,8 +599,26 @@ fun AppRoot(
                 onDismiss = { drawerOpen = false },
                 onSwitchUser = { drawerOpen = false; vm.switchUser() },
                 onSignOut = { drawerOpen = false; vm.signOut() },
-                logoUri = business?.logoUri
+                logoUri = business?.logoUri,
+                visible = screenVisible
             )
+        }
+    }
+}
+
+/** Placeholder shown when the signed-in cashier lacks the capability to view a screen. */
+@Composable
+private fun NoPermissionScreen() {
+    val t = LocalPosTokens.current
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.padding(24.dp)
+        ) {
+            Icon(Icons.Filled.Lock, contentDescription = null, tint = t.inkTertiary, modifier = Modifier.size(40.dp))
+            Spacer(Modifier.height(10.dp))
+            Text("You don't have permission to view this", color = t.inkSecondary, fontWeight = FontWeight.SemiBold)
+            Text("Ask an admin to grant access.", color = t.inkTertiary, fontSize = 12.sp)
         }
     }
 }
@@ -1137,6 +1177,11 @@ private fun NotificationCard(n: com.portionspot.pos.data.AppNotification, onClic
 @Composable
 private fun AdminManageScreen(vm: PosViewModel, currency: String) {
     val t = LocalPosTokens.current
+    // The admin console is only reached by admins (who hold every capability), but gate
+    // the money/staff controls on the caps too so the rule is enforced in one place.
+    val caps by vm.allowedCaps.collectAsState()
+    val canVoid = com.portionspot.pos.auth.Capability.VOID_SALES in caps
+    val canManageStaff = com.portionspot.pos.auth.Capability.MANAGE_STAFF in caps
     val business by vm.business.collectAsState()
     val cashiers by vm.eodCashiers.collectAsState()
     val methods by vm.eodMethods.collectAsState()
@@ -1164,6 +1209,7 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
     var resetConfirm by remember { mutableStateOf(false) }
     var dedupeConfirm by remember { mutableStateOf(false) }
     var resetPwFor by remember { mutableStateOf<com.portionspot.pos.auth.StaffRow?>(null) }
+    var permsFor by remember { mutableStateOf<com.portionspot.pos.auth.StaffRow?>(null) }
     val staff by vm.staff.collectAsState()
     val syncConnection by vm.connection.collectAsState()
     LaunchedEffect(syncConnection) { if (syncConnection != null) vm.refreshStaff() }
@@ -1472,10 +1518,12 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
                         Text("${money(r.refundTotal, currency)} · ${r.customerName ?: "Walk-in"}", color = t.inkPrimary, fontSize = 13.sp)
                         Text("#${r.saleReceiptNo ?: r.saleId.takeLast(6)} · ${relativeAgo(r.createdAt)}", color = t.inkTertiary, fontSize = 11.sp)
                     }
-                    OutlinedButton(
-                        onClick = { voidFor = r.id },
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = t.danger)
-                    ) { Text("Void") }
+                    if (canVoid) {
+                        OutlinedButton(
+                            onClick = { voidFor = r.id },
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = t.danger)
+                        ) { Text("Void") }
+                    }
                 }
             }
         }
@@ -1512,27 +1560,46 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
                 item { Text("No staff loaded yet — tap Refresh.", color = t.inkTertiary, fontSize = 13.sp) }
             } else {
                 items(staff, key = { it.id }) { s ->
-                    Row(Modifier.fillMaxWidth().padding(vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text(s.displayName.ifBlank { "(no name)" }, color = t.inkPrimary, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-                            Text(
-                                s.role.replaceFirstChar { it.uppercase() } + if (!s.active) " · inactive" else "",
-                                color = if (s.active) t.inkTertiary else t.danger, fontSize = 11.sp
-                            )
+                    Column(Modifier.fillMaxWidth().padding(vertical = 5.dp)) {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(s.displayName.ifBlank { "(no name)" }, color = t.inkPrimary, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                                Text(
+                                    s.role.replaceFirstChar { it.uppercase() } + if (!s.active) " · inactive" else "",
+                                    color = if (s.active) t.inkTertiary else t.danger, fontSize = 11.sp
+                                )
+                            }
+                            if (canManageStaff) {
+                                TextButton(onClick = { resetPwFor = s }) { Text("Reset PW") }
+                                // Admins aren't toggled here; only cashiers are (de)activated.
+                                if (s.role != "admin") {
+                                    Switch(checked = s.active, onCheckedChange = { on -> vm.setCashierActive(s.id, on) })
+                                }
+                            }
                         }
-                        TextButton(onClick = { resetPwFor = s }) { Text("Reset PW") }
-                        // Admins aren't toggled here; only cashiers are (de)activated.
-                        if (s.role != "admin") {
-                            Switch(checked = s.active, onCheckedChange = { on -> vm.setCashierActive(s.id, on) })
+                        // Per-person permissions — cashiers only (admins implicitly hold all).
+                        if (s.role != "admin" && canManageStaff) {
+                            val granted = s.perms()
+                            val onCount = com.portionspot.pos.auth.Capability.entries.count { granted.allows(it) }
+                            TextButton(
+                                onClick = { permsFor = s },
+                                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)
+                            ) {
+                                Icon(Icons.Filled.Lock, contentDescription = null, modifier = Modifier.size(15.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("Permissions ($onCount of ${com.portionspot.pos.auth.Capability.entries.size})", fontSize = 12.sp)
+                            }
                         }
                     }
                 }
             }
             item {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = { showAddCashier = true }) {
-                        Icon(Icons.Filled.PersonAdd, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(6.dp)); Text("Add cashier")
+                    if (canManageStaff) {
+                        Button(onClick = { showAddCashier = true }) {
+                            Icon(Icons.Filled.PersonAdd, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp)); Text("Add cashier")
+                        }
                     }
                     OutlinedButton(onClick = { vm.refreshStaff() }) { Text("Refresh") }
                 }
@@ -1580,6 +1647,25 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
             staffName = s.displayName.ifBlank { "this account" },
             onDismiss = { resetPwFor = null },
             onReset = { pass, cb -> vm.resetCashierPassword(s.id, pass, cb) }
+        )
+    }
+    permsFor?.let { s ->
+        val ctx = LocalContext.current
+        StaffPermissionsDialog(
+            staffName = s.displayName.ifBlank { "this cashier" },
+            initial = s.perms(),
+            onDismiss = { permsFor = null },
+            onSave = { map ->
+                vm.setStaffPermissions(s.id, map) { res ->
+                    when (res) {
+                        is com.portionspot.pos.auth.StaffResult.Ok ->
+                            Toast.makeText(ctx, "Permissions saved", Toast.LENGTH_SHORT).show()
+                        is com.portionspot.pos.auth.StaffResult.Err ->
+                            Toast.makeText(ctx, res.message, Toast.LENGTH_SHORT).show()
+                    }
+                }
+                permsFor = null
+            }
         )
     }
     if (dedupeConfirm) {
@@ -1860,6 +1946,53 @@ private fun ResetPasswordDialog(
     }
 }
 
+/**
+ * Admin editor for one cashier's capability grants (auth/Permissions.kt). One switch per
+ * capability, pre-filled from the cashier's current grants (empty ⇒ cashier defaults).
+ * Saving PATCHes the full map to pos_staff.permissions via [PosViewModel.setStaffPermissions].
+ */
+@Composable
+private fun StaffPermissionsDialog(
+    staffName: String,
+    initial: com.portionspot.pos.auth.Permissions,
+    onDismiss: () -> Unit,
+    onSave: (Map<String, Boolean>) -> Unit,
+) {
+    val t = LocalPosTokens.current
+    val caps = com.portionspot.pos.auth.Capability.entries
+    val state = remember(staffName) {
+        mutableStateMapOf<com.portionspot.pos.auth.Capability, Boolean>().apply {
+            caps.forEach { put(it, initial.allows(it)) }
+        }
+    }
+    PosContainedForm(
+        title = "Permissions",
+        onDismiss = onDismiss,
+        confirmLabel = "Save",
+        onConfirm = { onSave(caps.associate { it.key to (state[it] ?: false) }) }
+    ) {
+        Text(
+            "What $staffName can do. An admin always has every permission; these apply to this cashier only.",
+            fontSize = 12.sp, color = t.inkSecondary
+        )
+        PosFormCard {
+            caps.forEachIndexed { i, cap ->
+                Row(
+                    Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(cap.label, color = t.inkPrimary, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                    Switch(
+                        checked = state[cap] ?: false,
+                        onCheckedChange = { state[cap] = it }
+                    )
+                }
+                if (i < caps.size - 1) HorizontalDivider(color = t.surfaceBorder)
+            }
+        }
+    }
+}
+
 private fun todayStartMs(): Long {
     val c = Calendar.getInstance()
     c.set(Calendar.HOUR_OF_DAY, 0); c.set(Calendar.MINUTE, 0); c.set(Calendar.SECOND, 0); c.set(Calendar.MILLISECOND, 0)
@@ -2017,14 +2150,15 @@ private fun MobileBottomNav(
     moreOpen: Boolean,
     onSelect: (Screen) -> Unit,
     onMore: () -> Unit,
-    moreBadge: Int = 0
+    moreBadge: Int = 0,
+    visible: (Screen) -> Boolean = { true },
 ) {
     val t = LocalPosTokens.current
     val overflowActive = current in OVERFLOW_SCREENS
     Column(Modifier.fillMaxWidth().background(t.surface1)) {
         HorizontalDivider(color = t.surfaceBorder)
         Row(Modifier.fillMaxWidth().navigationBarsPadding()) {
-            PINNED_SCREENS.forEach { s ->
+            PINNED_SCREENS.filter(visible).forEach { s ->
                 BottomNavItem(
                     icon = screenIcon(s),
                     label = s.short,
@@ -2088,7 +2222,12 @@ private fun BottomNavItem(
 
 /** "More" bottom sheet listing overflow destinations (web MoreSheet). */
 @Composable
-private fun MoreSheet(current: Screen, onSelect: (Screen) -> Unit, onDismiss: () -> Unit) {
+private fun MoreSheet(
+    current: Screen,
+    onSelect: (Screen) -> Unit,
+    onDismiss: () -> Unit,
+    visible: (Screen) -> Boolean = { true },
+) {
     val t = LocalPosTokens.current
     Box(
         Modifier.fillMaxSize().background(Color(0x73000000)).clickable(onClick = onDismiss),
@@ -2114,7 +2253,7 @@ private fun MoreSheet(current: Screen, onSelect: (Screen) -> Unit, onDismiss: ()
                 letterSpacing = 1.sp,
                 modifier = Modifier.padding(bottom = 6.dp)
             )
-            OVERFLOW_SCREENS.forEach { s ->
+            OVERFLOW_SCREENS.filter(visible).forEach { s ->
                 val active = current == s
                 Row(
                     Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
@@ -2268,7 +2407,8 @@ private fun SideDrawer(
     onDismiss: () -> Unit,
     onSwitchUser: () -> Unit,
     onSignOut: () -> Unit,
-    logoUri: String? = null
+    logoUri: String? = null,
+    visible: (Screen) -> Boolean = { true },
 ) {
     val t = LocalPosTokens.current
     Row(
@@ -2298,7 +2438,7 @@ private fun SideDrawer(
                 Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(10.dp),
                 verticalArrangement = Arrangement.spacedBy(2.dp)
             ) {
-                Screen.entries.forEach { s ->
+                Screen.entries.filter(visible).forEach { s ->
                     val active = current == s
                     Row(
                         Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
@@ -2372,6 +2512,8 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
     val paynowReady by vm.paynowOnlineReady.collectAsState()
     val parkedSales by vm.parkedSales.collectAsState()
     val parkedCount by vm.parkedCount.collectAsState()
+    val caps by vm.allowedCaps.collectAsState()
+    val canGiveDiscounts = com.portionspot.pos.auth.Capability.GIVE_DISCOUNTS in caps
     var showParked by remember { mutableStateOf(false) }
 
     var search by remember { mutableStateOf("") }
@@ -2571,7 +2713,7 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
         )
     }
     if (showCart) {
-        CartDialog(cart, currency, vm, onDismiss = { showCart = false })
+        CartDialog(cart, currency, vm, canGiveDiscounts = canGiveDiscounts, onDismiss = { showCart = false })
     }
     if (showPayment) {
         PaymentDialog(
@@ -2584,6 +2726,7 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
             secondRate = prefs.secondCurrencyRate,
             customers = customers,
             paynowAvailable = paynowReady,
+            canGiveDiscounts = canGiveDiscounts,
             onCreateCustomer = { name, onCreated -> vm.createCustomer(name, onCreated = onCreated) },
             onPaynowInitiate = { amount, onResult -> vm.paynowInitiate(amount, onResult) },
             onPaynowPoll = { reference, onResult -> vm.paynowPoll(reference, onResult) },
@@ -2605,6 +2748,7 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
             currency = currency,
             customers = customers,
             validityDays = prefs.defaultQuoteValidityDays,
+            canGiveDiscounts = canGiveDiscounts,
             onDismiss = { showQuote = false }
         ) { discount, customer ->
             showQuote = false
@@ -3079,13 +3223,15 @@ private fun QuoteDialog(
     currency: String,
     customers: List<CustomerWithBalance>,
     validityDays: Int,
+    canGiveDiscounts: Boolean = true,
     onDismiss: () -> Unit,
     onConfirm: (discount: Double, customer: Customer?) -> Unit
 ) {
     var customer by remember { mutableStateOf<Customer?>(null) }
     var discountText by remember { mutableStateOf("") }
     val netGoods = (subtotal - itemDiscount + itemMarkup).coerceAtLeast(0.0)
-    val discount = (discountText.toDoubleOrNull() ?: 0.0).coerceIn(0.0, netGoods)
+    // Cashiers without the give_discounts capability can't enter one.
+    val discount = if (canGiveDiscounts) (discountText.toDoubleOrNull() ?: 0.0).coerceIn(0.0, netGoods) else 0.0
     val total = (netGoods - discount).coerceAtLeast(0.0)
     PosContainedForm(
         title = "New quote",
@@ -3096,11 +3242,13 @@ private fun QuoteDialog(
         val t = LocalPosTokens.current
         CustomerPicker(customers = customers, selected = customer, onSelect = { customer = it })
         PosFormCard {
-            PosField(
-                value = discountText,
-                onValueChange = { discountText = it },
-                label = "Discount ($currency)", keyboardType = KeyboardType.Decimal, modifier = Modifier.fillMaxWidth()
-            )
+            if (canGiveDiscounts) {
+                PosField(
+                    value = discountText,
+                    onValueChange = { discountText = it },
+                    label = "Discount ($currency)", keyboardType = KeyboardType.Decimal, modifier = Modifier.fillMaxWidth()
+                )
+            }
             Row(Modifier.fillMaxWidth()) {
                 Text("Quote total", modifier = Modifier.weight(1f), fontWeight = FontWeight.SemiBold, color = t.inkPrimary)
                 Text(money(total, currency), fontWeight = FontWeight.Black, color = t.inkPrimary)
@@ -3454,7 +3602,13 @@ private fun PriceOption(title: String, subtitle: String, price: String, accent: 
 }
 
 @Composable
-private fun CartDialog(cart: List<CartLine>, currency: String, vm: PosViewModel, onDismiss: () -> Unit) {
+private fun CartDialog(
+    cart: List<CartLine>,
+    currency: String,
+    vm: PosViewModel,
+    canGiveDiscounts: Boolean = true,
+    onDismiss: () -> Unit,
+) {
     val t = LocalPosTokens.current
     var editingQtyLine by remember { mutableStateOf<CartLine?>(null) }
     var editingDiscountLine by remember { mutableStateOf<CartLine?>(null) }
@@ -3476,20 +3630,23 @@ private fun CartDialog(cart: List<CartLine>, currency: String, vm: PosViewModel,
                             else "${modeLabel(line.mode)} · ${money(line.unitPrice, currency)}/ea",
                             color = t.inkTertiary, fontSize = 11.sp
                         )
-                        // Per-item discount affordance (tap to set/edit).
-                        Text(
-                            if (line.lineDiscountApplied > 0)
-                                "Less ${money(line.lineDiscountApplied, currency)} — edit"
-                            else "Add discount",
-                            color = if (line.lineDiscountApplied > 0) t.danger else t.inkTertiary,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier
-                                .padding(top = 2.dp)
-                                .clip(RoundedCornerShape(6.dp))
-                                .clickable { editingDiscountLine = line }
-                                .padding(vertical = 2.dp, horizontal = 2.dp)
-                        )
+                        // Per-item discount affordance (tap to set/edit). Hidden entirely
+                        // for a cashier without the give_discounts capability.
+                        if (canGiveDiscounts) {
+                            Text(
+                                if (line.lineDiscountApplied > 0)
+                                    "Less ${money(line.lineDiscountApplied, currency)} — edit"
+                                else "Add discount",
+                                color = if (line.lineDiscountApplied > 0) t.danger else t.inkTertiary,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier
+                                    .padding(top = 2.dp)
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .clickable { editingDiscountLine = line }
+                                    .padding(vertical = 2.dp, horizontal = 2.dp)
+                            )
+                        }
                         // Per-item markup affordance (tap to set/edit) — mirror of the
                         // discount above, but ADDS to the line.
                         Text(
@@ -3771,6 +3928,7 @@ private fun PaymentDialog(
     secondRate: Double = 0.0,
     customers: List<CustomerWithBalance>,
     paynowAvailable: Boolean = false,
+    canGiveDiscounts: Boolean = true,
     onCreateCustomer: (name: String, onCreated: (Customer) -> Unit) -> Unit = { _, _ -> },
     onPaynowInitiate: (amount: Double, onResult: (PaynowInit) -> Unit) -> Unit = { _, _ -> },
     onPaynowPoll: (reference: String, onResult: (PaynowPoll) -> Unit) -> Unit = { _, _ -> },
@@ -3812,7 +3970,8 @@ private fun PaymentDialog(
     // markups ([itemMarkup]) already went on before this whole-sale discount; the
     // taxable base is the goods value net of both, plus markup.
     val netGoods = (subtotal - itemDiscount + itemMarkup).coerceAtLeast(0.0)
-    val discount = (discountText.toDoubleOrNull() ?: 0.0).coerceIn(0.0, netGoods)
+    // Cashiers without give_discounts can't apply a whole-sale discount.
+    val discount = if (canGiveDiscounts) (discountText.toDoubleOrNull() ?: 0.0).coerceIn(0.0, netGoods) else 0.0
     val taxableBase = netGoods - discount
     val vat = if (business.vatEnabled) taxableBase * business.vatPercent / 100.0 else 0.0
     val total = taxableBase + vat
@@ -3885,15 +4044,17 @@ private fun PaymentDialog(
         if (itemMarkup > 0) {
             TotalRow("Item markups", "+${money(itemMarkup, currency)}")
         }
-        PosField(
-            value = discountText,
-            onValueChange = { discountText = it.filter { ch -> ch.isDigit() || ch == '.' } },
-            label = "Discount (optional)",
-            keyboardType = KeyboardType.Decimal,
-            modifier = Modifier.fillMaxWidth()
-        )
-        if (discount > 0) {
-            TotalRow("Discount", "-${money(discount, currency)}")
+        if (canGiveDiscounts) {
+            PosField(
+                value = discountText,
+                onValueChange = { discountText = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                label = "Discount (optional)",
+                keyboardType = KeyboardType.Decimal,
+                modifier = Modifier.fillMaxWidth()
+            )
+            if (discount > 0) {
+                TotalRow("Discount", "-${money(discount, currency)}")
+            }
         }
         if (business.vatEnabled) {
             TotalRow("VAT (${trimPct(business.vatPercent)}%)", money(vat, currency))
@@ -4957,6 +5118,8 @@ private fun ItemsScreen(vm: PosViewModel, currency: String) {
     val t = LocalPosTokens.current
     val items by vm.items.collectAsState()
     val business by vm.business.collectAsState()
+    val caps by vm.allowedCaps.collectAsState()
+    val canManageInventory = com.portionspot.pos.auth.Capability.MANAGE_INVENTORY in caps
     var showAdd by remember { mutableStateOf(false) }
     var showPriceList by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<Item?>(null) }
@@ -5000,7 +5163,7 @@ private fun ItemsScreen(vm: PosViewModel, currency: String) {
                 LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(12.dp)) {
                     items(shown, key = { it.id }) { item ->
                         Card(
-                            onClick = { editing = item },
+                            onClick = { if (canManageInventory) editing = item },
                             modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
                         ) {
                             Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -5053,13 +5216,15 @@ private fun ItemsScreen(vm: PosViewModel, currency: String) {
                 }
             }
         }
-        FilledTonalButton(
-            onClick = { showAdd = true },
-            modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp)
-        ) {
-            Icon(Icons.Filled.Add, contentDescription = null)
-            Spacer(Modifier.width(8.dp))
-            Text("Add item")
+        if (canManageInventory) {
+            FilledTonalButton(
+                onClick = { showAdd = true },
+                modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp)
+            ) {
+                Icon(Icons.Filled.Add, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("Add item")
+            }
         }
     }
 
@@ -6659,6 +6824,8 @@ private fun ExpensesScreen(vm: PosViewModel, currency: String) {
     val t = LocalPosTokens.current
     val expenses by vm.expenses.collectAsState()
     val pending by vm.pendingExpenses.collectAsState()
+    val caps by vm.allowedCaps.collectAsState()
+    val canManageExpenses = com.portionspot.pos.auth.Capability.MANAGE_EXPENSES_ORDERS in caps
 
     // PRESETS mirror the web: Today(0d) · This Week(6d) · This Month(29d) · All.
     val presets = remember {
@@ -6766,7 +6933,7 @@ private fun ExpensesScreen(vm: PosViewModel, currency: String) {
                     contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 96.dp)
                 ) {
                     items(filtered, key = { it.id }) { e ->
-                        val editable = e.status == "pending"
+                        val editable = e.status == "pending" && canManageExpenses
                         Row(
                             Modifier
                                 .fillMaxWidth()
@@ -6822,13 +6989,15 @@ private fun ExpensesScreen(vm: PosViewModel, currency: String) {
             }
         }
 
-        FilledTonalButton(
-            onClick = { adding = true },
-            modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp)
-        ) {
-            Icon(Icons.Filled.Add, contentDescription = null)
-            Spacer(Modifier.width(8.dp))
-            Text("Submit expense")
+        if (canManageExpenses) {
+            FilledTonalButton(
+                onClick = { adding = true },
+                modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp)
+            ) {
+                Icon(Icons.Filled.Add, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("Submit expense")
+            }
         }
     }
 
@@ -7164,6 +7333,8 @@ private fun PurchaseOrdersScreen(vm: PosViewModel, currency: String) {
     val t = LocalPosTokens.current
     val pos by vm.purchaseOrders.collectAsState()
     val payables by vm.supplierPayables.collectAsState()
+    val caps by vm.allowedCaps.collectAsState()
+    val canManageOrders = com.portionspot.pos.auth.Capability.MANAGE_EXPENSES_ORDERS in caps
     val nowMs = remember { System.currentTimeMillis() }
 
     var statusFilter by remember { mutableStateOf("all") }
@@ -7330,13 +7501,15 @@ private fun PurchaseOrdersScreen(vm: PosViewModel, currency: String) {
             }
         }
 
-        FilledTonalButton(
-            onClick = { creating = true },
-            modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp)
-        ) {
-            Icon(Icons.Filled.Add, contentDescription = null)
-            Spacer(Modifier.width(8.dp))
-            Text("New PO")
+        if (canManageOrders) {
+            FilledTonalButton(
+                onClick = { creating = true },
+                modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp)
+            ) {
+                Icon(Icons.Filled.Add, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("New PO")
+            }
         }
     }
 
@@ -8542,6 +8715,9 @@ private fun ReportStatRow(label: String, value: String) {
 private fun ReceiptsScreen(vm: PosViewModel, business: Business, printer: PrinterUi) {
     val t = LocalPosTokens.current
     val currency = business.currency
+    val caps by vm.allowedCaps.collectAsState()
+    val canRefund = com.portionspot.pos.auth.Capability.PROCESS_REFUNDS in caps
+    val canEditReceipts = com.portionspot.pos.auth.Capability.EDIT_RECEIPTS in caps
     val sales by vm.recentSales.collectAsState()
     val quotes by vm.quotes.collectAsState()
     val refundedBySale by vm.refundedBySale.collectAsState()
@@ -8629,8 +8805,10 @@ private fun ReceiptsScreen(vm: PosViewModel, business: Business, printer: Printe
                         IconButton(onClick = { printer.sharePdfReceipt(business, sale) { vm.loadLines(sale.id) } }) {
                             Icon(Icons.Filled.Share, contentDescription = "Share PDF", tint = t.inkSecondary)
                         }
-                        IconButton(onClick = { refundFor = sale }) {
-                            Icon(Icons.Filled.AssignmentReturn, contentDescription = "Refund", tint = t.inkSecondary)
+                        if (canRefund) {
+                            IconButton(onClick = { refundFor = sale }) {
+                                Icon(Icons.Filled.AssignmentReturn, contentDescription = "Refund", tint = t.inkSecondary)
+                            }
                         }
                     }
                 }
@@ -8647,6 +8825,7 @@ private fun ReceiptsScreen(vm: PosViewModel, business: Business, printer: Printe
         SaleDetailDialog(
             vm, business, live,
             refunded = refundedBySale[live.id] ?: 0.0,
+            canEditReceipts = canEditReceipts,
             onDismiss = { detailFor = null },
             onEdit = { detailFor = null; editFor = live }
         )
@@ -8803,6 +8982,7 @@ private fun SaleDetailDialog(
     business: Business,
     sale: SaleEntity,
     refunded: Double,
+    canEditReceipts: Boolean,
     onDismiss: () -> Unit,
     onEdit: () -> Unit,
 ) {
@@ -8818,7 +8998,7 @@ private fun SaleDetailDialog(
     }
 
     val windowMins = vm.saleEditWindowMinutes
-    val editable = sale.isEditable(windowMins) && refunded <= 0.005
+    val editable = sale.isEditable(windowMins) && refunded <= 0.005 && canEditReceipts
     val minutesLeft = ((sale.soldAt + windowMins * 60_000L - System.currentTimeMillis()) / 60_000L)
         .coerceAtLeast(0L)
     val stamp = SimpleDateFormat("dd MMM yyyy · HH:mm", Locale.getDefault()).format(Date(sale.soldAt))
@@ -8944,6 +9124,10 @@ private fun SaleDetailDialog(
                     fontSize = 12.sp, color = t.inkTertiary
                 )
             }
+            !canEditReceipts && sale.isEditable(windowMins) && refunded <= 0.005 -> Text(
+                "You don't have permission to edit receipts — ask an admin.",
+                fontSize = 12.sp, color = t.inkTertiary
+            )
             refunded > 0.005 -> Text(
                 "This receipt has a refund against it, so it can no longer be edited.",
                 fontSize = 12.sp, color = t.inkTertiary

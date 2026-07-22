@@ -4,6 +4,7 @@ import com.portionspot.pos.sync.Connection
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -17,7 +18,12 @@ data class StaffRow(
     val role: String = "cashier",
     @SerialName("display_name") val displayName: String = "",
     val active: Boolean = true,
-)
+    /** jsonb capability grants for this staff member; null for legacy rows. */
+    val permissions: JsonObject? = null,
+) {
+    /** Parsed capability grants (empty ⇒ cashier defaults apply in the editor). */
+    fun perms(): Permissions = Permissions.fromJson(permissions)
+}
 
 sealed interface StaffResult {
     data class Ok(val message: String = "Done") : StaffResult
@@ -55,7 +61,7 @@ class StaffAdminClient(
     /** All staff (admin JWT + RLS gate this). Empty on any error. */
     fun listStaff(): List<StaffRow> {
         val url = "${connection.url}/rest/v1/pos_staff" +
-            "?select=id,role,display_name,active&order=display_name.asc"
+            "?select=id,role,display_name,active,permissions&order=display_name.asc"
         return try {
             client.newCall(Request.Builder().url(url).get().authed().build()).execute().use { resp ->
                 val text = resp.body?.string().orEmpty()
@@ -79,6 +85,32 @@ class StaffAdminClient(
 
     fun resetPassword(staffId: String, password: String): StaffResult =
         callFn("{\"action\":\"reset_password\",\"staffId\":${q(staffId)},\"password\":${q(password)}}")
+
+    /**
+     * Update one staff member's capability grants directly via PostgREST (no Edge
+     * Function needed — RLS policy `pos_staff_admin_update` = is_pos_admin() lets an
+     * admin PATCH the row). [permissions] is a full key→boolean map; it overwrites the
+     * whole `permissions` jsonb. Uses `Prefer: return=minimal` so no body comes back.
+     */
+    fun setPermissions(staffId: String, permissions: Map<String, Boolean>): StaffResult {
+        val obj = permissions.entries.joinToString(",") { "${q(it.key)}:${it.value}" }
+        val body = "{\"permissions\":{$obj}}"
+        return try {
+            val req = Request.Builder()
+                .url("${connection.url}/rest/v1/pos_staff?id=eq.$staffId")
+                .patch(body.toRequestBody(jsonMedia))
+                .authed()
+                .header("Content-Type", "application/json")
+                .header("Prefer", "return=minimal")
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) StaffResult.Ok("Permissions saved")
+                else StaffResult.Err("Couldn't save permissions (HTTP ${resp.code})")
+            }
+        } catch (e: Exception) {
+            StaffResult.Err(e.message ?: "Could not reach the server")
+        }
+    }
 
     private fun callFn(body: String): StaffResult = try {
         val req = Request.Builder()

@@ -3,6 +3,7 @@ package com.portionspot.pos.auth
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -32,8 +33,10 @@ data class SessionDto(
 @Serializable
 data class StaffProfileDto(
     val role: String,
-    @SerialName("display_name") val displayName: String,
+    @SerialName("display_name") val displayName: String = "",
     val active: Boolean = true,
+    /** jsonb capability grants; null/absent for legacy rows ⇒ cashier defaults apply. */
+    val permissions: JsonObject? = null,
 )
 
 /** GoTrue error bodies come in two shapes; capture both loosely. */
@@ -114,7 +117,7 @@ class SupabaseAuth(
             ?: throw IOException("Bad URL"))
             .newBuilder()
             .addQueryParameter("id", "eq.$userId")
-            .addQueryParameter("select", "role,display_name,active")
+            .addQueryParameter("select", "role,display_name,active,permissions")
             .build()
         val req = Request.Builder().url(url).get()
             .header("apikey", anonKey)

@@ -35,6 +35,8 @@ import com.portionspot.pos.data.SaleStamp
 import com.portionspot.pos.data.StockMovement
 import com.portionspot.pos.data.Tender
 import com.portionspot.pos.data.TopProduct
+import com.portionspot.pos.auth.Capability
+import com.portionspot.pos.auth.Permissions
 import com.portionspot.pos.payments.PaynowClient
 import com.portionspot.pos.payments.PaynowInit
 import com.portionspot.pos.payments.PaynowPoll
@@ -129,10 +131,41 @@ class PosViewModel(
     private var currentCashierId: String? = null
     private var currentCashierName: String? = null
     private var currentIsAdmin: Boolean = false
-    fun setCurrentCashier(id: String?, name: String?, isAdmin: Boolean = false) {
+
+    // Per-person permissions for the signed-in user (see auth/Permissions.kt). Admins are
+    // never gated. Exposed as flows so the UI can hide/disable controls reactively, and
+    // read synchronously via [can] for the handler-side (defense-in-depth) block.
+    private val _currentIsAdmin = MutableStateFlow(false)
+    private val _currentPermissions = MutableStateFlow(Permissions.EMPTY)
+
+    /** The set of capabilities the current user is allowed to exercise right now (admin =
+     *  all). Collect this in Compose to gate visible controls. */
+    val allowedCaps: StateFlow<Set<Capability>> =
+        combine(_currentIsAdmin, _currentPermissions) { admin, perms ->
+            if (admin) Capability.entries.toSet()
+            else Capability.entries.filter { perms.allows(it) }.toSet()
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptySet())
+
+    /** Synchronous capability check for action handlers (the second, non-UI gate). */
+    fun can(cap: Capability): Boolean = _currentIsAdmin.value || _currentPermissions.value.allows(cap)
+
+    fun setCurrentCashier(
+        id: String?,
+        name: String?,
+        isAdmin: Boolean = false,
+        permissions: Permissions = Permissions.EMPTY,
+    ) {
         currentCashierId = id
         currentCashierName = name
         currentIsAdmin = isAdmin
+        _currentIsAdmin.value = isAdmin
+        _currentPermissions.value = permissions
+    }
+
+    /** Pull the signed-in user's own grants from pos_staff (admin edits reach the device).
+     *  Wired to app foreground (PosApp) and the manual "Sync now". No-op offline/local. */
+    fun refreshMyPermissions() {
+        viewModelScope.launch { authManager.refreshCurrentPermissions() }
     }
 
     /**
@@ -696,6 +729,8 @@ class PosViewModel(
      * (0 = no ceiling), so a cashier can never discount past either limit.
      */
     fun setLineDiscount(lineKey: String, amount: Double) {
+        // A cashier without give_discounts can't set a per-line discount either.
+        if (!can(Capability.GIVE_DISCOUNTS)) return
         val cap = _shopPrefs.value.maxItemDiscount
         _cart.value = _cart.value.map { line ->
             if (line.lineKey != lineKey) line
@@ -763,11 +798,14 @@ class PosViewModel(
         if (lines.isEmpty()) return
         if (checkoutInFlight) return
         checkoutInFlight = true
+        // Handler-side discount gate: a cashier without give_discounts can never apply a
+        // whole-sale discount, even if a stale screen sent one through.
+        val effDiscount = if (can(Capability.GIVE_DISCOUNTS)) discount else 0.0
         val biz = business.value
         viewModelScope.launch {
             try {
                 val saved = repo.checkout(
-                    bid, lines, payments, discount,
+                    bid, lines, payments, effDiscount,
                     customer = customer,
                     onCredit = onCredit,
                     changeGiven = changeGiven,
@@ -805,10 +843,11 @@ class PosViewModel(
         val bid = businessId.value ?: return
         val lines = _cart.value
         if (lines.isEmpty()) return
+        val effDiscount = if (can(Capability.GIVE_DISCOUNTS)) discount else 0.0
         val biz = business.value
         viewModelScope.launch {
             val saved = repo.saveQuote(
-                bid, lines, discount,
+                bid, lines, effDiscount,
                 note = note,
                 customer = customer,
                 vatEnabled = biz?.vatEnabled ?: false,
@@ -903,6 +942,7 @@ class PosViewModel(
      * or the receipt has a refund against it).
      */
     fun editSale(sale: SaleEntity, lines: List<CartLine>, onDone: (Boolean) -> Unit = {}) {
+        if (!can(Capability.EDIT_RECEIPTS)) { onDone(false); return }
         viewModelScope.launch {
             val biz = business.value
             val result = repo.editSale(
@@ -949,6 +989,7 @@ class PosViewModel(
     ) {
         val bid = businessId.value ?: return
         if (name.isBlank()) return
+        if (!can(Capability.MANAGE_INVENTORY)) return
         viewModelScope.launch {
             repo.saveItem(
                 Item(
@@ -982,6 +1023,7 @@ class PosViewModel(
 
     /** Persist edits to an existing item (rename, reprice, restock, toggle tracking). */
     fun updateItem(item: Item) {
+        if (!can(Capability.MANAGE_INVENTORY)) return
         viewModelScope.launch {
             repo.saveItem(item)
             nudgeSync("updateItem")
@@ -1007,6 +1049,7 @@ class PosViewModel(
 
     /** Set an item's on-hand to [newQty], logging the change ("adjust"/"restock"). */
     fun adjustStock(itemId: String, newQty: Double, type: String = "adjust", note: String? = null) {
+        if (!can(Capability.MANAGE_INVENTORY)) return
         viewModelScope.launch {
             repo.adjustStock(itemId, newQty, type, note, currentCashierId, currentCashierName)
         }
@@ -1159,6 +1202,7 @@ class PosViewModel(
     ) {
         val bid = businessId.value ?: return
         if (returns.isEmpty()) return
+        if (!can(Capability.PROCESS_REFUNDS)) return
         viewModelScope.launch {
             val customer = sale.customerId?.let { repo.customerById(it) }
             repo.createRefund(
@@ -1354,6 +1398,7 @@ class PosViewModel(
 
     /** Admin void of a wrongful refund (§8) — reverses stock + owed balance, audited. */
     fun voidRefund(refundId: String, onDone: () -> Unit = {}) {
+        if (!can(Capability.VOID_SALES)) return
         viewModelScope.launch {
             repo.voidRefund(refundId, currentCashierId, currentCashierName)
             nudgeSync("voidRefund")
@@ -1415,6 +1460,7 @@ class PosViewModel(
     ) {
         val bid = businessId.value ?: return
         if (amount <= 0) return
+        if (!can(Capability.MANAGE_EXPENSES_ORDERS)) return
         viewModelScope.launch {
             val e = repo.submitExpense(
                 bid, category, amount, date, description, recurring, recurrencePeriod,
@@ -1431,6 +1477,7 @@ class PosViewModel(
         recurring: Boolean, recurrencePeriod: String?
     ) {
         if (amount <= 0) return
+        if (!can(Capability.MANAGE_EXPENSES_ORDERS)) return
         viewModelScope.launch {
             repo.updatePendingExpense(id, category, amount, date, description, recurring, recurrencePeriod)
             nudgeSync("updateExpense")
@@ -1553,6 +1600,7 @@ class PosViewModel(
     ) {
         val bid = businessId.value ?: return
         if (lines.isEmpty()) return
+        if (!can(Capability.MANAGE_EXPENSES_ORDERS)) return
         viewModelScope.launch {
             repo.createPurchaseOrder(
                 bid, supplierId, supplierName.trim(),
@@ -1675,6 +1723,8 @@ class PosViewModel(
             // duplicate immediately so the catalogue self-cleans without user action.
             repo.dedupeItems()
             refreshSyncState()
+            // Pick up any permission change an admin made to this user on another device.
+            authManager.refreshCurrentPermissions()
         }
     }
 
@@ -1713,10 +1763,33 @@ class PosViewModel(
         email: String, password: String, displayName: String, role: String = "cashier",
         onResult: (com.portionspot.pos.auth.StaffResult) -> Unit,
     ) {
+        if (!can(Capability.MANAGE_STAFF)) {
+            onResult(com.portionspot.pos.auth.StaffResult.Err("You don't have permission to manage staff"))
+            return
+        }
         viewModelScope.launch {
             val client = staffClient()
                 ?: return@launch onResult(com.portionspot.pos.auth.StaffResult.Err("Connect cloud sync first"))
             val r = withContext(Dispatchers.IO) { client.createCashier(email, password, displayName, role) }
+            if (r is com.portionspot.pos.auth.StaffResult.Ok) refreshStaff()
+            onResult(r)
+        }
+    }
+
+    /** Save a staff member's capability grants (admin-only, direct PATCH to pos_staff). */
+    fun setStaffPermissions(
+        staffId: String,
+        permissions: Map<String, Boolean>,
+        onResult: (com.portionspot.pos.auth.StaffResult) -> Unit = {},
+    ) {
+        if (!can(Capability.MANAGE_STAFF)) {
+            onResult(com.portionspot.pos.auth.StaffResult.Err("You don't have permission to manage staff"))
+            return
+        }
+        viewModelScope.launch {
+            val client = staffClient()
+                ?: return@launch onResult(com.portionspot.pos.auth.StaffResult.Err("Connect cloud sync first"))
+            val r = withContext(Dispatchers.IO) { client.setPermissions(staffId, permissions) }
             if (r is com.portionspot.pos.auth.StaffResult.Ok) refreshStaff()
             onResult(r)
         }
@@ -1727,6 +1800,10 @@ class PosViewModel(
         staffId: String, password: String,
         onResult: (com.portionspot.pos.auth.StaffResult) -> Unit = {},
     ) {
+        if (!can(Capability.MANAGE_STAFF)) {
+            onResult(com.portionspot.pos.auth.StaffResult.Err("You don't have permission to manage staff"))
+            return
+        }
         viewModelScope.launch {
             val client = staffClient()
                 ?: return@launch onResult(com.portionspot.pos.auth.StaffResult.Err("Connect cloud sync first"))
@@ -1740,6 +1817,10 @@ class PosViewModel(
         staffId: String, active: Boolean,
         onResult: (com.portionspot.pos.auth.StaffResult) -> Unit = {},
     ) {
+        if (!can(Capability.MANAGE_STAFF)) {
+            onResult(com.portionspot.pos.auth.StaffResult.Err("You don't have permission to manage staff"))
+            return
+        }
         viewModelScope.launch {
             val client = staffClient()
                 ?: return@launch onResult(com.portionspot.pos.auth.StaffResult.Err("Connect cloud sync first"))

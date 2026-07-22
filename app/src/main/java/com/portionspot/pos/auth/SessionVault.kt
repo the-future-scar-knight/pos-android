@@ -27,6 +27,9 @@ data class CachedAuth(
     val accessToken: String,
     val refreshToken: String,
     val expiresAt: Long,       // epoch seconds
+    /** Per-person capability grants, keyed by [Capability.key]. Cached so gating still
+     *  works offline; refreshed from pos_staff on login and on foreground/sync. */
+    val permissions: Map<String, Boolean> = emptyMap(),
 )
 
 /** One staff member provisioned on this device: their cached session + PIN gate. */
@@ -59,6 +62,7 @@ data class AccountSummary(
     val role: String,
     val email: String,
     val hasPin: Boolean,
+    val permissions: Map<String, Boolean> = emptyMap(),
 ) {
     val isAdmin: Boolean get() = role == "admin"
 }
@@ -144,7 +148,7 @@ class SessionVault(context: Context) {
     // ── account queries ───────────────────────────────────────────────────
 
     fun accounts(): List<AccountSummary> = load().accounts.map {
-        AccountSummary(it.auth.userId, it.auth.displayName, it.auth.role, it.auth.email, it.hasPin)
+        AccountSummary(it.auth.userId, it.auth.displayName, it.auth.role, it.auth.email, it.hasPin, it.auth.permissions)
     }
 
     fun hasAnyAccount(): Boolean = load().accounts.isNotEmpty()
@@ -193,7 +197,7 @@ class SessionVault(context: Context) {
         val active = if (data.activeUserId == userId) null else data.activeUserId
         persist(data.copy(accounts = accounts, activeUserId = active))
         return accounts.map {
-            AccountSummary(it.auth.userId, it.auth.displayName, it.auth.role, it.auth.email, it.hasPin)
+            AccountSummary(it.auth.userId, it.auth.displayName, it.auth.role, it.auth.email, it.hasPin, it.auth.permissions)
         }
     }
 

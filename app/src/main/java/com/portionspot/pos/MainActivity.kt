@@ -136,7 +136,9 @@ class MainActivity : ComponentActivity() {
                     // per-cashier PIN, staff management, attribution, sync. Backing out
                     // of login (no account yet) returns to local mode.
                     else -> AuthGate(container.authManager, onExitToLocal = { vm.useLocalMode() }) { user ->
-                        LaunchedEffect(user.id) { vm.setCurrentCashier(user.id, user.displayName, user.isAdmin) }
+                        LaunchedEffect(user.id, user.permissions) {
+                            vm.setCurrentCashier(user.id, user.displayName, user.isAdmin, user.permissions)
+                        }
                         val open by openTarget
                         val wantMobileMoney = open == Notifier.OPEN_MOBILE_MONEY
                         val wantAdminAlerts = open == Notifier.OPEN_ADMIN_ALERTS
