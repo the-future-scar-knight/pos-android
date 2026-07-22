@@ -38,6 +38,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -53,6 +54,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.portionspot.pos.device.ConnectivityObserver
 import com.portionspot.pos.ui.LocalPosTokens
 import com.portionspot.pos.ui.PosField
 import kotlinx.coroutines.launch
@@ -76,7 +78,7 @@ fun AuthGate(
         // With no account yet, [onExitToLocal] (when cloud mode was just opted into)
         // becomes the back arrow so the user can return to using the till locally.
         is AuthState.LoggedOut -> LoginScreen(auth, onBack = onExitToLocal)
-        is AuthState.AddAccount -> LoginScreen(auth, onBack = { auth.backToPicker() })
+        is AuthState.AddAccount -> LoginScreen(auth, onBack = { auth.backToPicker() }, prefillEmail = s.prefillEmail)
         is AuthState.Picker -> AccountPickerScreen(auth, s.accounts)
         is AuthState.Locked -> PinUnlockScreen(auth, s.account)
         is AuthState.PinSetup -> PinSetupScreen(auth)
@@ -209,10 +211,23 @@ private fun ErrorText(message: String?) {
     }
 }
 
-/** The lock screen when the device already has accounts: pick who's using it. */
+/** The lock screen when the device already has accounts: pick who's using it. When
+ *  online (and a cloud connection is configured) a second "Other staff" section lists
+ *  roster members who have never signed in here, so the owner can switch into any
+ *  active account by name — that person then types their own password once. */
 @Composable
 private fun AccountPickerScreen(auth: AuthManager, accounts: List<AccountSummary>) {
     val t = LocalPosTokens.current
+    val online by ConnectivityObserver.rememberOnlineState()
+    val roster by auth.roster.collectAsState()
+    val rosterLoading by auth.rosterLoading.collectAsState()
+
+    // Fetch the roster only while online; drop it the moment the device goes offline so
+    // the picker collapses back to local accounts exactly as before.
+    LaunchedEffect(online) {
+        if (online) auth.loadRoster() else auth.clearRoster()
+    }
+
     AuthScaffold("Who's using this device?", "Tap your name, then enter your PIN") {
         accounts.forEach { acc ->
             Row(
@@ -256,6 +271,81 @@ private fun AccountPickerScreen(auth: AuthManager, accounts: List<AccountSummary
                 }
             }
         }
+
+        // ── Other staff (online only): roster members not yet on this device. ──
+        if (online) {
+            Spacer(Modifier.height(20.dp))
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    "Other staff",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = t.inkTertiary,
+                    modifier = Modifier.weight(1f),
+                )
+                if (rosterLoading) {
+                    CircularProgressIndicator(
+                        Modifier.width(16.dp).height(16.dp),
+                        color = t.brand.s600,
+                        strokeWidth = 2.dp,
+                    )
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+            if (roster.isEmpty()) {
+                Text(
+                    if (rosterLoading) "Loading staff…" else "No other staff to switch to",
+                    fontSize = 12.sp,
+                    color = t.inkTertiary,
+                )
+            } else {
+                roster.forEach { member ->
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(t.surface1)
+                            .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
+                            .clickable { auth.switchToStaff(member.email) }
+                            .padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Icon(
+                            Icons.Rounded.AccountCircle,
+                            contentDescription = null,
+                            tint = t.inkTertiary,
+                            modifier = Modifier.width(36.dp).height(36.dp),
+                        )
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                member.displayName.ifBlank { member.email },
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = t.inkPrimary,
+                            )
+                            Text(
+                                if (member.isAdmin) "Admin" else "Cashier",
+                                fontSize = 12.sp,
+                                color = t.inkTertiary,
+                            )
+                        }
+                        Text(
+                            "Password",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = t.brand.s600,
+                        )
+                    }
+                }
+            }
+        }
+
         Spacer(Modifier.height(16.dp))
         OutlinedButton(
             onClick = { auth.addAccount() },
@@ -269,10 +359,10 @@ private fun AccountPickerScreen(auth: AuthManager, accounts: List<AccountSummary
 }
 
 @Composable
-private fun LoginScreen(auth: AuthManager, onBack: (() -> Unit)?) {
+private fun LoginScreen(auth: AuthManager, onBack: (() -> Unit)?, prefillEmail: String? = null) {
     val t = LocalPosTokens.current
     val scope = rememberCoroutineScope()
-    var email by remember { mutableStateOf("") }
+    var email by remember { mutableStateOf(prefillEmail ?: "") }
     var password by remember { mutableStateOf("") }
     var showPassword by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
@@ -290,7 +380,12 @@ private fun LoginScreen(auth: AuthManager, onBack: (() -> Unit)?) {
         }
     }
 
-    AuthScaffold("PortionSpot POS", "Sign in to start selling", onBack = onBack) {
+    val switching = prefillEmail != null
+    AuthScaffold(
+        if (switching) "Switch account" else "PortionSpot POS",
+        if (switching) "Enter your password to switch in" else "Sign in to start selling",
+        onBack = onBack,
+    ) {
         PosField(
             value = email,
             onValueChange = { email = it },

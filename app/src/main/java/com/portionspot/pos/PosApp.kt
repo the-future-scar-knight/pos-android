@@ -49,6 +49,9 @@ class AppContainer(app: Application) {
         // A new/updated admin alert (or a read-state change) nudges a debounced sync so
         // it lands on the OTHER phones in seconds, not on the ~15-minute worker cycle.
         repository.onSyncWorthyChange = { reason -> syncManager.requestSync(reason) }
+        // Let the lock-screen picker fetch the shop roster (switch-by-name) using the
+        // saved cloud connection. Null until the owner has connected a database.
+        authManager.connectionProvider = { syncConfig.connection() }
     }
 }
 

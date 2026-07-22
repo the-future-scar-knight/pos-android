@@ -1,6 +1,7 @@
 package com.portionspot.pos.auth
 
 import android.content.Context
+import com.portionspot.pos.sync.Connection
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -23,6 +24,20 @@ data class PosUser(
     val isAdmin: Boolean get() = role == "admin"
 }
 
+/**
+ * A shop-roster staff member the lock-screen picker can offer even though they have
+ * never signed in on THIS device. Populated from the cloud `pos_staff` roster while
+ * online. Tapping one starts a password sign-in pre-filled with [email].
+ */
+data class RosterMember(
+    val userId: String,
+    val email: String,
+    val displayName: String,
+    val role: String,
+) {
+    val isAdmin: Boolean get() = role == "admin"
+}
+
 sealed class AuthState {
     /** Reading the vault on process start. */
     object Loading : AuthState()
@@ -30,8 +45,11 @@ sealed class AuthState {
     /** No accounts on this device — online email+password login required. */
     object LoggedOut : AuthState()
 
-    /** Adding another account from the picker (keeps existing accounts). */
-    object AddAccount : AuthState()
+    /** Adding another account from the picker (keeps existing accounts). When
+     *  [prefillEmail] is set the login screen seeds that email — used by the
+     *  lock-screen "switch to a named staff member" flow, where the person only has
+     *  to type their own password. */
+    data class AddAccount(val prefillEmail: String? = null) : AuthState()
 
     /** One or more accounts provisioned: pick who's using the device. */
     data class Picker(val accounts: List<AccountSummary>) : AuthState()
@@ -77,6 +95,22 @@ class AuthManager(
     private val _state = MutableStateFlow<AuthState>(AuthState.Loading)
     val state: StateFlow<AuthState> = _state
 
+    /**
+     * Resolves the saved cloud connection (Supabase url + anon key), wired by the
+     * app container from [com.portionspot.pos.sync.SyncConfig]. Null before a
+     * connection is configured; when null the roster fetch is skipped entirely.
+     */
+    var connectionProvider: (suspend () -> Connection?)? = null
+
+    /** Shop-roster members eligible for lock-screen "switch by name": active staff
+     *  who are NOT already on this device and are NOT the current user. */
+    private val _roster = MutableStateFlow<List<RosterMember>>(emptyList())
+    val roster: StateFlow<List<RosterMember>> = _roster
+
+    /** True while a roster fetch is in flight (drives the picker's spinner). */
+    private val _rosterLoading = MutableStateFlow(false)
+    val rosterLoading: StateFlow<Boolean> = _rosterLoading
+
     /** True when the server refused our refresh token: prompt re-login, keep data. */
     private val _reloginRequired = MutableStateFlow(false)
     val reloginRequired: StateFlow<Boolean> = _reloginRequired
@@ -111,7 +145,59 @@ class AuthManager(
 
     /** From the picker: add another account via online login. */
     fun addAccount() {
-        _state.value = AuthState.AddAccount
+        _state.value = AuthState.AddAccount()
+    }
+
+    /**
+     * From the picker's "Other staff" section: sign in as a roster member who has
+     * never been added on this device. Their own password is still required (no free
+     * admin impersonation) — we just seed their email so they only type a password.
+     * On success it flows through the normal path (first time here ⇒ PIN setup).
+     */
+    fun switchToStaff(email: String) {
+        _state.value = AuthState.AddAccount(prefillEmail = email)
+    }
+
+    /**
+     * Fetch the shop roster for the picker's "Other staff" section. Online-only and
+     * best-effort: runs on IO with whatever token is available (falling back to the
+     * connection's anon key inside [StaffAdminClient]); any failure — offline, no
+     * connection configured, or RLS blocking an unauthenticated read — simply leaves
+     * the roster empty so the picker shows only local accounts. Excludes active staff
+     * already provisioned on this device (matched by id OR email) and the current user.
+     */
+    fun loadRoster() {
+        val provider = connectionProvider
+        if (provider == null) { _roster.value = emptyList(); return }
+        scope.launch {
+            _rosterLoading.value = true
+            try {
+                val conn = withContext(Dispatchers.IO) { provider() }
+                if (conn == null) { _roster.value = emptyList(); return@launch }
+                val token = currentAccessToken
+                val rows = withContext(Dispatchers.IO) {
+                    StaffAdminClient(conn) { token }.listRoster()
+                }
+                val localIds = vault.accounts().map { it.userId }.toSet()
+                val localEmails = vault.accounts().map { it.email.trim().lowercase() }.toSet()
+                _roster.value = rows.asSequence()
+                    .filter { it.active }
+                    .map { RosterMember(it.id, it.email.orEmpty().trim(), it.displayName, it.role) }
+                    .filter { it.userId.isNotBlank() && it.email.isNotBlank() }
+                    .filter { it.userId !in localIds && it.email.lowercase() !in localEmails }
+                    .filter { it.userId != activeUserId }
+                    .toList()
+            } catch (_: Exception) {
+                _roster.value = emptyList()
+            } finally {
+                _rosterLoading.value = false
+            }
+        }
+    }
+
+    /** Drop any roster (e.g. when the device goes offline). */
+    fun clearRoster() {
+        _roster.value = emptyList()
     }
 
     /** Back out of add-account / PIN entry to the picker. */
@@ -317,7 +403,7 @@ class AuthManager(
      *  cached session until the new login overwrites it, so nothing is lost if the
      *  user backs out. */
     fun promptRelogin() {
-        _state.value = if (vault.hasAnyAccount()) AuthState.AddAccount else AuthState.LoggedOut
+        _state.value = if (vault.hasAnyAccount()) AuthState.AddAccount() else AuthState.LoggedOut
     }
 
     /**

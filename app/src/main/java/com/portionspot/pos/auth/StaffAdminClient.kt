@@ -25,6 +25,18 @@ data class StaffRow(
     fun perms(): Permissions = Permissions.fromJson(permissions)
 }
 
+/** One roster entry for the lock-screen "switch by name" picker (email included). */
+@Serializable
+data class RosterRow(
+    val id: String = "",
+    @SerialName("display_name") val displayName: String = "",
+    val role: String = "cashier",
+    val active: Boolean = true,
+    /** Backfilled on existing staff; may still be null for a freshly created cashier
+     *  until the create-cashier email backfill lands. */
+    val email: String? = null,
+)
+
 sealed interface StaffResult {
     data class Ok(val message: String = "Done") : StaffResult
     data class Err(val message: String) : StaffResult
@@ -58,6 +70,27 @@ class StaffAdminClient(
         .header("Authorization", "Bearer ${bearer()}")
         .header("Accept", "application/json")
 
+    /**
+     * Lightweight shop roster for the lock-screen "switch by name" picker:
+     * id, display_name, role, active, email. Filtered to active staff. Runs with
+     * whatever token is available (falls back to the anon key via [authed]); returns
+     * an empty list on any failure or RLS block so the picker degrades to local
+     * accounts only.
+     */
+    fun listRoster(): List<RosterRow> {
+        val url = "${connection.url}/rest/v1/pos_staff" +
+            "?select=id,display_name,role,active,email&active=eq.true&order=display_name.asc"
+        return try {
+            client.newCall(Request.Builder().url(url).get().authed().build()).execute().use { resp ->
+                val text = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) emptyList()
+                else runCatching { json.decodeFromString<List<RosterRow>>(text) }.getOrDefault(emptyList())
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
     /** All staff (admin JWT + RLS gate this). Empty on any error. */
     fun listStaff(): List<StaffRow> {
         val url = "${connection.url}/rest/v1/pos_staff" +
@@ -73,12 +106,22 @@ class StaffAdminClient(
         }
     }
 
-    fun createCashier(email: String, password: String, displayName: String, role: String = "cashier"): StaffResult =
-        callFn(
+    fun createCashier(email: String, password: String, displayName: String, role: String = "cashier"): StaffResult {
+        val (result, newId) = callFnWithId(
             "{\"action\":\"create\"," +
                 "\"email\":${q(email)},\"password\":${q(password)}," +
                 "\"displayName\":${q(displayName)},\"role\":${q(role)}}"
         )
+        // Best-effort: the Edge Function may not populate pos_staff.email, which would
+        // break lock-screen "switch by name" for this new cashier. If it returned the
+        // new id, backfill the email directly (admin JWT + RLS admin-update, like
+        // setPermissions). If the id isn't in the response, skip — the row's backfill
+        // and a later password login via "Add another account" still cover it.
+        if (result is StaffResult.Ok && !newId.isNullOrBlank()) {
+            runCatching { patchEmail(newId, email) }
+        }
+        return result
+    }
 
     fun setActive(staffId: String, active: Boolean): StaffResult =
         callFn("{\"action\":\"set_active\",\"staffId\":${q(staffId)},\"active\":$active}")
@@ -112,7 +155,11 @@ class StaffAdminClient(
         }
     }
 
-    private fun callFn(body: String): StaffResult = try {
+    private fun callFn(body: String): StaffResult = callFnWithId(body).first
+
+    /** Like [callFn] but also surfaces any staff/user id the function returned (used to
+     *  backfill pos_staff.email for a newly created cashier). id is null if absent. */
+    private fun callFnWithId(body: String): Pair<StaffResult, String?> = try {
         val req = Request.Builder()
             .url("${connection.url}/functions/v1/create-cashier")
             .post(body.toRequestBody(jsonMedia))
@@ -121,16 +168,42 @@ class StaffAdminClient(
         client.newCall(req).execute().use { resp ->
             val text = resp.body?.string().orEmpty()
             val parsed = runCatching { json.decodeFromString<FnResponse>(text) }.getOrNull()
-            if (parsed?.ok == true) StaffResult.Ok()
-            else StaffResult.Err(parsed?.error ?: "Failed (HTTP ${resp.code})")
+            if (parsed?.ok == true) StaffResult.Ok() to parsed.newId()
+            else StaffResult.Err(parsed?.error ?: "Failed (HTTP ${resp.code})") to null
         }
     } catch (e: Exception) {
-        StaffResult.Err(e.message ?: "Could not reach the server")
+        StaffResult.Err(e.message ?: "Could not reach the server") to null
+    }
+
+    /** Best-effort admin PATCH of pos_staff.email (RLS admin-update). Throws on network
+     *  failure; the caller wraps it in runCatching so a miss is silent. */
+    private fun patchEmail(staffId: String, email: String) {
+        val req = Request.Builder()
+            .url("${connection.url}/rest/v1/pos_staff?id=eq.$staffId")
+            .patch("{\"email\":${q(email)}}".toRequestBody(jsonMedia))
+            .authed()
+            .header("Content-Type", "application/json")
+            .header("Prefer", "return=minimal")
+            .build()
+        client.newCall(req).execute().close()
     }
 
     private fun q(s: String): String =
         "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
 
     @Serializable
-    private data class FnResponse(val ok: Boolean = false, val error: String? = null)
+    private data class FnResponse(
+        val ok: Boolean = false,
+        val error: String? = null,
+        // The function's response shape isn't guaranteed; accept the common id carriers.
+        val id: String? = null,
+        @SerialName("userId") val userId: String? = null,
+        @SerialName("staffId") val staffId: String? = null,
+        val user: FnUser? = null,
+    ) {
+        fun newId(): String? = id ?: userId ?: staffId ?: user?.id
+    }
+
+    @Serializable
+    private data class FnUser(val id: String? = null)
 }
