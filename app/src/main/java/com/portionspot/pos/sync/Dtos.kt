@@ -15,6 +15,7 @@ import com.portionspot.pos.data.RefundLine
 import com.portionspot.pos.data.SaleEntity
 import com.portionspot.pos.data.SaleLine
 import com.portionspot.pos.data.SalePayment
+import com.portionspot.pos.data.StaffRequest
 import com.portionspot.pos.data.Supplier
 import com.portionspot.pos.data.newId
 import kotlinx.serialization.SerialName
@@ -1366,3 +1367,139 @@ fun AuditEntry.toAuditPush() = AuditPushDto(
     createdAt = IsoTime.toIso(createdAt),
     updatedAt = IsoTime.toIso(updatedAt),
 )
+
+// ─────────────────────────────────────────────────────────────────────────────
+// staff_requests — the admin⇄cashier approval channel (Phase 3). A cashier raises a
+// request (over-threshold discount, void…) that reaches the admin's phone; the admin
+// approves/denies and the decision syncs back.
+//
+// UPSERT KEY IS `local_id` (UNIQUE in the cloud, = the Android UUID), but the push is
+// SPLIT into two RLS-shaped modes (see PosSyncEngine.push):
+//   • a PENDING row (status='pending', decided_at NULL) goes up IGNORE-DUPLICATES — a
+//     cashier device may only INSERT + SELECT (RLS), so a merge upsert would be rejected.
+//   • a DECIDED row (decided_at != null) goes up MERGE-DUPLICATES — only an admin device
+//     ever writes one, and the admin passes the UPDATE policy.
+// The engine keys off status/decided_at alone, so it never needs the device role.
+//
+// TYPE RULES:
+//   • created_at / updated_at are TIMESTAMPTZ -> fixed-format UTC ISO via [IsoTime]
+//     (the `updated_at=gt.<cursor>` pull depends on it).
+//   • decided_at is plain BIGINT epoch ms -> send the Long as-is.
+//   • amount is NUMERIC -> comes BACK as a JSON string (PostgREST precision), hence
+//     String? + [toMoney] on the pull side; nullable because not every request carries one.
+//   • `applied` is device-local on the cashier side (a cashier can't UPDATE the cloud
+//     row), so a pull PRESERVES the local value rather than letting a stale false win.
+// ─────────────────────────────────────────────────────────────────────────────
+@Serializable
+data class StaffRequestDto(
+    @SerialName("local_id") val localId: String? = null,
+    @SerialName("business_id") val businessId: String? = null,
+    val type: String = "",
+    @SerialName("target_type") val targetType: String? = null,
+    @SerialName("target_id") val targetId: String? = null,
+    @SerialName("target_name") val targetName: String? = null,
+    val amount: String? = null,
+    val note: String? = null,
+    @SerialName("requested_by") val requestedBy: String? = null,
+    @SerialName("requested_by_name") val requestedByName: String? = null,
+    val status: String = "pending",
+    @SerialName("decided_by") val decidedBy: String? = null,
+    @SerialName("decided_by_name") val decidedByName: String? = null,
+    @SerialName("decided_at") val decidedAt: Long? = null,
+    val applied: Boolean = false,
+    @SerialName("created_at") val createdAt: String? = null,
+    @SerialName("updated_at") val updatedAt: String? = null,
+    val deleted: Boolean = false,
+) {
+    fun bridgeId(): String = localId?.ifBlank { null } ?: "req-${newId()}"
+    fun cursorStamp(): String = updatedAt ?: createdAt ?: IsoTime.EPOCH
+}
+
+fun StaffRequestDto.toStaffRequest(businessId: String, local: StaffRequest?): StaffRequest {
+    val bid = local?.id ?: bridgeId()
+    val base = local ?: StaffRequest(id = bid, businessId = businessId, type = type)
+    return base.copy(
+        id = bid,
+        localId = bid,
+        businessId = businessId,
+        type = type.ifBlank { base.type },
+        targetType = targetType,
+        targetId = targetId,
+        targetName = targetName,
+        amount = amount?.toMoney() ?: base.amount,
+        note = note,
+        requestedBy = requestedBy,
+        requestedByName = requestedByName,
+        status = status,
+        decidedBy = decidedBy,
+        decidedByName = decidedByName,
+        decidedAt = decidedAt,
+        // Device-local on the cashier side: keep this phone's own applied flag rather than
+        // letting a cloud false (never written by a cashier) clobber it. An admin device
+        // that legitimately set applied=true pushes it and it wins via last-write-wins.
+        applied = applied || base.applied,
+        createdAt = IsoTime.toMillis(createdAt).takeIf { it > 0 } ?: base.createdAt,
+        updatedAt = IsoTime.toMillis(updatedAt),
+        deleted = deleted,
+        pendingSync = false,
+    )
+}
+
+@Serializable
+data class StaffRequestPushDto(
+    @SerialName("local_id") val localId: String,
+    @SerialName("business_id") val businessId: String,
+    val type: String,
+    @SerialName("target_type") val targetType: String? = null,
+    @SerialName("target_id") val targetId: String? = null,
+    @SerialName("target_name") val targetName: String? = null,
+    val amount: Double? = null,
+    val note: String? = null,
+    @SerialName("requested_by") val requestedBy: String? = null,
+    @SerialName("requested_by_name") val requestedByName: String? = null,
+    val status: String = "pending",
+    @SerialName("decided_by") val decidedBy: String? = null,
+    @SerialName("decided_by_name") val decidedByName: String? = null,
+    @SerialName("decided_at") val decidedAt: Long? = null,
+    val applied: Boolean = false,
+    @SerialName("created_at") val createdAt: String,
+    @SerialName("updated_at") val updatedAt: String,
+    val deleted: Boolean = false,
+)
+
+fun StaffRequest.toStaffRequestPush() = StaffRequestPushDto(
+    localId = localId.ifBlank { id },
+    businessId = businessId,
+    type = type,
+    targetType = targetType,
+    targetId = targetId,
+    targetName = targetName,
+    amount = amount,
+    note = note,
+    requestedBy = requestedBy,
+    requestedByName = requestedByName,
+    status = status,
+    decidedBy = decidedBy,
+    decidedByName = decidedByName,
+    decidedAt = decidedAt,
+    applied = applied,
+    createdAt = IsoTime.toIso(createdAt),
+    updatedAt = IsoTime.toIso(updatedAt),
+    deleted = deleted,
+)
+
+/**
+ * Pure push-partition rule (extracted so it can be unit-tested — see Phase 3 §5). Splits
+ * a batch of locally-dirty [StaffRequest]s into (insertOnce, merge):
+ *   • a decided row (decidedAt != null) is ONLY ever created by an admin device, which
+ *     passes the cloud UPDATE policy → merge-upsert so a decision overwrites its row.
+ *   • everything else is a still-pending cashier row → insert-once (ignore-duplicates),
+ *     because a cashier may only INSERT under RLS and a merge would be rejected.
+ * Keying off decidedAt alone means the engine never has to know the device's role.
+ */
+internal fun partitionStaffRequestPush(
+    rows: List<StaffRequest>
+): Pair<List<StaffRequest>, List<StaffRequest>> {
+    val (decided, pending) = rows.partition { it.decidedAt != null }
+    return pending to decided   // (insertOnce, merge)
+}

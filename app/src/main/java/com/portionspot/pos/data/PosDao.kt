@@ -796,6 +796,58 @@ interface AuditDao {
 }
 
 @Dao
+interface StaffRequestDao {
+    /** Admin queue: pending requests awaiting a decision, oldest first (act on the
+     *  longest-waiting cashier first). Drives the "Requests" section of the Alerts screen. */
+    @Query(
+        "SELECT * FROM staff_requests WHERE businessId = :businessId AND deleted = 0 " +
+            "AND status = 'pending' ORDER BY createdAt ASC"
+    )
+    fun observePending(businessId: String): Flow<List<StaffRequest>>
+
+    /** Count of pending requests → the Alerts tab badge on the admin side. */
+    @Query(
+        "SELECT COUNT(*) FROM staff_requests WHERE businessId = :businessId AND deleted = 0 " +
+            "AND status = 'pending'"
+    )
+    fun observePendingCount(businessId: String): Flow<Int>
+
+    /** A cashier's own recent requests (any status) → the checkout status surface. Capped
+     *  so a busy till doesn't stream its whole history into the banner flow. */
+    @Query(
+        "SELECT * FROM staff_requests WHERE businessId = :businessId AND deleted = 0 " +
+            "AND requestedBy = :requestedBy ORDER BY createdAt DESC LIMIT :limit"
+    )
+    fun observeMine(businessId: String, requestedBy: String, limit: Int = 20): Flow<List<StaffRequest>>
+
+    @Query("SELECT * FROM staff_requests WHERE id = :id LIMIT 1")
+    suspend fun getById(id: String): StaffRequest?
+
+    @Upsert
+    suspend fun upsert(request: StaffRequest)
+
+    /**
+     * Mark applied WITHOUT re-queuing for sync — this is DEVICE-LOCAL cashier state. The
+     * cashier can't UPDATE the cloud row (RLS: admin-only), so dirtying it would fail RLS
+     * every cycle as a per-table error; the cloud `applied` mirror is written only by an
+     * admin device. See [StaffRequest.applied].
+     */
+    @Query("UPDATE staff_requests SET applied = 1 WHERE id = :id")
+    suspend fun markAppliedLocal(id: String)
+
+    // ---- sync ----
+    /** Rows with unsynced local edits — the upload queue (both pending-new and decided). */
+    @Query("SELECT * FROM staff_requests WHERE pendingSync = 1")
+    suspend fun pending(): List<StaffRequest>
+
+    @Query("UPDATE staff_requests SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun markSynced(ids: List<String>)
+
+    @Query("DELETE FROM staff_requests WHERE businessId = :businessId")
+    suspend fun wipe(businessId: String)
+}
+
+@Dao
 interface SettingDao {
     @Query("SELECT value FROM settings WHERE `key` = :key LIMIT 1")
     suspend fun get(key: String): String?

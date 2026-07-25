@@ -15,6 +15,7 @@ import com.portionspot.pos.data.RefundDao
 import com.portionspot.pos.data.SaleDao
 import com.portionspot.pos.data.SaleEntity
 import com.portionspot.pos.data.SalePaymentDao
+import com.portionspot.pos.data.StaffRequestDao
 import com.portionspot.pos.data.SupplierDao
 import com.portionspot.pos.media.ProductImages
 import kotlinx.coroutines.Dispatchers
@@ -68,6 +69,7 @@ class PosSyncEngine(
     private val poDao: PurchaseOrderDao,
     private val notificationDao: NotificationDao,
     private val auditDao: AuditDao,
+    private val staffRequestDao: StaffRequestDao,
     private val config: SyncConfig,
     /** Current signed-in user's JWT for RLS; null falls back to anon (denied). */
     private val accessToken: () -> String? = { null },
@@ -115,7 +117,8 @@ class PosSyncEngine(
             poDao.pending().size +
             poDao.pendingLines().size +
             notificationDao.pending().size +
-            auditDao.pending().size
+            auditDao.pending().size +
+            staffRequestDao.pending().size
     }
 
     // ── push (Stage 2) ──────────────────────────────────────────────────────
@@ -194,6 +197,36 @@ class PosSyncEngine(
             api.upsert("customers", syncJson.encodeToString(customers.map { it.toCustomerPush() }), "local_id")
             customerDao.markSynced(customers.map { it.id })
             customers.size
+        }
+
+        // staff_requests — the admin⇄cashier approval channel. AFTER customers, since a
+        // request may reference a customer as its target. RLS SPLITS this into two upserts
+        // on the SAME conflict key `local_id` (see partitionStaffRequestPush + the DTO
+        // header): a still-PENDING cashier row goes up IGNORE-DUPLICATES (a cashier device
+        // may only INSERT under RLS — a merge would be rejected every cycle), while a
+        // DECIDED row (only ever written by an admin device, which passes the UPDATE policy)
+        // goes up MERGE-DUPLICATES so the decision overwrites the shared row. Both halves
+        // mark their own rows synced, mirroring the sales fresh/edited split.
+        pushTable("staff_requests") {
+            val rows = staffRequestDao.pending()
+            if (rows.isEmpty()) return@pushTable 0
+            val (insertOnce, merge) = partitionStaffRequestPush(rows)
+            if (insertOnce.isNotEmpty()) {
+                api.upsert(
+                    "staff_requests",
+                    syncJson.encodeToString(insertOnce.map { it.toStaffRequestPush() }),
+                    "local_id", ignoreDuplicates = true
+                )
+            }
+            if (merge.isNotEmpty()) {
+                api.upsert(
+                    "staff_requests",
+                    syncJson.encodeToString(merge.map { it.toStaffRequestPush() }),
+                    "local_id", ignoreDuplicates = false
+                )
+            }
+            staffRequestDao.markSynced(rows.map { it.id })
+            rows.size
         }
 
         // credit — after customers, so every referenced customer has a cloud bigint id
@@ -431,7 +464,31 @@ class PosSyncEngine(
         n += pullPurchaseOrderLines(api)
         n += pullNotifications(api, bid)
         n += pullAudit(api, bid)
+        n += pullStaffRequests(api, bid)
         return n
+    }
+
+    /**
+     * staff_requests → the local approval channel, bridged by local_id. Last-write-wins on
+     * updated_at, per-table cursor "staff_requests" — the same shape as pullExpenses. The
+     * DTO->entity merge PRESERVES the device-local `applied` flag on the cashier side (a
+     * cashier can't UPDATE the cloud row, so a cloud `false` must not clobber a local apply).
+     */
+    private suspend fun pullStaffRequests(api: SupabaseRest, bid: String): Int {
+        val rows = syncJson.decodeFromString<List<StaffRequestDto>>(
+            api.selectSince("staff_requests", config.cursor("staff_requests"), PAGE)
+        )
+        if (rows.isEmpty()) return 0
+        var applied = 0
+        for (dto in rows) {
+            val local = staffRequestDao.getById(dto.bridgeId())
+            if (local == null || IsoTime.toMillis(dto.updatedAt) > local.updatedAt) {
+                staffRequestDao.upsert(dto.toStaffRequest(bid, local))
+                applied++
+            }
+        }
+        config.setCursor("staff_requests", rows.maxOf { it.cursorStamp() })
+        return applied
     }
 
     /**

@@ -37,6 +37,7 @@ class PosRepository(private val db: PosDatabase) {
     private val mobileMoneyDao = db.mobileMoneyDao()
     private val notificationDao = db.notificationDao()
     private val auditDao = db.auditDao()
+    private val staffRequestDao = db.staffRequestDao()
 
     /**
      * Fire-and-forget hook the DI container points at [com.portionspot.pos.sync.SyncManager.requestSync],
@@ -167,6 +168,7 @@ class PosRepository(private val db: PosDatabase) {
             refundDao.wipePayments(bid)
             mobileMoneyDao.wipe(bid)
             notificationDao.wipe(bid)
+            staffRequestDao.wipe(bid)
             itemDao.wipe(bid)
             customerDao.wipe(bid)
         }
@@ -2390,6 +2392,118 @@ class PosRepository(private val db: PosDatabase) {
             fired += n.copy(pushedAt = stamp)
         }
         return fired
+    }
+
+    // ---- admin⇄cashier approval channel (Phase 3, staff_requests) --------
+
+    /** Admin-side queue: pending requests awaiting a decision (oldest first). */
+    fun pendingStaffRequestsFlow(businessId: String): Flow<List<StaffRequest>> =
+        staffRequestDao.observePending(businessId)
+
+    /** Admin Alerts tab badge input: how many requests are still pending. */
+    fun pendingStaffRequestCountFlow(businessId: String): Flow<Int> =
+        staffRequestDao.observePendingCount(businessId)
+
+    /** Cashier-side status surface: this cashier's own recent requests, newest first. */
+    fun myStaffRequestsFlow(businessId: String, requestedBy: String): Flow<List<StaffRequest>> =
+        staffRequestDao.observeMine(businessId, requestedBy)
+
+    /**
+     * A cashier RAISES an approval request (§3). Inserts a pending row (pendingSync=true so
+     * it goes UP insert-once) and mints an admin-facing feed notification so the owner's
+     * phone buzzes. The notification is stamped `pushedAt` here so the ORIGINATING (cashier)
+     * phone does not buzz itself for its own request; the audience="admin" match means the
+     * admin phone fires it once via [fireUnpushedHeadsUps] after the pull brings it down.
+     * Returns the created request so the caller can track its status.
+     */
+    suspend fun submitStaffRequest(
+        type: String,
+        targetType: String?,
+        targetId: String?,
+        targetName: String?,
+        amount: Double?,
+        note: String?,
+        byId: String?,
+        byName: String?,
+    ): StaffRequest {
+        val biz = businessDao.getOnce() ?: throw IllegalStateException("No business")
+        val stamp = now()
+        val req = StaffRequest(
+            businessId = biz.id, type = type, targetType = targetType, targetId = targetId,
+            targetName = targetName, amount = amount, note = note?.takeIf { it.isNotBlank() },
+            requestedBy = byId, requestedByName = byName, status = "pending",
+            createdAt = stamp, updatedAt = stamp, pendingSync = true
+        )
+        staffRequestDao.upsert(req)
+        val amountLabel = amount?.let { " ${fmtMoney(it)}" } ?: ""
+        val n = AppNotification(
+            businessId = biz.id, category = "requests", severity = "warn",
+            title = "Approval requested",
+            body = "${byName ?: "A cashier"} needs approval for a $type$amountLabel" +
+                (targetName?.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""),
+            dedupeKey = "reqpending:${req.id}", audience = "admin",
+            refType = "staff_request", refId = req.id,
+            eventAt = stamp, createdAt = stamp, pushedAt = stamp,   // don't buzz the requester's own phone
+            updatedAt = stamp, pendingSync = true
+        )
+        upsertNotificationByKey(n)
+        nudgeSync("staff-request-submitted")
+        return req
+    }
+
+    /**
+     * An admin DECIDES a request (§3). Sets status/decidedBy/decidedAt (pendingSync=true so
+     * it goes UP merge-upsert — only admin devices write decided rows and they pass the
+     * cloud UPDATE policy). It then:
+     *   • TOMBSTONES the original "reqpending:<id>" admin notification — the action is now
+     *     resolved, so it must clear off EVERY admin phone (tombstones sync), not linger as
+     *     a stale "needs approval" item. A denied request is likewise done with.
+     *   • Mints a decision notification aimed at the CASHIER (audience="cashier") so the
+     *     requesting phone buzzes with the outcome; `pushedAt` is stamped so THIS admin
+     *     phone doesn't buzz itself for a cashier-facing alert.
+     */
+    suspend fun decideStaffRequest(id: String, approve: Boolean, byId: String?, byName: String?): StaffRequest? {
+        val req = staffRequestDao.getById(id) ?: return null
+        if (req.status != "pending") return req   // already decided — idempotent no-op
+        val stamp = now()
+        val decided = req.copy(
+            status = if (approve) "approved" else "denied",
+            decidedBy = byId, decidedByName = byName, decidedAt = stamp,
+            updatedAt = stamp, pendingSync = true
+        )
+        staffRequestDao.upsert(decided)
+        // Resolve the pending-approval alert on every admin phone (tombstones sync).
+        notificationDao.getByKey(req.businessId, "reqpending:$id")?.let {
+            notificationDao.tombstone(listOf(it.id), stamp)
+        }
+        val amountLabel = req.amount?.let { " ${fmtMoney(it)}" } ?: ""
+        val n = AppNotification(
+            businessId = req.businessId, category = "requests",
+            severity = if (approve) "info" else "warn",
+            title = if (approve) "Request approved" else "Request denied",
+            body = "Your ${req.type}$amountLabel request was " +
+                (if (approve) "approved" else "denied") +
+                (byName?.let { " by $it" } ?: ""),
+            dedupeKey = "reqdecided:$id", audience = "cashier",
+            refType = "staff_request", refId = id,
+            eventAt = stamp, createdAt = stamp, pushedAt = stamp,   // don't buzz the deciding admin's own phone
+            updatedAt = stamp, pendingSync = true
+        )
+        upsertNotificationByKey(n)
+        nudgeSync("staff-request-decided")
+        return decided
+    }
+
+    /**
+     * The cashier CONSUMED an approved request (applied the discount to the still-open
+     * sale). This is DEVICE-LOCAL state on the cashier side: RLS blocks the cashier
+     * updating a decided cloud row, so we set `applied` WITHOUT pendingSync — never letting
+     * a cashier device dirty a decided row for push (it would fail RLS every cycle). The
+     * cloud `applied` mirror stays false unless an admin device writes it. See
+     * [StaffRequest.applied] and [StaffRequestDao.markAppliedLocal].
+     */
+    suspend fun markRequestApplied(id: String) {
+        staffRequestDao.markAppliedLocal(id)
     }
 
     // ---- admin: audit log (Phase 7, §8) ----------------------------------
