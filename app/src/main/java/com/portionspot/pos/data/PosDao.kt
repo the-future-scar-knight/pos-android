@@ -126,6 +126,16 @@ interface SaleDao {
     )
     fun observeSalesForCustomer(customerId: String): Flow<List<SaleEntity>>
 
+    /** Completed sales that carried a whole-sale discount, newest first — the admin's
+     *  "Discounts given" review list (§Job 2). Capped so a busy till doesn't stream its
+     *  whole history. Line-level discounts fold into [SaleEntity.discountTotal] on the
+     *  same row, so this is the single source for "what did we knock off, and who by". */
+    @Query(
+        "SELECT * FROM sales WHERE businessId = :businessId AND deleted = 0 " +
+            "AND status = 'completed' AND discountTotal > 0 ORDER BY soldAt DESC LIMIT :limit"
+    )
+    fun observeDiscountedSales(businessId: String, limit: Int = 200): Flow<List<SaleEntity>>
+
     /** (id, receiptNo) for every live sale — cheap lookup to label ledger rows with the
      *  originating transaction's reference. */
     @Query("SELECT id, receiptNo FROM sales WHERE businessId = :businessId AND deleted = 0")

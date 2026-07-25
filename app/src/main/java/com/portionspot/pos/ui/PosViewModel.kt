@@ -175,21 +175,9 @@ class PosViewModel(
         viewModelScope.launch { authManager.refreshCurrentPermissions() }
     }
 
-    /**
-     * Does a [discount] (currency units) on goods worth [subtotal] need manager
-     * approval before it can be applied? True only for a cashier whose discount
-     * exceeds the shop's [ShopPrefs.discountThresholdPct]. Admins are never gated,
-     * and a threshold of 0 disables the gate. See [verifyAdminPin].
-     */
-    fun discountNeedsApproval(discount: Double, subtotal: Double): Boolean {
-        if (currentIsAdmin || discount <= 0.0 || subtotal <= 0.0) return false
-        val threshold = _shopPrefs.value.discountThresholdPct
-        if (threshold <= 0.0) return false
-        return (discount / subtotal) * 100.0 > threshold
-    }
-
-    /** Verify a manager/admin PIN to authorise an over-threshold discount. */
-    suspend fun verifyAdminPin(pin: String): Boolean = authManager.verifyAdminPin(pin)
+    // Discounts are RECORDED, not approved (§Job 2): a cashier who holds the give_discounts
+    // capability applies a discount directly and the admin reviews it after the fact in the
+    // console's "Discounts given" list — there is no live per-discount PIN interruption.
 
     val business: StateFlow<Business?> =
         repo.businessFlow.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
@@ -1083,27 +1071,46 @@ class PosViewModel(
         address: String? = null,
         note: String? = null,
         wholesale: Boolean = false,
-        creditLimit: Double? = null
+        creditLimit: Double? = null,
+        onCreditLimitQueued: () -> Unit = {}
     ) {
         val bid = businessId.value ?: return
         if (name.isBlank()) return
+        // A cashier can create a customer, but a credit limit they set needs admin approval:
+        // the customer is created with NO limit and a request is raised for it (§Job 1).
+        val gateLimit = creditLimit != null && !currentIsAdmin
+        val customer = Customer(
+            businessId = bid,
+            name = name.trim(),
+            phone = phone?.trim()?.ifBlank { null },
+            email = email?.trim()?.ifBlank { null },
+            address = address?.trim()?.ifBlank { null },
+            note = note?.trim()?.ifBlank { null },
+            wholesale = wholesale,
+            creditLimit = if (gateLimit) null else creditLimit
+        )
         viewModelScope.launch {
-            repo.saveCustomer(
-                Customer(
-                    businessId = bid,
-                    name = name.trim(),
-                    phone = phone?.trim()?.ifBlank { null },
-                    email = email?.trim()?.ifBlank { null },
-                    address = address?.trim()?.ifBlank { null },
-                    note = note?.trim()?.ifBlank { null },
-                    wholesale = wholesale,
-                    creditLimit = creditLimit
+            repo.saveCustomer(customer)
+            nudgeSync("addCustomer")
+            if (gateLimit) {
+                submitStaffRequest(
+                    type = "credit_limit", amount = creditLimit,
+                    targetType = "customer", targetId = customer.id, targetName = customer.name
                 )
-            )
+                onCreditLimitQueued()
+            }
         }
     }
 
-    /** Save edits to an existing customer's details (keeps the same id; re-flags for sync). */
+    /**
+     * Save edits to an existing customer's details (keeps the same id; re-flags for sync).
+     *
+     * Credit-limit rule (§Job 1): an ADMIN sets the limit directly. A NON-ADMIN cannot —
+     * ANY change to the credit-limit figure (raise OR lower) is NOT applied locally; instead
+     * it files a `credit_limit` approval request for the admin and the customer's real limit
+     * is left untouched until approved. Every OTHER field still saves immediately.
+     * [onCreditLimitQueued] fires when a request was raised so the UI can say so.
+     */
     fun updateCustomer(
         customer: Customer,
         name: String,
@@ -1112,9 +1119,14 @@ class PosViewModel(
         address: String?,
         note: String?,
         wholesale: Boolean,
-        creditLimit: Double?
+        creditLimit: Double?,
+        onCreditLimitQueued: () -> Unit = {}
     ) {
         if (name.isBlank()) return
+        // A cashier changing the figure ⇒ route it through approval; keep the old limit for now.
+        val limitChanged = creditLimit != customer.creditLimit
+        val gateLimit = limitChanged && !currentIsAdmin
+        val effLimit = if (gateLimit) customer.creditLimit else creditLimit
         viewModelScope.launch {
             repo.saveCustomer(
                 customer.copy(
@@ -1124,12 +1136,19 @@ class PosViewModel(
                     address = address?.trim()?.ifBlank { null },
                     note = note?.trim()?.ifBlank { null },
                     wholesale = wholesale,
-                    creditLimit = creditLimit,
+                    creditLimit = effLimit,
                     updatedAt = System.currentTimeMillis(),
                     pendingSync = true
                 )
             )
             nudgeSync("updateCustomer")
+            if (gateLimit) {
+                submitStaffRequest(
+                    type = "credit_limit", amount = creditLimit,
+                    targetType = "customer", targetId = customer.id, targetName = customer.name
+                )
+                onCreditLimitQueued()
+            }
         }
     }
 
@@ -1417,15 +1436,23 @@ class PosViewModel(
                 byId = currentCashierId, byName = currentCashierName
             )
             onCreated(req.id)
+            // Reach the admin now, then poll fast until the decision rides back.
             sync.requestPullNow("request-submitted")
+            sync.goHot()
         }
     }
 
-    /** Admin APPROVES/DENIES a pending request, then pulls so the cashier phone sees it. */
-    fun decideStaffRequest(id: String, approve: Boolean) {
+    /**
+     * Admin APPROVES/DENIES a pending request, then pulls so the cashier phone sees it.
+     * [approvedAmount] (approve only) lets the admin confirm a DIFFERENT figure than was
+     * requested — e.g. grant a smaller credit limit than the cashier asked for. On approval
+     * of a `credit_limit` request the repository executes the change on this device.
+     */
+    fun decideStaffRequest(id: String, approve: Boolean, approvedAmount: Double? = null) {
         viewModelScope.launch {
-            repo.decideStaffRequest(id, approve, currentCashierId, currentCashierName)
+            repo.decideStaffRequest(id, approve, currentCashierId, currentCashierName, approvedAmount)
             sync.requestPullNow("request-decided")
+            sync.goHot()
         }
     }
 
@@ -1438,6 +1465,14 @@ class PosViewModel(
     val auditLog: StateFlow<List<AuditEntry>> =
         businessId.filterNotNull()
             .flatMapLatest { repo.auditFlow(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Completed sales that carried a discount, newest first — the admin's "Discounts given"
+     *  review surface (§Job 2). Discounts are recorded here, not approved, so the admin can
+     *  see who discounted what without being interrupted at the till. */
+    val discountsGiven: StateFlow<List<SaleEntity>> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.discountedSalesFlow(it) }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     // End-of-day / shift summary — the selected day (start-of-day millis).

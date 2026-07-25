@@ -81,6 +81,10 @@ class PosRepository(private val db: PosDatabase) {
     fun salesForCustomerFlow(customerId: String): Flow<List<SaleEntity>> =
         saleDao.observeSalesForCustomer(customerId)
 
+    /** Completed sales that carried a discount, newest first — admin "Discounts given". */
+    fun discountedSalesFlow(businessId: String): Flow<List<SaleEntity>> =
+        saleDao.observeDiscountedSales(businessId)
+
     fun takingsSinceFlow(businessId: String, since: Long): Flow<Double> =
         saleDao.observeTakingsSince(businessId, since)
 
@@ -2461,14 +2465,38 @@ class PosRepository(private val db: PosDatabase) {
      *   • Mints a decision notification aimed at the CASHIER (audience="cashier") so the
      *     requesting phone buzzes with the outcome; `pushedAt` is stamped so THIS admin
      *     phone doesn't buzz itself for a cashier-facing alert.
+     *
+     * [approvedAmount] lets the admin OVERRIDE the requested figure before confirming (they
+     * set/confirm the final number). Null ⇒ approve the amount as requested.
+     *
+     * ★ EXECUTE-THE-ANSWER: for an APPROVED `credit_limit` request this admin device applies
+     * the approved amount to the customer via the normal [saveCustomer] path — so the change
+     * is marked pendingSync and rides the ordinary customer sync out to every device — then
+     * records [StaffRequest.applied]=true. This is IDEMPOTENT: the pending-status guard above
+     * plus the `applied` flag stop any double-application if the decided row is re-pulled.
      */
-    suspend fun decideStaffRequest(id: String, approve: Boolean, byId: String?, byName: String?): StaffRequest? {
+    suspend fun decideStaffRequest(
+        id: String, approve: Boolean, byId: String?, byName: String?, approvedAmount: Double? = null
+    ): StaffRequest? {
         val req = staffRequestDao.getById(id) ?: return null
         if (req.status != "pending") return req   // already decided — idempotent no-op
         val stamp = now()
+        val effAmount = if (approve) (approvedAmount ?: req.amount) else req.amount
+        // Apply the approved answer on THIS device before flipping status.
+        var applied = false
+        if (approve && !req.applied && req.type == "credit_limit" &&
+            req.targetType == "customer" && req.targetId != null
+        ) {
+            customerById(req.targetId)?.let { cust ->
+                saveCustomer(cust.copy(creditLimit = effAmount))
+                applied = true
+            }
+        }
         val decided = req.copy(
             status = if (approve) "approved" else "denied",
+            amount = effAmount,
             decidedBy = byId, decidedByName = byName, decidedAt = stamp,
+            applied = applied,
             updatedAt = stamp, pendingSync = true
         )
         staffRequestDao.upsert(decided)

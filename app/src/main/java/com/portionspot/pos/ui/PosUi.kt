@@ -145,6 +145,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -216,6 +217,7 @@ import com.portionspot.pos.data.RefundPayment
 import com.portionspot.pos.data.RefundWithLines
 import com.portionspot.pos.data.computeRefundTotal
 import com.portionspot.pos.data.SaleEntity
+import com.portionspot.pos.data.StaffRequest
 import com.portionspot.pos.data.SaleLine
 import com.portionspot.pos.data.SalePayment
 import com.portionspot.pos.data.AuditEntry
@@ -1083,7 +1085,10 @@ private val ALERT_CATS = listOf(
 private fun AdminAlertsScreen(vm: PosViewModel, currency: String) {
     val t = LocalPosTokens.current
     val all by vm.notifications.collectAsState()
+    val requests by vm.pendingRequests.collectAsState()
+    val customers by vm.customers.collectAsState()
     var cat by remember { mutableStateOf("all") }
+    var approveFor by remember { mutableStateOf<StaffRequest?>(null) }
 
     val shown = if (cat == "all") all else all.filter { it.category == cat }
 
@@ -1098,26 +1103,184 @@ private fun AdminAlertsScreen(vm: PosViewModel, currency: String) {
             }
         }
         Spacer(Modifier.height(10.dp))
-        Row(
-            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            ALERT_CATS.forEach { (id, label) ->
-                FilterChip(selected = cat == id, onClick = { cat = id }, label = { Text(label) })
+
+        LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            // ---- Requests (§Job 1): cashier approval requests awaiting a decision ----
+            if (requests.isNotEmpty()) {
+                item {
+                    Text(
+                        "Requests (${requests.size})",
+                        color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 14.sp,
+                        modifier = Modifier.padding(bottom = 2.dp)
+                    )
+                }
+                items(requests, key = { "req_${it.id}" }) { req ->
+                    val currentLimit = customers.firstOrNull { it.customer.id == req.targetId }?.customer?.creditLimit
+                    RequestCard(
+                        req = req,
+                        currentLimit = currentLimit,
+                        currency = currency,
+                        onApprove = { approveFor = req },
+                        onDeny = { vm.decideStaffRequest(req.id, approve = false) }
+                    )
+                }
+                item { Spacer(Modifier.height(6.dp)) }
             }
-        }
-        Spacer(Modifier.height(12.dp))
-        if (shown.isEmpty()) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("No alerts. Everything looks healthy.", color = t.inkTertiary)
+
+            // ---- Category filter + alert feed ----
+            item {
+                Row(
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    ALERT_CATS.forEach { (id, label) ->
+                        FilterChip(selected = cat == id, onClick = { cat = id }, label = { Text(label) })
+                    }
+                }
             }
-        } else {
-            LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            item { Spacer(Modifier.height(6.dp)) }
+            if (shown.isEmpty() && requests.isEmpty()) {
+                item {
+                    Box(Modifier.fillMaxWidth().padding(top = 40.dp), contentAlignment = Alignment.Center) {
+                        Text("No alerts. Everything looks healthy.", color = t.inkTertiary)
+                    }
+                }
+            } else {
                 items(shown, key = { it.id }) { n ->
                     NotificationCard(n, onClick = { if (n.readAt == null) vm.markNotificationRead(n.id) })
                 }
             }
         }
+    }
+
+    approveFor?.let { req ->
+        val currentLimit = customers.firstOrNull { it.customer.id == req.targetId }?.customer?.creditLimit
+        ApproveRequestDialog(
+            req = req,
+            currentLimit = currentLimit,
+            currency = currency,
+            onConfirm = { amount ->
+                vm.decideStaffRequest(req.id, approve = true, approvedAmount = amount)
+                approveFor = null
+            },
+            onDismiss = { approveFor = null }
+        )
+    }
+}
+
+/**
+ * One pending staff request in the admin Alerts "Requests" section (§Job 1). For the
+ * credit-limit type it shows requester, customer, the current limit → requested figure,
+ * an optional note and age, with Approve (which opens an editable-amount confirm) and Deny.
+ */
+@Composable
+private fun RequestCard(
+    req: StaffRequest,
+    currentLimit: Double?,
+    currency: String,
+    onApprove: () -> Unit,
+    onDeny: () -> Unit
+) {
+    val t = LocalPosTokens.current
+    Column(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+            .background(t.surface2).border(1.dp, t.warning.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
+            .padding(14.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Filled.Lock, contentDescription = null, tint = t.warning, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    if (req.type == "credit_limit") "Credit limit" else req.type,
+                    color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 14.sp
+                )
+                Text(
+                    (req.requestedByName ?: "A cashier") +
+                        (req.targetName?.let { " · $it" } ?: ""),
+                    color = t.inkSecondary, fontSize = 12.sp
+                )
+            }
+            Text(relativeAgo(req.createdAt), color = t.inkTertiary, fontSize = 10.sp)
+        }
+        Spacer(Modifier.height(8.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "Current ${currentLimit?.let { money(it, currency) } ?: "none"}",
+                color = t.inkTertiary, fontSize = 12.sp
+            )
+            Spacer(Modifier.width(6.dp))
+            Icon(Icons.Filled.ChevronRight, contentDescription = "to", tint = t.inkTertiary, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(6.dp))
+            Text(
+                req.amount?.let { money(it, currency) } ?: "—",
+                color = t.brand.s600, fontWeight = FontWeight.Black, fontSize = 15.sp
+            )
+        }
+        req.note?.takeIf { it.isNotBlank() }?.let {
+            Spacer(Modifier.height(4.dp))
+            Text("\"$it\"", color = t.inkTertiary, fontSize = 11.sp, fontStyle = FontStyle.Italic)
+        }
+        Spacer(Modifier.height(10.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = onApprove, modifier = Modifier.weight(1f)) {
+                Icon(Icons.Filled.Check, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(4.dp)); Text("Approve")
+            }
+            OutlinedButton(
+                onClick = onDeny,
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = t.danger)
+            ) {
+                Icon(Icons.Filled.Close, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(4.dp)); Text("Deny")
+            }
+        }
+    }
+}
+
+/**
+ * Approve-a-request confirm (§Job 1): the admin sets/confirms the FINAL figure before it is
+ * applied — pre-filled with the requested amount but fully editable, so they can grant a
+ * different limit than was asked. Confirming executes the change on this device.
+ */
+@Composable
+private fun ApproveRequestDialog(
+    req: StaffRequest,
+    currentLimit: Double?,
+    currency: String,
+    onConfirm: (Double?) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val t = LocalPosTokens.current
+    var amount by remember {
+        mutableStateOf(req.amount?.let { if (it % 1.0 == 0.0) it.toLong().toString() else it.toString() } ?: "")
+    }
+    PosContainedForm(
+        title = "Approve credit limit",
+        onDismiss = onDismiss,
+        confirmLabel = "Approve",
+        confirmEnabled = true,
+        onConfirm = { onConfirm(amount.trim().toDoubleOrNull()) }
+    ) {
+        Text(
+            (req.requestedByName ?: "A cashier") + " asked to set " +
+                (req.targetName ?: "this customer") + "'s credit limit " +
+                "(currently ${currentLimit?.let { money(it, currency) } ?: "none"}).",
+            style = MaterialTheme.typography.bodySmall, color = t.inkSecondary
+        )
+        PosFormCard {
+            PosField(
+                value = amount,
+                onValueChange = { amount = it },
+                label = "Approved credit limit ($)",
+                keyboardType = KeyboardType.Decimal,
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
+        Text(
+            "Leave blank to approve no limit. You can change the figure before approving.",
+            fontSize = 11.sp, color = t.inkTertiary
+        )
     }
 }
 
@@ -1190,6 +1353,7 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
     val aging by vm.debtAging.collectAsState()
     val refunds by vm.refunds.collectAsState()
     val audit by vm.auditLog.collectAsState()
+    val discountsGiven by vm.discountsGiven.collectAsState()
     // Accounting spine (B3): cash position + expense approvals + recurring schedules.
     val cashOnHand by vm.cashOnHand.collectAsState()
     val payables by vm.payablesTotal.collectAsState()
@@ -1210,6 +1374,7 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
     var dedupeConfirm by remember { mutableStateOf(false) }
     var resetPwFor by remember { mutableStateOf<com.portionspot.pos.auth.StaffRow?>(null) }
     var permsFor by remember { mutableStateOf<com.portionspot.pos.auth.StaffRow?>(null) }
+    var removeStaffFor by remember { mutableStateOf<com.portionspot.pos.auth.StaffRow?>(null) }
     val staff by vm.staff.collectAsState()
     val syncConnection by vm.connection.collectAsState()
     LaunchedEffect(syncConnection) { if (syncConnection != null) vm.refreshStaff() }
@@ -1546,6 +1711,43 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
                 }
             }
         }
+        // ---- Discounts given (§Job 2: recorded, not approved — the admin reviews here) ----
+        item { AdminSectionHeader("Discounts given") }
+        if (discountsGiven.isEmpty()) {
+            item { Text("No discounts given yet.", color = t.inkTertiary, fontSize = 12.sp) }
+        } else {
+            item {
+                val total = discountsGiven.sumOf { it.discountTotal }
+                Text(
+                    "${discountsGiven.size} discounted ${if (discountsGiven.size == 1) "sale" else "sales"} · ${money(total, currency)} off in total",
+                    color = t.inkTertiary, fontSize = 12.sp
+                )
+            }
+            items(discountsGiven, key = { "disc_${it.id}" }) { s ->
+                Row(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                        .background(t.surface1).border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp)).padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            (s.createdByName ?: "Unattributed") +
+                                (s.customerName?.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""),
+                            color = t.inkPrimary, fontWeight = FontWeight.SemiBold, fontSize = 13.sp
+                        )
+                        Text(
+                            "#${s.receiptNo ?: s.id.takeLast(6).uppercase()} · ${relativeAgo(s.soldAt)}",
+                            color = t.inkTertiary, fontSize = 11.sp
+                        )
+                    }
+                    Column(horizontalAlignment = Alignment.End) {
+                        Text("-${money(s.discountTotal, currency)}", color = t.danger, fontWeight = FontWeight.Black, fontSize = 14.sp)
+                        Text("of ${money(s.subtotal, currency)}", color = t.inkTertiary, fontSize = 10.sp)
+                    }
+                }
+            }
+        }
+
         // ---- Cashiers (staff accounts) ----
         item { AdminSectionHeader("Cashiers") }
         if (syncConnection == null) {
@@ -1571,9 +1773,18 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
                             }
                             if (canManageStaff) {
                                 TextButton(onClick = { resetPwFor = s }) { Text("Reset PW") }
-                                // Admins aren't toggled here; only cashiers are (de)activated.
+                                // Admins aren't removed here; only cashiers are (de)activated.
+                                // Remove = soft-deactivate (history/attribution kept); a
+                                // deactivated account can't log in and drops off the roster.
                                 if (s.role != "admin") {
-                                    Switch(checked = s.active, onCheckedChange = { on -> vm.setCashierActive(s.id, on) })
+                                    if (s.active) {
+                                        TextButton(
+                                            onClick = { removeStaffFor = s },
+                                            colors = ButtonDefaults.textButtonColors(contentColor = t.danger)
+                                        ) { Text("Remove") }
+                                    } else {
+                                        TextButton(onClick = { vm.setCashierActive(s.id, true) }) { Text("Reactivate") }
+                                    }
                                 }
                             }
                         }
@@ -1666,6 +1877,28 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
                 }
                 permsFor = null
             }
+        )
+    }
+    removeStaffFor?.let { s ->
+        val ctx = LocalContext.current
+        ConfirmDialog(
+            title = "Remove ${s.displayName.ifBlank { "this cashier" }}?",
+            message = "They can no longer log in and won't appear in the lock-screen roster. " +
+                "Their past sales and attribution stay intact, and you can reactivate them later.",
+            confirmLabel = "Remove",
+            onConfirm = {
+                val id = s.id
+                removeStaffFor = null
+                vm.setCashierActive(id, false) { res ->
+                    when (res) {
+                        is com.portionspot.pos.auth.StaffResult.Ok ->
+                            Toast.makeText(ctx, "Staff member removed", Toast.LENGTH_SHORT).show()
+                        is com.portionspot.pos.auth.StaffResult.Err ->
+                            Toast.makeText(ctx, res.message, Toast.LENGTH_SHORT).show()
+                    }
+                }
+            },
+            onDismiss = { removeStaffFor = null }
         )
     }
     if (dedupeConfirm) {
@@ -2525,10 +2758,6 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
     var showPayment by remember { mutableStateOf(false) }
     var quoteMode by remember { mutableStateOf(false) }
     var showQuote by remember { mutableStateOf(false) }
-    // Discount-approval gate (§1.2): a cashier's over-threshold discount is parked here
-    // until a manager PIN approves it, then the sale/quote goes through.
-    var pendingSale by remember { mutableStateOf<PendingSale?>(null) }
-    var pendingQuote by remember { mutableStateOf<Pair<Double, Customer?>?>(null) }
     var priceModalItem by remember { mutableStateOf<Item?>(null) }
     var measuredItem by remember { mutableStateOf<Item?>(null) }
     var scanning by remember { mutableStateOf(false) }
@@ -2733,11 +2962,10 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
             onDismiss = { showPayment = false }
         ) { payments, discount, customer, onCredit, changeGiven, tillDiscrepancy ->
             showPayment = false
-            if (vm.discountNeedsApproval(discount, cart.sumOf { it.lineSubtotal })) {
-                pendingSale = PendingSale(payments, discount, customer, onCredit, changeGiven, tillDiscrepancy)
-            } else {
-                vm.checkout(payments, discount, customer, onCredit, changeGiven, tillDiscrepancy)
-            }
+            // Discounts are RECORDED, never approved (§Job 2): the give_discounts permission
+            // gate already decided whether a discount was allowed at all; the admin reviews
+            // discounts given after the fact in the console rather than being interrupted here.
+            vm.checkout(payments, discount, customer, onCredit, changeGiven, tillDiscrepancy)
         }
     }
     if (showQuote) {
@@ -2752,32 +2980,9 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
             onDismiss = { showQuote = false }
         ) { discount, customer ->
             showQuote = false
-            if (vm.discountNeedsApproval(discount, cart.sumOf { it.lineSubtotal })) {
-                pendingQuote = discount to customer
-            } else {
-                vm.generateQuote(discount, customer)
-                quoteMode = false
-            }
+            vm.generateQuote(discount, customer)
+            quoteMode = false
         }
-    }
-    pendingSale?.let { pending ->
-        ApprovalPinDialog(
-            reason = "A discount of ${money(pending.discount, currency)} needs manager approval.",
-            onVerify = { pin -> vm.verifyAdminPin(pin) },
-            onApproved = {
-                vm.checkout(pending.payments, pending.discount, pending.customer, pending.onCredit, pending.changeGiven, pending.tillDiscrepancy)
-                pendingSale = null
-            },
-            onDismiss = { pendingSale = null }
-        )
-    }
-    pendingQuote?.let { (discount, cust) ->
-        ApprovalPinDialog(
-            reason = "A discount of ${money(discount, currency)} needs manager approval.",
-            onVerify = { pin -> vm.verifyAdminPin(pin) },
-            onApproved = { vm.generateQuote(discount, cust); quoteMode = false; pendingQuote = null },
-            onDismiss = { pendingQuote = null }
-        )
     }
     lastReceipt?.let { receipt ->
         ReceiptDialog(
@@ -3397,62 +3602,6 @@ private fun BoxScope.FloatingCart(
                 }
             }
         }
-    }
-}
-
-/** A checkout parked pending manager approval of an over-threshold discount (§1.2). */
-private data class PendingSale(
-    val payments: List<Tender>,
-    val discount: Double,
-    val customer: Customer?,
-    val onCredit: Boolean,
-    val changeGiven: Double,
-    val tillDiscrepancy: Boolean
-)
-
-/**
- * Manager-approval PIN gate (§1.2 parity): a cashier applying a discount above the
- * shop threshold must have an admin authorise it with their PIN. Verified against any
- * admin account on the device via [onVerify]; [onApproved] fires only on a match.
- */
-@Composable
-private fun ApprovalPinDialog(
-    reason: String,
-    onVerify: suspend (String) -> Boolean,
-    onApproved: () -> Unit,
-    onDismiss: () -> Unit
-) {
-    val scope = rememberCoroutineScope()
-    var pin by remember { mutableStateOf("") }
-    var busy by remember { mutableStateOf(false) }
-    var error by remember { mutableStateOf<String?>(null) }
-    PosContainedForm(
-        title = "Manager approval",
-        onDismiss = { if (!busy) onDismiss() },
-        confirmLabel = "Approve",
-        confirmEnabled = pin.length >= 4 && !busy,
-        onConfirm = {
-            busy = true; error = null
-            scope.launch {
-                val ok = onVerify(pin)
-                busy = false
-                if (ok) onApproved() else { error = "Wrong PIN — ask an admin"; pin = "" }
-            }
-        }
-    ) {
-        val t = LocalPosTokens.current
-        Text(reason, style = MaterialTheme.typography.bodySmall, color = t.inkSecondary)
-        PosFormCard {
-            PosField(
-                value = pin,
-                onValueChange = { if (it.length <= 6 && it.all(Char::isDigit)) pin = it },
-                label = "Admin PIN",
-                keyboardType = KeyboardType.NumberPassword,
-                visualTransformation = PasswordVisualTransformation(),
-                modifier = Modifier.fillMaxWidth()
-            )
-        }
-        error?.let { Text(it, color = t.danger, fontSize = 12.sp) }
     }
 }
 
@@ -5961,6 +6110,7 @@ private fun StockHistoryDialog(vm: PosViewModel, item: Item, onDismiss: () -> Un
 @Composable
 private fun CustomersScreen(vm: PosViewModel, currency: String) {
     val t = LocalPosTokens.current
+    val ctx = LocalContext.current
     val customers by vm.customers.collectAsState()
     var showAdd by remember { mutableStateOf(false) }
     var selected by remember { mutableStateOf<Customer?>(null) }
@@ -6085,7 +6235,9 @@ private fun CustomersScreen(vm: PosViewModel, currency: String) {
             title = "New customer",
             onDismiss = { showAdd = false; prefill = null }
         ) { name, phone, email, address, note, wholesale, creditLimit ->
-            vm.addCustomer(name, phone, email, address, note, wholesale, creditLimit)
+            vm.addCustomer(name, phone, email, address, note, wholesale, creditLimit) {
+                Toast.makeText(ctx, "Credit limit sent to admin for approval", Toast.LENGTH_LONG).show()
+            }
             showAdd = false; prefill = null
         }
     }
@@ -6536,7 +6688,9 @@ private fun CustomerDetailDialog(
             confirmLabel = "Save changes",
             onDismiss = { showEdit = false }
         ) { name, phone, email, address, note, ws, creditLimit ->
-            vm.updateCustomer(customer, name, phone, email, address, note, ws, creditLimit)
+            vm.updateCustomer(customer, name, phone, email, address, note, ws, creditLimit) {
+                Toast.makeText(pdfCtx, "Credit limit change sent to admin for approval", Toast.LENGTH_LONG).show()
+            }
             wholesale = ws
             showEdit = false
         }
@@ -10011,16 +10165,13 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
             Spacer(Modifier.height(20.dp))
             SettingsSectionHeader("Discounts")
             Text(
-                "A cashier giving a whole-sale discount above this percentage needs an admin " +
-                    "PIN to approve it. Admins are never asked. Set 0 to never require approval.",
+                "Only staff with the 'Give discounts' permission can discount a sale. Discounts " +
+                    "aren't approved one-by-one — they're recorded on the sale and the admin " +
+                    "reviews them in Admin console → Discounts given.",
                 fontSize = 12.sp,
                 color = t.inkTertiary
             )
-            SettingsField("Approval threshold (%)", trimPct(prefs.discountThresholdPct)) {
-                it.toDoubleOrNull()?.coerceIn(0.0, 100.0)?.let { p ->
-                    vm.savePrefs(prefs.copy(discountThresholdPct = p))
-                }
-            }
+            Spacer(Modifier.height(12.dp))
 
             // Per-item discount ceiling: a hard cap the till enforces at the cart, so a
             // cashier can knock money off a single line but never past this amount.

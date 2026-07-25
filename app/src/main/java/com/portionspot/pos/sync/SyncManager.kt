@@ -58,6 +58,13 @@ class SyncManager(
     @Volatile
     private var lastAttemptAt: Long = 0L
 
+    /** Epoch-ms deadline until which the foreground loop polls at [HOT_POLL_MS] instead of
+     *  [POLL_MS]. Set by [goHot] while a staff-request round-trip is in flight so the
+     *  admin's decision reaches the cashier (and vice-versa) in seconds, not a poll cycle.
+     *  0 (or past) = normal cadence. */
+    @Volatile
+    private var hotUntil: Long = 0L
+
     init {
         // Flush the moment the device comes back online (offline→online) if anything is
         // queued. Seeded emit is the current state, so we only act on a real transition.
@@ -137,15 +144,39 @@ class SyncManager(
                 return
             }
             if (pollJob?.isActive == true) return
-            pollJob = scope.launch {
-                // Come back to the app → catch up immediately (coalesced), then settle
-                // into the steady cadence.
-                pollOnce("foreground")
-                while (true) {
-                    delay(POLL_MS)
-                    pollOnce("poll")
-                }
+            startPollLoop()
+        }
+    }
+
+    /** (Re)start the foreground poll loop. The per-iteration delay honours [hotUntil], so
+     *  entering hot mode ([goHot]) speeds the loop up mid-flight and it decays back to the
+     *  steady cadence once the window lapses. Always called under `synchronized(this)`. */
+    private fun startPollLoop() {
+        pollJob?.cancel()
+        pollJob = scope.launch {
+            // Come back to the app (or just went hot) → catch up immediately (coalesced),
+            // then settle into whichever cadence applies.
+            pollOnce("foreground")
+            while (true) {
+                val hot = System.currentTimeMillis() < hotUntil
+                delay(if (hot) HOT_POLL_MS else POLL_MS)
+                pollOnce(if (System.currentTimeMillis() < hotUntil) "hot-poll" else "poll")
             }
+        }
+    }
+
+    /**
+     * Enter "hot-poll" mode for [windowMs]: while a staff-request I just submitted (cashier)
+     * or decided (admin) is in flight, poll every [HOT_POLL_MS] instead of [POLL_MS] so the
+     * round-trip feels live. Cancels the current long sleep and restarts the loop so the
+     * faster cadence takes effect at once — but ONLY when foregrounded (a null [pollJob]
+     * means backgrounded; the window is still remembered and honoured when the loop resumes).
+     * Coalesced against [HOT_MIN_GAP_MS] in [pollOnce] so it can't double-fire.
+     */
+    fun goHot(windowMs: Long = HOT_WINDOW_MS) {
+        synchronized(this) {
+            hotUntil = System.currentTimeMillis() + windowMs
+            if (pollJob?.isActive == true) startPollLoop()
         }
     }
 
@@ -167,7 +198,10 @@ class SyncManager(
     private suspend fun pollOnce(reason: String) {
         if (!config.isConfigured()) return
         val now = System.currentTimeMillis()
-        if (now - lastAttemptAt < MIN_GAP_MS) return
+        // In a hot window the gate loosens to [HOT_MIN_GAP_MS] so the ~6s cadence isn't
+        // swallowed by the normal 20s coalescer, while still blocking a true double-fire.
+        val minGap = if (now < hotUntil) HOT_MIN_GAP_MS else MIN_GAP_MS
+        if (now - lastAttemptAt < minGap) return
         if (!ConnectivityObserver.currentlyOnline(appContext)) return
         lastAttemptAt = now
         val outcome = engine.sync()
@@ -252,5 +286,15 @@ class SyncManager(
         /** Minimum gap between any two automatic passes. Anything triggered inside this
          *  window is dropped, so push-on-change + poll + pull-on-open never stack. */
         const val MIN_GAP_MS = 20_000L
+
+        /** Hot-poll cadence (~6s) while a staff-request round-trip is in flight. */
+        const val HOT_POLL_MS = 6_000L
+
+        /** How long a single [goHot] call stays hot (~2.5 min) before decaying to [POLL_MS]. */
+        const val HOT_WINDOW_MS = 150_000L
+
+        /** Loosened coalescing gap during a hot window — small enough to let the ~6s cadence
+         *  through, large enough that two triggers in quick succession still collapse. */
+        const val HOT_MIN_GAP_MS = 4_000L
     }
 }
