@@ -26,7 +26,11 @@ class NotificationEngineTest {
         aging: List<DebtAgingRow> = emptyList(),
         pendingSync: Int = 0,
         lastSync: Long? = now
-    ) = NotifSnapshot(now, "USD", items, owed, pending, large, aging, pendingSync, lastSync, th)
+    ) = NotifSnapshot(
+        nowMs = now, currency = "USD", trackedItems = items, owedRefunds = owed,
+        pendingPayments = pending, largeSales = large, agingRows = aging,
+        pendingSyncCount = pendingSync, lastSyncAt = lastSync, thresholds = th
+    )
 
     private fun refund(total: Double, hoursAgo: Int) =
         Refund(businessId = "b", saleId = "s", refundTotal = total, status = "owed", createdAt = now - hoursAgo * HOUR)
@@ -71,6 +75,26 @@ class NotificationEngineTest {
     @Test fun large_sale_is_flagged() {
         val sale = SaleEntity(businessId = "b", total = 600.0, soldAt = now)
         assertNotNull(NotificationEngine.compute(snap(large = listOf(sale))).firstOrNull { it.dedupeKey == "largesale:${sale.id}" })
+    }
+
+    @Test fun audience_match_targets_the_right_role() {
+        // "admin" alerts buzz only the admin phone.
+        assertTrue(NotificationEngine.audienceMatches("admin", isAdmin = true))
+        assertTrue(!NotificationEngine.audienceMatches("admin", isAdmin = false))
+
+        // "cashier" alerts buzz only the non-admin (cashier) phones.
+        assertTrue(NotificationEngine.audienceMatches("cashier", isAdmin = false))
+        assertTrue(!NotificationEngine.audienceMatches("cashier", isAdmin = true))
+
+        // "all" reaches everyone.
+        assertTrue(NotificationEngine.audienceMatches("all", isAdmin = true))
+        assertTrue(NotificationEngine.audienceMatches("all", isAdmin = false))
+
+        // An unknown/legacy value is treated as admin-only (the historical default), so a
+        // cashier phone never buzzes for it.
+        assertTrue(NotificationEngine.audienceMatches("", isAdmin = true))
+        assertTrue(!NotificationEngine.audienceMatches("", isAdmin = false))
+        assertTrue(NotificationEngine.audienceMatches("owner", isAdmin = true))
     }
 
     @Test fun over_credit_limit_flagged_only_when_balance_exceeds_limit() {

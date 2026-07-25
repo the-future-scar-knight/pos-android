@@ -353,6 +353,16 @@ class AuthManager(
     fun accessTokenOrNull(): String? = currentAccessToken
 
     /**
+     * Is the CURRENT device operating as an admin? Drives notification-audience gating
+     * (which alerts raise a heads-up on THIS phone, and where they deep-link). Reads the
+     * active cached session's role directly from the vault so it works from a background
+     * pass with no live UI. Local (phone-only) mode has NO cloud session — the local
+     * owner is always the admin (see MainActivity's LOCAL mode) — so a null session reads
+     * as admin. Cheap enough to call per sync pass (a decrypt of the small vault blob).
+     */
+    fun isDeviceAdmin(): Boolean = vault.activeSession()?.role?.let { it == "admin" } ?: true
+
+    /**
      * Called before a sync pass. Refreshes the active account's access token when
      * it's within a minute of expiry. Offline: keep what we have (sync only runs
      * online anyway, and a failed pass just retries later — records stay queued).

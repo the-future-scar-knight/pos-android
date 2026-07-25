@@ -94,14 +94,23 @@ object Notifier {
         }
     }
 
-    /** Post a persisted admin notification (§8) and deep-link to the admin Alerts feed. */
-    fun notifyAdmin(context: Context, n: AppNotification) {
+    /**
+     * Post a persisted notification (§8) as a system heads-up. Deep-link is audience-aware:
+     * an "admin" alert opens the admin Alerts feed (OPEN_ADMIN_ALERTS), while a "cashier" /
+     * "all" alert just opens the app — the admin Alerts screen is admin-only (MainActivity
+     * routes isAdmin → AdminRoot), so deep-linking a cashier there would dead-end. The
+     * caller is responsible for the audience/role match ([NotificationEngine.audienceMatches]);
+     * this only chooses the target once it has decided to fire.
+     */
+    fun notifyAlert(context: Context, n: AppNotification) {
         ensureChannel(context)
         if (!NotificationManagerCompat.from(context).areNotificationsEnabled()) return
 
         val open = Intent(context, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-            putExtra(EXTRA_OPEN, OPEN_ADMIN_ALERTS)
+            // Only admin-audience alerts deep-link into the admin Alerts feed; cashier/all
+            // alerts open the app plainly (that screen isn't reachable for a cashier).
+            if (n.audience == "admin") putExtra(EXTRA_OPEN, OPEN_ADMIN_ALERTS)
         }
         val pi = PendingIntent.getActivity(
             context, n.dedupeKey.hashCode(), open,

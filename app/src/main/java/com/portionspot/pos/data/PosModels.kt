@@ -834,6 +834,11 @@ data class AppNotification(
     val title: String,
     val body: String,
     val dedupeKey: String,                // stable natural key: recompute updates this row
+    /** Who this alert is FOR: "admin" | "cashier" | "all". Drives BOTH which device
+     *  fires a system heads-up (a cashier phone must not buzz for an admin-only alert)
+     *  and where its deep-link lands. SYNCED so every phone agrees on the target; a
+     *  legacy/foreign row with no value reads as "admin" (the historical behaviour). */
+    val audience: String = "admin",
     val refType: String? = null,          // sale | refund | item | customer | mm_receipt | device
     val refId: String? = null,
     val eventAt: Long = now(),            // underlying event time (drives escalation age)
@@ -877,6 +882,63 @@ data class AuditEntry(
     /** Mirrors [createdAt] — the row is immutable; this only drives the pull cursor. */
     val updatedAt: Long = createdAt,
     /** Local-only: true => still waiting to go up. */
+    val pendingSync: Boolean = true
+)
+
+/**
+ * A remote approval request from a cashier to the admin (Phase 3, admin⇄cashier
+ * channel). A cashier who hits an admin-gated action (an over-threshold discount, a
+ * void, a price override…) can, instead of entering an admin PIN on the till, RAISE a
+ * request that lands in the admin's Alerts feed on the OTHER phone; the admin approves
+ * or denies it and the decision rides back.
+ *
+ * SYNCED via the cloud `staff_requests` table, whose RLS is the whole reason the sync is
+ * split into two modes (see PosSyncEngine.push):
+ *   • staff may INSERT + SELECT, ONLY an admin may UPDATE/DELETE.
+ *   • A cashier's freshly-created PENDING row therefore goes up INSERT-ONCE (ignore-
+ *     duplicates on local_id) — a merge upsert would trip the UPDATE policy and be
+ *     rejected every cycle.
+ *   • Only an admin ever writes a DECIDED row ([decidedAt] != null), so decided rows go
+ *     up merge-upsert (the admin passes the UPDATE policy). The engine keys off
+ *     status/[decidedAt] alone, so it never has to know the device's role.
+ *   • No remote cancel in v1: a cashier can't UPDATE a pushed row, so a stale pending
+ *     request is superseded by creating a NEW one and letting the admin deny the old.
+ *
+ * [applied] = the approved action was actually consumed by the requester (e.g. the
+ * cashier tapped "apply" and the discount went onto the still-open sale). It is a
+ * DEVICE-LOCAL nicety on the cashier side: the cashier can't UPDATE the cloud row, so a
+ * cashier-side apply is set WITHOUT [pendingSync] and never pushed (cloud `applied`
+ * stays false unless an admin device writes it). Mirroring it up is a nice-to-have, not
+ * a correctness field.
+ */
+@Entity(
+    tableName = "staff_requests",
+    indices = [Index("businessId"), Index("status"), Index("requestedBy")]
+)
+data class StaffRequest(
+    @PrimaryKey val id: String = newId(),
+    val localId: String = id,             // cloud upsert key (defaults to id, like Expense/Supplier)
+    val businessId: String,
+    val type: String,                     // discount | void | price_override | … (free-form v1)
+    val targetType: String? = null,       // sale | item | customer | … (what the request is about)
+    val targetId: String? = null,
+    val targetName: String? = null,       // snapshot for display (brief cart summary, item name…)
+    val amount: Double? = null,           // the discount / override amount, when the request carries one
+    val note: String? = null,
+    val requestedBy: String? = null,      // cashier auth uuid
+    val requestedByName: String? = null,  // display-name snapshot
+    val status: String = "pending",       // pending | approved | denied
+    val decidedBy: String? = null,        // admin auth uuid
+    val decidedByName: String? = null,
+    val decidedAt: Long? = null,          // when the admin decided (drives the push partition)
+    /** DEVICE-LOCAL on the cashier side: the approved action was consumed. Set without
+     *  [pendingSync] on a cashier device (RLS blocks the cashier updating a decided row);
+     *  an admin device may write it and push. */
+    val applied: Boolean = false,
+    val createdAt: Long = now(),
+    val updatedAt: Long = now(),
+    val deleted: Boolean = false,
+    /** Local-only: true => has unsynced local edits to push. */
     val pendingSync: Boolean = true
 )
 

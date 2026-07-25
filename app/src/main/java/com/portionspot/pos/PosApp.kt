@@ -39,7 +39,8 @@ class AppContainer(app: Application) {
         database.refundDao(), database.mobileMoneyDao(),
         database.expenseDao(), database.cashTxnDao(),
         database.supplierDao(), database.purchaseOrderDao(),
-        database.notificationDao(), database.auditDao(), syncConfig,
+        database.notificationDao(), database.auditDao(),
+        database.staffRequestDao(), syncConfig,
         accessToken = authManager::accessTokenOrNull,
         ensureFreshToken = { authManager.refreshIfNeeded() }
     )

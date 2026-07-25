@@ -1,7 +1,10 @@
 package com.portionspot.pos.sync
 
 import android.content.Context
+import com.portionspot.pos.PosApp
 import com.portionspot.pos.device.ConnectivityObserver
+import com.portionspot.pos.notify.AdminNotificationWorker
+import com.portionspot.pos.notify.Notifier
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -172,7 +175,29 @@ class SyncManager(
             _status.value = SyncStatus.Done(
                 outcome.pushed, outcome.pulled, System.currentTimeMillis(), outcome.pushErrors
             )
+            afterPull(outcome.pulled)
         }
+    }
+
+    /**
+     * After a foreground pass that PULLED rows, deliver cross-device heads-ups (BUG A) and
+     * recompute engine conditions off the freshly-synced data. A notification row that
+     * arrived here — most importantly an event alert like a cashier's expense submission,
+     * which the sweep never re-derives — otherwise sits silently in the feed and never
+     * buzzes. We fire directly here (this path owns [appContext] for [Notifier]) for
+     * whichever rows match THIS device's role, then kick [AdminNotificationWorker.runNow]
+     * so engine conditions recompute within the poll cadence instead of the 30-min sweep.
+     * runNow coalesces via unique REPLACE work, so the extra kick can't pile up.
+     */
+    private suspend fun afterPull(pulled: Int) {
+        if (pulled <= 0) return
+        val app = appContext.applicationContext as? PosApp ?: return
+        val isAdmin = app.container.authManager.isDeviceAdmin()
+        runCatching {
+            app.container.repository.fireUnpushedHeadsUps(isAdmin)
+                .forEach { Notifier.notifyAlert(appContext, it) }
+        }
+        AdminNotificationWorker.runNow(appContext)
     }
 
     suspend fun test(url: String, key: String): ConnectionTest = withContext(Dispatchers.IO) {
@@ -207,6 +232,7 @@ class SyncManager(
             is SyncOutcome.Failed -> SyncStatus.Error(outcome.message)
             SyncOutcome.NotConfigured -> SyncStatus.Idle
         }
+        if (outcome is SyncOutcome.Success) afterPull(outcome.pulled)
         return outcome
     }
 

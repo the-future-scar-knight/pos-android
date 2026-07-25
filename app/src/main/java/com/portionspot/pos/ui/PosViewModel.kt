@@ -32,6 +32,7 @@ import com.portionspot.pos.data.SalePayment
 import com.portionspot.pos.data.isEditable
 import com.portionspot.pos.data.SalesSummary
 import com.portionspot.pos.data.SaleStamp
+import com.portionspot.pos.data.StaffRequest
 import com.portionspot.pos.data.StockMovement
 import com.portionspot.pos.data.Tender
 import com.portionspot.pos.data.TopProduct
@@ -56,6 +57,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -138,6 +140,10 @@ class PosViewModel(
     private val _currentIsAdmin = MutableStateFlow(false)
     private val _currentPermissions = MutableStateFlow(Permissions.EMPTY)
 
+    /** Mirror of the signed-in cashier id as a flow, so the cashier's own-requests feed
+     *  (Phase 3) re-subscribes when the active session changes on a shared device. */
+    private val _cashierId = MutableStateFlow<String?>(null)
+
     /** The set of capabilities the current user is allowed to exercise right now (admin =
      *  all). Collect this in Compose to gate visible controls. */
     val allowedCaps: StateFlow<Set<Capability>> =
@@ -160,6 +166,7 @@ class PosViewModel(
         currentIsAdmin = isAdmin
         _currentIsAdmin.value = isAdmin
         _currentPermissions.value = permissions
+        _cashierId.value = id
     }
 
     /** Pull the signed-in user's own grants from pos_staff (admin edits reach the device).
@@ -1360,6 +1367,71 @@ class PosViewModel(
             val lastSync = sync.lastSyncAt()
             repo.runNotificationSweep(thresholds, pending, lastSync)
         }
+    }
+
+    // ---- Admin⇄cashier approval channel (Phase 3, staff_requests) --------
+
+    /** Admin side: pending requests awaiting a decision (oldest first). Drives the
+     *  "Requests" section above the Alerts feed. */
+    val pendingRequests: StateFlow<List<StaffRequest>> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.pendingStaffRequestsFlow(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Admin side: pending-request count (badges onto the Alerts tab alongside unread). */
+    val pendingRequestCount: StateFlow<Int> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.pendingStaffRequestCountFlow(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0)
+
+    /** Cashier side: this cashier's own recent requests, newest first — the checkout
+     *  status surface ("Waiting…", "Approved — apply", "Denied"). Re-subscribes when the
+     *  active cashier changes on a shared device. */
+    val myRequests: StateFlow<List<StaffRequest>> =
+        combine(businessId.filterNotNull(), _cashierId) { bid, cid -> bid to cid }
+            .flatMapLatest { (bid, cid) ->
+                if (cid.isNullOrBlank()) flowOf(emptyList())
+                else repo.myStaffRequestsFlow(bid, cid)
+            }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /**
+     * Cashier RAISES an approval request as an alternative to the admin-PIN gate. Fires a
+     * pull immediately so the round-trip (admin decides → decision comes back) starts
+     * without waiting for the poll cadence. [onCreated] returns the new request id so the
+     * caller can track the exact row it just made.
+     */
+    fun submitStaffRequest(
+        type: String,
+        amount: Double?,
+        targetType: String? = null,
+        targetId: String? = null,
+        targetName: String? = null,
+        note: String? = null,
+        onCreated: (String) -> Unit = {}
+    ) {
+        viewModelScope.launch {
+            val req = repo.submitStaffRequest(
+                type = type, targetType = targetType, targetId = targetId,
+                targetName = targetName, amount = amount, note = note,
+                byId = currentCashierId, byName = currentCashierName
+            )
+            onCreated(req.id)
+            sync.requestPullNow("request-submitted")
+        }
+    }
+
+    /** Admin APPROVES/DENIES a pending request, then pulls so the cashier phone sees it. */
+    fun decideStaffRequest(id: String, approve: Boolean) {
+        viewModelScope.launch {
+            repo.decideStaffRequest(id, approve, currentCashierId, currentCashierName)
+            sync.requestPullNow("request-decided")
+        }
+    }
+
+    /** Cashier marks an approved request consumed (discount applied). Device-local. */
+    fun markRequestApplied(id: String) {
+        viewModelScope.launch { repo.markRequestApplied(id) }
     }
 
     /** Append-only audit trail (newest first) for the admin audit-log viewer. */
