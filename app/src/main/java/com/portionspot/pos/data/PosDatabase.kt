@@ -593,6 +593,26 @@ val MIGRATION_27_28 = object : Migration(27, 28) {
     }
 }
 
+/**
+ * v28 → v29 — NOTIFICATION AUDIENCE (admin⇄cashier targeting). Adds `audience` to
+ * `notifications` so a row can be aimed at the admin phone, the cashier phones, or
+ * everyone. It drives which device raises a system heads-up (a cashier must not buzz
+ * for an admin-only alert) and where the notification deep-links.
+ *
+ * DEFAULT 'admin' backfills the whole existing feed to the historical behaviour — every
+ * alert built so far (engine conditions, expense submissions, recurring postings) was
+ * admin-facing — so no data is dropped and old rows keep targeting the admin. `audience`
+ * is SYNCED (it is content, not device-local state), so pushing it re-queues nothing on
+ * its own; the cloud column `notifications.audience text not null default 'admin'` is
+ * added in parallel and a push that beats it fails per-table (surfaced + retried) — the
+ * engine already tolerates that.
+ */
+val MIGRATION_28_29 = object : Migration(28, 29) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE notifications ADD COLUMN audience TEXT NOT NULL DEFAULT 'admin'")
+    }
+}
+
 @Database(
     entities = [
         Business::class,
@@ -616,7 +636,7 @@ val MIGRATION_27_28 = object : Migration(27, 28) {
         AppNotification::class,
         AuditEntry::class
     ],
-    version = 28,
+    version = 29,
     exportSchema = false
 )
 abstract class PosDatabase : RoomDatabase() {
@@ -662,7 +682,7 @@ abstract class PosDatabase : RoomDatabase() {
                         MIGRATION_17_18, MIGRATION_18_19, MIGRATION_19_20,
                         MIGRATION_20_21, MIGRATION_21_22, MIGRATION_22_23,
                         MIGRATION_23_24, MIGRATION_24_25, MIGRATION_25_26,
-                        MIGRATION_26_27, MIGRATION_27_28
+                        MIGRATION_26_27, MIGRATION_27_28, MIGRATION_28_29
                     )
                     .fallbackToDestructiveMigration()
                     .build()

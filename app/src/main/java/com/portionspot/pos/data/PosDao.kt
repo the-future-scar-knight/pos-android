@@ -736,6 +736,23 @@ interface NotificationDao {
     @Query("UPDATE notifications SET deleted = 1, updatedAt = :at, pendingSync = 1 WHERE id IN (:ids)")
     suspend fun tombstone(ids: List<String>, at: Long)
 
+    /**
+     * Cross-device delivery queue (BUG A fix): live, unread rows THIS phone has not yet
+     * raised a heads-up for. A row lands here after a PULL brought it down (or the sweep
+     * created it without pushing), and the caller filters by audience against the device
+     * role before firing. Not scoped to a business id — a device holds exactly one shop's
+     * feed — so the background pass can query it without first resolving the id.
+     */
+    @Query(
+        "SELECT * FROM notifications WHERE deleted = 0 AND readAt IS NULL AND pushedAt IS NULL"
+    )
+    suspend fun unpushed(): List<AppNotification>
+
+    /** Stamp the device-local heads-up marker WITHOUT touching updatedAt/pendingSync:
+     *  which phone has buzzed is device-local state and must never dirty the shared row. */
+    @Query("UPDATE notifications SET pushedAt = :at WHERE id = :id")
+    suspend fun markPushed(id: String, at: Long)
+
     @Query("DELETE FROM notifications WHERE businessId = :businessId")
     suspend fun wipe(businessId: String)
 }

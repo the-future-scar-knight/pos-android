@@ -834,6 +834,11 @@ data class AppNotification(
     val title: String,
     val body: String,
     val dedupeKey: String,                // stable natural key: recompute updates this row
+    /** Who this alert is FOR: "admin" | "cashier" | "all". Drives BOTH which device
+     *  fires a system heads-up (a cashier phone must not buzz for an admin-only alert)
+     *  and where its deep-link lands. SYNCED so every phone agrees on the target; a
+     *  legacy/foreign row with no value reads as "admin" (the historical behaviour). */
+    val audience: String = "admin",
     val refType: String? = null,          // sale | refund | item | customer | mm_receipt | device
     val refId: String? = null,
     val eventAt: Long = now(),            // underlying event time (drives escalation age)

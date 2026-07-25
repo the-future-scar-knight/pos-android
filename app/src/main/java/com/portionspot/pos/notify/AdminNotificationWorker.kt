@@ -25,11 +25,23 @@ class AdminNotificationWorker(appContext: Context, params: WorkerParameters) :
         val app = applicationContext as? PosApp ?: return Result.success()
         return try {
             val repo = app.container.repository
+            // Role gating (BUG B fix): the sweep still COMPUTES + persists the whole-shop
+            // feed on every device (the feed and its sync must stay complete), but a
+            // system heads-up only fires for rows this device's role is the audience for —
+            // a cashier phone must not buzz for an admin-only alert. In local mode there is
+            // no cloud session and the local owner is always the admin.
+            val isAdmin = app.container.authManager.isDeviceAdmin()
             val thresholds = repo.loadNotifThresholds()
             val pending = repo.pendingSyncCount()
             val lastSync = app.container.syncManager.lastSyncAt()
             val toPush = repo.runNotificationSweep(thresholds, pending, lastSync)
-            toPush.forEach { Notifier.notifyAdmin(applicationContext, it) }
+            toPush.filter { NotificationEngine.audienceMatches(it.audience, isAdmin) }
+                .forEach { Notifier.notifyAlert(applicationContext, it) }
+            // Also deliver any row that ARRIVED via a pull and was never re-derived by the
+            // sweep (BUG A fix): event alerts like a cashier's expense submission live only
+            // as a synced row, so without this they never buzz on the admin phone.
+            repo.fireUnpushedHeadsUps(isAdmin)
+                .forEach { Notifier.notifyAlert(applicationContext, it) }
             Result.success()
         } catch (e: Exception) {
             Result.retry()

@@ -2367,6 +2367,31 @@ class PosRepository(private val db: PosDatabase) {
         return toPush
     }
 
+    /**
+     * Cross-device heads-up delivery (BUG A fix). A notification row that ARRIVED on this
+     * phone via a pull — most importantly an event alert like a cashier's expense
+     * submission, which the sweep deliberately never re-derives — otherwise sits silently
+     * in the feed and never buzzes. This fires a system heads-up for every live, unread
+     * row this device has not yet pushed AND whose [AppNotification.audience] matches the
+     * device's current role, then stamps [AppNotification.pushedAt] so it fires once.
+     *
+     * [isAdmin] is the signed-in session's role ("all" reaches everyone, "cashier" only
+     * non-admins, "admin"/unknown only admins — see [NotificationEngine.audienceMatches]).
+     * The pushedAt stamp is DEVICE-LOCAL: written via [NotificationDao.markPushed] without
+     * touching updatedAt/pendingSync, exactly like the sweep, so it never dirties the
+     * shared row for upload. Returns the rows fired so the Context-owning caller posts them.
+     */
+    suspend fun fireUnpushedHeadsUps(isAdmin: Boolean): List<AppNotification> {
+        val stamp = now()
+        val fired = ArrayList<AppNotification>()
+        for (n in notificationDao.unpushed()) {
+            if (!NotificationEngine.audienceMatches(n.audience, isAdmin)) continue
+            notificationDao.markPushed(n.id, stamp)
+            fired += n.copy(pushedAt = stamp)
+        }
+        return fired
+    }
+
     // ---- admin: audit log (Phase 7, §8) ----------------------------------
 
     fun auditFlow(businessId: String): Flow<List<AuditEntry>> = auditDao.observeForBusiness(businessId)

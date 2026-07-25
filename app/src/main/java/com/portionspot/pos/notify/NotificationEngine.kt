@@ -59,6 +59,21 @@ object NotificationEngine {
     private const val HOUR = 60L * 60 * 1000
     private const val DAY = 24L * HOUR
 
+    /**
+     * Should THIS device raise a system heads-up (and own the deep-link) for an alert
+     * targeted at [audience], given whether the signed-in session is an admin?
+     *
+     * Pure so it can be unit-tested and reused from every firing site (the sweep, the
+     * cross-device pull delivery, the AdminNotificationWorker). "all" reaches everyone;
+     * "cashier" reaches only non-admins; anything else (including the legacy/default
+     * "admin") reaches only admins — a cashier phone must never buzz for an admin alert.
+     */
+    fun audienceMatches(audience: String, isAdmin: Boolean): Boolean = when (audience) {
+        "all" -> true
+        "cashier" -> !isAdmin
+        else -> isAdmin      // "admin" and any unknown value are admin-only
+    }
+
     fun compute(s: NotifSnapshot): List<NotifCandidate> {
         val t = s.thresholds
         val out = ArrayList<NotifCandidate>()

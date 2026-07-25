@@ -1194,6 +1194,9 @@ data class NotificationDto(
     val title: String = "",
     val body: String = "",
     @SerialName("dedupe_key") val dedupeKey: String = "",
+    // Legacy cloud rows predate this column; default to "admin" so they keep targeting
+    // the admin phone exactly as they did before audience existed.
+    val audience: String = "admin",
     @SerialName("ref_type") val refType: String? = null,
     @SerialName("ref_id") val refId: String? = null,
     @SerialName("event_at") val eventAt: Long? = null,
@@ -1225,6 +1228,7 @@ fun NotificationDto.toNotification(businessId: String, local: AppNotification?):
         title = title,
         body = body,
         dedupeKey = dedupeKey.ifBlank { base.dedupeKey },
+        audience = audience.ifBlank { "admin" },   // audience IS shared content
         refType = refType,
         refId = refId,
         eventAt = eventAt ?: base.eventAt,
@@ -1246,6 +1250,7 @@ data class NotificationPushDto(
     val title: String,
     val body: String,
     @SerialName("dedupe_key") val dedupeKey: String,
+    val audience: String = "admin",
     @SerialName("ref_type") val refType: String? = null,
     @SerialName("ref_id") val refId: String? = null,
     @SerialName("event_at") val eventAt: Long,
@@ -1264,6 +1269,7 @@ fun AppNotification.toNotificationPush() = NotificationPushDto(
     title = title,
     body = body,
     dedupeKey = dedupeKey,
+    audience = audience,
     refType = refType,
     refId = refId,
     eventAt = eventAt,

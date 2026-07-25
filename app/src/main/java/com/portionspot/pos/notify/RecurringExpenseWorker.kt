@@ -25,8 +25,12 @@ class RecurringExpenseWorker(appContext: Context, params: WorkerParameters) :
     override suspend fun doWork(): Result {
         val app = applicationContext as? PosApp ?: return Result.success()
         return try {
+            // Recurring postings are admin-facing (audience="admin"); only buzz this phone
+            // when it is the admin. In local mode the owner is always the admin.
+            val isAdmin = app.container.authManager.isDeviceAdmin()
             val toPush = app.container.repository.runRecurringExpenseSweep()
-            toPush.forEach { Notifier.notifyAdmin(applicationContext, it) }
+            toPush.filter { NotificationEngine.audienceMatches(it.audience, isAdmin) }
+                .forEach { Notifier.notifyAlert(applicationContext, it) }
             Result.success()
         } catch (e: Exception) {
             Result.retry()
