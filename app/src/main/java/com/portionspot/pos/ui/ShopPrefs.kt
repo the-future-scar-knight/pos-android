@@ -18,11 +18,30 @@ data class ShopPrefs(
     val receiptShowTagline: Boolean = true,
     val receiptShowAddress: Boolean = true,
     val receiptShowVat: Boolean = true,      // show the VAT line + VAT number
+    val receiptShowCashier: Boolean = true,  // "Served by <cashier>" line
+    val receiptShowPayment: Boolean = true,  // the tender/paid-via block
+    val receiptShowChange: Boolean = true,   // the change-given line
+    val receiptBoldTotals: Boolean = true,   // embolden the TOTAL line
     val receiptShowFooter: Boolean = true,
     // ── Tax / price rounding ──
     // Rounding step applied to a computed price. 0.0 = off; 0.01/0.05/0.10/0.50/1.0.
     val wholesaleRounding: Double = 0.0,     // applied to wholesale unit prices
     val checkoutRounding: Double = 0.0,      // applied to the checkout grand total
+    // ── Quotes (§1.2 parity) ──
+    val defaultQuoteValidityDays: Int = 7,   // a generated quote lapses after N days
+    // ── Discounts (§1.2 parity) ──
+    // A cashier applying a discount above this % of the goods value needs a manager/
+    // admin PIN to approve it. Admins are never gated. 0 = no approval ever required.
+    val discountThresholdPct: Double = 5.0,
+    // Hard cap (in base-currency units) on the discount a cashier may take off a
+    // single cart line. This is a ceiling the till physically enforces — unlike
+    // [discountThresholdPct] (a PIN gate), it can never be exceeded. 0 = no limit.
+    val maxItemDiscount: Double = 0.0,
+    // ── Receipt editing (B5) ──
+    // How long after a sale the owner may still correct the receipt IN PLACE (add or
+    // remove items, change quantities). Outside this window the receipt is locked and
+    // a correction must go through a void/refund instead. 0 = editing off entirely.
+    val saleEditWindowMinutes: Int = 30,
     // ── Margins ──
     val marginFormula: String = "markup",    // "markup" (over cost) or "gross" (of price)
     val autoConvertUnitsToBoxes: Boolean = false, // show stock as N boxes + loose units
@@ -96,6 +115,15 @@ data class ReceiptStyleFlags(
     val showTagline: Boolean,
     val showAddress: Boolean,
     val showFooter: Boolean,
+)
+
+/** Receipt-edit window presets surfaced as chips in Settings (B5). */
+val SALE_EDIT_WINDOWS = listOf(
+    0 to "Off",
+    15 to "15 min",
+    30 to "30 min",
+    60 to "1 hour",
+    240 to "4 hours",
 )
 
 /** Rounding-step presets surfaced as chips for the tax/price rounding pickers. */

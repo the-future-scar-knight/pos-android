@@ -1,14 +1,22 @@
 package com.portionspot.pos.sync
 
+import com.portionspot.pos.data.AppNotification
+import com.portionspot.pos.data.AuditEntry
+import com.portionspot.pos.data.CashTxn
 import com.portionspot.pos.data.CreditTxn
 import com.portionspot.pos.data.Customer
+import com.portionspot.pos.data.Expense
 import com.portionspot.pos.data.Item
 import com.portionspot.pos.data.MobileMoneyReceipt
+import com.portionspot.pos.data.PurchaseOrder
+import com.portionspot.pos.data.PurchaseOrderLine
 import com.portionspot.pos.data.Refund
 import com.portionspot.pos.data.RefundLine
 import com.portionspot.pos.data.SaleEntity
 import com.portionspot.pos.data.SaleLine
 import com.portionspot.pos.data.SalePayment
+import com.portionspot.pos.data.StaffRequest
+import com.portionspot.pos.data.Supplier
 import com.portionspot.pos.data.newId
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -109,28 +117,71 @@ data class ProductDto(
     val active: Boolean = true,
     @SerialName("product_type") val productType: String = "box",
     @SerialName("box_only") val boxOnly: Boolean = false,
+    @SerialName("image_url") val imageUrl: String? = null,
+    @SerialName("show_image") val showImage: Boolean = true,
+    // Measured products (unit-priced). These cloud columns are NEW: older rows have
+    // them null, which must never wipe what the device already holds — see [toItem].
+    val unit: String? = null,
+    @SerialName("price_per_unit") val pricePerUnit: String? = null,
+    @SerialName("stock_measured") val stockMeasured: String? = null,
     @SerialName("updated_at") val updatedAt: String? = null,
 )
+
+/** Coerce a cloud/legacy product_type to the three values the app understands. Older
+ *  rows (and the app's own earlier push) used "unit" for a single-unit item; map that —
+ *  and anything unrecognised — to box vs piece by box size. */
+fun normalizeProductType(raw: String?, boxSize: Int): String = when (raw?.trim()?.lowercase()) {
+    "box" -> "box"
+    "set" -> "set"
+    "piece" -> "piece"
+    "measured" -> "measured"
+    else -> if (boxSize > 1) "box" else "piece"
+}
 
 /** Merge a pulled product onto the local [Item] (bridged by sku), preserving the
  *  Android-only fields the cloud doesn't carry (barcode, colour, unit, tax rate). */
 fun ProductDto.toItem(businessId: String, local: Item?): Item {
     val boxSz = if (boxSize < 1) 1 else boxSize
     val base = local ?: Item(businessId = businessId, name = name, sku = sku)
+    // Remote is the source of truth for the image. Keep the local cached copy only
+    // when the remote URL is unchanged; otherwise drop it (and any pending flag) so
+    // display falls back to the new remote image (Coil fetches + caches it).
+    val remoteImageUnchanged = imageUrl == base.imageUrl
+    // Guard the type: if the local item is measured and the cloud row doesn't explicitly
+    // declare a product_type, keep it measured so its unit fields aren't stranded. An
+    // explicit cloud type (box/set/piece/measured) still wins.
+    val mergedType =
+        if (base.productType == "measured" && productType.isBlank()) "measured"
+        else normalizeProductType(productType, boxSz)
+    // Measured fields now EXIST in the cloud, so the pull applies them — but a null
+    // (never-written, pre-migration) cloud value means "not set" and must keep the
+    // local value rather than zeroing a product the device knows how to price.
+    val mergedUnit = unit?.trim()?.ifBlank { null } ?: base.unit
+    val mergedPricePerUnit = pricePerUnit?.toDoubleOrNull() ?: base.pricePerUnit
+    val mergedStockMeasured = stockMeasured?.toDoubleOrNull() ?: base.stockMeasured
     return base.copy(
         businessId = businessId,
         name = name,
-        sku = sku,
+        // Never let a blank cloud sku wipe a real local sku (keeps the merge bridge stable).
+        sku = sku.ifBlank { base.sku?.ifBlank { null } ?: sku },
         category = category,
         price = retailPrice.toMoney(),
         wholesalePrice = wholesalePrice.toMoney(),
         boxPrice = boxPrice.toMoney(),
         boxSize = boxSz,
+        productType = mergedType,
         // cloud cost_price defaults to 0 = "unknown"; keep Android's null-means-unknown
         cost = costPrice?.toDoubleOrNull()?.takeIf { it > 0.0 },
         trackStock = true,
         stockQty = (stockBoxes * boxSz + stockUnits).toDouble(),
         reorderLevel = lowStockThreshold.toDouble(),
+        unit = mergedUnit,
+        pricePerUnit = mergedPricePerUnit,
+        stockMeasured = mergedStockMeasured,
+        imageUrl = imageUrl,
+        imageLocalPath = if (remoteImageUnchanged) base.imageLocalPath else null,
+        imagePending = if (remoteImageUnchanged) base.imagePending else false,
+        showImage = showImage,
         isActive = active,
         updatedAt = IsoTime.toMillis(updatedAt),
         deleted = false,
@@ -149,6 +200,7 @@ data class CustomerDto(
     val address: String? = null,
     val notes: String? = null,
     val balance: String? = null,
+    @SerialName("credit_limit") val creditLimit: String? = null,
     @SerialName("is_trade_account") val isTradeAccount: Boolean = false,
     @SerialName("updated_at") val updatedAt: String? = null,
 )
@@ -168,6 +220,9 @@ fun CustomerDto.toCustomer(businessId: String, local: Customer?): Customer {
         address = address,
         note = notes,
         wholesale = isTradeAccount,
+        // credit_limit is user-set master data on the cloud (the web has an editable
+        // field); take the cloud value, falling back to the local one when unset.
+        creditLimit = creditLimit?.toDoubleOrNull() ?: local?.creditLimit,
         updatedAt = IsoTime.toMillis(updatedAt),
         deleted = false,
         pendingSync = false,
@@ -289,6 +344,9 @@ data class SaleItemJson(
     val subMode: String? = null,
     val unitPrice: Double = 0.0,
     val lineDiscount: Double = 0.0,
+    // Per-line markup (cashier-only; folded into the price on customer receipts, but
+    // recorded here so the shop can report on it in the cloud/web). Mirrors lineDiscount.
+    val lineMarkup: Double = 0.0,
     val unitsPerLine: Int = 1,
     val boxSize: Int? = null,
 )
@@ -311,11 +369,13 @@ data class SaleDto(
     val items: List<SaleItemJson> = emptyList(),
     val subtotal: String? = null,
     @SerialName("total_discount") val totalDiscount: String? = null,
+    @SerialName("markup_total") val markupTotal: String? = null,
     @SerialName("vat_amount") val vatAmount: String? = null,
     @SerialName("grand_total") val grandTotal: String? = null,
     val payments: List<SalePaymentJson> = emptyList(),
     @SerialName("amount_paid") val amountPaid: String? = null,
     @SerialName("change_given") val changeGiven: String? = null,
+    @SerialName("change_owed") val changeOwed: String? = null,
     @SerialName("amount_owing") val amountOwing: String? = null,
     @SerialName("pay_method") val payMethod: String? = null,
     val cashier: String? = null,
@@ -337,9 +397,11 @@ fun SaleDto.toSaleEntity(businessId: String): SaleEntity = SaleEntity(
     discountTotal = totalDiscount.toMoney(),
     taxTotal = vatAmount.toMoney(),
     total = grandTotal.toMoney(),
+    markupTotal = markupTotal.toMoney(),
     paymentMethod = payMethod ?: "cash",
     amountPaid = amountPaid.toMoney(),
     changeDue = changeGiven?.toDoubleOrNull(),
+    changeOwed = changeOwed?.toDoubleOrNull(),
     paymentStatus = "paid",
     note = notes?.ifBlank { null },
     customerId = customerId?.ifBlank { null },
@@ -352,23 +414,131 @@ fun SaleDto.toSaleEntity(businessId: String): SaleEntity = SaleEntity(
     synced = true,
 )
 
-/** Materialise the JSONB line items into Room [SaleLine]s. [resolveItemId] maps a sku
- *  to the local item id so reports/profit joins work; unknown skus stay null. */
-fun SaleDto.toSaleLines(businessId: String, resolveItemId: (String?) -> String?): List<SaleLine> =
+/**
+ * Materialise the JSONB line items into Room [SaleLine]s. [resolveItemId] maps a sku
+ * to the local item id so reports/profit joins work; unknown skus stay null.
+ *
+ * [saleId] defaults to the cloud row's id (correct when the pull is INSERTING the sale
+ * under that id). When an incoming edit is being folded onto an EXISTING local sale the
+ * caller passes that sale's local UUID instead, so the replacement lines hang off the
+ * row that already owns the tenders, refunds and audit trail.
+ */
+fun SaleDto.toSaleLines(
+    businessId: String,
+    saleId: String = id,
+    resolveItemId: (String?) -> String?,
+): List<SaleLine> =
     items.map { li ->
         SaleLine(
-            saleId = id,
+            saleId = saleId,
             businessId = businessId,
             itemId = resolveItemId(li.sku),
             name = li.name,
             qty = li.qty,
             unitPrice = li.unitPrice,
             lineDiscount = li.lineDiscount,
+            lineMarkup = li.lineMarkup,
             lineTotal = li.unitPrice * li.qty - li.lineDiscount,
             mode = li.mode,
             unitsPerLine = if (li.unitsPerLine < 1) 1 else li.unitsPerLine,
         )
     }
+
+/**
+ * Fold a pulled cloud sale onto the EXISTING local row it matches — the receipt-EDIT
+ * half of the pull, and the reason a corrected receipt reaches the other phones at all.
+ *
+ * The rules, all of which exist because this row is money:
+ *  - The local PRIMARY KEY never moves. The local UUID is referenced by sale lines,
+ *    tenders, refunds, credit rows and the audit trail, so the cloud row is folded ONTO
+ *    it; `id`, `businessId`, `receiptNo` and `soldAt` stay exactly as they were.
+ *  - The pulled values are AUTHORITATIVE and are only ever MAPPED — no total is
+ *    recomputed here. The single derivation is [paymentStatus], which the local model
+ *    stores as a flag where the cloud stores the amount still owing (see below).
+ *  - A field the cloud row does not carry (a web-written row that omits the column) falls
+ *    back to what the device already had, so a pull can never blank out local money.
+ *  - Local-only state the cloud has no column for — `validUntil`, `tendered`,
+ *    `paymentRef`, `serverCreatedAt`, `deleted`, and the edit markers — is preserved.
+ *    The caller stamps [SaleEntity.editedAt]/[SaleEntity.editCount] when the incoming
+ *    row actually differs (see [saleSignature]); the cloud schema has no column for them.
+ *  - `synced = true`: this row just came DOWN, so it must not bounce straight back up.
+ */
+fun SaleDto.mergeIntoSale(local: SaleEntity): SaleEntity {
+    // A money column that is absent OR unparseable must never become 0.0 on a device
+    // that already holds a figure — it keeps what it had.
+    fun money(raw: String?, fallback: Double): Double = raw?.toDoubleOrNull() ?: fallback
+    val paid = amountPaid?.toDoubleOrNull()
+    val given = changeGiven?.toDoubleOrNull()
+    val grand = grandTotal?.toDoubleOrNull()
+    // The cloud keeps "how much is still owing"; the local model keeps a paid/unpaid
+    // flag. Prefer the settlement arithmetic the till itself uses (total + change handed
+    // back - tendered), because the Android push does not populate `amount_owing`; fall
+    // back to the explicit column for rows written by the web POS, and keep the local
+    // flag when the row carries no settlement information at all.
+    val owing: Double? = when {
+        paid != null -> ((grand ?: local.total) + (given ?: 0.0) - paid).coerceAtLeast(0.0)
+        amountOwing != null -> amountOwing.toMoney()
+        else -> null
+    }
+    return local.copy(
+        receiptNo = local.receiptNo ?: ref ?: id,
+        status = status,
+        subtotal = money(subtotal, local.subtotal),
+        discountTotal = money(totalDiscount, local.discountTotal),
+        markupTotal = money(markupTotal, local.markupTotal),
+        taxTotal = money(vatAmount, local.taxTotal),
+        total = grand ?: local.total,
+        paymentMethod = payMethod?.ifBlank { null } ?: local.paymentMethod,
+        amountPaid = paid ?: local.amountPaid,
+        changeDue = given ?: local.changeDue,
+        changeOwed = this.changeOwed?.toDoubleOrNull() ?: local.changeOwed,
+        paymentStatus = owing?.let { if (it > MONEY_EPS) "unpaid" else "paid" } ?: local.paymentStatus,
+        note = notes?.ifBlank { null } ?: local.note,
+        customerId = customerId?.ifBlank { null } ?: local.customerId,
+        customerName = customerName?.ifBlank { null } ?: local.customerName,
+        createdBy = cashierId?.ifBlank { null } ?: local.createdBy,
+        createdByName = cashier?.ifBlank { null } ?: local.createdByName,
+        updatedAt = IsoTime.toMillis(cursorStamp()),
+        synced = true,
+    )
+}
+
+/** Half a cent: below this two money values are the same amount. */
+private const val MONEY_EPS = 0.005
+
+private fun cents(v: Double): Long = Math.round(v * 100.0)
+
+/**
+ * A stable fingerprint of everything a shop would call "the receipt": its money, its
+ * settlement, its state and its goods. Two sales with the same signature are the same
+ * receipt, whatever their row ids or timestamps.
+ *
+ * Used on the pull to tell a genuine receipt EDIT (badge it, bump the edit count) from a
+ * row that merely came back down with a fresher `updated_at`. Line ids and saleIds are
+ * deliberately not part of it — a pulled line is minted fresh every time.
+ */
+internal fun saleSignature(sale: SaleEntity, lines: List<SaleLine>): String {
+    val head = listOf(
+        sale.status,
+        sale.paymentStatus,
+        sale.paymentMethod,
+        cents(sale.subtotal), cents(sale.discountTotal), cents(sale.markupTotal),
+        cents(sale.taxTotal), cents(sale.total), cents(sale.amountPaid),
+        cents(sale.changeDue ?: 0.0), cents(sale.changeOwed ?: 0.0),
+        sale.customerId.orEmpty(), sale.note.orEmpty(),
+    ).joinToString("|")
+    val goods = lines
+        .map { l ->
+            listOf(
+                l.name.trim().lowercase(), cents(l.qty), cents(l.unitPrice),
+                cents(l.lineDiscount), cents(l.lineMarkup), cents(l.lineTotal),
+                l.mode, l.unitsPerLine.toString(),
+            ).joinToString(",")
+        }
+        .sorted()
+        .joinToString(";")
+    return "$head#$goods"
+}
 
 // ── push DTOs (Stage 2) ───────────────────────────────────────────────────────
 // The exact row shape the web writes (src/lib/sync.js pushSales). Stage 2 push is
@@ -392,12 +562,22 @@ data class ProductPushDto(
     @SerialName("stock_units") val stockUnits: Int = 0,
     @SerialName("low_stock_threshold") val lowStockThreshold: Int = 5,
     val active: Boolean = true,
+    @SerialName("image_url") val imageUrl: String? = null,
+    @SerialName("show_image") val showImage: Boolean = true,
+    // Measured products — the cloud now carries these, so they two-way sync.
+    val unit: String = "pc",
+    @SerialName("price_per_unit") val pricePerUnit: Double = 0.0,
+    @SerialName("stock_measured") val stockMeasured: Double = 0.0,
     @SerialName("updated_at") val updatedAt: String,
 )
 
 /** Local [Item] → the web `products` row (upsert on sku). Total on-hand units are
  *  split back into boxes + loose the way the web stores them. Caller must ensure a
- *  non-blank sku (products.sku is NOT NULL and is the conflict key). */
+ *  non-blank sku (products.sku is NOT NULL and is the conflict key).
+ *
+ *  Only a REMOTE image URL is pushed: a still-pending local file path is never a
+ *  valid cloud value, so the sync engine uploads it to Storage (which sets [imageUrl]
+ *  to the public URL and clears [imagePending]) BEFORE calling this. */
 fun Item.toProductPush(): ProductPushDto {
     val bs = if (boxSize < 1) 1 else boxSize
     val totalUnits = stockQty.toInt()
@@ -405,7 +585,7 @@ fun Item.toProductPush(): ProductPushDto {
         sku = sku.orEmpty(),
         name = name,
         category = category,
-        productType = if (bs > 1) "box" else "unit",
+        productType = normalizeProductType(productType, bs),
         boxPrice = boxPrice,
         boxSize = bs,
         wholesalePrice = wholesalePrice,
@@ -415,6 +595,11 @@ fun Item.toProductPush(): ProductPushDto {
         stockUnits = if (bs > 1) totalUnits % bs else totalUnits,
         lowStockThreshold = reorderLevel.toInt(),
         active = isActive,
+        imageUrl = if (imagePending) null else imageUrl,
+        showImage = showImage,
+        unit = unit,
+        pricePerUnit = pricePerUnit,
+        stockMeasured = stockMeasured,
         updatedAt = IsoTime.toIso(updatedAt),
     )
 }
@@ -430,11 +615,13 @@ data class SalePushDto(
     val items: List<SaleItemJson> = emptyList(),
     val subtotal: Double = 0.0,
     @SerialName("total_discount") val totalDiscount: Double = 0.0,
+    @SerialName("markup_total") val markupTotal: Double = 0.0,
     @SerialName("vat_amount") val vatAmount: Double = 0.0,
     @SerialName("grand_total") val grandTotal: Double = 0.0,
     val payments: List<SalePaymentJson> = emptyList(),
     @SerialName("amount_paid") val amountPaid: Double = 0.0,
     @SerialName("change_given") val changeGiven: Double = 0.0,
+    @SerialName("change_owed") val changeOwed: Double = 0.0,
     @SerialName("amount_owing") val amountOwing: Double = 0.0,
     @SerialName("pay_method") val payMethod: String = "cash",
     val cashier: String = "",
@@ -457,9 +644,14 @@ private fun SaleLine.toItemJson(sku: String?): SaleItemJson = SaleItemJson(
     subMode = if (mode == "box") "boxes" else "",
     unitPrice = unitPrice,
     lineDiscount = lineDiscount,
+    lineMarkup = lineMarkup,
     unitsPerLine = unitsPerLine,
     boxSize = if (mode == "box") unitsPerLine else null,
 )
+
+/** Just an `id`, for read-back verification of a push (see SupabaseRest.selectIdsIn). */
+@Serializable
+data class IdRow(val id: String)
 
 /** A completed sale + its lines/tenders → the web `sales` row shape (type='sale'). */
 fun buildSalePush(
@@ -479,11 +671,13 @@ fun buildSalePush(
         items = lines.map { it.toItemJson(skuOf(it.itemId)) },
         subtotal = sale.subtotal,
         totalDiscount = sale.discountTotal,
+        markupTotal = sale.markupTotal,
         vatAmount = sale.taxTotal,
         grandTotal = sale.total,
         payments = payments.map { SalePaymentJson(amount = it.amount, method = it.method) },
         amountPaid = sale.amountPaid,
         changeGiven = sale.changeDue ?: 0.0,
+        changeOwed = sale.changeOwed ?: 0.0,
         payMethod = sale.paymentMethod,
         cashier = sale.createdByName ?: "",
         cashierId = sale.createdBy ?: "",
@@ -527,8 +721,10 @@ fun buildRefundPush(
     updatedAt = IsoTime.toIso(refund.updatedAt),
 )
 
-/** Customer push (upsert on local_id). Deliberately OMITS `balance`/`credit_limit`:
- *  those are ledger-derived and owned by whoever computes them — never overwrite them. */
+/** Customer push (upsert on local_id). Deliberately OMITS `balance` — it is
+ *  ledger-derived and owned by whoever computes it, so we never overwrite it.
+ *  `credit_limit` IS synced: it's user-set master data (the web exposes an editable
+ *  field), so it two-way syncs like name/phone. */
 @Serializable
 data class CustomerPushDto(
     @SerialName("local_id") val localId: String,
@@ -536,6 +732,7 @@ data class CustomerPushDto(
     val phone: String? = null,
     val email: String? = null,
     val address: String? = null,
+    @SerialName("credit_limit") val creditLimit: Double? = null,
     @SerialName("is_trade_account") val isTradeAccount: Boolean = false,
     val notes: String? = null,
     @SerialName("updated_at") val updatedAt: String,
@@ -547,6 +744,7 @@ fun Customer.toCustomerPush() = CustomerPushDto(
     phone = phone,
     email = email,
     address = address,
+    creditLimit = creditLimit,
     isTradeAccount = wholesale,
     notes = note,
     updatedAt = IsoTime.toIso(updatedAt),
@@ -557,7 +755,9 @@ fun Customer.toCustomerPush() = CustomerPushDto(
 @Serializable
 data class CreditPushDto(
     @SerialName("local_id") val localId: String,
-    @SerialName("customer_id") val customerId: String,
+    // Nullable: a walk-in change/refund row has no customer, and the cloud column is
+    // nullable — pushing null is correct, never a reason to silently drop a money row.
+    @SerialName("customer_id") val customerId: String? = null,
     @SerialName("customer_name") val customerName: String? = null,
     val type: String,
     val amount: Double = 0.0,
@@ -567,7 +767,7 @@ data class CreditPushDto(
     @SerialName("updated_at") val updatedAt: String,
 )
 
-fun CreditTxn.toCreditPush(cloudCustomerId: String, customerName: String?) = CreditPushDto(
+fun CreditTxn.toCreditPush(cloudCustomerId: String?, customerName: String?) = CreditPushDto(
     localId = id,
     customerId = cloudCustomerId,
     customerName = customerName,
@@ -622,3 +822,804 @@ fun MobileMoneyReceipt.toPush() = MobileMoneyPushDto(
     cashierId = createdBy,
     updatedAt = IsoTime.toIso(updatedAt),
 )
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Accounting spine + supplier orders (expenses, cash_txns, suppliers,
+// purchase_orders, purchase_order_items). These cloud tables ALL upsert on
+// `local_id` (= the Android UUID), so the device owns row identity end to end.
+//
+// TYPE RULES (the cloud schema is mixed on purpose):
+//   • created_at / updated_at are TIMESTAMPTZ  -> send the fixed-format UTC ISO
+//     string from [IsoTime] (the `updated_at=gt.<cursor>` pull depends on it).
+//   • approved_at / posted_at / next_run_at / last_run_at / eta /
+//     arrival_prompted_at / sent_at / received_at are plain BIGINT epoch ms ->
+//     send the Kotlin Long as-is.
+//   • date / period_start / period_end are DATE -> already yyyy-MM-dd strings
+//     locally, so they pass straight through.
+// numeric columns come BACK as JSON strings (PostgREST precision), hence the
+// String? + [toMoney] on every pull-side money field.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── expenses ─────────────────────────────────────────────────────────────────
+@Serializable
+data class ExpenseDto(
+    @SerialName("local_id") val localId: String? = null,
+    @SerialName("business_id") val businessId: String? = null,
+    val category: String = "Other",
+    val amount: String? = null,
+    val date: String = "",
+    val description: String? = null,
+    val status: String = "pending",
+    @SerialName("submitted_by") val submittedBy: String? = null,
+    @SerialName("submitted_by_name") val submittedByName: String? = null,
+    @SerialName("approved_by") val approvedBy: String? = null,
+    @SerialName("approved_by_name") val approvedByName: String? = null,
+    @SerialName("approved_at") val approvedAt: Long? = null,
+    @SerialName("posted_at") val postedAt: Long? = null,
+    @SerialName("cash_portion") val cashPortion: String? = null,
+    @SerialName("payable_portion") val payablePortion: String? = null,
+    @SerialName("capital_portion") val capitalPortion: String? = null,
+    val recurring: Boolean = false,
+    @SerialName("recurrence_period") val recurrencePeriod: String? = null,
+    @SerialName("recurrence_active") val recurrenceActive: Boolean = true,
+    @SerialName("is_template") val isTemplate: Boolean = false,
+    @SerialName("template_id") val templateId: String? = null,
+    @SerialName("next_run_at") val nextRunAt: Long? = null,
+    @SerialName("last_run_at") val lastRunAt: Long? = null,
+    @SerialName("period_start") val periodStart: String? = null,
+    @SerialName("period_end") val periodEnd: String? = null,
+    @SerialName("created_at") val createdAt: String? = null,
+    @SerialName("updated_at") val updatedAt: String? = null,
+    val deleted: Boolean = false,
+) {
+    fun bridgeId(): String = localId?.ifBlank { null } ?: "exp-${newId()}"
+    fun cursorStamp(): String = updatedAt ?: createdAt ?: IsoTime.EPOCH
+}
+
+fun ExpenseDto.toExpense(businessId: String, local: Expense?): Expense {
+    val bid = local?.id ?: bridgeId()
+    val base = local ?: Expense(id = bid, businessId = businessId, date = date)
+    return base.copy(
+        id = bid,
+        localId = bid,
+        businessId = businessId,
+        category = category,
+        amount = amount.toMoney(),
+        date = date.ifBlank { base.date },
+        description = description,
+        status = status,
+        submittedBy = submittedBy,
+        submittedByName = submittedByName,
+        approvedBy = approvedBy,
+        approvedByName = approvedByName,
+        approvedAt = approvedAt,
+        postedAt = postedAt,
+        cashPortion = cashPortion.toMoney(),
+        payablePortion = payablePortion.toMoney(),
+        capitalPortion = capitalPortion.toMoney(),
+        recurring = recurring,
+        recurrencePeriod = recurrencePeriod,
+        recurrenceActive = recurrenceActive,
+        isTemplate = isTemplate,
+        templateId = templateId,
+        nextRunAt = nextRunAt,
+        lastRunAt = lastRunAt,
+        periodStart = periodStart,
+        periodEnd = periodEnd,
+        createdAt = IsoTime.toMillis(createdAt).takeIf { it > 0 } ?: base.createdAt,
+        updatedAt = IsoTime.toMillis(updatedAt),
+        deleted = deleted,
+        pendingSync = false,
+    )
+}
+
+@Serializable
+data class ExpensePushDto(
+    @SerialName("local_id") val localId: String,
+    @SerialName("business_id") val businessId: String,
+    val category: String,
+    val amount: Double = 0.0,
+    val date: String,
+    val description: String? = null,
+    val status: String = "pending",
+    @SerialName("submitted_by") val submittedBy: String? = null,
+    @SerialName("submitted_by_name") val submittedByName: String? = null,
+    @SerialName("approved_by") val approvedBy: String? = null,
+    @SerialName("approved_by_name") val approvedByName: String? = null,
+    @SerialName("approved_at") val approvedAt: Long? = null,
+    @SerialName("posted_at") val postedAt: Long? = null,
+    @SerialName("cash_portion") val cashPortion: Double = 0.0,
+    @SerialName("payable_portion") val payablePortion: Double = 0.0,
+    @SerialName("capital_portion") val capitalPortion: Double = 0.0,
+    val recurring: Boolean = false,
+    @SerialName("recurrence_period") val recurrencePeriod: String? = null,
+    @SerialName("recurrence_active") val recurrenceActive: Boolean = true,
+    @SerialName("is_template") val isTemplate: Boolean = false,
+    @SerialName("template_id") val templateId: String? = null,
+    @SerialName("next_run_at") val nextRunAt: Long? = null,
+    @SerialName("last_run_at") val lastRunAt: Long? = null,
+    @SerialName("period_start") val periodStart: String? = null,
+    @SerialName("period_end") val periodEnd: String? = null,
+    @SerialName("created_at") val createdAt: String,
+    @SerialName("updated_at") val updatedAt: String,
+    val deleted: Boolean = false,
+)
+
+fun Expense.toExpensePush() = ExpensePushDto(
+    localId = localId.ifBlank { id },
+    businessId = businessId,
+    category = category,
+    amount = amount,
+    date = date,
+    description = description,
+    status = status,
+    submittedBy = submittedBy,
+    submittedByName = submittedByName,
+    approvedBy = approvedBy,
+    approvedByName = approvedByName,
+    approvedAt = approvedAt,
+    postedAt = postedAt,
+    cashPortion = cashPortion,
+    payablePortion = payablePortion,
+    capitalPortion = capitalPortion,
+    recurring = recurring,
+    recurrencePeriod = recurrencePeriod,
+    recurrenceActive = recurrenceActive,
+    isTemplate = isTemplate,
+    templateId = templateId,
+    nextRunAt = nextRunAt,
+    lastRunAt = lastRunAt,
+    periodStart = periodStart,
+    periodEnd = periodEnd,
+    createdAt = IsoTime.toIso(createdAt),
+    updatedAt = IsoTime.toIso(updatedAt),
+    deleted = deleted,
+)
+
+// ── cash_txns ────────────────────────────────────────────────────────────────
+@Serializable
+data class CashTxnDto(
+    @SerialName("local_id") val localId: String? = null,
+    @SerialName("business_id") val businessId: String? = null,
+    val type: String = "adjust",
+    val amount: String? = null,
+    val source: String? = null,
+    val note: String? = null,
+    @SerialName("ref_type") val refType: String? = null,
+    @SerialName("ref_id") val refId: String? = null,
+    @SerialName("created_by") val createdBy: String? = null,
+    @SerialName("created_by_name") val createdByName: String? = null,
+    @SerialName("created_at") val createdAt: String? = null,
+    @SerialName("updated_at") val updatedAt: String? = null,
+    val deleted: Boolean = false,
+) {
+    fun bridgeId(): String = localId?.ifBlank { null } ?: "cash-${newId()}"
+    fun cursorStamp(): String = updatedAt ?: createdAt ?: IsoTime.EPOCH
+}
+
+fun CashTxnDto.toCashTxn(businessId: String, local: CashTxn?): CashTxn {
+    val bid = local?.id ?: bridgeId()
+    val base = local ?: CashTxn(id = bid, businessId = businessId, type = type)
+    return base.copy(
+        id = bid,
+        localId = bid,
+        businessId = businessId,
+        type = type,
+        amount = amount.toMoney(),
+        source = source,
+        note = note,
+        refType = refType,
+        refId = refId,
+        createdBy = createdBy,
+        createdByName = createdByName,
+        createdAt = IsoTime.toMillis(createdAt).takeIf { it > 0 } ?: base.createdAt,
+        updatedAt = IsoTime.toMillis(updatedAt),
+        deleted = deleted,
+        pendingSync = false,
+    )
+}
+
+@Serializable
+data class CashTxnPushDto(
+    @SerialName("local_id") val localId: String,
+    @SerialName("business_id") val businessId: String,
+    val type: String,
+    val amount: Double = 0.0,
+    val source: String? = null,
+    val note: String? = null,
+    @SerialName("ref_type") val refType: String? = null,
+    @SerialName("ref_id") val refId: String? = null,
+    @SerialName("created_by") val createdBy: String? = null,
+    @SerialName("created_by_name") val createdByName: String? = null,
+    @SerialName("created_at") val createdAt: String,
+    @SerialName("updated_at") val updatedAt: String,
+    val deleted: Boolean = false,
+)
+
+fun CashTxn.toCashTxnPush() = CashTxnPushDto(
+    localId = localId.ifBlank { id },
+    businessId = businessId,
+    type = type,
+    amount = amount,
+    source = source,
+    note = note,
+    refType = refType,
+    refId = refId,
+    createdBy = createdBy,
+    createdByName = createdByName,
+    createdAt = IsoTime.toIso(createdAt),
+    updatedAt = IsoTime.toIso(updatedAt),
+    deleted = deleted,
+)
+
+// ── suppliers ────────────────────────────────────────────────────────────────
+@Serializable
+data class SupplierDto(
+    @SerialName("local_id") val localId: String? = null,
+    @SerialName("business_id") val businessId: String? = null,
+    val name: String = "",
+    val phone: String? = null,
+    val email: String? = null,
+    val address: String? = null,
+    val notes: String? = null,
+    @SerialName("created_at") val createdAt: String? = null,
+    @SerialName("updated_at") val updatedAt: String? = null,
+    val deleted: Boolean = false,
+) {
+    fun bridgeId(): String = localId?.ifBlank { null } ?: "sup-${newId()}"
+    fun cursorStamp(): String = updatedAt ?: createdAt ?: IsoTime.EPOCH
+}
+
+fun SupplierDto.toSupplier(businessId: String, local: Supplier?): Supplier {
+    val bid = local?.id ?: bridgeId()
+    val base = local ?: Supplier(id = bid, businessId = businessId, name = name)
+    return base.copy(
+        id = bid,
+        localId = bid,
+        businessId = businessId,
+        name = name.ifBlank { base.name },
+        phone = phone,
+        email = email,
+        address = address,
+        notes = notes,
+        createdAt = IsoTime.toMillis(createdAt).takeIf { it > 0 } ?: base.createdAt,
+        updatedAt = IsoTime.toMillis(updatedAt),
+        deleted = deleted,
+        pendingSync = false,
+    )
+}
+
+@Serializable
+data class SupplierPushDto(
+    @SerialName("local_id") val localId: String,
+    @SerialName("business_id") val businessId: String,
+    val name: String,
+    val phone: String? = null,
+    val email: String? = null,
+    val address: String? = null,
+    val notes: String? = null,
+    @SerialName("created_at") val createdAt: String,
+    @SerialName("updated_at") val updatedAt: String,
+    val deleted: Boolean = false,
+)
+
+fun Supplier.toSupplierPush() = SupplierPushDto(
+    localId = localId.ifBlank { id },
+    businessId = businessId,
+    name = name,
+    phone = phone,
+    email = email,
+    address = address,
+    notes = notes,
+    createdAt = IsoTime.toIso(createdAt),
+    updatedAt = IsoTime.toIso(updatedAt),
+    deleted = deleted,
+)
+
+// ── purchase_orders ──────────────────────────────────────────────────────────
+@Serializable
+data class PurchaseOrderDto(
+    @SerialName("local_id") val localId: String? = null,
+    @SerialName("business_id") val businessId: String? = null,
+    val ref: String = "",
+    @SerialName("supplier_id") val supplierId: String? = null,
+    @SerialName("supplier_name") val supplierName: String? = null,
+    val status: String = "draft",
+    val notes: String? = null,
+    val eta: Long? = null,
+    @SerialName("cash_paid") val cashPaid: String? = null,
+    @SerialName("capital_paid") val capitalPaid: String? = null,
+    @SerialName("payable_remainder") val payableRemainder: String? = null,
+    @SerialName("arrival_prompted_at") val arrivalPromptedAt: Long? = null,
+    @SerialName("sent_at") val sentAt: Long? = null,
+    @SerialName("received_at") val receivedAt: Long? = null,
+    @SerialName("created_at") val createdAt: String? = null,
+    @SerialName("updated_at") val updatedAt: String? = null,
+    val deleted: Boolean = false,
+) {
+    fun bridgeId(): String = localId?.ifBlank { null } ?: "po-${newId()}"
+    fun cursorStamp(): String = updatedAt ?: createdAt ?: IsoTime.EPOCH
+}
+
+fun PurchaseOrderDto.toPurchaseOrder(businessId: String, local: PurchaseOrder?): PurchaseOrder {
+    val bid = local?.id ?: bridgeId()
+    val base = local ?: PurchaseOrder(id = bid, businessId = businessId, ref = ref)
+    return base.copy(
+        id = bid,
+        localId = bid,
+        businessId = businessId,
+        ref = ref.ifBlank { base.ref },
+        supplierId = supplierId,
+        supplierName = supplierName ?: base.supplierName,
+        status = status,
+        notes = notes,
+        eta = eta,
+        cashPaid = cashPaid.toMoney(),
+        capitalPaid = capitalPaid.toMoney(),
+        payableRemainder = payableRemainder.toMoney(),
+        arrivalPromptedAt = arrivalPromptedAt,
+        createdAt = IsoTime.toMillis(createdAt).takeIf { it > 0 } ?: base.createdAt,
+        sentAt = sentAt,
+        receivedAt = receivedAt,
+        updatedAt = IsoTime.toMillis(updatedAt),
+        deleted = deleted,
+        pendingSync = false,
+    )
+}
+
+@Serializable
+data class PurchaseOrderPushDto(
+    @SerialName("local_id") val localId: String,
+    @SerialName("business_id") val businessId: String,
+    val ref: String,
+    @SerialName("supplier_id") val supplierId: String? = null,
+    @SerialName("supplier_name") val supplierName: String = "",
+    val status: String = "draft",
+    val notes: String? = null,
+    val eta: Long? = null,
+    @SerialName("cash_paid") val cashPaid: Double = 0.0,
+    @SerialName("capital_paid") val capitalPaid: Double = 0.0,
+    @SerialName("payable_remainder") val payableRemainder: Double = 0.0,
+    @SerialName("arrival_prompted_at") val arrivalPromptedAt: Long? = null,
+    @SerialName("sent_at") val sentAt: Long? = null,
+    @SerialName("received_at") val receivedAt: Long? = null,
+    @SerialName("created_at") val createdAt: String,
+    @SerialName("updated_at") val updatedAt: String,
+    val deleted: Boolean = false,
+)
+
+fun PurchaseOrder.toPurchaseOrderPush() = PurchaseOrderPushDto(
+    localId = localId.ifBlank { id },
+    businessId = businessId,
+    ref = ref,
+    supplierId = supplierId,
+    supplierName = supplierName,
+    status = status,
+    notes = notes,
+    eta = eta,
+    cashPaid = cashPaid,
+    capitalPaid = capitalPaid,
+    payableRemainder = payableRemainder,
+    arrivalPromptedAt = arrivalPromptedAt,
+    sentAt = sentAt,
+    receivedAt = receivedAt,
+    createdAt = IsoTime.toIso(createdAt),
+    updatedAt = IsoTime.toIso(updatedAt),
+    deleted = deleted,
+)
+
+// ── purchase_order_items ─────────────────────────────────────────────────────
+// Linked to its header by `po_local_id` (a plain value link — the cloud has NO hard
+// FK — so a line can never be rejected for arriving before/without its parent).
+// The line carries no timestamps of its own on-device: it only ever changes as part
+// of a PO write, so both cloud stamps come from the parent PO's updatedAt.
+@Serializable
+data class PurchaseOrderLineDto(
+    @SerialName("local_id") val localId: String? = null,
+    @SerialName("po_local_id") val poLocalId: String = "",
+    @SerialName("item_id") val itemId: String? = null,
+    val name: String = "",
+    val sku: String? = null,
+    val qty: String? = null,
+    @SerialName("unit_cost") val unitCost: String? = null,
+    @SerialName("sell_price") val sellPrice: String? = null,
+    @SerialName("stock_on_arrival") val stockOnArrival: Boolean = true,
+    @SerialName("product_type") val productType: String = "piece",
+    @SerialName("received_qty") val receivedQty: String? = null,
+    @SerialName("created_at") val createdAt: String? = null,
+    @SerialName("updated_at") val updatedAt: String? = null,
+) {
+    fun bridgeId(): String = localId?.ifBlank { null } ?: "pol-${newId()}"
+    fun cursorStamp(): String = updatedAt ?: createdAt ?: IsoTime.EPOCH
+}
+
+fun PurchaseOrderLineDto.toPurchaseOrderLine(local: PurchaseOrderLine?): PurchaseOrderLine {
+    val bid = local?.id ?: bridgeId()
+    val base = local ?: PurchaseOrderLine(id = bid, poId = poLocalId)
+    return base.copy(
+        id = bid,
+        localId = bid,
+        poId = poLocalId.ifBlank { base.poId },
+        itemId = itemId,
+        name = name.ifBlank { base.name },
+        sku = sku,
+        qty = qty?.toDoubleOrNull() ?: base.qty,
+        unitCost = unitCost.toMoney(),
+        sellPrice = sellPrice?.toDoubleOrNull(),
+        stockOnArrival = stockOnArrival,
+        productType = productType,
+        receivedQty = receivedQty?.toDoubleOrNull(),
+        pendingSync = false,
+    )
+}
+
+@Serializable
+data class PurchaseOrderLinePushDto(
+    @SerialName("local_id") val localId: String,
+    @SerialName("po_local_id") val poLocalId: String,
+    @SerialName("item_id") val itemId: String? = null,
+    val name: String = "",
+    val sku: String? = null,
+    val qty: Double = 0.0,
+    @SerialName("unit_cost") val unitCost: Double = 0.0,
+    @SerialName("sell_price") val sellPrice: Double? = null,
+    @SerialName("stock_on_arrival") val stockOnArrival: Boolean = true,
+    @SerialName("product_type") val productType: String = "piece",
+    @SerialName("received_qty") val receivedQty: Double? = null,
+    @SerialName("created_at") val createdAt: String,
+    @SerialName("updated_at") val updatedAt: String,
+)
+
+/** [stamp] is the parent PO's `updatedAt` (epoch ms): lines have no clock of their
+ *  own, and the pull cursor needs a moving `updated_at` on every push. */
+fun PurchaseOrderLine.toPurchaseOrderLinePush(stamp: Long) = PurchaseOrderLinePushDto(
+    localId = localId.ifBlank { id },
+    poLocalId = poId,
+    itemId = itemId,
+    name = name,
+    sku = sku,
+    qty = qty,
+    unitCost = unitCost,
+    sellPrice = sellPrice,
+    stockOnArrival = stockOnArrival,
+    productType = productType,
+    receivedQty = receivedQty,
+    createdAt = IsoTime.toIso(stamp),
+    updatedAt = IsoTime.toIso(stamp),
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// notifications — the admin alert feed, shared across the cashier phones and the
+// admin phone.
+//
+// UPSERT KEY IS COMPOSITE: `business_id,dedupe_key`, NOT `local_id`. Two devices
+// computing the same condition (the same low-stock item, the same owed refund) mint
+// DIFFERENT local ids but the SAME dedupeKey; conflicting on local_id would leave one
+// cloud row per device. `local_id` is still sent (it is this device's row id, useful
+// for tracing) but the cloud column is deliberately non-unique.
+//
+// TYPE RULES:
+//   • created_at / updated_at are TIMESTAMPTZ -> fixed-format UTC ISO via [IsoTime]
+//     (the `updated_at=gt.<cursor>` pull depends on it).
+//   • event_at / read_at are plain BIGINT epoch ms -> send the Long as-is.
+//   • pushedAt is NOT in the contract at all: it is device-local state recording
+//     whether THIS phone already fired its own heads-up notification. It is never
+//     sent, and a pull must preserve the local value.
+// ─────────────────────────────────────────────────────────────────────────────
+@Serializable
+data class NotificationDto(
+    @SerialName("local_id") val localId: String? = null,
+    @SerialName("business_id") val businessId: String? = null,
+    val category: String = "system",
+    val severity: String = "info",
+    val title: String = "",
+    val body: String = "",
+    @SerialName("dedupe_key") val dedupeKey: String = "",
+    // Legacy cloud rows predate this column; default to "admin" so they keep targeting
+    // the admin phone exactly as they did before audience existed.
+    val audience: String = "admin",
+    @SerialName("ref_type") val refType: String? = null,
+    @SerialName("ref_id") val refId: String? = null,
+    @SerialName("event_at") val eventAt: Long? = null,
+    @SerialName("read_at") val readAt: Long? = null,
+    @SerialName("created_at") val createdAt: String? = null,
+    @SerialName("updated_at") val updatedAt: String? = null,
+    val deleted: Boolean = false,
+) {
+    fun bridgeId(): String = localId?.ifBlank { null } ?: "notif-${newId()}"
+    fun cursorStamp(): String = updatedAt ?: createdAt ?: IsoTime.EPOCH
+}
+
+/**
+ * Merge an incoming cloud row onto [local] (matched by `(businessId, dedupeKey)`, never
+ * by id). The local row's `id` and `pushedAt` survive untouched, so this device keeps
+ * its own record of whether it has already raised a heads-up for the alert.
+ */
+fun NotificationDto.toNotification(businessId: String, local: AppNotification?): AppNotification {
+    val bid = local?.id ?: bridgeId()
+    val base = local ?: AppNotification(
+        id = bid, businessId = businessId, category = category,
+        title = title, body = body, dedupeKey = dedupeKey
+    )
+    return base.copy(
+        id = bid,                       // keep THIS device's row id
+        businessId = businessId,
+        category = category,
+        severity = severity,
+        title = title,
+        body = body,
+        dedupeKey = dedupeKey.ifBlank { base.dedupeKey },
+        audience = audience.ifBlank { "admin" },   // audience IS shared content
+        refType = refType,
+        refId = refId,
+        eventAt = eventAt ?: base.eventAt,
+        readAt = readAt,                // read-state IS shared
+        pushedAt = base.pushedAt,       // device-local: never overwritten by a pull
+        createdAt = IsoTime.toMillis(createdAt).takeIf { it > 0 } ?: base.createdAt,
+        updatedAt = IsoTime.toMillis(updatedAt),
+        deleted = deleted,
+        pendingSync = false,
+    )
+}
+
+@Serializable
+data class NotificationPushDto(
+    @SerialName("local_id") val localId: String,
+    @SerialName("business_id") val businessId: String,
+    val category: String,
+    val severity: String,
+    val title: String,
+    val body: String,
+    @SerialName("dedupe_key") val dedupeKey: String,
+    val audience: String = "admin",
+    @SerialName("ref_type") val refType: String? = null,
+    @SerialName("ref_id") val refId: String? = null,
+    @SerialName("event_at") val eventAt: Long,
+    @SerialName("read_at") val readAt: Long? = null,
+    @SerialName("created_at") val createdAt: String,
+    @SerialName("updated_at") val updatedAt: String,
+    val deleted: Boolean = false,
+)
+
+/** NOTE: no `pushed_at` — see the header. */
+fun AppNotification.toNotificationPush() = NotificationPushDto(
+    localId = id,
+    businessId = businessId,
+    category = category,
+    severity = severity,
+    title = title,
+    body = body,
+    dedupeKey = dedupeKey,
+    audience = audience,
+    refType = refType,
+    refId = refId,
+    eventAt = eventAt,
+    readAt = readAt,
+    createdAt = IsoTime.toIso(createdAt),
+    updatedAt = IsoTime.toIso(updatedAt),
+    deleted = deleted,
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// audit_log — the append-only trail (receipt edits, till shortages/overages, voids,
+// write-offs) recorded on whichever phone performed the action, mirrored so the
+// owner's admin phone can see all of them.
+//
+// UPSERT KEY IS `local_id` (UNIQUE in the cloud) with IGNORE-DUPLICATES. The cloud
+// table has SELECT/INSERT/DELETE policies but deliberately NO UPDATE policy — an audit
+// trail must not be rewritable after the fact — so a merge-duplicates upsert would be
+// rejected by RLS on every re-push. Insert-once is also semantically right: the row is
+// immutable, so there is never anything to update.
+//
+// TYPE RULES:
+//   • created_at / updated_at are TIMESTAMPTZ -> fixed-format UTC ISO via [IsoTime]
+//     (the `updated_at=gt.<cursor>` pull depends on it).
+//   • `action` is NOT NULL in the cloud — never send a blank/absent value.
+//   • `details` (jsonb) is NOT ours: other writers own it. It is not in either DTO, so
+//     a push leaves it NULL and a pull ignores it.
+// ─────────────────────────────────────────────────────────────────────────────
+@Serializable
+data class AuditDto(
+    @SerialName("local_id") val localId: String? = null,
+    @SerialName("business_id") val businessId: String? = null,
+    val action: String = "",
+    @SerialName("entity_type") val entityType: String? = null,
+    @SerialName("entity_id") val entityId: String? = null,
+    val summary: String? = null,
+    val meta: String? = null,
+    @SerialName("user_id") val userId: String? = null,
+    @SerialName("user_name") val userName: String? = null,
+    @SerialName("created_at") val createdAt: String? = null,
+    @SerialName("updated_at") val updatedAt: String? = null,
+) {
+    fun cursorStamp(): String = updatedAt ?: createdAt ?: IsoTime.EPOCH
+}
+
+/**
+ * Build the local row for an incoming cloud entry. Only ever called for an id this
+ * device does NOT already hold (see PosSyncEngine.pullAudit) — an existing local entry
+ * is skipped, never merged. `pendingSync = false`: it came FROM the cloud.
+ */
+fun AuditDto.toAudit(businessId: String, id: String): AuditEntry {
+    val created = IsoTime.toMillis(createdAt).takeIf { it > 0 } ?: System.currentTimeMillis()
+    return AuditEntry(
+        id = id,
+        businessId = businessId,
+        action = action.ifBlank { "unknown" },
+        entityType = entityType,
+        entityId = entityId,
+        summary = summary.orEmpty(),
+        meta = meta,
+        createdBy = userId,
+        createdByName = userName,
+        createdAt = created,
+        updatedAt = IsoTime.toMillis(updatedAt).takeIf { it > 0 } ?: created,
+        pendingSync = false,
+    )
+}
+
+@Serializable
+data class AuditPushDto(
+    @SerialName("local_id") val localId: String,
+    @SerialName("business_id") val businessId: String,
+    val action: String,
+    @SerialName("entity_type") val entityType: String? = null,
+    @SerialName("entity_id") val entityId: String? = null,
+    val summary: String? = null,
+    val meta: String? = null,
+    @SerialName("user_id") val userId: String? = null,
+    @SerialName("user_name") val userName: String? = null,
+    @SerialName("created_at") val createdAt: String,
+    @SerialName("updated_at") val updatedAt: String,
+)
+
+/** NOTE: no `details` — see the header. `action` falls back rather than going NULL. */
+fun AuditEntry.toAuditPush() = AuditPushDto(
+    localId = id,
+    businessId = businessId,
+    action = action.ifBlank { "unknown" },
+    entityType = entityType,
+    entityId = entityId,
+    summary = summary,
+    meta = meta,
+    userId = createdBy,
+    userName = createdByName,
+    createdAt = IsoTime.toIso(createdAt),
+    updatedAt = IsoTime.toIso(updatedAt),
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// staff_requests — the admin⇄cashier approval channel (Phase 3). A cashier raises a
+// request (over-threshold discount, void…) that reaches the admin's phone; the admin
+// approves/denies and the decision syncs back.
+//
+// UPSERT KEY IS `local_id` (UNIQUE in the cloud, = the Android UUID), but the push is
+// SPLIT into two RLS-shaped modes (see PosSyncEngine.push):
+//   • a PENDING row (status='pending', decided_at NULL) goes up IGNORE-DUPLICATES — a
+//     cashier device may only INSERT + SELECT (RLS), so a merge upsert would be rejected.
+//   • a DECIDED row (decided_at != null) goes up MERGE-DUPLICATES — only an admin device
+//     ever writes one, and the admin passes the UPDATE policy.
+// The engine keys off status/decided_at alone, so it never needs the device role.
+//
+// TYPE RULES:
+//   • created_at / updated_at are TIMESTAMPTZ -> fixed-format UTC ISO via [IsoTime]
+//     (the `updated_at=gt.<cursor>` pull depends on it).
+//   • decided_at is plain BIGINT epoch ms -> send the Long as-is.
+//   • amount is NUMERIC -> comes BACK as a JSON string (PostgREST precision), hence
+//     String? + [toMoney] on the pull side; nullable because not every request carries one.
+//   • `applied` is device-local on the cashier side (a cashier can't UPDATE the cloud
+//     row), so a pull PRESERVES the local value rather than letting a stale false win.
+// ─────────────────────────────────────────────────────────────────────────────
+@Serializable
+data class StaffRequestDto(
+    @SerialName("local_id") val localId: String? = null,
+    @SerialName("business_id") val businessId: String? = null,
+    val type: String = "",
+    @SerialName("target_type") val targetType: String? = null,
+    @SerialName("target_id") val targetId: String? = null,
+    @SerialName("target_name") val targetName: String? = null,
+    val amount: String? = null,
+    val note: String? = null,
+    @SerialName("requested_by") val requestedBy: String? = null,
+    @SerialName("requested_by_name") val requestedByName: String? = null,
+    val status: String = "pending",
+    @SerialName("decided_by") val decidedBy: String? = null,
+    @SerialName("decided_by_name") val decidedByName: String? = null,
+    @SerialName("decided_at") val decidedAt: Long? = null,
+    val applied: Boolean = false,
+    @SerialName("created_at") val createdAt: String? = null,
+    @SerialName("updated_at") val updatedAt: String? = null,
+    val deleted: Boolean = false,
+) {
+    fun bridgeId(): String = localId?.ifBlank { null } ?: "req-${newId()}"
+    fun cursorStamp(): String = updatedAt ?: createdAt ?: IsoTime.EPOCH
+}
+
+fun StaffRequestDto.toStaffRequest(businessId: String, local: StaffRequest?): StaffRequest {
+    val bid = local?.id ?: bridgeId()
+    val base = local ?: StaffRequest(id = bid, businessId = businessId, type = type)
+    return base.copy(
+        id = bid,
+        localId = bid,
+        businessId = businessId,
+        type = type.ifBlank { base.type },
+        targetType = targetType,
+        targetId = targetId,
+        targetName = targetName,
+        amount = amount?.toMoney() ?: base.amount,
+        note = note,
+        requestedBy = requestedBy,
+        requestedByName = requestedByName,
+        status = status,
+        decidedBy = decidedBy,
+        decidedByName = decidedByName,
+        decidedAt = decidedAt,
+        // Device-local on the cashier side: keep this phone's own applied flag rather than
+        // letting a cloud false (never written by a cashier) clobber it. An admin device
+        // that legitimately set applied=true pushes it and it wins via last-write-wins.
+        applied = applied || base.applied,
+        createdAt = IsoTime.toMillis(createdAt).takeIf { it > 0 } ?: base.createdAt,
+        updatedAt = IsoTime.toMillis(updatedAt),
+        deleted = deleted,
+        pendingSync = false,
+    )
+}
+
+@Serializable
+data class StaffRequestPushDto(
+    @SerialName("local_id") val localId: String,
+    @SerialName("business_id") val businessId: String,
+    val type: String,
+    @SerialName("target_type") val targetType: String? = null,
+    @SerialName("target_id") val targetId: String? = null,
+    @SerialName("target_name") val targetName: String? = null,
+    val amount: Double? = null,
+    val note: String? = null,
+    @SerialName("requested_by") val requestedBy: String? = null,
+    @SerialName("requested_by_name") val requestedByName: String? = null,
+    val status: String = "pending",
+    @SerialName("decided_by") val decidedBy: String? = null,
+    @SerialName("decided_by_name") val decidedByName: String? = null,
+    @SerialName("decided_at") val decidedAt: Long? = null,
+    val applied: Boolean = false,
+    @SerialName("created_at") val createdAt: String,
+    @SerialName("updated_at") val updatedAt: String,
+    val deleted: Boolean = false,
+)
+
+fun StaffRequest.toStaffRequestPush() = StaffRequestPushDto(
+    localId = localId.ifBlank { id },
+    businessId = businessId,
+    type = type,
+    targetType = targetType,
+    targetId = targetId,
+    targetName = targetName,
+    amount = amount,
+    note = note,
+    requestedBy = requestedBy,
+    requestedByName = requestedByName,
+    status = status,
+    decidedBy = decidedBy,
+    decidedByName = decidedByName,
+    decidedAt = decidedAt,
+    applied = applied,
+    createdAt = IsoTime.toIso(createdAt),
+    updatedAt = IsoTime.toIso(updatedAt),
+    deleted = deleted,
+)
+
+/**
+ * Pure push-partition rule (extracted so it can be unit-tested — see Phase 3 §5). Splits
+ * a batch of locally-dirty [StaffRequest]s into (insertOnce, merge):
+ *   • a decided row (decidedAt != null) is ONLY ever created by an admin device, which
+ *     passes the cloud UPDATE policy → merge-upsert so a decision overwrites its row.
+ *   • everything else is a still-pending cashier row → insert-once (ignore-duplicates),
+ *     because a cashier may only INSERT under RLS and a merge would be rejected.
+ * Keying off decidedAt alone means the engine never has to know the device's role.
+ */
+internal fun partitionStaffRequestPush(
+    rows: List<StaffRequest>
+): Pair<List<StaffRequest>, List<StaffRequest>> {
+    val (decided, pending) = rows.partition { it.decidedAt != null }
+    return pending to decided   // (insertOnce, merge)
+}

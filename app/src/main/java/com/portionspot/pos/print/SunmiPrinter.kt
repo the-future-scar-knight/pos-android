@@ -5,18 +5,24 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.os.IBinder
+import android.os.RemoteException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import woyou.aidlservice.jiuiv5.ICallback
 import woyou.aidlservice.jiuiv5.IWoyouService
 import kotlin.coroutines.resume
 
 /**
  * Prints to the built-in printer of a Sunmi handheld POS via the device's
  * InnerPrinter service (woyou.aidlservice.jiuiv5). We bind the service, hand it
- * the SAME ESC/POS byte stream the Bluetooth path uses (sendRAWData), then
- * unbind. On non-Sunmi hardware the bind simply fails and we report it.
+ * the SAME ESC/POS byte stream the Bluetooth path uses (sendRAWData) — the stream
+ * already ends with a feed + cut, so no extra commands are needed — then unbind.
+ * On non-Sunmi hardware the bind simply fails and we report it.
+ *
+ * The transaction code for sendRAWData is fixed by the method order in
+ * IWoyouService.aidl; see that file for why the order must not change.
  */
 object SunmiPrinter {
 
@@ -49,10 +55,40 @@ object SunmiPrinter {
                     "Built-in printer not found. Is this a Sunmi device?"
                 )
 
-                // Null callback is accepted by the InnerPrinter for fire-and-forget raw data.
-                service.sendRAWData(data, null)
-                Thread.sleep(150)
-                PrintResult.Success
+                // Send the raw ESC/POS and wait for the printer's own callback so we
+                // report a real success/failure instead of failing silently. The byte[]
+                // is copied into the service during the (synchronous) binder transact,
+                // so the data is safe even if we unbind right after.
+                val outcome = withTimeoutOrNull(8000) {
+                    suspendCancellableCoroutine<Boolean> { cont ->
+                        val callback = object : ICallback.Stub() {
+                            override fun onRunResult(isSuccess: Boolean) {
+                                if (cont.isActive) cont.resume(isSuccess)
+                            }
+                            override fun onReturnString(result: String?) {}
+                            override fun onRaiseException(code: Int, msg: String?) {
+                                if (cont.isActive) cont.resume(false)
+                            }
+                            override fun onPrintResult(code: Int, msg: String?) {
+                                if (cont.isActive) cont.resume(code == 0)
+                            }
+                        }
+                        try {
+                            service.sendRAWData(data, callback)
+                        } catch (e: RemoteException) {
+                            if (cont.isActive) cont.resume(false)
+                        }
+                    }
+                }
+
+                when (outcome) {
+                    false -> PrintResult.Error("Built-in printer rejected the job.")
+                    // true = printer confirmed. null = the transact succeeded but this
+                    // firmware never invoked the callback; the bytes were already
+                    // delivered, so treat it as a best-effort success rather than a
+                    // false alarm.
+                    else -> PrintResult.Success
+                }
             } catch (e: Exception) {
                 PrintResult.Error(e.message ?: "Built-in printer failed")
             } finally {

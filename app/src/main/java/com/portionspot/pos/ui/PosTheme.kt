@@ -1,19 +1,33 @@
 package com.portionspot.pos.ui
 
 import android.app.Activity
+import android.provider.Settings
+import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.Easing
+import androidx.compose.animation.core.FastOutLinearInEasing
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearOutSlowInEasing
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Typography
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.TextUnit
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 
 /**
@@ -87,19 +101,27 @@ fun buildRamp(hex: String): BrandRamp = BrandRamp(
 
 data class AccentPreset(val id: String, val name: String, val hex: String)
 
+// A coordinated wheel of accents. Every hex is a mid-tone "500" (roughly equal
+// perceived lightness/chroma) so the generated 50→800 ramp lands in the same
+// tonal family across themes — the picker reads as one designed set, not a
+// random rainbow. Ordered around the colour wheel (green → blue → violet →
+// red → orange) with the new default (Pine) first. Every original id is kept so
+// a persisted selection never breaks; a few hexes were re-tuned for harmony and
+// to sit clearly apart from the FIXED wholesale blue (#1E5BFF) and danger red.
 val ACCENT_PRESETS = listOf(
-    AccentPreset("red",     "Signature Red", "#ff3830"),
-    AccentPreset("crimson", "Crimson",       "#e11d48"),
-    AccentPreset("rose",    "Rose",          "#db2777"),
-    AccentPreset("orange",  "Sunset",        "#ea580c"),
-    AccentPreset("amber",   "Amber",         "#d97706"),
-    AccentPreset("gold",    "Gold",          "#b8860b"),
+    AccentPreset("pine",    "Pine",          "#0F766E"), // NEW default — deep teal-green
     AccentPreset("emerald", "Emerald",       "#059669"),
-    AccentPreset("teal",    "Teal",          "#0d9488"),
-    AccentPreset("blue",    "Ocean",         "#2563eb"),
-    AccentPreset("navy",    "Navy",          "#1e3a8a"),
-    AccentPreset("indigo",  "Indigo",        "#4f46e5"),
-    AccentPreset("violet",  "Violet",        "#7c3aed"),
+    AccentPreset("teal",    "Teal",          "#0D9488"),
+    AccentPreset("blue",    "Ocean",         "#0E7490"), // cyan-teal — distinct from the fixed wholesale blue
+    AccentPreset("navy",    "Navy",          "#1E3A8A"),
+    AccentPreset("indigo",  "Indigo",        "#4F46E5"),
+    AccentPreset("violet",  "Violet",        "#7C3AED"),
+    AccentPreset("rose",    "Rose",          "#E11D48"),
+    AccentPreset("crimson", "Crimson",       "#DC2626"),
+    AccentPreset("red",     "Signature Red", "#FF3830"), // web-parity anchor — kept exact
+    AccentPreset("orange",  "Sunset",        "#EA580C"),
+    AccentPreset("amber",   "Amber",         "#D97706"),
+    AccentPreset("gold",    "Gold",          "#B8860B"),
     AccentPreset("slate",   "Graphite",      "#475569"),
 )
 
@@ -110,15 +132,20 @@ data class BackgroundPreset(
     val gradient: List<Color>? = null, // when set, the canvas is this gradient
 )
 
+// Canvases are kept high-key (the POS is read in bright workshops) but softened:
+// pure-grey/pure-white were fatiguing and made the white cards vanish into the
+// background. Each now carries a whisper of warmth or hue so cards read as raised
+// surfaces, and the gradients use gentle same-family stops (never muddy). Default
+// is "Cloud" — a soft cool off-white that lets the Pine accent do the talking.
 val BACKGROUND_PRESETS = listOf(
-    BackgroundPreset("cloud", "Cloud", Color(0xFFF3F4F6)),
-    BackgroundPreset("paper", "Paper", Color(0xFFFFFFFF)),
-    BackgroundPreset("sand",  "Sand",  Color(0xFFF5F1EA)),
-    BackgroundPreset("mist",  "Mist",  Color(0xFFEEF1F6)),
-    BackgroundPreset("sky",   "Sky",   Color(0xFFEEF4FB), listOf(Color(0xFFF3F8FF), Color(0xFFE6EEFB))),
-    BackgroundPreset("mint",  "Mint",  Color(0xFFEEF6F1), listOf(Color(0xFFF1FAF4), Color(0xFFE4F1E9))),
-    BackgroundPreset("dawn",  "Dawn",  Color(0xFFFBF1EF), listOf(Color(0xFFFDF3F0), Color(0xFFF7E8EF))),
-    BackgroundPreset("dusk",  "Dusk",  Color(0xFFF0F0F7), listOf(Color(0xFFF4F3FB), Color(0xFFEAE8F5))),
+    BackgroundPreset("cloud", "Cloud", Color(0xFFF2F4F7)),                       // soft cool off-white (default)
+    BackgroundPreset("paper", "Paper", Color(0xFFFBFAF7)),                       // warm near-white
+    BackgroundPreset("sand",  "Sand",  Color(0xFFF3EEE4)),                       // warm neutral
+    BackgroundPreset("mist",  "Mist",  Color(0xFFEBEFF4)),                       // cool grey-blue
+    BackgroundPreset("sky",   "Sky",   Color(0xFFEAF2FB), listOf(Color(0xFFF1F7FF), Color(0xFFDFEAF8))),
+    BackgroundPreset("mint",  "Mint",  Color(0xFFE9F4EE), listOf(Color(0xFFF0F9F3), Color(0xFFDCEDE4))), // pairs with Pine
+    BackgroundPreset("dawn",  "Dawn",  Color(0xFFFBF0EC), listOf(Color(0xFFFDF4F0), Color(0xFFF6E6EA))),
+    BackgroundPreset("dusk",  "Dusk",  Color(0xFFEFEFF7), listOf(Color(0xFFF4F3FB), Color(0xFFE6E5F2))),
 )
 
 data class SidebarPreset(val id: String, val name: String, val desc: String)
@@ -128,11 +155,15 @@ val SIDEBAR_PRESETS = listOf(
     SidebarPreset("accent", "Accent",   "Tinted with your color"),
 )
 
-/** The user's persisted theme selection. Default is Signature Red — matches
- *  the web's DEFAULT_THEME ({ accent: 'red', accentHex: '#ff3830' }). */
+/** The user's persisted theme selection. The out-of-box default is now "Pine"
+ *  (a deep teal-green) — calmer over long retail shifts than the old fire-engine
+ *  red, and cleanly distinct from the fixed wholesale blue and the danger red so
+ *  the three never blur together. Signature Red (#ff3830, the web's old default)
+ *  is still one tap away under Settings → Appearance. A cashier who had already
+ *  chosen a theme keeps it; only fresh installs get Pine. */
 data class ThemeChoice(
-    val accent: String = "red",
-    val accentHex: String = "#ff3830",
+    val accent: String = "pine",
+    val accentHex: String = "#0F766E",
     val background: String = "cloud",
     val sidebar: String = "dark",
 )
@@ -213,6 +244,153 @@ fun buildTokens(choice: ThemeChoice): PosTokens {
 
 val LocalPosTokens = staticCompositionLocalOf { buildTokens(DEFAULT_THEME) }
 
+// ── Motion ───────────────────────────────────────────────────────────────────
+// Motion values live here for the same reason colours do: literals scattered
+// across screens drift. Unlike [PosTokens] these are NOT themeable — motion is a
+// property of the app's character, not of the accent the shop picked, so this is
+// a plain object rather than another CompositionLocal.
+//
+// The durations are deliberately short. A cashier repeats a handful of actions
+// hundreds of times a shift on cheap hardware while a customer waits, so motion
+// here buys tactile confirmation and nothing else. Anything that reads as
+// decoration is a tax paid on every sale.
+
+object PosMotion {
+    /** Entrances. Compose's default [FastOutSlowInEasing] is an ease-IN-out — it
+     *  front-loads a slow start, which is exactly what makes UI feel sluggish. */
+    val EnterEasing: Easing = LinearOutSlowInEasing
+
+    /** On-screen movement between two known positions (slides, reorders). */
+    val MoveEasing: Easing = FastOutSlowInEasing
+
+    /** Exits. Accelerating out is correct; the user has already moved on. */
+    val ExitEasing: Easing = FastOutLinearInEasing
+
+    /** iOS-like drawer curve (from Ionic). For sheets and the side drawer. */
+    val DrawerEasing: Easing = CubicBezierEasing(0.32f, 0.72f, 0f, 1f)
+
+    /** Press feedback. Below ~100ms reads as a glitch; above ~160ms as lag. */
+    const val Press = 120
+
+    /** Controls: tabs, toggles, chips, pills. */
+    const val Control = 180
+
+    /** Surfaces: dialogs, sheets, the drawer. */
+    const val Surface = 240
+
+    /** Exits run shorter than their entrance — see [ExitEasing]. */
+    const val SurfaceExit = 160
+
+    /** Settle for surfaces. No bounce: this app counts money, and a springy
+     *  payment sheet reads as unserious. */
+    fun <T> surfaceSpring() = spring<T>(
+        dampingRatio = Spring.DampingRatioNoBouncy,
+        stiffness = Spring.StiffnessMediumLow,
+    )
+}
+
+/**
+ * True when the user has turned system animations off (Developer Options, or the
+ * accessibility "Remove animations" toggle). Android has no `prefers-reduced-motion`;
+ * the animator duration scale is the signal, and a scale of 0 means the platform is
+ * already skipping its own animations, so ours should follow.
+ *
+ * Read it once — it needs an app restart to change, and polling it per-frame would
+ * cost more than the animations it disables.
+ */
+val LocalReduceMotion = staticCompositionLocalOf { false }
+
+@Composable
+fun rememberReduceMotion(): Boolean {
+    val resolver = LocalContext.current.contentResolver
+    return remember {
+        runCatching {
+            Settings.Global.getFloat(resolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f) == 0f
+        }.getOrDefault(false)
+    }
+}
+
+// ── Responsive sizing ────────────────────────────────────────────────────────
+// The layout used to be frozen: a fixed 2-column grid and hard-coded card/text
+// sizes, so a big tablet till showed two giant cards while a small handheld
+// crammed the same two. This is genuine *screen-size* responsiveness (driven by
+// the window's width in dp) and is orthogonal to the fontScale=1f pin in
+// MainActivity — that pin only stops the device's ACCESSIBILITY font setting from
+// blowing the UI up; it does not adapt to the actual screen. Here we do.
+//
+// Buckets (screenWidthDp): Compact <360 (small phones / the Sunmi V1s-G handheld),
+// Medium 360–599 (typical phones), Expanded 600–839 (large phones landscape /
+// small tablets), Large ≥840 (tablet tills). The Sunmi stays at 2 columns and
+// slightly tightened sizes so the tight low-DPI screen never clips.
+
+enum class PosWidthClass { Compact, Medium, Expanded, Large }
+
+/** Screen-size–derived dimensions read across the POS surfaces via [LocalPosDimens]. */
+data class PosDimens(
+    val widthClass: PosWidthClass,
+    val productColumns: Int,
+    val gridPadding: Dp,
+    val gridSpacing: Dp,
+    val cardHeight: Dp,
+    val cardPadding: Dp,
+    val cardCorner: Dp,
+    val cardImageHeight: Dp,
+    val cardPriceSize: TextUnit,
+    val cardNameSize: TextUnit,
+    val cardMetaSize: TextUnit,
+    // Dense single-row (LIST) presentation of the same product — a compact
+    // alternative to the grid card, used by the POS list-view toggle.
+    val listRowMinHeight: Dp,
+    val listRowPadding: Dp,
+    val listThumb: Dp,
+)
+
+fun posDimensFor(widthDp: Int): PosDimens {
+    val cls = when {
+        widthDp < 360 -> PosWidthClass.Compact
+        widthDp < 600 -> PosWidthClass.Medium
+        widthDp < 840 -> PosWidthClass.Expanded
+        else -> PosWidthClass.Large
+    }
+    return when (cls) {
+        // Compact = the Sunmi handheld: a low-DPI, physically SHORT screen. The old
+        // 140dp card meant that with the soft keyboard open you could barely see a
+        // full row of two. Tightened here (shorter card, smaller hero band, trimmed
+        // padding/type) so at least a full row of 2 stays comfortably visible while
+        // typing a search. Medium+ are left roomy for real phones/tablets.
+        PosWidthClass.Compact -> PosDimens(
+            widthClass = cls, productColumns = 2,
+            gridPadding = 8.dp, gridSpacing = 8.dp,
+            cardHeight = 116.dp, cardPadding = 8.dp, cardCorner = 12.dp, cardImageHeight = 42.dp,
+            cardPriceSize = 14.sp, cardNameSize = 11.sp, cardMetaSize = 9.sp,
+            listRowMinHeight = 52.dp, listRowPadding = 10.dp, listThumb = 38.dp,
+        )
+        PosWidthClass.Medium -> PosDimens(
+            widthClass = cls, productColumns = 2,
+            gridPadding = 12.dp, gridSpacing = 10.dp,
+            cardHeight = 152.dp, cardPadding = 12.dp, cardCorner = 16.dp, cardImageHeight = 56.dp,
+            cardPriceSize = 16.sp, cardNameSize = 12.sp, cardMetaSize = 10.sp,
+            listRowMinHeight = 58.dp, listRowPadding = 12.dp, listThumb = 42.dp,
+        )
+        PosWidthClass.Expanded -> PosDimens(
+            widthClass = cls, productColumns = 3,
+            gridPadding = 16.dp, gridSpacing = 12.dp,
+            cardHeight = 168.dp, cardPadding = 14.dp, cardCorner = 18.dp, cardImageHeight = 66.dp,
+            cardPriceSize = 18.sp, cardNameSize = 13.sp, cardMetaSize = 11.sp,
+            listRowMinHeight = 62.dp, listRowPadding = 14.dp, listThumb = 46.dp,
+        )
+        PosWidthClass.Large -> PosDimens(
+            widthClass = cls, productColumns = 4,
+            gridPadding = 20.dp, gridSpacing = 14.dp,
+            cardHeight = 184.dp, cardPadding = 16.dp, cardCorner = 20.dp, cardImageHeight = 78.dp,
+            cardPriceSize = 20.sp, cardNameSize = 14.sp, cardMetaSize = 11.sp,
+            listRowMinHeight = 66.dp, listRowPadding = 16.dp, listThumb = 50.dp,
+        )
+    }
+}
+
+val LocalPosDimens = staticCompositionLocalOf { posDimensFor(400) }
+
 // ── App font ─────────────────────────────────────────────────────────────────
 // The web app uses Poppins, which we previously pulled via *downloadable* Google
 // Fonts. That path needs Google Play Services (the `com.google.android.gms` font
@@ -268,6 +446,14 @@ fun PosTheme(
         outline = tokens.surfaceBorder,
         error = tokens.danger,
         onError = Color.White,
+        // Material 3 tints every ELEVATED surface (dialogs, menus, elevated cards)
+        // with `surfaceTint` — which defaults to `primary` (the brand red). At a
+        // dialog's 6dp tonal elevation that paints a muddy pink wash behind the
+        // white content, so the accent, the wash, and the fixed blue/greys clash.
+        // Killing the tint (transparent) keeps elevated surfaces clean white across
+        // EVERY theme; the brand still shows on buttons, chips and accents where we
+        // set it explicitly. (prompt §2 — popup colours don't fit together.)
+        surfaceTint = Color.Transparent,
     )
 
     val view = LocalView.current
@@ -279,7 +465,14 @@ fun PosTheme(
         }
     }
 
-    CompositionLocalProvider(LocalPosTokens provides tokens) {
+    val widthDp = LocalConfiguration.current.screenWidthDp
+    val dimens = remember(widthDp) { posDimensFor(widthDp) }
+
+    CompositionLocalProvider(
+        LocalPosTokens provides tokens,
+        LocalPosDimens provides dimens,
+        LocalReduceMotion provides rememberReduceMotion(),
+    ) {
         MaterialTheme(
             colorScheme = colors,
             typography = posTypography(Poppins),

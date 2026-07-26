@@ -55,6 +55,45 @@ class DtoMappingTest {
     }
 
     @Test
+    fun product_imageUrlAndShowImage_roundTrip() {
+        // Pull: cloud image_url + show_image land on the Item.
+        val dto = ProductDto(
+            sku = "OIL-DELO-5L", name = "Delo 5L", retailPrice = "23",
+            imageUrl = "https://x.supabase.co/storage/v1/object/public/product-images/biz1/i1.jpg",
+            showImage = false, updatedAt = "2026-07-06T09:00:00.000Z",
+        )
+        val item = dto.toItem("biz1", null)
+        assertEquals(dto.imageUrl, item.imageUrl)
+        assertTrue(!item.showImage)
+
+        // Push: a REMOTE url is sent; a still-pending local path is NOT (sent as null).
+        val remote = item.copy(imagePending = false).toProductPush()
+        assertEquals(dto.imageUrl, remote.imageUrl)
+        assertTrue(!remote.showImage)
+        val pendingLocal = item.copy(
+            imageLocalPath = "/data/.../local.jpg", imagePending = true,
+        ).toProductPush()
+        assertNull(pendingLocal.imageUrl)              // never push a device-local path
+    }
+
+    @Test
+    fun product_pullKeepsLocalCache_whenImageUrlUnchanged() {
+        val url = "https://x/obj/public/product-images/biz1/i1.jpg"
+        val existing = com.portionspot.pos.data.Item(
+            id = "local-1", businessId = "biz1", name = "Delo", sku = "OIL-DELO-5L",
+            imageUrl = url, imageLocalPath = "/data/cache/i1.jpg",
+        )
+        // Same remote url ⇒ keep the on-device cached copy.
+        val same = ProductDto(sku = "OIL-DELO-5L", name = "Delo", retailPrice = "9", imageUrl = url)
+            .toItem("biz1", existing)
+        assertEquals("/data/cache/i1.jpg", same.imageLocalPath)
+        // Changed remote url ⇒ drop the stale local copy (display falls back to remote).
+        val changed = ProductDto(sku = "OIL-DELO-5L", name = "Delo", retailPrice = "9", imageUrl = "$url?v=2")
+            .toItem("biz1", existing)
+        assertNull(changed.imageLocalPath)
+    }
+
+    @Test
     fun sale_parsesJsonbItemsAndStringTotals() {
         val json = """
           {"id":"PSM-1","ref":"PSM-1","type":"sale","status":"completed",
@@ -115,6 +154,96 @@ class DtoMappingTest {
         assertEquals(4, dto.items[0].boxSize)
         assertEquals(1, dto.payments.size)
         assertEquals("cash", dto.payments[0].method)
+    }
+
+    // ── pulled receipt EDITS (the fix for "the admin phone kept the old total") ──
+    // A cloud sale that already exists locally must be folded ONTO the local row, not
+    // skipped and not duplicated. These pin the mapping half of that; the engine half
+    // (match, last-write-wins, transactional line replacement) lives in pullSales.
+
+    private fun editedDto(
+        ref: String = "8FD-0031",
+        grandTotal: String = "80",
+        amountPaid: String = "80",
+        items: List<SaleItemJson> = listOf(
+            SaleItemJson(qty = 1.0, sku = "OIL-DELO-5L", name = "Delo 5L", unitPrice = 80.0)
+        ),
+        updatedAt: String = "2026-07-25T11:30:02.000Z",
+    ) = SaleDto(
+        id = ref, ref = ref, type = "sale", status = "completed",
+        items = items, subtotal = grandTotal, grandTotal = grandTotal,
+        amountPaid = amountPaid, changeGiven = "0", changeOwed = "0", payMethod = "cash",
+        createdAt = "2026-07-25T11:00:00.000Z", updatedAt = updatedAt,
+    )
+
+    private fun localSale(
+        id: String = "local-uuid-1",
+        total: Double = 100.0,
+        updatedAt: Long = 1L,
+    ) = com.portionspot.pos.data.SaleEntity(
+        id = id, businessId = "biz1", receiptNo = "8FD-0031", status = "completed",
+        subtotal = total, total = total, amountPaid = total, paymentMethod = "cash",
+        soldAt = 1L, updatedAt = updatedAt, synced = true,
+    )
+
+    @Test
+    fun sale_mergeKeepsLocalPrimaryKeyAndTakesCloudMoney() {
+        val merged = editedDto().mergeIntoSale(localSale())
+        assertEquals("local-uuid-1", merged.id)          // PK never moves: lines/refunds/audit point at it
+        assertEquals("8FD-0031", merged.receiptNo)
+        assertEquals("biz1", merged.businessId)
+        assertEquals(80.0, merged.total, eps)            // the edited grand_total lands
+        assertEquals(80.0, merged.subtotal, eps)
+        assertEquals(80.0, merged.amountPaid, eps)
+        assertEquals("paid", merged.paymentStatus)       // total + change given - paid = 0
+        assertEquals(1L, merged.soldAt)                  // an edit never moves the sale date
+        assertTrue(merged.synced)                        // came DOWN — must not bounce back up
+    }
+
+    @Test
+    fun sale_mergeDerivesUnpaidFromSettlement() {
+        // Android's push does not populate amount_owing, so "still owing" comes from the
+        // same arithmetic the till uses: total + change handed back - tendered.
+        val merged = editedDto(grandTotal = "100", amountPaid = "60").mergeIntoSale(localSale())
+        assertEquals("unpaid", merged.paymentStatus)
+        assertEquals(60.0, merged.amountPaid, eps)
+    }
+
+    @Test
+    fun sale_mergeNeverBlanksMoneyTheCloudRowOmits() {
+        val bare = SaleDto(id = "8FD-0031", ref = "8FD-0031", updatedAt = "2026-07-25T11:30:02.000Z")
+        val merged = bare.mergeIntoSale(localSale(total = 100.0))
+        assertEquals(100.0, merged.total, eps)           // absent grand_total ⇒ keep ours
+        assertEquals(100.0, merged.amountPaid, eps)
+        assertEquals("paid", merged.paymentStatus)       // no settlement info ⇒ keep the flag
+    }
+
+    @Test
+    fun sale_signatureChangesWithMoneyAndGoods() {
+        val local = localSale()
+        val lines = listOf(
+            com.portionspot.pos.data.SaleLine(
+                saleId = local.id, businessId = "biz1", name = "Delo 5L",
+                qty = 2.0, unitPrice = 50.0, lineTotal = 100.0,
+            )
+        )
+        val dto = editedDto()
+        val merged = dto.mergeIntoSale(local)
+        val newLines = dto.toSaleLines("biz1", local.id) { "item-1" }
+        // 2 x 50 = 100 became 1 x 80 = 80: a real edit, so the badge is earned.
+        assertTrue(saleSignature(merged, newLines) != saleSignature(local, lines))
+        // The same receipt re-pulled with only a fresher stamp is NOT an edit.
+        val same = dto.mergeIntoSale(merged)
+        assertEquals(saleSignature(merged, newLines), saleSignature(same, newLines))
+    }
+
+    @Test
+    fun sale_pulledLinesHangOffTheLocalSaleId() {
+        val lines = editedDto().toSaleLines("biz1", "local-uuid-1") { "item-1" }
+        assertEquals(1, lines.size)
+        assertEquals("local-uuid-1", lines[0].saleId)    // not the cloud ref
+        assertEquals("item-1", lines[0].itemId)
+        assertEquals(80.0, lines[0].lineTotal, eps)
     }
 
     @Test

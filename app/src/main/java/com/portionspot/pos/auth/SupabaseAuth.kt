@@ -3,6 +3,7 @@ package com.portionspot.pos.auth
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -32,8 +33,10 @@ data class SessionDto(
 @Serializable
 data class StaffProfileDto(
     val role: String,
-    @SerialName("display_name") val displayName: String,
+    @SerialName("display_name") val displayName: String = "",
     val active: Boolean = true,
+    /** jsonb capability grants; null/absent for legacy rows ⇒ cashier defaults apply. */
+    val permissions: JsonObject? = null,
 )
 
 /** GoTrue error bodies come in two shapes; capture both loosely. */
@@ -114,7 +117,7 @@ class SupabaseAuth(
             ?: throw IOException("Bad URL"))
             .newBuilder()
             .addQueryParameter("id", "eq.$userId")
-            .addQueryParameter("select", "role,display_name,active")
+            .addQueryParameter("select", "role,display_name,active,permissions")
             .build()
         val req = Request.Builder().url(url).get()
             .header("apikey", anonKey)
@@ -143,10 +146,13 @@ class SupabaseAuth(
         return try {
             client.newCall(req).execute().use { resp ->
                 val text = resp.body?.string().orEmpty()
-                if (resp.isSuccessful) {
-                    AuthResult.Success(json.decodeFromString<SessionDto>(text))
-                } else {
-                    AuthResult.Rejected(parseError(text, resp.code))
+                when {
+                    resp.isSuccessful -> AuthResult.Success(json.decodeFromString<SessionDto>(text))
+                    // A server-side blip or a rate limit is NOT a verdict on the session.
+                    // Treating it as one used to be the difference between "retry in a
+                    // minute" and telling a working shop to sign in again mid-trade.
+                    resp.code == 429 || resp.code >= 500 -> AuthResult.Offline(parseError(text, resp.code))
+                    else -> AuthResult.Rejected(parseError(text, resp.code))
                 }
             }
         } catch (e: Exception) {

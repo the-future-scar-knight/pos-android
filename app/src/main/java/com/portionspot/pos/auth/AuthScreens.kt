@@ -1,35 +1,44 @@
 package com.portionspot.pos.auth
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.rounded.AccountCircle
 import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material.icons.rounded.PersonAdd
 import androidx.compose.material.icons.rounded.Storefront
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Surface
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -38,44 +47,59 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.portionspot.pos.device.ConnectivityObserver
+import com.portionspot.pos.ui.LocalPosTokens
+import com.portionspot.pos.ui.PosField
 import kotlinx.coroutines.launch
 
 /**
- * Wraps the whole app: routes between login / PIN setup / PIN unlock and the
- * real POS content depending on [AuthManager.state]. Also shows the
- * "session expired" banner when a refresh is rejected server-side.
+ * Wraps the whole app: routes between the account picker / login / PIN setup /
+ * PIN unlock and the real POS content depending on [AuthManager.state]. Also shows
+ * the "session expired" banner when a refresh is rejected server-side.
  */
 @Composable
-fun AuthGate(auth: AuthManager, content: @Composable (PosUser) -> Unit) {
+fun AuthGate(
+    auth: AuthManager,
+    onExitToLocal: (() -> Unit)? = null,
+    content: @Composable (PosUser) -> Unit,
+) {
     val state by auth.state.collectAsState()
     val reloginRequired by auth.reloginRequired.collectAsState()
 
     when (val s = state) {
         is AuthState.Loading -> Box(Modifier.fillMaxSize()) {}
-        is AuthState.LoggedOut -> LoginScreen(auth)
-        is AuthState.Locked -> PinUnlockScreen(auth, s.displayName)
+        // With no account yet, [onExitToLocal] (when cloud mode was just opted into)
+        // becomes the back arrow so the user can return to using the till locally.
+        is AuthState.LoggedOut -> LoginScreen(auth, onBack = onExitToLocal)
+        is AuthState.AddAccount -> LoginScreen(auth, onBack = { auth.backToPicker() }, prefillEmail = s.prefillEmail)
+        is AuthState.Picker -> AccountPickerScreen(auth, s.accounts)
+        is AuthState.Locked -> PinUnlockScreen(auth, s.account)
         is AuthState.PinSetup -> PinSetupScreen(auth)
         is AuthState.Active -> Column(Modifier.fillMaxSize()) {
             if (reloginRequired) {
-                Surface(
-                    color = MaterialTheme.colorScheme.errorContainer,
-                    contentColor = MaterialTheme.colorScheme.onErrorContainer,
-                    modifier = Modifier.fillMaxWidth()
+                val t = LocalPosTokens.current
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .background(t.danger.copy(alpha = 0.12f))
+                        .padding(horizontal = 16.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Row(
-                        Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            "Session expired — sales keep saving on this device",
-                            style = MaterialTheme.typography.bodySmall,
-                            modifier = Modifier.weight(1f)
-                        )
-                        TextButton(onClick = { auth.promptRelogin() }) { Text("Sign in") }
+                    Text(
+                        "Session expired — sales keep saving on this device",
+                        fontSize = 12.sp,
+                        color = t.danger,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = { auth.promptRelogin() }) {
+                        Text("Sign in", color = t.brand.s600, fontWeight = FontWeight.SemiBold)
                     }
                 }
             }
@@ -85,39 +109,95 @@ fun AuthGate(auth: AuthManager, content: @Composable (PosUser) -> Unit) {
 }
 
 @Composable
-private fun AuthScaffold(
+internal fun AuthScaffold(
     title: String,
     subtitle: String,
+    onBack: (() -> Unit)? = null,
     content: @Composable () -> Unit,
 ) {
-    Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-        Column(
-            Modifier
-                .fillMaxSize()
-                .safeDrawingPadding()
-                .imePadding()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
-        ) {
-            Icon(
-                Icons.Rounded.Storefront,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.width(48.dp).height(48.dp)
-            )
-            Spacer(Modifier.height(12.dp))
-            Text(title, style = MaterialTheme.typography.headlineSmall,
-                color = MaterialTheme.colorScheme.onBackground)
-            Spacer(Modifier.height(4.dp))
-            Text(
-                subtitle,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Spacer(Modifier.height(24.dp))
-            content()
+    val t = LocalPosTokens.current
+    Box(Modifier.fillMaxSize().background(t.canvas)) {
+        Column(Modifier.fillMaxSize()) {
+            if (onBack != null) {
+                Row(Modifier.fillMaxWidth().safeDrawingPadding().padding(horizontal = 4.dp)) {
+                    IconButton(onClick = onBack) {
+                        Icon(
+                            Icons.AutoMirrored.Rounded.ArrowBack,
+                            contentDescription = "Back to accounts",
+                            tint = t.inkSecondary,
+                        )
+                    }
+                }
+            }
+            // Scroll container fills the space. The scrolling column is forced to be at
+            // LEAST the viewport tall (heightIn min = maxHeight) and centers its content:
+            // when the form is short it sits centered (the original look); when the
+            // keyboard is up and the content is taller than the shrunken viewport, the
+            // column grows past the viewport so Center becomes a top-anchored layout and
+            // the whole thing scrolls FROM THE TOP — the title/logo stay reachable instead
+            // of being pushed off-screen.
+            BoxWithConstraints(
+                Modifier
+                    .fillMaxSize()
+                    .then(if (onBack == null) Modifier.safeDrawingPadding() else Modifier)
+                    .imePadding()
+            ) {
+                // Center the form when it fits. When the keyboard shrinks the viewport
+                // and the form is taller than the remaining space, the inner Box grows
+                // PAST the viewport, so its content anchors at the TOP and the whole thing
+                // scrolls from the top — the title/logo can never be clipped or covered.
+                val viewportHeight = maxHeight
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = viewportHeight),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        // Padding lives on the INNER column, never on the min-height Box.
+                        // Applied outside, it added 48dp on top of the viewport height, so
+                        // the form was permanently 48dp scrollable even when it all fitted —
+                        // and scrolling up slid the title under the top edge ("whatever
+                        // reaches that point gets hidden"). Inside, the box is exactly the
+                        // viewport when the content fits, so there is nothing to scroll.
+                        Column(
+                            Modifier
+                                .wrapContentHeight()
+                                .padding(horizontal = 24.dp, vertical = 24.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                        ) {
+                            Box(
+                                Modifier
+                                    .clip(RoundedCornerShape(16.dp))
+                                    .background(t.brand.s50)
+                                    .padding(14.dp),
+                            ) {
+                                Icon(
+                                    Icons.Rounded.Storefront,
+                                    contentDescription = null,
+                                    tint = t.brand.s600,
+                                    modifier = Modifier.width(36.dp).height(36.dp),
+                                )
+                            }
+                            Spacer(Modifier.height(14.dp))
+                            Text(
+                                title,
+                                fontSize = 22.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = t.inkPrimary,
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            Text(subtitle, fontSize = 14.sp, color = t.inkSecondary)
+                            Spacer(Modifier.height(24.dp))
+                            content()
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -125,19 +205,164 @@ private fun AuthScaffold(
 @Composable
 private fun ErrorText(message: String?) {
     if (message != null) {
+        val t = LocalPosTokens.current
         Spacer(Modifier.height(8.dp))
-        Text(
-            message,
-            color = MaterialTheme.colorScheme.error,
-            style = MaterialTheme.typography.bodyMedium
-        )
+        Text(message, color = t.danger, fontSize = 14.sp)
+    }
+}
+
+/** The lock screen when the device already has accounts: pick who's using it. When
+ *  online (and a cloud connection is configured) a second "Other staff" section lists
+ *  roster members who have never signed in here, so the owner can switch into any
+ *  active account by name — that person then types their own password once. */
+@Composable
+private fun AccountPickerScreen(auth: AuthManager, accounts: List<AccountSummary>) {
+    val t = LocalPosTokens.current
+    val online by ConnectivityObserver.rememberOnlineState()
+    val roster by auth.roster.collectAsState()
+    val rosterLoading by auth.rosterLoading.collectAsState()
+
+    // Fetch the roster only while online; drop it the moment the device goes offline so
+    // the picker collapses back to local accounts exactly as before.
+    LaunchedEffect(online) {
+        if (online) auth.loadRoster() else auth.clearRoster()
+    }
+
+    AuthScaffold("Who's using this device?", "Tap your name, then enter your PIN") {
+        accounts.forEach { acc ->
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 4.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(t.surface1)
+                    .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
+                    .clickable { auth.chooseAccount(acc.userId) }
+                    .padding(14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Icon(
+                    Icons.Rounded.AccountCircle,
+                    contentDescription = null,
+                    tint = t.brand.s600,
+                    modifier = Modifier.width(36.dp).height(36.dp),
+                )
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        acc.displayName.ifBlank { acc.email },
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = t.inkPrimary,
+                    )
+                    Text(
+                        if (acc.isAdmin) "Admin" else "Cashier",
+                        fontSize = 12.sp,
+                        color = t.inkTertiary,
+                    )
+                }
+                if (!acc.hasPin) {
+                    Text(
+                        "Set PIN",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = t.brand.s600,
+                    )
+                }
+            }
+        }
+
+        // ── Other staff (online only): roster members not yet on this device. ──
+        if (online) {
+            Spacer(Modifier.height(20.dp))
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    "Other staff",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = t.inkTertiary,
+                    modifier = Modifier.weight(1f),
+                )
+                if (rosterLoading) {
+                    CircularProgressIndicator(
+                        Modifier.width(16.dp).height(16.dp),
+                        color = t.brand.s600,
+                        strokeWidth = 2.dp,
+                    )
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+            if (roster.isEmpty()) {
+                Text(
+                    if (rosterLoading) "Loading staff…" else "No other staff to switch to",
+                    fontSize = 12.sp,
+                    color = t.inkTertiary,
+                )
+            } else {
+                roster.forEach { member ->
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(t.surface1)
+                            .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
+                            .clickable { auth.switchToStaff(member.email) }
+                            .padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Icon(
+                            Icons.Rounded.AccountCircle,
+                            contentDescription = null,
+                            tint = t.inkTertiary,
+                            modifier = Modifier.width(36.dp).height(36.dp),
+                        )
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                member.displayName.ifBlank { member.email },
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = t.inkPrimary,
+                            )
+                            Text(
+                                if (member.isAdmin) "Admin" else "Cashier",
+                                fontSize = 12.sp,
+                                color = t.inkTertiary,
+                            )
+                        }
+                        Text(
+                            "Password",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = t.brand.s600,
+                        )
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+        OutlinedButton(
+            onClick = { auth.addAccount() },
+            modifier = Modifier.fillMaxWidth().height(48.dp),
+        ) {
+            Icon(Icons.Rounded.PersonAdd, contentDescription = null, modifier = Modifier.width(18.dp).height(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("Add another account")
+        }
     }
 }
 
 @Composable
-private fun LoginScreen(auth: AuthManager) {
+private fun LoginScreen(auth: AuthManager, onBack: (() -> Unit)?, prefillEmail: String? = null) {
+    val t = LocalPosTokens.current
     val scope = rememberCoroutineScope()
-    var email by remember { mutableStateOf("") }
+    var email by remember { mutableStateOf(prefillEmail ?: "") }
     var password by remember { mutableStateOf("") }
     var showPassword by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
@@ -155,87 +380,94 @@ private fun LoginScreen(auth: AuthManager) {
         }
     }
 
-    AuthScaffold("PortionSpot POS", "Sign in to start selling") {
-        OutlinedTextField(
+    val switching = prefillEmail != null
+    AuthScaffold(
+        if (switching) "Switch account" else "PortionSpot POS",
+        if (switching) "Enter your password to switch in" else "Sign in to start selling",
+        onBack = onBack,
+    ) {
+        PosField(
             value = email,
             onValueChange = { email = it },
-            label = { Text("Email") },
-            singleLine = true,
-            enabled = !busy,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
-            modifier = Modifier.fillMaxWidth()
+            label = "Email",
+            keyboardType = KeyboardType.Email,
+            modifier = Modifier.fillMaxWidth(),
         )
         Spacer(Modifier.height(12.dp))
-        OutlinedTextField(
+        PosField(
             value = password,
             onValueChange = { password = it },
-            label = { Text("Password") },
-            singleLine = true,
-            enabled = !busy,
+            label = "Password",
+            keyboardType = KeyboardType.Password,
             visualTransformation =
                 if (showPassword) VisualTransformation.None else PasswordVisualTransformation(),
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-            trailingIcon = {
-                IconButton(onClick = { showPassword = !showPassword }) {
+            modifier = Modifier.fillMaxWidth(),
+            trailing = {
+                IconButton(onClick = { showPassword = !showPassword }, modifier = Modifier.width(24.dp).height(24.dp)) {
                     Icon(
                         if (showPassword) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility,
-                        contentDescription = if (showPassword) "Hide password" else "Show password"
+                        contentDescription = if (showPassword) "Hide password" else "Show password",
+                        tint = t.inkTertiary,
+                        modifier = Modifier.width(20.dp).height(20.dp),
                     )
                 }
             },
-            modifier = Modifier.fillMaxWidth()
         )
         ErrorText(error)
         Spacer(Modifier.height(20.dp))
         Button(
             onClick = { submit() },
             enabled = !busy && email.isNotBlank() && password.isNotBlank(),
-            modifier = Modifier.fillMaxWidth().height(48.dp)
+            modifier = Modifier.fillMaxWidth().height(48.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = t.brand.s600, contentColor = t.inkOnBrand,
+            ),
         ) {
             if (busy) CircularProgressIndicator(
                 Modifier.width(22.dp).height(22.dp),
-                color = MaterialTheme.colorScheme.onPrimary,
-                strokeWidth = 2.dp
+                color = t.inkOnBrand,
+                strokeWidth = 2.dp,
             ) else Text("Sign in")
         }
         Spacer(Modifier.height(12.dp))
         Text(
-            "First sign-in needs internet. After that you can unlock and sell offline.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
+            "Signing in needs internet once. After that this person can unlock and sell offline with a PIN.",
+            fontSize = 12.sp,
+            color = t.inkTertiary,
         )
     }
 }
 
 @Composable
-private fun PinField(
+internal fun PinField(
     value: String,
     onChange: (String) -> Unit,
     label: String,
     enabled: Boolean = true,
 ) {
-    OutlinedTextField(
+    PosField(
         value = value,
         onValueChange = { new -> if (new.length <= 6 && new.all { it.isDigit() }) onChange(new) },
-        label = { Text(label) },
-        singleLine = true,
-        enabled = enabled,
+        label = label,
+        keyboardType = KeyboardType.NumberPassword,
         visualTransformation = PasswordVisualTransformation(),
-        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-        modifier = Modifier.fillMaxWidth()
+        modifier = Modifier.fillMaxWidth(),
     )
 }
 
 @Composable
 private fun PinSetupScreen(auth: AuthManager) {
+    val t = LocalPosTokens.current
+    val scope = rememberCoroutineScope()
     var pin by remember { mutableStateOf("") }
     var confirm by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
 
     AuthScaffold("Set a PIN", "Unlock quickly on this device, even offline") {
-        PinField(pin, { pin = it }, "PIN (4-6 digits)")
+        PinField(pin, { pin = it }, "PIN (4-6 digits)", enabled = !busy)
         Spacer(Modifier.height(12.dp))
-        PinField(confirm, { confirm = it }, "Confirm PIN")
+        PinField(confirm, { confirm = it }, "Confirm PIN", enabled = !busy)
         ErrorText(error)
         Spacer(Modifier.height(20.dp))
         Button(
@@ -243,18 +475,29 @@ private fun PinSetupScreen(auth: AuthManager) {
                 when {
                     pin.length < 4 -> error = "PIN must be at least 4 digits"
                     pin != confirm -> error = "PINs don't match"
-                    else -> auth.setPin(pin)
+                    else -> {
+                        busy = true; error = null
+                        // Hashing runs on Dispatchers.IO inside setPin, so the UI
+                        // stays responsive while the PIN is derived.
+                        scope.launch { auth.setPin(pin) }
+                    }
                 }
             },
-            enabled = pin.isNotEmpty() && confirm.isNotEmpty(),
-            modifier = Modifier.fillMaxWidth().height(48.dp)
-        ) { Text("Save PIN") }
-        TextButton(onClick = { auth.skipPin() }) { Text("Skip for now") }
+            enabled = !busy && pin.isNotEmpty() && confirm.isNotEmpty(),
+            modifier = Modifier.fillMaxWidth().height(48.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = t.brand.s600, contentColor = t.inkOnBrand,
+            ),
+        ) { Text(if (busy) "Saving…" else "Save PIN") }
+        TextButton(onClick = { auth.skipPin() }, enabled = !busy) {
+            Text("Skip for now", color = t.inkSecondary)
+        }
     }
 }
 
 @Composable
-private fun PinUnlockScreen(auth: AuthManager, displayName: String) {
+private fun PinUnlockScreen(auth: AuthManager, account: AccountSummary) {
+    val t = LocalPosTokens.current
     val scope = rememberCoroutineScope()
     var pin by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
@@ -272,11 +515,15 @@ private fun PinUnlockScreen(auth: AuthManager, displayName: String) {
         }
     }
 
-    AuthScaffold("Welcome back, $displayName", "Enter your PIN to unlock") {
+    AuthScaffold(
+        "Welcome back, ${account.displayName.ifBlank { account.email }}",
+        "Enter your PIN to unlock",
+        onBack = { auth.backToPicker() },
+    ) {
         Icon(
             Icons.Rounded.Lock,
             contentDescription = null,
-            tint = MaterialTheme.colorScheme.onSurfaceVariant
+            tint = t.inkTertiary,
         )
         Spacer(Modifier.height(12.dp))
         PinField(pin, { pin = it }, "PIN", enabled = !busy)
@@ -285,16 +532,19 @@ private fun PinUnlockScreen(auth: AuthManager, displayName: String) {
         Button(
             onClick = { submit() },
             enabled = !busy && pin.length >= 4,
-            modifier = Modifier.fillMaxWidth().height(48.dp)
+            modifier = Modifier.fillMaxWidth().height(48.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = t.brand.s600, contentColor = t.inkOnBrand,
+            ),
         ) {
             if (busy) CircularProgressIndicator(
                 Modifier.width(22.dp).height(22.dp),
-                color = MaterialTheme.colorScheme.onPrimary,
-                strokeWidth = 2.dp
+                color = t.inkOnBrand,
+                strokeWidth = 2.dp,
             ) else Text("Unlock")
         }
-        TextButton(onClick = {
-            scope.launch { auth.logout() }
-        }) { Text("Sign in with password instead") }
+        TextButton(onClick = { auth.addAccount() }) {
+            Text("Sign in with password instead", color = t.brand.s600)
+        }
     }
 }

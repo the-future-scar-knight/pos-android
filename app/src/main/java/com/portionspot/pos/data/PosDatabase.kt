@@ -316,6 +316,505 @@ val MIGRATION_14_15 = object : Migration(14, 15) {
     }
 }
 
+/** v15 → v16: quotes. A quote is a `sales` row with status='quote'; add its
+ *  lapse date. Additive + nullable, so existing sales are untouched. */
+val MIGRATION_15_16 = object : Migration(15, 16) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE sales ADD COLUMN validUntil INTEGER")
+    }
+}
+
+/**
+ * v16 → v17: product images. Adds the remote image URL (mirrors the cloud
+ * `products.image_url`), a local cached-copy path + pending-upload flag (both
+ * local-only), and the `show_image` toggle to `items`. Additive + nullable/defaulted,
+ * so existing items keep NULL image / show=on and their cards are unchanged.
+ */
+val MIGRATION_16_17 = object : Migration(16, 17) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE items ADD COLUMN imageUrl TEXT")
+        db.execSQL("ALTER TABLE items ADD COLUMN imageLocalPath TEXT")
+        db.execSQL("ALTER TABLE items ADD COLUMN imagePending INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE items ADD COLUMN showImage INTEGER NOT NULL DEFAULT 1")
+    }
+}
+
+/**
+ * v17 → v18: product type (Box / Set / Piece). Adds `productType` to `items` so the
+ * catalog carries the web's three-way product model instead of inferring box-vs-unit
+ * from box size. Existing rows are backfilled by their box size — a real box item
+ * (boxSize > 1) becomes "box"; a single-unit item becomes "piece" (sold individually).
+ * Additive + defaulted, so nothing is dropped and every existing card is unchanged.
+ */
+val MIGRATION_17_18 = object : Migration(17, 18) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE items ADD COLUMN productType TEXT NOT NULL DEFAULT 'box'")
+        db.execSQL("UPDATE items SET productType = CASE WHEN boxSize > 1 THEN 'box' ELSE 'piece' END")
+    }
+}
+
+/**
+ * v18 → v19: per-customer credit limit. Adds a nullable `creditLimit` (REAL) to
+ * `customers` — a local-only credit ceiling the cashier can set when editing a
+ * customer. Additive + nullable, so existing rows keep NULL (no limit set) and
+ * nothing is dropped.
+ */
+val MIGRATION_18_19 = object : Migration(18, 19) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE customers ADD COLUMN creditLimit REAL")
+    }
+}
+
+/**
+ * v19 → v20: per-item markup. Mirrors the per-item discount plumbing but ADDS to the
+ * line price instead of subtracting. Adds `lineMarkup` to `sale_items` (per-line
+ * markup snapshot) and `markupTotal` to `sales` (sum of per-item markups, the mirror
+ * of `discountTotal`). Local-only — the shared cloud schema has no markup column, so
+ * these are never pushed. Additive + defaulted, so existing rows keep 0 and nothing
+ * is dropped.
+ */
+val MIGRATION_19_20 = object : Migration(19, 20) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE sale_items ADD COLUMN lineMarkup REAL NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE sales ADD COLUMN markupTotal REAL NOT NULL DEFAULT 0")
+    }
+}
+
+// Records the change the shop still owes the customer (change due minus change
+// handed over now). Nullable; local-only (the cloud has no such column).
+val MIGRATION_20_21 = object : Migration(20, 21) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE sales ADD COLUMN changeOwed REAL")
+    }
+}
+
+// v21 → v22: measured (unit-priced) products. Adds the two decimal LOCAL-ONLY
+// columns backing productType='measured' — price for one unit and the decimal
+// on-hand quantity. The existing `unit` TEXT column doubles as the measured unit
+// label (kg/L/m/…), so no new unit column is needed. Cloud has no matching
+// columns; these stay on-device.
+val MIGRATION_21_22 = object : Migration(21, 22) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE items ADD COLUMN pricePerUnit REAL NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE items ADD COLUMN stockMeasured REAL NOT NULL DEFAULT 0")
+    }
+}
+
+/**
+ * v22 → v23: expenses become the accounting spine + a cash ledger (B3).
+ *
+ *  1. Extends `expenses` with the approval lifecycle (status/approver/postedAt), the
+ *     double-entry-lite funding split (cash/payable/capital portions), the recurring
+ *     schedule (period/active/template/next-run) and sync-ready columns (localId +
+ *     pendingSync). Every column is additive with a default, so existing expenses are
+ *     untouched. Existing rows are backfilled: localId = id, status = 'approved' (they
+ *     were already real spent costs, so they keep counting toward derived profit),
+ *     postedAt = createdAt. They deliberately get NO funding-portion backfill and NO
+ *     cash-ledger row — the cash balance starts fresh from this version, so a history
+ *     of expenses with no matching historical cash-in can't drive it negative.
+ *  2. Creates the `cash_txns` cash-on-hand ledger (append-only, sync-ready).
+ *
+ * Real migration — additive only, no data dropped.
+ */
+val MIGRATION_22_23 = object : Migration(22, 23) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        // 1. Expense: approval + funding split + recurring + sync-ready.
+        db.execSQL("ALTER TABLE expenses ADD COLUMN localId TEXT NOT NULL DEFAULT ''")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN status TEXT NOT NULL DEFAULT 'approved'")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN submittedBy TEXT")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN submittedByName TEXT")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN approvedBy TEXT")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN approvedByName TEXT")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN approvedAt INTEGER")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN postedAt INTEGER")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN cashPortion REAL NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN payablePortion REAL NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN capitalPortion REAL NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN recurring INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN recurrencePeriod TEXT")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN recurrenceActive INTEGER NOT NULL DEFAULT 1")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN isTemplate INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN templateId TEXT")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN nextRunAt INTEGER")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN lastRunAt INTEGER")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN periodStart TEXT")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN periodEnd TEXT")
+        db.execSQL("ALTER TABLE expenses ADD COLUMN pendingSync INTEGER NOT NULL DEFAULT 1")
+        db.execSQL("UPDATE expenses SET localId = id, postedAt = createdAt")
+
+        // 2. Cash-on-hand ledger (append-only, sync-ready).
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS cash_txns (" +
+                "id TEXT NOT NULL PRIMARY KEY, " +
+                "localId TEXT NOT NULL, " +
+                "businessId TEXT NOT NULL, " +
+                "type TEXT NOT NULL, " +
+                "amount REAL NOT NULL DEFAULT 0, " +
+                "source TEXT, " +
+                "note TEXT, " +
+                "refType TEXT, " +
+                "refId TEXT, " +
+                "createdBy TEXT, " +
+                "createdByName TEXT, " +
+                "createdAt INTEGER NOT NULL, " +
+                "updatedAt INTEGER NOT NULL, " +
+                "deleted INTEGER NOT NULL DEFAULT 0, " +
+                "pendingSync INTEGER NOT NULL DEFAULT 1)"
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_cash_txns_businessId ON cash_txns (businessId)")
+    }
+}
+
+/**
+ * v23 → v24: supplier orders + pending stock (B4).
+ *
+ *  1. `items` gains two LOCAL-ONLY columns backing incoming (pending) stock: `pendingQty`
+ *     (ordered-but-not-arrived units, shown as a "+N pending" badge and NOT sellable) and
+ *     `pendingNew` (a product created by a PO whose first arrival hasn't been confirmed —
+ *     fully blocked from sale until arrival). The cloud `products` table has no matching
+ *     columns, so these stay on-device.
+ *  2. `purchase_orders` gains the ETA + payment split: `eta`, `cashPaid`, `capitalPaid`,
+ *     `payableRemainder`, `arrivalPromptedAt`. Paying for a PO drains cash via a
+ *     `cash_txns` "purchase" row (NOT an expense — a cash→inventory asset purchase), and
+ *     any unpaid balance is accounts payable to the supplier.
+ *  3. `purchase_order_items` gains `sellPrice`, `stockOnArrival`, `productType` so a line
+ *     can seed a brand-new product and be flagged to auto-stock on arrival.
+ *
+ * Real migration — additive with defaults, no data dropped.
+ */
+val MIGRATION_23_24 = object : Migration(23, 24) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE items ADD COLUMN pendingQty REAL NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE items ADD COLUMN pendingNew INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE purchase_orders ADD COLUMN eta INTEGER")
+        db.execSQL("ALTER TABLE purchase_orders ADD COLUMN cashPaid REAL NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE purchase_orders ADD COLUMN capitalPaid REAL NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE purchase_orders ADD COLUMN payableRemainder REAL NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE purchase_orders ADD COLUMN arrivalPromptedAt INTEGER")
+        db.execSQL("ALTER TABLE purchase_order_items ADD COLUMN sellPrice REAL")
+        db.execSQL("ALTER TABLE purchase_order_items ADD COLUMN stockOnArrival INTEGER NOT NULL DEFAULT 1")
+        db.execSQL("ALTER TABLE purchase_order_items ADD COLUMN productType TEXT NOT NULL DEFAULT 'piece'")
+    }
+}
+
+/**
+ * B5 — view + edit receipt. A receipt edited inside the admin window is rewritten IN
+ * PLACE (same id, same receiptNo), so the only new state is the marker saying it
+ * happened. The actual what-changed history is append-only rows in `audit_log`.
+ */
+val MIGRATION_24_25 = object : Migration(24, 25) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE sales ADD COLUMN editedAt INTEGER")
+        db.execSQL("ALTER TABLE sales ADD COLUMN editCount INTEGER NOT NULL DEFAULT 0")
+    }
+}
+
+/**
+ * v25 → v26: cloud sync for the accounting/supplier tables.
+ *
+ * The owner approved pushing the previously LOCAL-ONLY features to the shared Supabase,
+ * and the cloud tables (`expenses`, `cash_txns`, `suppliers`, `purchase_orders`,
+ * `purchase_order_items`, plus `products.unit/price_per_unit/stock_measured`) now exist.
+ * `expenses` and `cash_txns` were already built sync-ready (they carry localId +
+ * pendingSync); the three supplier-order tables were not, so they gain both here.
+ *
+ * BACKFILL matters: every row already on the device is stamped `localId = id` and
+ * `pendingSync = 1` so the whole existing history uploads on the FIRST sync pass rather
+ * than only rows touched from now on. expenses/cash_txns are re-stamped pending for the
+ * same reason — nothing ever marked them synced, but this makes it explicit.
+ */
+val MIGRATION_25_26 = object : Migration(25, 26) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        // suppliers / purchase_orders / purchase_order_items become sync-ready.
+        db.execSQL("ALTER TABLE suppliers ADD COLUMN localId TEXT NOT NULL DEFAULT ''")
+        db.execSQL("ALTER TABLE suppliers ADD COLUMN pendingSync INTEGER NOT NULL DEFAULT 1")
+        db.execSQL("UPDATE suppliers SET localId = id, pendingSync = 1")
+
+        db.execSQL("ALTER TABLE purchase_orders ADD COLUMN localId TEXT NOT NULL DEFAULT ''")
+        db.execSQL("ALTER TABLE purchase_orders ADD COLUMN pendingSync INTEGER NOT NULL DEFAULT 1")
+        db.execSQL("UPDATE purchase_orders SET localId = id, pendingSync = 1")
+
+        db.execSQL("ALTER TABLE purchase_order_items ADD COLUMN localId TEXT NOT NULL DEFAULT ''")
+        db.execSQL("ALTER TABLE purchase_order_items ADD COLUMN pendingSync INTEGER NOT NULL DEFAULT 1")
+        db.execSQL("UPDATE purchase_order_items SET localId = id, pendingSync = 1")
+
+        // Already-recorded expenses / cash movements: make sure they queue for upload.
+        db.execSQL("UPDATE expenses SET localId = id WHERE localId IS NULL OR localId = ''")
+        db.execSQL("UPDATE expenses SET pendingSync = 1")
+        db.execSQL("UPDATE cash_txns SET localId = id WHERE localId IS NULL OR localId = ''")
+        db.execSQL("UPDATE cash_txns SET pendingSync = 1")
+
+        // Measured products now have cloud columns — re-queue the catalogue so the
+        // unit / price_per_unit / stock_measured this device holds reaches the cloud.
+        db.execSQL("UPDATE items SET pendingSync = 1 WHERE productType = 'measured'")
+    }
+}
+
+/**
+ * v26 → v27: admin notifications become CLOUD-SYNCED (multi-device).
+ *
+ * Alerts were local-only, so a condition a cashier's phone noticed never reached the
+ * owner's admin phone. The cloud `notifications` table upserts on the composite key
+ * `(business_id, dedupe_key)`, so the row needs the two sync columns every other synced
+ * entity carries: `updatedAt` (last-write-wins + the `updated_at=gt.<cursor>` pull) and
+ * `pendingSync` (the upload queue).
+ *
+ * BACKFILL: existing rows get `updatedAt = createdAt` and `pendingSync = 1` so the whole
+ * feed this device already holds uploads once on the next pass instead of staying
+ * invisible to the other phones. `pushedAt` is deliberately untouched — it is
+ * device-local state about THIS phone's heads-up notifications.
+ */
+val MIGRATION_26_27 = object : Migration(26, 27) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE notifications ADD COLUMN updatedAt INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE notifications ADD COLUMN pendingSync INTEGER NOT NULL DEFAULT 1")
+        db.execSQL("UPDATE notifications SET updatedAt = createdAt WHERE updatedAt = 0")
+        db.execSQL("UPDATE notifications SET pendingSync = 1")
+    }
+}
+
+/**
+ * v27 → v28 — AUDIT LOG SYNC. The append-only trail gains the two sync columns every
+ * other synced table already has: `updatedAt` (feeds the `updated_at=gt.<cursor>` pull
+ * cursor; for an immutable row it simply mirrors `createdAt`) and `pendingSync` (the
+ * upload queue).
+ *
+ * BACKFILL: existing rows get `updatedAt = createdAt` and `pendingSync = 1`, so the
+ * history this device already holds uploads ONCE on the next pass instead of staying
+ * invisible to the admin phone. The cloud side has no UPDATE policy, so that one upload
+ * is insert-or-skip and re-running it can never rewrite a shared row.
+ */
+val MIGRATION_27_28 = object : Migration(27, 28) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE audit_log ADD COLUMN updatedAt INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE audit_log ADD COLUMN pendingSync INTEGER NOT NULL DEFAULT 1")
+        db.execSQL("UPDATE audit_log SET updatedAt = createdAt WHERE updatedAt = 0")
+        db.execSQL("UPDATE audit_log SET pendingSync = 1")
+    }
+}
+
+/**
+ * v28 → v29 — NOTIFICATION AUDIENCE (admin⇄cashier targeting). Adds `audience` to
+ * `notifications` so a row can be aimed at the admin phone, the cashier phones, or
+ * everyone. It drives which device raises a system heads-up (a cashier must not buzz
+ * for an admin-only alert) and where the notification deep-links.
+ *
+ * DEFAULT 'admin' backfills the whole existing feed to the historical behaviour — every
+ * alert built so far (engine conditions, expense submissions, recurring postings) was
+ * admin-facing — so no data is dropped and old rows keep targeting the admin. `audience`
+ * is SYNCED (it is content, not device-local state), so pushing it re-queues nothing on
+ * its own; the cloud column `notifications.audience text not null default 'admin'` is
+ * added in parallel and a push that beats it fails per-table (surfaced + retried) — the
+ * engine already tolerates that.
+ */
+val MIGRATION_28_29 = object : Migration(28, 29) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE notifications ADD COLUMN audience TEXT NOT NULL DEFAULT 'admin'")
+    }
+}
+
+/**
+ * v29 → v30 — STAFF REQUESTS (admin⇄cashier approval channel, Phase 3). Adds the
+ * `staff_requests` table: a cashier RAISES a request (over-threshold discount, void…)
+ * that lands in the admin's Alerts feed on the other phone; the admin approves/denies it
+ * and the decision syncs back.
+ *
+ * SYNC-READY from birth: carries `localId` (= id) + `pendingSync`, and the cloud table
+ * `public.staff_requests` already exists (see the Phase-3 brief). RLS shapes the push
+ * (staff INSERT/SELECT, admin-only UPDATE/DELETE), which is handled in PosSyncEngine.
+ *
+ * Additive only — a brand-new table, so no existing data is touched. Indices on
+ * businessId / status / requestedBy back the admin-pending, my-requests and pending-count
+ * queries.
+ */
+val MIGRATION_29_30 = object : Migration(29, 30) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS staff_requests (" +
+                "id TEXT NOT NULL PRIMARY KEY, " +
+                "localId TEXT NOT NULL DEFAULT '', " +
+                "businessId TEXT NOT NULL, " +
+                "type TEXT NOT NULL, " +
+                "targetType TEXT, " +
+                "targetId TEXT, " +
+                "targetName TEXT, " +
+                "amount REAL, " +
+                "note TEXT, " +
+                "requestedBy TEXT, " +
+                "requestedByName TEXT, " +
+                "status TEXT NOT NULL DEFAULT 'pending', " +
+                "decidedBy TEXT, " +
+                "decidedByName TEXT, " +
+                "decidedAt INTEGER, " +
+                "applied INTEGER NOT NULL DEFAULT 0, " +
+                "createdAt INTEGER NOT NULL, " +
+                "updatedAt INTEGER NOT NULL, " +
+                "deleted INTEGER NOT NULL DEFAULT 0, " +
+                "pendingSync INTEGER NOT NULL DEFAULT 1)"
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_staff_requests_businessId ON staff_requests (businessId)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_staff_requests_status ON staff_requests (status)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_staff_requests_requestedBy ON staff_requests (requestedBy)")
+    }
+}
+
+/**
+ * v30 → v31 — FREEZE COST OF GOODS AT SALE TIME. Adds `sale_items.unitCost`: the
+ * item's cost price captured the moment the line was rung up.
+ *
+ * Why: gross profit joined `items i` and used `i.cost` — the LIVE catalog cost — so
+ * editing a product's cost price silently rewrote the profit of every past sale. With
+ * the cost frozen on the line, history stops moving.
+ *
+ * Additive and nullable, so nothing is lost: the profit query prefers `li.unitCost`
+ * and falls back to `i.cost` only where the line has none (rows pulled from the cloud,
+ * which carries no cost column, keep reporting exactly as before).
+ *
+ * BACKFILL: existing lines take the item's CURRENT cost. That is an approximation, not
+ * the truth — the real cost at the time of those old sales was never recorded, and this
+ * is the best available stand-in. It is also exactly what those rows were already
+ * reporting, so the backfill moves no existing number; it only stops them moving again.
+ */
+val MIGRATION_30_31 = object : Migration(30, 31) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE sale_items ADD COLUMN unitCost REAL")
+        db.execSQL(
+            "UPDATE sale_items SET unitCost = " +
+                "(SELECT i.cost FROM items i WHERE i.id = sale_items.itemId) " +
+                "WHERE itemId IS NOT NULL"
+        )
+    }
+}
+
+/**
+ * v31 → v32 — TWO CASH LOCATIONS (till + safe). Adds `cash_txns.location`.
+ *
+ * The shop has no bank: its cash sits on-site in exactly two places, a working TILL float
+ * and a SAFE holding the day's takings. Rather than a second ledger (which would drift),
+ * the existing append-only ledger gains a location per movement. Cash-on-hand keeps its
+ * meaning — the SUM over both locations — because a move between them is written as a
+ * matching `transfer_out`/`transfer_in` PAIR that nets to zero.
+ *
+ * BACKFILL: every existing row defaults to 'till'. That is not a guess — before this
+ * version there was only the drawer, so all historical cash was till cash. The safe
+ * starts empty and fills on the first close of day.
+ *
+ * LOCAL-ONLY: the cloud `cash_txns` table has no `location`, so the column is absent from
+ * CashTxnDto and never pushed; a pulled row keeps whatever this device recorded.
+ */
+val MIGRATION_31_32 = object : Migration(31, 32) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE cash_txns ADD COLUMN location TEXT NOT NULL DEFAULT 'till'")
+    }
+}
+
+/**
+ * v32 → v33 — CLOSE THE DAY. Adds the `day_closes` table: one permanent row per counted
+ * close, holding what the ledger expected, what was physically counted, the variance
+ * between them, how much was moved into the safe and who closed.
+ *
+ * The variance is kept here as well as in the ledger (as a `variance` cash row) because
+ * the two answer different questions: the ledger keeps the BALANCE right, this keeps the
+ * HISTORY — including per-cashier attribution, so a repeat offender is visible.
+ *
+ * Brand-new table, so nothing existing is touched. Sync-ready (localId / updatedAt /
+ * pendingSync) but deliberately NOT wired to push or pull: the cloud schema has no
+ * `day_closes` and this phase does not change it.
+ */
+val MIGRATION_32_33 = object : Migration(32, 33) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS day_closes (" +
+                "id TEXT NOT NULL PRIMARY KEY, " +
+                "localId TEXT NOT NULL DEFAULT '', " +
+                "businessId TEXT NOT NULL, " +
+                "dayStart INTEGER NOT NULL, " +
+                "expectedCash REAL NOT NULL DEFAULT 0, " +
+                "countedCash REAL NOT NULL DEFAULT 0, " +
+                "variance REAL NOT NULL DEFAULT 0, " +
+                "movedToSafe REAL NOT NULL DEFAULT 0, " +
+                "floatTarget REAL NOT NULL DEFAULT 0, " +
+                "note TEXT, " +
+                "closedBy TEXT, " +
+                "closedByName TEXT, " +
+                "closedAt INTEGER NOT NULL, " +
+                "updatedAt INTEGER NOT NULL, " +
+                "deleted INTEGER NOT NULL DEFAULT 0, " +
+                "pendingSync INTEGER NOT NULL DEFAULT 1)"
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_day_closes_businessId ON day_closes (businessId)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_day_closes_closedAt ON day_closes (closedAt)")
+    }
+}
+
+/**
+ * v33 → v34 — OUTSIDE FUNDS (owner capital, loans, drawings). Adds `outside_funds`: the
+ * equity/liability ledger that sits beside the cash ledger, so money from outside the
+ * shop can never be mistaken for takings.
+ *
+ * BACKFILL matters here. Owner-funded money was already being recorded, just scattered:
+ * `expenses.capitalPortion` (a bill the owner covered out of pocket) and
+ * `purchase_orders.capitalPaid` (stock the owner paid for). Both are copied in as
+ * `kind='capital', direction='in'` rows carrying their source ref, so the owner's running
+ * "put in" total is CONTINUOUS across the upgrade instead of resetting to zero on a
+ * number they have been watching. Nothing is deleted or moved — the source columns stay
+ * exactly as they are; this is the one ledger that now totals them.
+ *
+ * `pendingSync = 0` on the backfilled rows: they are reconstructions of history, not new
+ * facts, so they should never queue for an upload that (deliberately) does not exist.
+ *
+ * Sync-ready but NOT wired to push/pull — the cloud schema has no `outside_funds`.
+ */
+val MIGRATION_33_34 = object : Migration(33, 34) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS outside_funds (" +
+                "id TEXT NOT NULL PRIMARY KEY, " +
+                "localId TEXT NOT NULL DEFAULT '', " +
+                "businessId TEXT NOT NULL, " +
+                "kind TEXT NOT NULL DEFAULT 'capital', " +
+                "direction TEXT NOT NULL DEFAULT 'in', " +
+                "amount REAL NOT NULL DEFAULT 0, " +
+                "source TEXT, " +
+                "note TEXT, " +
+                "refType TEXT, " +
+                "refId TEXT, " +
+                "createdBy TEXT, " +
+                "createdByName TEXT, " +
+                "createdAt INTEGER NOT NULL, " +
+                "updatedAt INTEGER NOT NULL, " +
+                "deleted INTEGER NOT NULL DEFAULT 0, " +
+                "pendingSync INTEGER NOT NULL DEFAULT 1)"
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_outside_funds_businessId ON outside_funds (businessId)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_outside_funds_createdAt ON outside_funds (createdAt)")
+
+        // Backfill 1: bills the owner covered out of pocket.
+        db.execSQL(
+            "INSERT INTO outside_funds (" +
+                "id, localId, businessId, kind, direction, amount, source, note, " +
+                "refType, refId, createdBy, createdByName, createdAt, updatedAt, deleted, pendingSync) " +
+                "SELECT 'of-exp-' || e.id, 'of-exp-' || e.id, e.businessId, 'capital', 'in', " +
+                "e.capitalPortion, 'Owner', 'Covered ' || e.category, 'expense', e.id, " +
+                "e.approvedBy, e.approvedByName, COALESCE(e.postedAt, e.createdAt), " +
+                "COALESCE(e.postedAt, e.createdAt), 0, 0 " +
+                "FROM expenses e WHERE e.deleted = 0 AND e.isTemplate = 0 " +
+                "AND e.status = 'approved' AND e.capitalPortion > 0"
+        )
+        // Backfill 2: stock the owner paid for.
+        db.execSQL(
+            "INSERT INTO outside_funds (" +
+                "id, localId, businessId, kind, direction, amount, source, note, " +
+                "refType, refId, createdBy, createdByName, createdAt, updatedAt, deleted, pendingSync) " +
+                "SELECT 'of-po-' || p.id, 'of-po-' || p.id, p.businessId, 'capital', 'in', " +
+                "p.capitalPaid, 'Owner', 'Covered ' || p.ref, 'purchase_order', p.id, " +
+                "NULL, NULL, p.createdAt, p.createdAt, 0, 0 " +
+                "FROM purchase_orders p WHERE p.deleted = 0 AND p.status != 'cancelled' " +
+                "AND p.capitalPaid > 0"
+        )
+    }
+}
+
 @Database(
     entities = [
         Business::class,
@@ -328,6 +827,7 @@ val MIGRATION_14_15 = object : Migration(14, 15) {
         CreditTxn::class,
         Setting::class,
         Expense::class,
+        CashTxn::class,
         Supplier::class,
         PurchaseOrder::class,
         PurchaseOrderLine::class,
@@ -336,9 +836,12 @@ val MIGRATION_14_15 = object : Migration(14, 15) {
         RefundPayment::class,
         MobileMoneyReceipt::class,
         AppNotification::class,
-        AuditEntry::class
+        AuditEntry::class,
+        StaffRequest::class,
+        DayClose::class,
+        OutsideFund::class
     ],
-    version = 15,
+    version = 34,
     exportSchema = false
 )
 abstract class PosDatabase : RoomDatabase() {
@@ -351,12 +854,16 @@ abstract class PosDatabase : RoomDatabase() {
     abstract fun creditDao(): CreditDao
     abstract fun settingDao(): SettingDao
     abstract fun expenseDao(): ExpenseDao
+    abstract fun cashTxnDao(): CashTxnDao
     abstract fun supplierDao(): SupplierDao
     abstract fun purchaseOrderDao(): PurchaseOrderDao
     abstract fun refundDao(): RefundDao
     abstract fun mobileMoneyDao(): MobileMoneyDao
     abstract fun notificationDao(): NotificationDao
     abstract fun auditDao(): AuditDao
+    abstract fun staffRequestDao(): StaffRequestDao
+    abstract fun dayCloseDao(): DayCloseDao
+    abstract fun outsideFundDao(): OutsideFundDao
 
     companion object {
         @Volatile
@@ -379,7 +886,13 @@ abstract class PosDatabase : RoomDatabase() {
                     .addMigrations(
                         MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9,
                         MIGRATION_9_10, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14,
-                        MIGRATION_14_15
+                        MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17,
+                        MIGRATION_17_18, MIGRATION_18_19, MIGRATION_19_20,
+                        MIGRATION_20_21, MIGRATION_21_22, MIGRATION_22_23,
+                        MIGRATION_23_24, MIGRATION_24_25, MIGRATION_25_26,
+                        MIGRATION_26_27, MIGRATION_27_28, MIGRATION_28_29,
+                        MIGRATION_29_30, MIGRATION_30_31, MIGRATION_31_32,
+                        MIGRATION_32_33, MIGRATION_33_34
                     )
                     .fallbackToDestructiveMigration()
                     .build()

@@ -4,6 +4,7 @@ import com.portionspot.pos.data.AppNotification
 import com.portionspot.pos.data.DebtAgingRow
 import com.portionspot.pos.data.Item
 import com.portionspot.pos.data.MobileMoneyReceipt
+import com.portionspot.pos.data.PurchaseOrder
 import com.portionspot.pos.data.Refund
 import com.portionspot.pos.data.SaleEntity
 import java.util.Locale
@@ -47,6 +48,7 @@ data class NotifSnapshot(
     val pendingPayments: List<MobileMoneyReceipt>,
     val largeSales: List<SaleEntity>,
     val agingRows: List<DebtAgingRow>,
+    val openPurchaseOrders: List<PurchaseOrder> = emptyList(),
     val pendingSyncCount: Int,
     val lastSyncAt: Long?,
     val thresholds: NotifThresholds = NotifThresholds()
@@ -57,23 +59,43 @@ object NotificationEngine {
     private const val HOUR = 60L * 60 * 1000
     private const val DAY = 24L * HOUR
 
+    /**
+     * Should THIS device raise a system heads-up (and own the deep-link) for an alert
+     * targeted at [audience], given whether the signed-in session is an admin?
+     *
+     * Pure so it can be unit-tested and reused from every firing site (the sweep, the
+     * cross-device pull delivery, the AdminNotificationWorker). "all" reaches everyone;
+     * "cashier" reaches only non-admins; anything else (including the legacy/default
+     * "admin") reaches only admins — a cashier phone must never buzz for an admin alert.
+     */
+    fun audienceMatches(audience: String, isAdmin: Boolean): Boolean = when (audience) {
+        "all" -> true
+        "cashier" -> !isAdmin
+        else -> isAdmin      // "admin" and any unknown value are admin-only
+    }
+
     fun compute(s: NotifSnapshot): List<NotifCandidate> {
         val t = s.thresholds
         val out = ArrayList<NotifCandidate>()
 
         // ---- Inventory: out of stock, then low stock ----
+        // Wording is product-type aware (§ Box/Set/Piece): a set reads "2 sets left",
+        // a piece "4 pieces left", a box item just "5 left" (the count carries it).
         for (it in s.trackedItems) {
             if (it.stockQty <= 0.0) {
+                val noun = stockNoun(it, 0.0)
                 out += NotifCandidate(
-                    "inventory", "danger", "Out of stock", "${it.name} has run out.",
+                    "inventory", "danger", "Out of stock",
+                    if (noun != null) "${it.name}: no $noun in stock." else "${it.name} has run out.",
                     "outstock:${it.id}", "item", it.id, s.nowMs, pushWorthy = true
                 )
             } else {
                 val level = if (it.reorderLevel > 0.0) it.reorderLevel else t.lowStockDefault
                 if (it.stockQty <= level) {
+                    val noun = stockNoun(it, it.stockQty)
                     out += NotifCandidate(
                         "inventory", "warn", "Low stock",
-                        "${it.name}: ${trimQty(it.stockQty)} left.",
+                        "${it.name}: ${trimQty(it.stockQty)}${noun?.let { n -> " $n" } ?: ""} left.",
                         "lowstock:${it.id}", "item", it.id, s.nowMs, pushWorthy = true
                     )
                 }
@@ -127,6 +149,33 @@ object NotificationEngine {
             }
         }
 
+        // ---- Customer over their credit limit (admin is informed; sale still went
+        //      through — the cashier only gets an advisory warning) ----
+        for (row in s.agingRows) {
+            val limit = row.creditLimit ?: continue
+            if (row.total > limit + 0.005) {
+                out += NotifCandidate(
+                    "sales", "danger", "Over credit limit",
+                    "${row.customerName} owes ${money(row.total, s.currency)} — over their ${money(limit, s.currency)} limit.",
+                    "overlimit:${row.customerId}", "customer", row.customerId, s.nowMs, pushWorthy = true
+                )
+            }
+        }
+
+        // ---- Purchase orders near / past their ETA — "has it arrived?" (§10.5) ----
+        // Prompt from one day before the ETA; escalate to danger once it is a day overdue.
+        for (po in s.openPurchaseOrders) {
+            val eta = po.eta ?: continue
+            if (s.nowMs < eta - DAY) continue          // still more than a day out — quiet
+            val overdue = s.nowMs > eta + DAY
+            out += NotifCandidate(
+                "inventory", if (overdue) "danger" else "warn",
+                if (overdue) "Order overdue — arrived?" else "Order arriving — confirm",
+                "${po.ref} from ${po.supplierName.ifBlank { "supplier" }} — confirm arrival to stock it.",
+                "poarrival:${po.id}", "purchase_order", po.id, eta, pushWorthy = true
+            )
+        }
+
         // ---- Device hasn't synced while records are pending ----
         if (s.pendingSyncCount > 0) {
             val since = s.lastSyncAt ?: 0L
@@ -150,4 +199,12 @@ object NotificationEngine {
 
     private fun trimQty(q: Double): String =
         if (q == q.toLong().toDouble()) q.toLong().toString() else q.toString()
+
+    /** Stock noun for the item's product type, singular/plural by [qty]; null for box/
+     *  unit items where the bare count already reads naturally ("5 left"). */
+    private fun stockNoun(item: Item, qty: Double): String? = when (item.productType) {
+        "set" -> if (qty == 1.0) "set" else "sets"
+        "piece" -> if (qty == 1.0) "piece" else "pieces"
+        else -> null
+    }
 }

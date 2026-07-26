@@ -1,3 +1,27 @@
+package com.portionspot.pos.sync
+
+/**
+ * The one-time Supabase setup script the app hands the user when their project is
+ * empty (see the "Set up your database" flow in CloudSyncSection). It creates EVERY
+ * table this app syncs to — the shared web-POS contract for the till core, plus the
+ * accounting spine, supplier orders, the admin alert feed, the audit trail, the
+ * approval channel and the staff roster (see [SyncConfig.TABLES] and the DTOs in
+ * Dtos.kt).
+ *
+ * Bundled in-app (not an asset) so it is available offline on the device. Fully
+ * idempotent — every statement is `if not exists` / `add column if not exists` — so
+ * pasting it into an ALREADY-configured project is a harmless no-op that never drops
+ * or overwrites data, and re-running an OLDER setup upgrades it in place.
+ *
+ * Policies here are deliberately permissive (`anon`/`authenticated` may read and
+ * write). A bring-your-own database starts with no staff rows, so the staff-gated
+ * policies used by a managed shop database would lock the owner out of their own
+ * data on day one.
+ *
+ * Keep this in lockstep with the repo `supabase-setup.sql` — this constant is
+ * GENERATED from that file, which is the source of truth.
+ */
+const val SUPABASE_SETUP_SQL: String = """
 -- ============================================================================
 -- ON-SPOT POS — Supabase setup (bring-your-own-database)
 -- ----------------------------------------------------------------------------
@@ -488,3 +512,4 @@ grant usage, select on all sequences in schema public to anon, authenticated;
 -- Done. Copy your Project URL and anon (public) key from
 -- Dashboard -> Project Settings -> API, then paste them into the app under
 -- Settings -> Cloud sync, and tap "Connect & sync".
+"""

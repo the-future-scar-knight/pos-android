@@ -36,6 +36,8 @@ class SyncConfig(private val dao: SettingDao) {
         // Forget where we were so a future reconnect re-pulls from scratch.
         TABLES.forEach { dao.delete(cursorKey(it)) }
         dao.delete(KEY_LAST_SYNC)
+        dao.delete(KEY_LAST_UPLOAD)
+        dao.delete(KEY_LAST_DOWNLOAD)
     }
 
     /**
@@ -60,15 +62,40 @@ class SyncConfig(private val dao: SettingDao) {
 
     suspend fun setLastSyncAt(ts: Long) = dao.put(Setting(KEY_LAST_SYNC, ts.toString()))
 
+    /** When this device last pushed >0 rows UP (distinct from a pull-only pass). */
+    suspend fun lastUploadAt(): Long? = dao.get(KEY_LAST_UPLOAD)?.toLongOrNull()
+
+    suspend fun setLastUploadAt(ts: Long) = dao.put(Setting(KEY_LAST_UPLOAD, ts.toString()))
+
+    /** When this device last pulled >0 rows DOWN. */
+    suspend fun lastDownloadAt(): Long? = dao.get(KEY_LAST_DOWNLOAD)?.toLongOrNull()
+
+    suspend fun setLastDownloadAt(ts: Long) = dao.put(Setting(KEY_LAST_DOWNLOAD, ts.toString()))
+
     companion object {
         const val KEY_URL = "supabase_url"
         const val KEY_KEY = "supabase_key"
         const val KEY_LAST_SYNC = "last_sync_at"
+        const val KEY_LAST_UPLOAD = "last_upload_at"
+        const val KEY_LAST_DOWNLOAD = "last_download_at"
         const val KEY_PUSH = "sync_push_enabled"
 
         /** Cloud tables Android syncs (the shared web-POS schema). */
         val TABLES = listOf(
-            "products", "customers", "sales", "credit_transactions", "mobile_money_receipts"
+            "products", "customers", "sales", "credit_transactions", "mobile_money_receipts",
+            // Accounting spine + supplier orders (owner-approved for cloud sync).
+            "expenses", "cash_txns", "suppliers", "purchase_orders", "purchase_order_items",
+            // Admin alert feed — so a condition a cashier phone notices reaches the
+            // owner's admin phone (upserts on the composite business_id,dedupe_key).
+            "notifications",
+            // Append-only audit trail — receipt edits, till shortages/overages and
+            // voids recorded on a cashier phone become visible on the admin phone.
+            "audit_log",
+            // Admin approval channel (credit-limit requests). The engine already sets
+            // and reads a "staff_requests" cursor; listing it here is what makes that
+            // cursor get cleared on disconnect/reset like every other table — without
+            // it, a reconnect leaves a stale cursor and silently skips older requests.
+            "staff_requests"
         )
 
         private fun cursorKey(table: String) = "cursor_$table"

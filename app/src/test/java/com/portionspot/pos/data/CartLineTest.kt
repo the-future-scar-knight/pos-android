@@ -84,6 +84,37 @@ class CartLineTest {
     }
 
     @Test
+    fun perItemDiscount_reducesNetAndTax_notGross() {
+        // 4 @ 10 = 40 gross; $6 off the line => 34 net. lineSubtotal stays gross (it
+        // feeds the sale subtotal); the discount comes off net + is taxed on net.
+        val line = CartLine("d1", "Wiper", unitPrice = 10.0, taxRate = 15.0, qty = 4.0, lineDiscount = 6.0)
+        assertEquals(40.0, line.lineGross, eps)
+        assertEquals(40.0, line.lineSubtotal, eps)         // gross, unchanged
+        assertEquals(6.0, line.lineDiscountApplied, eps)
+        assertEquals(34.0, line.lineNet, eps)              // 40 - 6
+        assertEquals(5.1, line.lineTax, eps)               // 15% of 34
+        assertEquals(39.1, line.lineTotal, eps)            // 34 + 5.1
+    }
+
+    @Test
+    fun perItemDiscount_clampedToLineValue_neverNegative() {
+        // A $50 discount on a $12 line can't make the line negative — it clamps to 12.
+        val line = CartLine("d2", "Fuse", unitPrice = 6.0, taxRate = 0.0, qty = 2.0, lineDiscount = 50.0)
+        assertEquals(12.0, line.lineDiscountApplied, eps)
+        assertEquals(0.0, line.lineNet, eps)
+        assertEquals(0.0, line.lineTotal, eps)
+    }
+
+    @Test
+    fun noDiscount_behavesExactlyAsBefore() {
+        // Backward-compatibility: a zero-discount line's totals are unchanged.
+        val line = CartLine("d3", "Belt", unitPrice = 25.0, taxRate = 15.0, qty = 2.0)
+        assertEquals(50.0, line.lineSubtotal, eps)
+        assertEquals(50.0, line.lineNet, eps)
+        assertEquals(57.5, line.lineTotal, eps)
+    }
+
+    @Test
     fun threePriceModes_allHaveDistinctLineKeys() {
         val retail = CartLine("i9", "Oil", 6.0, 0.0, 1.0, mode = "retail")
         val wholesale = CartLine("i9", "Oil", 5.0, 0.0, 1.0, mode = "wholesale")

@@ -12,6 +12,8 @@ import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import com.portionspot.pos.PosApp
+import com.portionspot.pos.notify.AdminNotificationWorker
+import com.portionspot.pos.notify.Notifier
 import java.util.concurrent.TimeUnit
 
 /**
@@ -24,9 +26,29 @@ class SyncWorker(appContext: Context, params: WorkerParameters) :
     CoroutineWorker(appContext, params) {
 
     override suspend fun doWork(): Result {
-        val engine = (applicationContext as PosApp).container.syncEngine
-        return when (engine.sync()) {
-            is SyncOutcome.Success -> Result.success()
+        val app = applicationContext as PosApp
+        val container = app.container
+        return when (val outcome = container.syncEngine.sync()) {
+            is SyncOutcome.Success -> {
+                // BUG A, background path: a pull may have brought down alert rows this
+                // phone must buzz for (a cashier's expense submission never gets re-derived
+                // by the sweep). This is a background pass with no live UI, so the role
+                // comes from the last-active/stored account in the vault; local mode has no
+                // cloud session and the owner is always the admin, so a null session reads
+                // as admin (see AuthManager.isDeviceAdmin). If genuinely indeterminate we
+                // therefore default to firing admin-audience alerts — the historical target.
+                if (outcome.pulled > 0) {
+                    val isAdmin = container.authManager.isDeviceAdmin()
+                    runCatching {
+                        container.repository.fireUnpushedHeadsUps(isAdmin)
+                            .forEach { Notifier.notifyAlert(applicationContext, it) }
+                    }
+                    // Recompute engine conditions off the freshly-synced data. Coalesced by
+                    // unique REPLACE work, so kicking it every background pull is safe.
+                    AdminNotificationWorker.runNow(applicationContext)
+                }
+                Result.success()
+            }
             SyncOutcome.NotConfigured -> Result.success()   // nothing to do yet
             is SyncOutcome.Failed -> Result.retry()         // back off and try again
         }

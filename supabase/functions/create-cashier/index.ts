@@ -1,6 +1,6 @@
-// create-cashier — admin-only creation and (de)activation of POS staff accounts.
+// create-cashier — admin-only creation, (de)activation, and password reset of POS staff.
 //
-// PREPARED, NOT YET DEPLOYED. Deploy with:  supabase functions deploy create-cashier
+// DEPLOYED (verify_jwt=true). Redeploy with:  supabase functions deploy create-cashier
 //
 // Why this exists: the app holds only the public anon key, which cannot create
 // auth users. This Edge Function runs with the SERVICE-ROLE key (auto-injected)
@@ -15,6 +15,7 @@
 // Request (POST JSON), Authorization: Bearer <caller admin JWT>:
 //   { "action": "create", "email": "...", "password": "...", "displayName": "...", "role"?: "cashier"|"admin" }
 //   { "action": "set_active", "staffId": "<uuid>", "active": true|false }
+//   { "action": "reset_password", "staffId": "<uuid>", "password": "..." }
 // Response: { ok: true, ... } | { ok: false, error }
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
@@ -139,6 +140,38 @@ Deno.serve(async (req) => {
       return json({ ok: false, error: "Could not save staff record: " + (await staffResp.text()) }, 400);
     }
     return json({ ok: true, id: newId, email, role, displayName });
+  }
+
+  if (action === "reset_password") {
+    const staffId = String(body.staffId ?? "");
+    const password = String(body.password ?? "");
+    if (!staffId) return json({ ok: false, error: "staffId is required" }, 400);
+    if (password.length < 6) {
+      return json({ ok: false, error: "Password must be at least 6 characters" }, 400);
+    }
+    // Only reset a REAL staff member's password (guards against pointing this at a
+    // non-staff auth user id). The caller is already verified as an active admin.
+    const staffResp = await fetch(
+      `${SUPABASE_URL}/rest/v1/pos_staff?id=eq.${staffId}&select=id&limit=1`,
+      { headers: svcHeaders() },
+    );
+    const staffRows = staffResp.ok ? await staffResp.json() : [];
+    if (!Array.isArray(staffRows) || staffRows.length === 0) {
+      return json({ ok: false, error: "No such staff member" }, 404);
+    }
+    const putResp = await fetch(`${SUPABASE_URL}/auth/v1/admin/users/${staffId}`, {
+      method: "PUT",
+      headers: svcHeaders(),
+      body: JSON.stringify({ password }),
+    });
+    if (!putResp.ok) {
+      const err = await putResp.json().catch(() => ({}));
+      return json(
+        { ok: false, error: err?.msg ?? err?.error_description ?? "Could not reset the password" },
+        400,
+      );
+    }
+    return json({ ok: true, id: staffId });
   }
 
   if (action === "set_active") {

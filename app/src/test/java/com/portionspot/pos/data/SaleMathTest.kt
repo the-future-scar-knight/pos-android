@@ -100,4 +100,61 @@ class SaleMathTest {
         assertEquals(1499.9985, t.taxTotal, eps)
         assertEquals(11499.9885, t.total, eps)
     }
+
+    // ── markup (mirror of the discount cases) ────────────────────────────────
+
+    @Test
+    fun markup_addedToTotal_noVat() {
+        // 100 goods + 20 markup => 120 total, no tax.
+        val t = computeSaleTotals(100.0, 0.0, vatEnabled = false, vatPercent = 15.0, markup = 20.0)
+        assertEquals(0.0, t.discount, eps)
+        assertEquals(20.0, t.markup, eps)
+        assertEquals(120.0, t.taxableBase, eps)
+        assertEquals(0.0, t.taxTotal, eps)
+        assertEquals(120.0, t.total, eps)
+    }
+
+    @Test
+    fun vat_chargedOnMarkedUpBase() {
+        // 100 goods + 20 markup => taxable 120; 15% VAT = 18; total 138.
+        val t = computeSaleTotals(100.0, 0.0, vatEnabled = true, vatPercent = 15.0, markup = 20.0)
+        assertEquals(120.0, t.taxableBase, eps)
+        assertEquals(18.0, t.taxTotal, eps)
+        assertEquals(138.0, t.total, eps)
+    }
+
+    @Test
+    fun discountAndMarkup_combine_onSameBase() {
+        // 100 goods − 30 discount + 50 markup => taxable 120; 15% VAT = 18; total 138.
+        val t = computeSaleTotals(100.0, 30.0, vatEnabled = true, vatPercent = 15.0, markup = 50.0)
+        assertEquals(30.0, t.discount, eps)
+        assertEquals(50.0, t.markup, eps)
+        assertEquals(120.0, t.taxableBase, eps)
+        assertEquals(18.0, t.taxTotal, eps)
+        assertEquals(138.0, t.total, eps)
+    }
+
+    @Test
+    fun negativeMarkup_clampedToZero() {
+        val t = computeSaleTotals(50.0, 0.0, vatEnabled = false, vatPercent = 15.0, markup = -10.0)
+        assertEquals(0.0, t.markup, eps)
+        assertEquals(50.0, t.total, eps)
+    }
+
+    @Test
+    fun markup_hasNoCap_canExceedSubtotal() {
+        // Unlike discount, markup is not clamped to the subtotal.
+        val t = computeSaleTotals(50.0, 0.0, vatEnabled = false, vatPercent = 15.0, markup = 200.0)
+        assertEquals(200.0, t.markup, eps)
+        assertEquals(250.0, t.taxableBase, eps)
+        assertEquals(250.0, t.total, eps)
+    }
+
+    @Test
+    fun markupDefaultsToZero_whenOmitted() {
+        // The existing (discount-only) call site behaviour is unchanged.
+        val t = computeSaleTotals(100.0, 0.0, vatEnabled = false, vatPercent = 15.0)
+        assertEquals(0.0, t.markup, eps)
+        assertEquals(100.0, t.total, eps)
+    }
 }

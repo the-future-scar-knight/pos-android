@@ -106,19 +106,71 @@ data class Item(
     @ColumnInfo(defaultValue = "0") val wholesalePrice: Double = 0.0,
     @ColumnInfo(defaultValue = "0") val boxPrice: Double = 0.0,
     @ColumnInfo(defaultValue = "1") val boxSize: Int = 1,
+    // How the product is sold (mirrors the web catalog's product_type):
+    //   "box"      — sold by the box AND/OR as loose units (uses boxSize/boxPrice).
+    //   "set"      — sold only as a complete set (no box split; stock counts sets).
+    //   "piece"    — sold individually, no box (stock counts pieces).
+    //   "measured" — sold by a DECIMAL quantity of [unit] (e.g. 2.35 kg). Pricing is
+    //                [pricePerUnit] × qty and on-hand lives in [stockMeasured]; the
+    //                integer box/piece stock (stockQty) is NOT used for measured items.
+    // Drives the product form's field set and the type-aware stock wording.
+    @ColumnInfo(defaultValue = "box") val productType: String = "box",
     val cost: Double? = null,
     val taxRate: Double = 0.0,            // percent, e.g. 16.0
     val trackStock: Boolean = false,
     val stockQty: Double = 0.0,
     @ColumnInfo(defaultValue = "0") val reorderLevel: Double = 0.0,  // low-stock threshold
     val unit: String = "pc",
+    // ──── Measured (unit-priced) products — productType == "measured" ────
+    // [pricePerUnit] is the price of ONE [unit] (kg, L, m, …); a measured line costs
+    // pricePerUnit × the decimal quantity the cashier enters. [stockMeasured] is the
+    // decimal on-hand quantity (in [unit]s), drawn down by the sold quantity at
+    // checkout — the integer stockQty is left untouched for measured items.
+    // Both now SYNC: the cloud `products` table carries `unit`, `price_per_unit` and
+    // `stock_measured`, so they push up and pull down like any other product field (a
+    // null cloud value is treated as "not set" and never wipes the local one).
+    @ColumnInfo(defaultValue = "0") val pricePerUnit: Double = 0.0,
+    @ColumnInfo(defaultValue = "0") val stockMeasured: Double = 0.0,
+    // ──── Pending (incoming) stock from a purchase order (B4) — LOCAL-ONLY ────
+    // [pendingQty] is stock that has been ORDERED from a supplier but not yet arrived:
+    // it shows as a "+N pending" badge and is NOT sellable. On arrival it moves into the
+    // real sellable stock (stockQty / stockMeasured) and this drops back to 0.
+    // [pendingNew] marks a product that was CREATED by a purchase order and has never
+    // had a confirmed arrival — it is fully blocked from sale until its first arrival is
+    // confirmed (an existing product keeps selling its current stock, unaffected). The
+    // cloud `products` table has no matching columns, so both stay on-device.
+    @ColumnInfo(defaultValue = "0") val pendingQty: Double = 0.0,
+    @ColumnInfo(defaultValue = "0") val pendingNew: Boolean = false,
     val colorHex: String? = null,        // tile colour when no image
+    // ──── Product image (mirrors the cloud `products.image_url` + `show_image`) ────
+    // [imageUrl] is the REMOTE Supabase Storage public URL — this is what syncs to the
+    // cloud. [imageLocalPath] is a downscaled on-device copy for offline/instant display
+    // AND the source bytes uploaded to Storage on push; it is LOCAL-ONLY. [imagePending]
+    // flags a locally picked/removed image not yet pushed to Storage (LOCAL-ONLY).
+    // Display prefers imageLocalPath, falling back to imageUrl.
+    val imageUrl: String? = null,
+    val imageLocalPath: String? = null,
+    @ColumnInfo(defaultValue = "0") val imagePending: Boolean = false,
+    @ColumnInfo(defaultValue = "1") val showImage: Boolean = true,
     val isActive: Boolean = true,
     val updatedAt: Long = now(),
     val deleted: Boolean = false,
     /** Local-only: true => has unsynced local edits to push. Never sent to cloud. */
     val pendingSync: Boolean = true
 )
+
+/** Measured (unit-priced) product: sold by a decimal quantity of [Item.unit]. */
+val Item.isMeasured: Boolean get() = productType == "measured"
+
+/** On-hand quantity used for badges / low-stock: the decimal [stockMeasured] for a
+ *  measured item, otherwise the integer/box unit count [stockQty]. */
+val Item.onHand: Double get() = if (isMeasured) stockMeasured else stockQty
+
+/** True when the item exists only as PENDING (incoming) stock and cannot be sold yet:
+ *  a purchase-order product whose first arrival has not been confirmed and which has no
+ *  real on-hand stock. Blocks add-to-cart until arrival (B4). An existing product with a
+ *  "+N pending" addition is NOT blocked — it keeps selling its current stock. */
+val Item.sellableBlocked: Boolean get() = pendingNew && onHand <= 0.0
 
 /** A COMPLETED receipt (frozen snapshot). The live cart stays in memory. */
 @Entity(
@@ -129,15 +181,19 @@ data class SaleEntity(
     @PrimaryKey val id: String = newId(),
     val businessId: String,
     val receiptNo: String? = null,
-    val status: String = "completed",     // completed | parked | refunded | void
+    val status: String = "completed",     // completed | parked | refunded | void | quote
+    /** For quotes (status='quote'): the date the quote lapses. Null for real sales. */
+    val validUntil: Long? = null,
     val subtotal: Double = 0.0,
     val discountTotal: Double = 0.0,
+    @ColumnInfo(defaultValue = "0") val markupTotal: Double = 0.0,  // sum of per-item markups (mirrors discountTotal)
     val taxTotal: Double = 0.0,
     val total: Double = 0.0,
     val paymentMethod: String = "cash",   // single tender code, or "split" when >1 payment row
     val tendered: Double? = null,
     @ColumnInfo(defaultValue = "0") val amountPaid: Double = 0.0,  // sum of all SalePayment rows
     val changeDue: Double? = null,         // change actually given back to the customer
+    val changeOwed: Double? = null,        // change the shop still owes the customer (given back < change due)
     val paymentRef: String? = null,        // mobile-money / Paynow reference number
     val paymentStatus: String = "paid",    // paid | unpaid (credit) | pending (Paynow)
     val note: String? = null,
@@ -153,9 +209,32 @@ data class SaleEntity(
     val serverCreatedAt: Long? = null,    // server time, set on sync
     val updatedAt: Long = now(),
     val deleted: Boolean = false,
+    // ──── In-place edit within the admin window (B5) ────
+    // The receipt is edited IN PLACE (same id, same receiptNo) — never duplicated —
+    // so there is exactly one row per sale. These two are the visible marker; the
+    // append-only `audit_log` holds the actual before/after history.
+    /** When the receipt was last edited; null => never edited. */
+    val editedAt: Long? = null,
+    /** How many times it has been edited. */
+    @ColumnInfo(defaultValue = "0") val editCount: Int = 0,
     /** false until the WorkManager sync (later milestone) pushes it to Supabase. */
     val synced: Boolean = false
 )
+
+/** True when this receipt has been edited in place at least once (B5). */
+val SaleEntity.wasEdited: Boolean get() = editedAt != null
+
+/**
+ * Is [this] sale still inside the shop's edit window? Editing is deliberately narrow:
+ * only a COMPLETED sale (never a quote, park, void or refund row) and only while
+ * `now - soldAt <= windowMinutes`. Past that the receipt is locked and a correction
+ * has to go through a void/refund, which leaves its own trail.
+ */
+fun SaleEntity.isEditable(windowMinutes: Int, now: Long = now()): Boolean =
+    status == "completed" &&
+        !deleted &&
+        windowMinutes > 0 &&
+        now - soldAt <= windowMinutes * 60_000L
 
 /** One line of a completed sale. name/unitPrice are SNAPSHOTS at sale time. */
 @Entity(
@@ -170,7 +249,23 @@ data class SaleLine(
     val name: String,                     // snapshot (item may change/delete later)
     val qty: Double = 1.0,
     val unitPrice: Double = 0.0,          // snapshot
+    /**
+     * COST OF GOODS, FROZEN AT SALE TIME — the [Item.cost] the product carried the
+     * moment this line was rung up. Without it, gross profit joined the LIVE catalog
+     * cost, so editing a product's cost price silently rewrote the profit of every
+     * past sale. Null means "not captured" (rows written before this column existed,
+     * or a line with no matching item); the profit query falls back to the catalog
+     * cost for exactly those rows.
+     *
+     * BASIS: cost of ONE STOCK UNIT — the same basis the profit query has always used
+     * against [unitPrice]. (Known pre-existing caveat, unchanged here: on a `box` line
+     * [unitPrice] is the price of a whole box while this is the cost of one unit, so a
+     * box line's margin reads high. Fixing that would move historical numbers and is a
+     * separate decision.)
+     */
+    val unitCost: Double? = null,
     val lineDiscount: Double = 0.0,
+    @ColumnInfo(defaultValue = "0") val lineMarkup: Double = 0.0,
     val lineTax: Double = 0.0,
     val lineTotal: Double = 0.0,
     // Price mode + pack size, snapshotted so a parked cart can be rebuilt and the
@@ -375,7 +470,10 @@ data class DebtAgingRow(
     val bucket30to60: Double = 0.0,
     val bucket60to90: Double = 0.0,
     val bucket90plus: Double = 0.0,
-    val oldestAt: Long = 0L
+    val oldestAt: Long = 0L,
+    /** The customer's credit ceiling (null = no limit set); carried so the notification
+     *  engine can flag a balance that has gone over it. */
+    val creditLimit: Double? = null
 ) {
     val total: Double get() = bucket0to30 + bucket30to60 + bucket60to90 + bucket90plus
 }
@@ -413,6 +511,13 @@ data class Customer(
      * by the sync engine.
      */
     @ColumnInfo(defaultValue = "0") val wholesale: Boolean = false,
+    /**
+     * Local-only per-customer credit ceiling (null = unset / no explicit limit). Like
+     * [wholesale] it is NOT read back from the shared `customers` table on pull, so the
+     * sync engine preserves it across pulls (toCustomer copies onto the existing local
+     * row without touching this field). Stored and displayed only — no checkout gating.
+     */
+    @ColumnInfo val creditLimit: Double? = null,
     val updatedAt: Long = now(),
     val deleted: Boolean = false,
     /** Local-only: true => has unsynced local edits to push. Never sent to cloud. */
@@ -451,6 +556,10 @@ data class CreditTxn(
     val pendingSync: Boolean = true
 )
 
+/** Lightweight (saleId → receipt reference) projection used to label a ledger row with
+ *  the sale that created it, without loading whole [SaleEntity] rows. */
+data class SaleRef(val id: String, val receiptNo: String?)
+
 /** A customer paired with their derived outstanding balance (read model). */
 data class CustomerWithBalance(
     val customer: Customer,
@@ -464,32 +573,273 @@ data class BalanceRow(
 )
 
 /**
- * A business running cost (rent, salaries, fuel…). LOCAL-ONLY, exactly like the
- * web: the cloud schema has no `expenses` table, so these never sync (no
- * pendingSync flag). [date] is a `yyyy-MM-dd` string (matches the web) so the
- * day-bucketed preset filters need no timezone math. [deleted] tombstones a row.
+ * A business running cost (rent, salaries, fuel…) and — from B3 — the accounting
+ * spine's expense record. Anyone may SUBMIT one; it stays [status] = "pending" until
+ * an admin approves (posts) or rejects it. On posting, double-entry-lite splits the
+ * amount across the accounts that funded it: [cashPortion] (drew cash-on-hand down),
+ * [payablePortion] (the shop now owes the payee — cash ran short) and [capitalPortion]
+ * (the owner covered it out of pocket — cash untouched). The three portions sum to
+ * [amount] once approved; they stay 0 while pending/rejected.
+ *
+ * RECURRING (e.g. rent): approving a recurring submission mints a TEMPLATE row
+ * ([isTemplate] = true) — the schedule, never itself counted as a posted cost — which
+ * auto-posts a child charge each period ([nextRunAt]). Children carry [templateId] and
+ * are ordinary approved postings. The admin can PAUSE ([recurrenceActive] = false),
+ * EDIT the amount, or CANCEL (tombstone the template) at any time.
+ *
+ * [date] is a `yyyy-MM-dd` string (matches the web) so day-bucketed filters need no
+ * timezone math. SYNCED: the cloud `expenses` table upserts on [localId].
  */
 @Entity(tableName = "expenses", indices = [Index("businessId")])
 data class Expense(
     @PrimaryKey val id: String = newId(),
+    val localId: String = id,             // sync-ready stable local key (defaults to id)
     val businessId: String,
     val category: String = "Other",
     val amount: Double = 0.0,
     val date: String,                     // yyyy-MM-dd
     val description: String? = null,
+    // ── Approval lifecycle ──
+    val status: String = "pending",       // pending | approved | rejected
+    val submittedBy: String? = null,
+    val submittedByName: String? = null,
+    val approvedBy: String? = null,
+    val approvedByName: String? = null,
+    val approvedAt: Long? = null,
+    val postedAt: Long? = null,           // when it hit the books (== approvedAt for one-offs)
+    // ── Double-entry-lite funding split (set on posting; sums to [amount]) ──
+    val cashPortion: Double = 0.0,        // reduced cash-on-hand
+    val payablePortion: Double = 0.0,     // shop owes the payee (cash ran short)
+    val capitalPortion: Double = 0.0,     // owner covered it (cash untouched)
+    // ── Recurring schedule ──
+    val recurring: Boolean = false,
+    val recurrencePeriod: String? = null, // daily | weekly | monthly
+    val recurrenceActive: Boolean = true, // admin can pause
+    val isTemplate: Boolean = false,      // true => schedule row, not a posted cost
+    val templateId: String? = null,       // set on auto-posted children
+    val nextRunAt: Long? = null,          // template: when the next child is due
+    val lastRunAt: Long? = null,          // template: when it last posted a child
+    // ── Optional time period the cost covers (informational) ──
+    val periodStart: String? = null,      // yyyy-MM-dd
+    val periodEnd: String? = null,        // yyyy-MM-dd
     val createdAt: Long = now(),
     val updatedAt: Long = now(),
-    val deleted: Boolean = false
+    val deleted: Boolean = false,
+    /** true => has unsynced local edits waiting to push to the cloud. */
+    val pendingSync: Boolean = true
 )
 
 /**
- * A goods supplier / vendor. Local-only (the web keeps these in Dexie, not the
- * cloud schema), so there is no `pendingSync` column. Purchase orders denormalise
- * the supplier's name onto each PO, so a tombstoned supplier never breaks history.
+ * WHERE the shop's cash physically sits. There is NO bank: the money is on-site in one
+ * of exactly two places, and every [CashTxn] belongs to one of them.
+ *
+ *  - [TILL] — the working float in the drawer. Only enough to make change. Sales cash
+ *    lands here and change/refund payouts leave from here.
+ *  - [SAFE] — the day's takings, moved out of the drawer at close of day. Taking money
+ *    back OUT of the safe needs the owner's say-so (see the `safe_withdrawal` staff
+ *    request), which is why it is a separate location and not just "more drawer".
+ *
+ * The two are balances over the SAME ledger — cash-on-hand stays `TILL + SAFE`, so every
+ * existing caller of the combined figure keeps reading the right number. Moving money
+ * between them is a TRANSFER (a matching `transfer_out`/`transfer_in` pair summing to
+ * zero): it is neither income nor expense and never changes the combined total.
+ */
+object CashLocation {
+    const val TILL = "till"
+    const val SAFE = "safe"
+
+    /** Human label for a stored location code (unknown/legacy reads as the till). */
+    fun label(code: String?): String = if (code == SAFE) "Safe" else "Till"
+
+    /** Normalise any stored/typed value to a known location (legacy rows = till). */
+    fun of(code: String?): String = if (code == SAFE) SAFE else TILL
+}
+
+/**
+ * One movement of physical CASH-ON-HAND. The accounting spine (B3): cash-on-hand =
+ * opening float (a setting) + Σ of these signed [amount]s. Cash comes IN from sales
+ * ("sale", +net cash tendered less change handed back) and goes OUT for approved
+ * expenses ("expense", −cashPortion) or ad-hoc payouts. Owner-capital-funded expenses
+ * create NO row here (cash untouched); the accounts-payable portion of a short-funded
+ * expense also creates no cash row — only the cash actually paid drains the drawer.
+ *
+ * Money handed BACK also drains it: a cash refund payout ("refund", −cash paid back)
+ * and change paid out on a balance the shop owed ("change_payout", −amount handed
+ * over). Change given at the till is NOT one of these — checkout already books cash in
+ * NET of it. Card/mobile-money reversals write no row: they never opened the drawer.
+ *
+ * TWO LOCATIONS ([location], local-only): the same ledger now answers "how much is in
+ * the drawer" and "how much is in the safe" separately, while the SUM over both stays
+ * the cash-on-hand every existing caller already reads. Types added for the till/safe
+ * model:
+ *  - "transfer_out" / "transfer_in" — the two halves of a move between locations. They
+ *    are written as a PAIR with equal and opposite amounts, so the combined balance is
+ *    provably unchanged (moving your own money is not income).
+ *  - "variance" — the close-of-day true-up to the physically counted cash. Signed:
+ *    negative = short, positive = over. Reported as a "cash short/over" line against
+ *    profit, never folded into gross profit.
+ *  - "drawing" — the owner taking money out (equity, NOT an expense: it must not reduce
+ *    profit). Mirrors the existing "capital" (owner putting money in).
+ *  - "loan" — outside borrowed money coming in (a liability to repay, not income).
+ *
+ * Append-only and immutable: a correction is a new "adjust" row, never an edit.
+ * SYNCED: the cloud `cash_txns` table upserts on [localId]. [location] is LOCAL-ONLY —
+ * the cloud table has no such column, so [com.portionspot.pos.sync.CashTxnDto] does not
+ * carry it and a pulled row keeps whatever this device already recorded (defaulting to
+ * the till, which is what every pre-split row was).
+ */
+@Entity(tableName = "cash_txns", indices = [Index("businessId")])
+data class CashTxn(
+    @PrimaryKey val id: String = newId(),
+    val localId: String = id,
+    val businessId: String,
+    // sale | expense | purchase | refund | change_payout | payout | capital | adjust
+    // | transfer_out | transfer_in | variance | drawing | loan
+    val type: String,
+    val amount: Double = 0.0,             // signed: + into that location, − out of it
+    /** LOCAL-ONLY: which on-site location this movement happened in ([CashLocation]). */
+    @ColumnInfo(defaultValue = "till") val location: String = CashLocation.TILL,
+    val source: String? = null,           // free note of the funding account, if useful
+    val note: String? = null,
+    val refType: String? = null,          // sale | expense | …
+    val refId: String? = null,
+    val createdBy: String? = null,
+    val createdByName: String? = null,
+    val createdAt: Long = now(),
+    val updatedAt: Long = now(),
+    val deleted: Boolean = false,
+    /** true => has unsynced local edits waiting to push to the cloud. */
+    val pendingSync: Boolean = true
+)
+
+/**
+ * A permanent record of ONE close-of-day count (§2). Written only when the owner presses
+ * "Close the day" — never on a timer, never automatically.
+ *
+ * The counted figure WINS: [countedCash] is what was physically in the drawer, and the
+ * close writes a `variance` [CashTxn] for `counted − expected` so the ledger agrees with
+ * reality from that moment on. [variance] is kept here too so the history reads without
+ * recomputation, and so a repeat offender is visible per cashier ([closedByName]).
+ *
+ * [movedToSafe] is the excess over [floatTarget] the owner physically moved into the safe
+ * as part of the same confirmation; it is recorded in the cash ledger as a matching
+ * transfer PAIR, so the till and safe balances both move and the combined total does not.
+ *
+ * LOCAL-ONLY but sync-ready (carries [localId] / [updatedAt] / [pendingSync] like every
+ * other syncable entity). No push/pull is wired: the cloud schema has no `day_closes`.
+ */
+@Entity(tableName = "day_closes", indices = [Index("businessId"), Index("closedAt")])
+data class DayClose(
+    @PrimaryKey val id: String = newId(),
+    val localId: String = id,             // cloud upsert key, when sync is ever wired
+    val businessId: String,
+    /** Start-of-day millis for the trading day being closed (grouping key for history). */
+    val dayStart: Long,
+    /** The till balance the ledger expected before the count. */
+    val expectedCash: Double = 0.0,
+    /** What was physically counted. This wins — the ledger is trued up to it. */
+    val countedCash: Double = 0.0,
+    /** counted − expected. Negative = short (a loss), positive = over (a gain). */
+    val variance: Double = 0.0,
+    /** Excess physically moved from the till into the safe at this close. */
+    val movedToSafe: Double = 0.0,
+    /** The float target in force for this close (what was left in the till). */
+    val floatTarget: Double = 0.0,
+    /** Required when |variance| exceeds the admin's threshold; free text otherwise. */
+    val note: String? = null,
+    val closedBy: String? = null,
+    val closedByName: String? = null,
+    val closedAt: Long = now(),
+    val updatedAt: Long = now(),
+    val deleted: Boolean = false,
+    /** Local-only: true => has unsynced local edits to push (nothing pushes it yet). */
+    val pendingSync: Boolean = true
+)
+
+/**
+ * Money that came from OUTSIDE the shop, or went out of it to the owner (§4 + §6).
+ * Neither sales nor profit — this is the equity/liability side of the till-and-safe
+ * model, kept as its own append-only ledger so "put in" and "borrowed" can be totalled
+ * separately and never confused with takings.
+ *
+ * [kind]:
+ *  - "capital" — the OWNER's own money. Money in RAISES what the shop owes the owner;
+ *    money out (a drawing) pays some of that back. Never an expense, so it must never
+ *    reduce profit.
+ *  - "loan"    — money BORROWED from outside. A liability to repay; "out" is a repayment.
+ *
+ * [direction] is "in" (into the shop) or "out" (back to the owner / lender).
+ *
+ * A row is written whether or not shop CASH moved: paying a bill straight from outside
+ * funds never touches the drawer (and writes no [CashTxn]), while an injection or a
+ * drawing does. [refType]/[refId] tie the row to whatever it funded.
+ *
+ * LOCAL-ONLY but sync-ready ([localId] / [updatedAt] / [pendingSync]); no push/pull is
+ * wired — the cloud schema has no `outside_funds`.
+ */
+@Entity(tableName = "outside_funds", indices = [Index("businessId"), Index("createdAt")])
+data class OutsideFund(
+    @PrimaryKey val id: String = newId(),
+    val localId: String = id,
+    val businessId: String,
+    val kind: String = "capital",         // capital (owner's own) | loan (must be repaid)
+    val direction: String = "in",         // in (into the shop) | out (back to owner/lender)
+    val amount: Double = 0.0,             // always POSITIVE; [direction] carries the sign
+    val source: String? = null,           // "Owner", a lender's name, …
+    val note: String? = null,
+    val refType: String? = null,          // expense | purchase_order | cash
+    val refId: String? = null,
+    val createdBy: String? = null,
+    val createdByName: String? = null,
+    val createdAt: Long = now(),
+    val updatedAt: Long = now(),
+    val deleted: Boolean = false,
+    /** Local-only: true => has unsynced local edits to push (nothing pushes it yet). */
+    val pendingSync: Boolean = true
+)
+
+/** Running totals of outside money (read model for the owner's "put in / taken out"). */
+data class OutsideFundTotals(
+    val capitalIn: Double = 0.0,
+    val capitalOut: Double = 0.0,
+    val loanIn: Double = 0.0,
+    val loanOut: Double = 0.0
+) {
+    /** What the shop still owes the owner: put in less taken out. */
+    val ownerNet: Double get() = capitalIn - capitalOut
+    /** Borrowings still outstanding: taken less repaid. */
+    val loanOutstanding: Double get() = loanIn - loanOut
+}
+
+/**
+ * One completed sale reduced to exactly what CASH-BASIS revenue/profit needs (read
+ * model, see [CashBasis]). Deliberately NOT the whole [SaleEntity]: this is aggregated
+ * per sale in SQL so the Kotlin side can do the FIFO repayment attribution that SQL
+ * cannot express.
+ *
+ *  - [costedRevenue] = Σ `unitPrice * qty` over the lines that HAVE a cost.
+ *  - [lineProfit]    = Σ `(unitPrice − cost * unitsPerLine) * qty` over those same lines.
+ *    So the cost of goods on those lines is exactly `costedRevenue − lineProfit`.
+ */
+data class CashBasisSaleRow(
+    val id: String,
+    val soldAt: Long,
+    val total: Double,
+    val amountPaid: Double,
+    val customerId: String?,
+    val costedRevenue: Double,
+    val lineProfit: Double
+)
+
+/**
+ * A goods supplier / vendor. Purchase orders denormalise the supplier's name onto
+ * each PO, so a tombstoned supplier never breaks history. SYNCED: the cloud
+ * `suppliers` table upserts on [localId] (= the Android UUID).
  */
 @Entity(tableName = "suppliers", indices = [Index("businessId")])
 data class Supplier(
     @PrimaryKey val id: String = newId(),
+    val localId: String = id,             // cloud upsert key (defaults to id)
     val businessId: String,
     val name: String,
     val phone: String? = null,
@@ -498,48 +848,77 @@ data class Supplier(
     val notes: String? = null,
     val createdAt: Long = now(),
     val updatedAt: Long = now(),
-    val deleted: Boolean = false
+    val deleted: Boolean = false,
+    /** true => has unsynced local edits waiting to push to the cloud `suppliers` table. */
+    val pendingSync: Boolean = true
 )
 
 /**
- * A purchase order (restock request to a [Supplier]). LOCAL-ONLY, like the web's
- * Dexie store — the cloud schema has no `purchase_orders` table, so no pendingSync.
- * Lifecycle: draft → sent → received (or cancelled). [supplierName] is denormalised
- * so deleting a supplier never orphans PO history. [ref] is the human code
- * `PO-YYMMDD-NNNN`. Receiving a PO bumps each linked item's stock (see repository).
+ * A purchase order (restock request to a [Supplier]). SYNCED: the cloud
+ * `purchase_orders` table upserts on [localId] (= the Android UUID).
+ * Lifecycle: draft → placed → (partial) → received (or cancelled). [supplierName] is
+ * denormalised so deleting a supplier never orphans PO history. [ref] is the human code
+ * `PO-YYMMDD-NNNN`.
+ *
+ * B4 accounting — buying stock is a CASH → INVENTORY conversion, NOT a profit-reducing
+ * expense: [cashPaid] drains the drawer via a `cash_txns` "purchase" row (never an
+ * `expenses` row, so it never hits the derived net-profit line — the goods only affect
+ * profit later through cost-of-goods-sold when they sell). [capitalPaid] is the owner
+ * funding it out of pocket (cash untouched); [payableRemainder] is the unpaid balance
+ * recorded as ACCOUNTS PAYABLE to the supplier. [eta] is the rough expected-arrival date
+ * that drives the "has it arrived?" prompt; [arrivalPromptedAt] dedupes that prompt.
  */
 @Entity(tableName = "purchase_orders", indices = [Index("businessId")])
 data class PurchaseOrder(
     @PrimaryKey val id: String = newId(),
+    val localId: String = id,               // cloud upsert key (defaults to id)
     val businessId: String,
     val ref: String,
     val supplierId: String? = null,
     val supplierName: String = "",
-    val status: String = "draft",          // draft | sent | received | cancelled
+    val status: String = "draft",          // draft | placed | partial | received | cancelled
     val notes: String? = null,
+    val eta: Long? = null,                  // rough expected-arrival date (epoch ms)
+    val cashPaid: Double = 0.0,             // paid now from cash-on-hand (drains the drawer)
+    val capitalPaid: Double = 0.0,          // owner covered out of pocket (cash untouched)
+    val payableRemainder: Double = 0.0,     // unpaid balance → accounts payable to supplier
+    val arrivalPromptedAt: Long? = null,    // last time the arrival prompt was raised (dedupe)
     val createdAt: Long = now(),
     val sentAt: Long? = null,
     val receivedAt: Long? = null,
     val updatedAt: Long = now(),
-    val deleted: Boolean = false
+    val deleted: Boolean = false,
+    /** true => has unsynced local edits waiting to push to `purchase_orders`. */
+    val pendingSync: Boolean = true
 )
 
 /**
  * One line on a [PurchaseOrder]. [itemId] links to the catalog [Item] by UUID
  * (the Android catalog keys on UUID, not the web's sku) so receiving can find the
  * product to restock; [name]/[sku] are snapshotted for display. [qty] is ordered
- * quantity in units; [receivedQty] is filled in when the PO is received.
+ * quantity in units; [receivedQty] is filled in as the PO is received.
+ *
+ * B4: [sellPrice] is the optional intended retail price for the incoming goods (used to
+ * seed a brand-new product's price on arrival). [stockOnArrival] flags whether this line
+ * should be reflected as PENDING stock and moved into sellable stock when it arrives (a
+ * consumable / non-inventory line can be off). [productType] seeds a new product's type.
  */
 @Entity(tableName = "purchase_order_items", indices = [Index("poId")])
 data class PurchaseOrderLine(
     @PrimaryKey val id: String = newId(),
+    val localId: String = id,               // cloud upsert key (defaults to id)
     val poId: String,
     val itemId: String? = null,
     val name: String = "",
     val sku: String? = null,
     val qty: Double = 1.0,
     val unitCost: Double = 0.0,
-    val receivedQty: Double? = null
+    val sellPrice: Double? = null,
+    val stockOnArrival: Boolean = true,
+    val productType: String = "piece",
+    val receivedQty: Double? = null,
+    /** true => has unsynced local edits waiting to push to `purchase_order_items`. */
+    val pendingSync: Boolean = true
 )
 
 /**
@@ -618,7 +997,15 @@ data class MobileMoneyReceipt(
  * unread badges; [pushedAt] stops a system notification firing twice for the same
  * escalation. [eventAt] is the UNDERLYING event time (a refund's creation, a payment's
  * arrival) so the N-hour escalation in §8 is measured from when it really happened,
- * not from when the engine noticed. Local-only — never synced.
+ * not from when the engine noticed.
+ *
+ * SYNCED (multi-device): a cashier phone's alert must reach the admin's phone, so rows
+ * upsert to the cloud `notifications` table on the COMPOSITE key
+ * `(business_id, dedupe_key)` — never on id, because two devices computing the same
+ * condition mint different local ids but the SAME dedupeKey and must converge on one
+ * cloud row. [readAt] is synced (read on one device = read everywhere).
+ * [pushedAt] is DEVICE-LOCAL and never sent or overwritten by a pull: it records
+ * whether THIS phone already fired its own heads-up notification.
  */
 @Entity(
     tableName = "notifications",
@@ -632,20 +1019,38 @@ data class AppNotification(
     val title: String,
     val body: String,
     val dedupeKey: String,                // stable natural key: recompute updates this row
+    /** Who this alert is FOR: "admin" | "cashier" | "all". Drives BOTH which device
+     *  fires a system heads-up (a cashier phone must not buzz for an admin-only alert)
+     *  and where its deep-link lands. SYNCED so every phone agrees on the target; a
+     *  legacy/foreign row with no value reads as "admin" (the historical behaviour). */
+    val audience: String = "admin",
     val refType: String? = null,          // sale | refund | item | customer | mm_receipt | device
     val refId: String? = null,
     val eventAt: Long = now(),            // underlying event time (drives escalation age)
     val createdAt: Long = now(),          // first seen
-    val readAt: Long? = null,             // null => unread
-    val pushedAt: Long? = null,           // when a system notification was last fired for it
-    val deleted: Boolean = false
+    val readAt: Long? = null,             // null => unread (SYNCED)
+    /** DEVICE-LOCAL: when THIS phone last fired a system notification for the row.
+     *  Never pushed, never overwritten by a pull — each device pushes for itself. */
+    val pushedAt: Long? = null,
+    val updatedAt: Long = now(),          // last local edit; drives last-write-wins
+    val deleted: Boolean = false,
+    /** Local-only: true => has unsynced local edits to push. */
+    val pendingSync: Boolean = true
 )
 
 /**
  * One immutable audit-trail entry (prompt §8 "full audit log"). Written whenever an
  * admin/cashier performs a sensitive action — voiding a refund, adjusting stock,
- * overriding a price, locking a payment method, writing off a debt. Append-only and
- * local-only. Attribution ([createdBy]/[createdByName]) is stamped at write time.
+ * overriding a price, locking a payment method, writing off a debt. Append-only.
+ * Attribution ([createdBy]/[createdByName]) is stamped at write time.
+ *
+ * SYNCED (one-way in effect): the trail is mirrored to the cloud `audit_log` so the
+ * owner's admin phone sees receipt edits, till shortages/overages and voids recorded
+ * on the cashier phones. Because the cloud table has SELECT/INSERT/DELETE policies but
+ * deliberately NO UPDATE policy (an audit trail must not be rewritable), the push uses
+ * ignore-duplicates and a pulled row that already exists locally is skipped, never
+ * overwritten. [updatedAt] exists only to feed the `updated_at=gt.<cursor>` pull cursor
+ * and always equals [createdAt] for a row this device wrote.
  */
 @Entity(tableName = "audit_log", indices = [Index("businessId")])
 data class AuditEntry(
@@ -658,7 +1063,68 @@ data class AuditEntry(
     val meta: String? = null,
     val createdBy: String? = null,
     val createdByName: String? = null,
-    val createdAt: Long = now()
+    val createdAt: Long = now(),
+    /** Mirrors [createdAt] — the row is immutable; this only drives the pull cursor. */
+    val updatedAt: Long = createdAt,
+    /** Local-only: true => still waiting to go up. */
+    val pendingSync: Boolean = true
+)
+
+/**
+ * A remote approval request from a cashier to the admin (Phase 3, admin⇄cashier
+ * channel). A cashier who hits an admin-gated action (an over-threshold discount, a
+ * void, a price override…) can, instead of entering an admin PIN on the till, RAISE a
+ * request that lands in the admin's Alerts feed on the OTHER phone; the admin approves
+ * or denies it and the decision rides back.
+ *
+ * SYNCED via the cloud `staff_requests` table, whose RLS is the whole reason the sync is
+ * split into two modes (see PosSyncEngine.push):
+ *   • staff may INSERT + SELECT, ONLY an admin may UPDATE/DELETE.
+ *   • A cashier's freshly-created PENDING row therefore goes up INSERT-ONCE (ignore-
+ *     duplicates on local_id) — a merge upsert would trip the UPDATE policy and be
+ *     rejected every cycle.
+ *   • Only an admin ever writes a DECIDED row ([decidedAt] != null), so decided rows go
+ *     up merge-upsert (the admin passes the UPDATE policy). The engine keys off
+ *     status/[decidedAt] alone, so it never has to know the device's role.
+ *   • No remote cancel in v1: a cashier can't UPDATE a pushed row, so a stale pending
+ *     request is superseded by creating a NEW one and letting the admin deny the old.
+ *
+ * [applied] = the approved action was actually consumed by the requester (e.g. the
+ * cashier tapped "apply" and the discount went onto the still-open sale). It is a
+ * DEVICE-LOCAL nicety on the cashier side: the cashier can't UPDATE the cloud row, so a
+ * cashier-side apply is set WITHOUT [pendingSync] and never pushed (cloud `applied`
+ * stays false unless an admin device writes it). Mirroring it up is a nice-to-have, not
+ * a correctness field.
+ */
+@Entity(
+    tableName = "staff_requests",
+    indices = [Index("businessId"), Index("status"), Index("requestedBy")]
+)
+data class StaffRequest(
+    @PrimaryKey val id: String = newId(),
+    val localId: String = id,             // cloud upsert key (defaults to id, like Expense/Supplier)
+    val businessId: String,
+    val type: String,                     // discount | void | price_override | … (free-form v1)
+    val targetType: String? = null,       // sale | item | customer | … (what the request is about)
+    val targetId: String? = null,
+    val targetName: String? = null,       // snapshot for display (brief cart summary, item name…)
+    val amount: Double? = null,           // the discount / override amount, when the request carries one
+    val note: String? = null,
+    val requestedBy: String? = null,      // cashier auth uuid
+    val requestedByName: String? = null,  // display-name snapshot
+    val status: String = "pending",       // pending | approved | denied
+    val decidedBy: String? = null,        // admin auth uuid
+    val decidedByName: String? = null,
+    val decidedAt: Long? = null,          // when the admin decided (drives the push partition)
+    /** DEVICE-LOCAL on the cashier side: the approved action was consumed. Set without
+     *  [pendingSync] on a cashier device (RLS blocks the cashier updating a decided row);
+     *  an admin device may write it and push. */
+    val applied: Boolean = false,
+    val createdAt: Long = now(),
+    val updatedAt: Long = now(),
+    val deleted: Boolean = false,
+    /** Local-only: true => has unsynced local edits to push. */
+    val pendingSync: Boolean = true
 )
 
 /**

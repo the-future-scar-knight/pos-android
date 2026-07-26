@@ -30,3 +30,7 @@ replay_pid*.log
 /build-log.txt
 /build_*.txt
 /build_*.log
+
+# session build/verify logs (local only)
+compile-verify.log
+*.verify.log

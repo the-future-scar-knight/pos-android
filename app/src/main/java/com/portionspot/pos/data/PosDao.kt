@@ -51,6 +51,14 @@ interface ItemDao {
     @Query("SELECT * FROM items WHERE businessId = :businessId AND barcode = :barcode AND deleted = 0 LIMIT 1")
     suspend fun getByBarcode(businessId: String, barcode: String): Item?
 
+    /** Existing catalogue row that already owns this SKU (case/space-folded), if any.
+     *  Used to write onto the canonical row instead of inserting a duplicate. */
+    @Query(
+        "SELECT * FROM items WHERE businessId = :businessId AND deleted = 0 " +
+            "AND sku IS NOT NULL AND TRIM(LOWER(sku)) = TRIM(LOWER(:sku)) LIMIT 1"
+    )
+    suspend fun getBySku(businessId: String, sku: String): Item?
+
     @Upsert
     suspend fun upsert(item: Item)
 
@@ -74,6 +82,15 @@ interface ItemDao {
     /** Danger zone: zero out every item's on-hand for a business. */
     @Query("UPDATE items SET stockQty = 0, updatedAt = :at, pendingSync = 1 WHERE businessId = :businessId")
     suspend fun resetAllStock(businessId: String, at: Long)
+
+    /** Hard-delete one item (used to merge a duplicate catalogue row; never synced). */
+    @Query("DELETE FROM items WHERE id = :id")
+    suspend fun hardDelete(id: String)
+
+    /** Soft-delete (tombstone) one item — used to drop a never-arrived pending product
+     *  when its purchase order is cancelled. */
+    @Query("UPDATE items SET deleted = 1, updatedAt = :at, pendingSync = 1 WHERE id = :id")
+    suspend fun softDelete(id: String, at: Long)
 
     // ---- sync ----
     @Query("SELECT * FROM items WHERE pendingSync = 1")
@@ -101,6 +118,29 @@ interface SaleDao {
     )
     fun observeRecent(businessId: String, limit: Int = 100): Flow<List<SaleEntity>>
 
+    /** Completed sales for one customer, newest first — powers the Purchases tab of
+     *  the customer detail dialog. */
+    @Query(
+        "SELECT * FROM sales WHERE customerId = :customerId AND deleted = 0 " +
+            "AND status = 'completed' ORDER BY soldAt DESC"
+    )
+    fun observeSalesForCustomer(customerId: String): Flow<List<SaleEntity>>
+
+    /** Completed sales that carried a whole-sale discount, newest first — the admin's
+     *  "Discounts given" review list (§Job 2). Capped so a busy till doesn't stream its
+     *  whole history. Line-level discounts fold into [SaleEntity.discountTotal] on the
+     *  same row, so this is the single source for "what did we knock off, and who by". */
+    @Query(
+        "SELECT * FROM sales WHERE businessId = :businessId AND deleted = 0 " +
+            "AND status = 'completed' AND discountTotal > 0 ORDER BY soldAt DESC LIMIT :limit"
+    )
+    fun observeDiscountedSales(businessId: String, limit: Int = 200): Flow<List<SaleEntity>>
+
+    /** (id, receiptNo) for every live sale — cheap lookup to label ledger rows with the
+     *  originating transaction's reference. */
+    @Query("SELECT id, receiptNo FROM sales WHERE businessId = :businessId AND deleted = 0")
+    fun observeSaleRefs(businessId: String): Flow<List<SaleRef>>
+
     @Query("SELECT * FROM sale_items WHERE saleId = :saleId AND deleted = 0")
     suspend fun linesForSale(saleId: String): List<SaleLine>
 
@@ -114,12 +154,24 @@ interface SaleDao {
     @Query("SELECT COUNT(*) FROM sales WHERE businessId = :businessId AND deleted = 0 AND status = 'parked'")
     fun observeParkedCount(businessId: String): Flow<Int>
 
+    // ---- quotes (status = 'quote') ----
+    @Query(
+        "SELECT * FROM sales WHERE businessId = :businessId AND deleted = 0 " +
+            "AND status = 'quote' ORDER BY soldAt DESC"
+    )
+    fun observeQuotes(businessId: String): Flow<List<SaleEntity>>
+
     /** Hard-delete a sale + its lines + tenders (used when resuming a parked sale). */
     @Query("DELETE FROM sales WHERE id = :saleId")
     suspend fun hardDeleteSale(saleId: String)
 
     @Query("DELETE FROM sale_items WHERE saleId = :saleId")
     suspend fun hardDeleteLines(saleId: String)
+
+    /** Repoint sale lines from a merged-away duplicate item onto the survivor, so
+     *  historical sales still join to a live catalogue row after a de-dup. */
+    @Query("UPDATE sale_items SET itemId = :survivor WHERE itemId = :dup")
+    suspend fun repointLineItem(dup: String, survivor: String)
 
     @Query("DELETE FROM sale_payments WHERE saleId = :saleId")
     suspend fun hardDeletePayments(saleId: String)
@@ -159,6 +211,25 @@ interface SaleDao {
     )
     fun observeMethodBreakdown(businessId: String, from: Long, to: Long): Flow<List<MethodBreakdown>>
 
+    /**
+     * Count of completed sales in the window whose goods have been FULLY returned —
+     * the booked refund value (refundTotal, VAT+discount inclusive) reaches the sale
+     * total. The report subtracts this from the sale count so a fully-refunded sale
+     * stops counting as a live sale (prompt §5). Refunds are windowed on the same
+     * period so the count and the "refunds paid" money line tell one consistent story.
+     */
+    @Query(
+        "SELECT COUNT(*) FROM sales s " +
+            "WHERE s.businessId = :businessId AND s.deleted = 0 " +
+            "AND s.status = 'completed' AND s.soldAt >= :from AND s.soldAt < :to " +
+            "AND s.total > 0 AND (" +
+            "SELECT COALESCE(SUM(r.refundTotal), 0) FROM refunds r " +
+            "WHERE r.saleId = s.id AND r.deleted = 0 " +
+            "AND r.createdAt >= :from AND r.createdAt < :to" +
+            ") >= s.total - 0.01"
+    )
+    fun observeFullyRefundedCount(businessId: String, from: Long, to: Long): Flow<Int>
+
     // ---- dashboard ----
     /** Best-selling lines in a window (grouped by snapshot name, so ad-hoc lines count too). */
     @Query(
@@ -172,14 +243,34 @@ interface SaleDao {
     )
     fun observeTopProducts(businessId: String, from: Long, to: Long, limit: Int = 5): Flow<List<TopProduct>>
 
-    /** Gross profit = SUM((soldPrice - currentCost) * qty), only for items that have a cost. */
+    /**
+     * Gross profit = SUM((soldPrice − costOfWhatWasSold) * qty), only for lines that have
+     * a cost to work from.
+     *
+     * The cost basis is the FROZEN `li.unitCost` captured at checkout, falling back to
+     * the live catalog `i.cost` only for lines that never captured one (rows written
+     * before the column existed, or pulled from the cloud, which carries no cost).
+     * Before this, the query read `i.cost` directly, so editing a product's cost price
+     * silently rewrote the profit of every past sale.
+     *
+     * ★ `unitsPerLine` matters and was missing: `unitPrice` is the price of ONE LINE-UNIT
+     * (a whole box on a box line) while the cost is per STOCK UNIT, so a box of 4 was
+     * charged one unit of cost instead of four. That overstated profit on every box sale
+     * by `cost * (unitsPerLine - 1) * qty` — on a $80 box of 4 units costing $15 each it
+     * reported $65 profit instead of $20. Multiplying the cost up to the line-unit fixes
+     * it. `NULLIF(...,0)` guards a stray 0 box size, which would otherwise zero the cost
+     * and overstate profit all over again. Piece and measured lines carry 1 and are
+     * unaffected.
+     */
     @Query(
-        "SELECT COALESCE(SUM((li.unitPrice - i.cost) * li.qty), 0) " +
+        "SELECT COALESCE(SUM((li.unitPrice - " +
+            "COALESCE(li.unitCost, i.cost) * COALESCE(NULLIF(li.unitsPerLine, 0), 1)" +
+            ") * li.qty), 0) " +
             "FROM sale_items li JOIN sales s ON li.saleId = s.id " +
             "JOIN items i ON li.itemId = i.id " +
             "WHERE s.businessId = :businessId AND s.deleted = 0 AND li.deleted = 0 " +
             "AND s.status = 'completed' AND s.soldAt >= :from AND s.soldAt < :to " +
-            "AND i.cost IS NOT NULL"
+            "AND COALESCE(li.unitCost, i.cost) IS NOT NULL"
     )
     fun observeGrossProfit(businessId: String, from: Long, to: Long): Flow<Double>
 
@@ -194,9 +285,46 @@ interface SaleDao {
             "JOIN items i ON li.itemId = i.id " +
             "WHERE s.businessId = :businessId AND s.deleted = 0 AND li.deleted = 0 " +
             "AND s.status = 'completed' AND s.soldAt >= :from AND s.soldAt < :to " +
-            "AND i.cost IS NOT NULL"
+            // Same costed-line filter as observeGrossProfit, so margin = profit / this
+            // keeps measuring the SAME set of lines.
+            "AND COALESCE(li.unitCost, i.cost) IS NOT NULL"
     )
     fun observeCostedRevenue(businessId: String, from: Long, to: Long): Flow<Double>
+
+    /**
+     * Every live COMPLETED sale reduced to its CASH-BASIS inputs (§5): what it billed,
+     * what was settled at the till, and the costed-line economics behind it.
+     *
+     * ★ MEANING: this query recognises NOTHING on its own — it is raw input to
+     * [CashBasis], which decides what counts as revenue and when. It is unwindowed on
+     * purpose: a repayment made TODAY can settle a sale from last year, so the collected
+     * revenue of any window depends on sales outside it. The FIFO attribution that
+     * repayments need cannot be expressed in SQL, so the aggregation stops here.
+     *
+     * `costedRevenue` and `lineProfit` cover only lines that HAVE a cost (frozen
+     * `li.unitCost`, falling back to the live `i.cost` for rows written before the column
+     * existed) — the same costed-line filter the gross-profit query uses, so margin stays
+     * measured over one consistent set of lines. `unitsPerLine` multiplies the per-STOCK-
+     * UNIT cost up to the LINE-UNIT price (a box line prices a whole box), guarded by
+     * `NULLIF(...,0)` so a stray zero pack size can't zero the cost.
+     */
+    @Query(
+        "SELECT s.id AS id, s.soldAt AS soldAt, s.total AS total, " +
+            "s.amountPaid AS amountPaid, s.customerId AS customerId, " +
+            "COALESCE((SELECT SUM(li.unitPrice * li.qty) FROM sale_items li " +
+            "  JOIN items i ON li.itemId = i.id " +
+            "  WHERE li.saleId = s.id AND li.deleted = 0 " +
+            "  AND COALESCE(li.unitCost, i.cost) IS NOT NULL), 0) AS costedRevenue, " +
+            "COALESCE((SELECT SUM((li.unitPrice - " +
+            "    COALESCE(li.unitCost, i.cost) * COALESCE(NULLIF(li.unitsPerLine, 0), 1)" +
+            "  ) * li.qty) FROM sale_items li " +
+            "  JOIN items i ON li.itemId = i.id " +
+            "  WHERE li.saleId = s.id AND li.deleted = 0 " +
+            "  AND COALESCE(li.unitCost, i.cost) IS NOT NULL), 0) AS lineProfit " +
+            "FROM sales s WHERE s.businessId = :businessId AND s.deleted = 0 " +
+            "AND s.status = 'completed'"
+    )
+    fun observeCashBasisSales(businessId: String): Flow<List<CashBasisSaleRow>>
 
     /** Bare (timestamp,total) rows since [from], bucketed in-app into the 7-day chart. */
     @Query(
@@ -240,6 +368,23 @@ interface SaleDao {
     @Query("SELECT * FROM sales WHERE id = :id LIMIT 1")
     suspend fun getSaleById(id: String): SaleEntity?
 
+    /**
+     * Find a sale by its receipt reference. The cloud keys `sales` rows by REF (not by
+     * our local UUID), so a sale this device made comes back down under an id we've
+     * never seen — only the receiptNo identifies it. Prefers the locally-created row
+     * (id != receiptNo, i.e. the UUID one that owns the lines/payments) if a pulled
+     * twin is also present.
+     */
+    @Query(
+        "SELECT * FROM sales WHERE businessId = :businessId AND receiptNo = :receiptNo " +
+            "ORDER BY (id <> :receiptNo) DESC LIMIT 1"
+    )
+    suspend fun getSaleByReceiptNo(businessId: String, receiptNo: String): SaleEntity?
+
+    /** Every sale carrying a receipt ref (incl. tombstoned) — input to the duplicate heal. */
+    @Query("SELECT * FROM sales WHERE businessId = :businessId AND receiptNo IS NOT NULL")
+    suspend fun salesWithReceiptOnce(businessId: String): List<SaleEntity>
+
     @Query("UPDATE sales SET synced = 1 WHERE id = :id")
     suspend fun markSaleSynced(id: String)
 
@@ -248,6 +393,24 @@ interface SaleDao {
 
     @Upsert
     suspend fun upsertLines(lines: List<SaleLine>)
+
+    /**
+     * Apply a pulled EDIT to a sale that already exists locally: rewrite the row (same
+     * primary key — the local UUID that the lines, tenders, refunds, credit rows and the
+     * audit trail all point at) and swap its goods for [lines], which must already carry
+     * `saleId = sale.id`.
+     *
+     * ONE transaction on purpose. An edit can add, remove or re-quantify lines, so the
+     * replacement is delete-then-insert; doing that outside a transaction could leave a
+     * receipt showing money with none of its goods — or half of them — if the write is
+     * interrupted. Either the whole corrected receipt lands or nothing does.
+     */
+    @Transaction
+    suspend fun replaceSaleWithLines(sale: SaleEntity, lines: List<SaleLine>) {
+        hardDeleteLines(sale.id)
+        upsertSale(sale)
+        if (lines.isNotEmpty()) insertLines(lines)
+    }
 
     // ---- danger zone: wipe all sales data for a business ----
     @Query("DELETE FROM sales WHERE businessId = :businessId")
@@ -372,6 +535,33 @@ interface CreditDao {
     )
     fun observeChangeBalance(customerId: String): Flow<Double>
 
+    /** One-shot DEBT balance (credit_owed − credit_paid). Used to split an overpayment:
+     *  a repayment bigger than the debt settles it and books the rest as change owed. */
+    @Query(
+        "SELECT COALESCE(SUM(CASE WHEN type = 'credit_owed' THEN amount " +
+            "WHEN type = 'credit_paid' THEN -amount ELSE 0 END), 0) " +
+            "FROM credit_transactions WHERE customerId = :customerId AND deleted = 0"
+    )
+    suspend fun balanceOnce(customerId: String): Double
+
+    /** One-shot WE-OWE balance (change/refund owed − paid). Used to split an over-payout:
+     *  paying out more than we owe settles it and books the excess as customer debt. */
+    @Query(
+        "SELECT COALESCE(SUM(CASE WHEN type IN ('change_owed', 'refund_owed') THEN amount " +
+            "WHEN type IN ('change_paid', 'refund_paid') THEN -amount ELSE 0 END), 0) " +
+            "FROM credit_transactions WHERE customerId = :customerId AND deleted = 0"
+    )
+    suspend fun changeBalanceOnce(customerId: String): Double
+
+    /** Shop-wide money owed BACK to customers (change + unpaid refunds), net of payouts.
+     *  Powers the "You owe customers" summary on the Change & Credit screen. */
+    @Query(
+        "SELECT COALESCE(SUM(CASE WHEN type IN ('change_owed', 'refund_owed') THEN amount " +
+            "WHEN type IN ('change_paid', 'refund_paid') THEN -amount ELSE 0 END), 0) " +
+            "FROM credit_transactions WHERE businessId = :businessId AND deleted = 0"
+    )
+    fun observeTotalChangeOwed(businessId: String): Flow<Double>
+
     @Query("DELETE FROM credit_transactions WHERE businessId = :businessId")
     suspend fun wipe(businessId: String)
 
@@ -448,6 +638,10 @@ interface RefundDao {
     @Query("SELECT * FROM refunds WHERE saleId = :saleId AND deleted = 0")
     suspend fun forSaleOnce(saleId: String): List<Refund>
 
+    /** Money already refunded against one sale — the gate on editing it in place (B5). */
+    @Query("SELECT COALESCE(SUM(refundTotal), 0) FROM refunds WHERE saleId = :saleId AND deleted = 0")
+    suspend fun refundedTotalForSaleOnce(saleId: String): Double
+
     /** Refunds still owing money — one-shot for the notification engine (§8). */
     @Query("SELECT * FROM refunds WHERE businessId = :businessId AND deleted = 0 AND status = 'owed'")
     suspend fun owedOnce(businessId: String): List<Refund>
@@ -471,6 +665,14 @@ interface RefundDao {
     /** Money actually paid back so far on a refund. Outstanding = refundTotal − this. */
     @Query("SELECT COALESCE(SUM(amount), 0) FROM refund_payments WHERE refundId = :refundId")
     suspend fun paidSoFar(refundId: String): Double
+
+    /**
+     * Of that, the part handed back in PHYSICAL CASH — the only part that ever left the
+     * drawer, so the only part a void has to put back (card/mobile-money reversals never
+     * touched cash-on-hand).
+     */
+    @Query("SELECT COALESCE(SUM(amount), 0) FROM refund_payments WHERE refundId = :refundId AND method = 'cash'")
+    suspend fun cashPaidSoFar(refundId: String): Double
 
     /**
      * Units of a given sale line already returned across every prior refund — lets
@@ -593,18 +795,56 @@ interface NotificationDao {
     @Query("SELECT * FROM notifications WHERE businessId = :businessId AND dedupeKey = :key LIMIT 1")
     suspend fun getByKey(businessId: String, key: String): AppNotification?
 
+    /**
+     * Pull-merge lookup: the cloud row's identity is `(business_id, dedupe_key)`, NOT the
+     * id (ids are minted per device), so an incoming row is matched here and updated in
+     * place — keeping this device's local `id` and its device-local `pushedAt`.
+     * Includes tombstoned rows so a cleared-then-recurring condition reuses one row.
+     */
+    @Query("SELECT * FROM notifications WHERE businessId = :businessId AND dedupeKey = :dedupeKey LIMIT 1")
+    suspend fun getByDedupeKey(businessId: String, dedupeKey: String): AppNotification?
+
+    /** Rows with unsynced local edits — the upload queue. */
+    @Query("SELECT * FROM notifications WHERE pendingSync = 1")
+    suspend fun pending(): List<AppNotification>
+
+    @Query("UPDATE notifications SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun markSynced(ids: List<String>)
+
     @Upsert
     suspend fun upsert(notification: AppNotification)
 
-    @Query("UPDATE notifications SET readAt = :at WHERE id = :id")
+    /** Read-state IS synced, so marking read re-queues the row for upload. */
+    @Query("UPDATE notifications SET readAt = :at, updatedAt = :at, pendingSync = 1 WHERE id = :id")
     suspend fun markRead(id: String, at: Long)
 
-    @Query("UPDATE notifications SET readAt = :at WHERE businessId = :businessId AND readAt IS NULL AND deleted = 0")
+    @Query(
+        "UPDATE notifications SET readAt = :at, updatedAt = :at, pendingSync = 1 " +
+            "WHERE businessId = :businessId AND readAt IS NULL AND deleted = 0"
+    )
     suspend fun markAllRead(businessId: String, at: Long)
 
-    /** Tombstone rows whose condition has cleared (resolved low stock, settled refund). */
-    @Query("UPDATE notifications SET deleted = 1 WHERE id IN (:ids)")
-    suspend fun tombstone(ids: List<String>)
+    /** Tombstone rows whose condition has cleared (resolved low stock, settled refund).
+     *  Tombstones sync too, so the alert clears on every phone, not just this one. */
+    @Query("UPDATE notifications SET deleted = 1, updatedAt = :at, pendingSync = 1 WHERE id IN (:ids)")
+    suspend fun tombstone(ids: List<String>, at: Long)
+
+    /**
+     * Cross-device delivery queue (BUG A fix): live, unread rows THIS phone has not yet
+     * raised a heads-up for. A row lands here after a PULL brought it down (or the sweep
+     * created it without pushing), and the caller filters by audience against the device
+     * role before firing. Not scoped to a business id — a device holds exactly one shop's
+     * feed — so the background pass can query it without first resolving the id.
+     */
+    @Query(
+        "SELECT * FROM notifications WHERE deleted = 0 AND readAt IS NULL AND pushedAt IS NULL"
+    )
+    suspend fun unpushed(): List<AppNotification>
+
+    /** Stamp the device-local heads-up marker WITHOUT touching updatedAt/pendingSync:
+     *  which phone has buzzed is device-local state and must never dirty the shared row. */
+    @Query("UPDATE notifications SET pushedAt = :at WHERE id = :id")
+    suspend fun markPushed(id: String, at: Long)
 
     @Query("DELETE FROM notifications WHERE businessId = :businessId")
     suspend fun wipe(businessId: String)
@@ -621,7 +861,82 @@ interface AuditDao {
     )
     fun observeForBusiness(businessId: String, limit: Int = 300): Flow<List<AuditEntry>>
 
+    /** The append-only trail for ONE entity (a sale's edit history), newest first. */
+    @Query("SELECT * FROM audit_log WHERE entityId = :entityId ORDER BY createdAt DESC")
+    fun observeForEntity(entityId: String): Flow<List<AuditEntry>>
+
+    /** Rows still waiting to go up — the upload queue. */
+    @Query("SELECT * FROM audit_log WHERE pendingSync = 1")
+    suspend fun pending(): List<AuditEntry>
+
+    @Query("UPDATE audit_log SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun markSynced(ids: List<String>)
+
+    /**
+     * Pull guard: the cloud row's `local_id` IS the local `id`, so a hit here means we
+     * already hold that entry and the incoming copy must be SKIPPED — an audit row is
+     * never overwritten after the fact.
+     */
+    @Query("SELECT id FROM audit_log WHERE id IN (:ids)")
+    suspend fun existingIds(ids: List<String>): List<String>
+
+    /** Pull insert. IGNORE, not REPLACE — a race can never clobber a local row. */
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertAll(entries: List<AuditEntry>)
+
     @Query("DELETE FROM audit_log WHERE businessId = :businessId")
+    suspend fun wipe(businessId: String)
+}
+
+@Dao
+interface StaffRequestDao {
+    /** Admin queue: pending requests awaiting a decision, oldest first (act on the
+     *  longest-waiting cashier first). Drives the "Requests" section of the Alerts screen. */
+    @Query(
+        "SELECT * FROM staff_requests WHERE businessId = :businessId AND deleted = 0 " +
+            "AND status = 'pending' ORDER BY createdAt ASC"
+    )
+    fun observePending(businessId: String): Flow<List<StaffRequest>>
+
+    /** Count of pending requests → the Alerts tab badge on the admin side. */
+    @Query(
+        "SELECT COUNT(*) FROM staff_requests WHERE businessId = :businessId AND deleted = 0 " +
+            "AND status = 'pending'"
+    )
+    fun observePendingCount(businessId: String): Flow<Int>
+
+    /** A cashier's own recent requests (any status) → the checkout status surface. Capped
+     *  so a busy till doesn't stream its whole history into the banner flow. */
+    @Query(
+        "SELECT * FROM staff_requests WHERE businessId = :businessId AND deleted = 0 " +
+            "AND requestedBy = :requestedBy ORDER BY createdAt DESC LIMIT :limit"
+    )
+    fun observeMine(businessId: String, requestedBy: String, limit: Int = 20): Flow<List<StaffRequest>>
+
+    @Query("SELECT * FROM staff_requests WHERE id = :id LIMIT 1")
+    suspend fun getById(id: String): StaffRequest?
+
+    @Upsert
+    suspend fun upsert(request: StaffRequest)
+
+    /**
+     * Mark applied WITHOUT re-queuing for sync — this is DEVICE-LOCAL cashier state. The
+     * cashier can't UPDATE the cloud row (RLS: admin-only), so dirtying it would fail RLS
+     * every cycle as a per-table error; the cloud `applied` mirror is written only by an
+     * admin device. See [StaffRequest.applied].
+     */
+    @Query("UPDATE staff_requests SET applied = 1 WHERE id = :id")
+    suspend fun markAppliedLocal(id: String)
+
+    // ---- sync ----
+    /** Rows with unsynced local edits — the upload queue (both pending-new and decided). */
+    @Query("SELECT * FROM staff_requests WHERE pendingSync = 1")
+    suspend fun pending(): List<StaffRequest>
+
+    @Query("UPDATE staff_requests SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun markSynced(ids: List<String>)
+
+    @Query("DELETE FROM staff_requests WHERE businessId = :businessId")
     suspend fun wipe(businessId: String)
 }
 
@@ -639,18 +954,254 @@ interface SettingDao {
 
 @Dao
 interface ExpenseDao {
+    /** History feed: every real (non-template) expense, newest first. */
     @Query(
         "SELECT * FROM expenses WHERE businessId = :businessId AND deleted = 0 " +
-            "ORDER BY date DESC, createdAt DESC"
+            "AND isTemplate = 0 ORDER BY date DESC, createdAt DESC"
     )
     fun observeForBusiness(businessId: String): Flow<List<Expense>>
+
+    /** Awaiting an admin decision (submitted, not yet posted). */
+    @Query(
+        "SELECT * FROM expenses WHERE businessId = :businessId AND deleted = 0 " +
+            "AND status = 'pending' ORDER BY createdAt ASC"
+    )
+    fun observePending(businessId: String): Flow<List<Expense>>
+
+    /** Active recurring schedules (templates) for the admin to manage. */
+    @Query(
+        "SELECT * FROM expenses WHERE businessId = :businessId AND deleted = 0 " +
+            "AND isTemplate = 1 ORDER BY createdAt DESC"
+    )
+    fun observeTemplates(businessId: String): Flow<List<Expense>>
+
+    /** Sum of posted (approved, non-template) expense amounts in an epoch window —
+     *  the figure that reduces derived net profit on the dashboard. */
+    @Query(
+        "SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE businessId = :businessId " +
+            "AND deleted = 0 AND status = 'approved' AND isTemplate = 0 " +
+            "AND createdAt BETWEEN :from AND :to"
+    )
+    fun observePostedTotalBetween(businessId: String, from: Long, to: Long): Flow<Double>
+
+    /** Shop-wide accounts payable: what the shop still owes payees from short-funded,
+     *  posted expenses. (No partial-repayment mechanism yet — sum of the portions.) */
+    @Query(
+        "SELECT COALESCE(SUM(payablePortion), 0) FROM expenses WHERE businessId = :businessId " +
+            "AND deleted = 0 AND status = 'approved' AND isTemplate = 0"
+    )
+    fun observePayablesTotal(businessId: String): Flow<Double>
+
+    /** Shop-wide owner contributions: expenses the owner covered out of pocket. */
+    @Query(
+        "SELECT COALESCE(SUM(capitalPortion), 0) FROM expenses WHERE businessId = :businessId " +
+            "AND deleted = 0 AND status = 'approved' AND isTemplate = 0"
+    )
+    fun observeOwnerContributions(businessId: String): Flow<Double>
+
+    @Query("SELECT * FROM expenses WHERE id = :id LIMIT 1")
+    suspend fun getById(id: String): Expense?
+
+    /** Templates whose next charge is due (drives the auto-post worker). */
+    @Query(
+        "SELECT * FROM expenses WHERE businessId = :businessId AND deleted = 0 " +
+            "AND isTemplate = 1 AND recurrenceActive = 1 AND status = 'approved' " +
+            "AND nextRunAt IS NOT NULL AND nextRunAt <= :now"
+    )
+    suspend fun dueTemplates(businessId: String, now: Long): List<Expense>
 
     @Upsert
     suspend fun upsert(expense: Expense)
 
-    /** Soft-delete (tombstone) so the row is hidden but recoverable. */
-    @Query("UPDATE expenses SET deleted = 1, updatedAt = :at WHERE id = :id")
+    /** Soft-delete (tombstone) so the row is hidden but recoverable. Re-queues for
+     *  sync so the tombstone itself reaches the cloud. */
+    @Query("UPDATE expenses SET deleted = 1, updatedAt = :at, pendingSync = 1 WHERE id = :id")
     suspend fun softDelete(id: String, at: Long)
+
+    // ---- sync ----
+    @Query("SELECT * FROM expenses WHERE pendingSync = 1")
+    suspend fun pending(): List<Expense>
+
+    @Query("UPDATE expenses SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun markSynced(ids: List<String>)
+}
+
+@Dao
+interface CashTxnDao {
+    /** Running cash-on-hand movements (newest first). */
+    @Query(
+        "SELECT * FROM cash_txns WHERE businessId = :businessId AND deleted = 0 " +
+            "ORDER BY createdAt DESC"
+    )
+    fun observeForBusiness(businessId: String): Flow<List<CashTxn>>
+
+    /** Movements in ONE location only (newest first) — the till or safe statement. */
+    @Query(
+        "SELECT * FROM cash_txns WHERE businessId = :businessId AND deleted = 0 " +
+            "AND location = :location ORDER BY createdAt DESC LIMIT :limit"
+    )
+    fun observeForLocation(businessId: String, location: String, limit: Int = 100): Flow<List<CashTxn>>
+
+    /**
+     * Net of ALL cash movements, both locations — added to the opening float for
+     * cash-on-hand. Unchanged by the till/safe split ON PURPOSE: a transfer is written as
+     * a matching `transfer_out`/`transfer_in` pair that sums to zero, so this figure (and
+     * every existing caller of it) still reads total cash held on the premises.
+     */
+    @Query("SELECT COALESCE(SUM(amount), 0) FROM cash_txns WHERE businessId = :businessId AND deleted = 0")
+    fun observeMovementsSum(businessId: String): Flow<Double>
+
+    /** Same net, read once (for a synchronous shortfall check at approval time). */
+    @Query("SELECT COALESCE(SUM(amount), 0) FROM cash_txns WHERE businessId = :businessId AND deleted = 0")
+    suspend fun movementsSumOnce(businessId: String): Double
+
+    /**
+     * Net movements in ONE location. The TILL balance additionally carries the opening
+     * float (the float IS the drawer's starting money); the SAFE starts empty and is
+     * filled only by transfers in. Both are computed in the repository so the two
+     * balances can never disagree with the combined total.
+     */
+    @Query(
+        "SELECT COALESCE(SUM(amount), 0) FROM cash_txns " +
+            "WHERE businessId = :businessId AND deleted = 0 AND location = :location"
+    )
+    fun observeLocationSum(businessId: String, location: String): Flow<Double>
+
+    /** Same per-location net, read once (funding decisions need it synchronously). */
+    @Query(
+        "SELECT COALESCE(SUM(amount), 0) FROM cash_txns " +
+            "WHERE businessId = :businessId AND deleted = 0 AND location = :location"
+    )
+    suspend fun locationSumOnce(businessId: String, location: String): Double
+
+    /**
+     * CASH SHORT / OVER for a window: the signed sum of close-of-day `variance` rows.
+     * Negative = the drawer came up short (a real loss); positive = over (a gain). Kept
+     * OUT of gross profit deliberately — it is a separate line so a shortage is visible
+     * as a shortage rather than quietly eating margin.
+     */
+    @Query(
+        "SELECT COALESCE(SUM(amount), 0) FROM cash_txns WHERE businessId = :businessId " +
+            "AND deleted = 0 AND type = 'variance' AND createdAt >= :from AND createdAt < :to"
+    )
+    fun observeVarianceSum(businessId: String, from: Long, to: Long): Flow<Double>
+
+    /**
+     * Net of the movements that are EQUITY / OUTSIDE money rather than trading: the owner
+     * putting cash in ("capital"), borrowing ("loan") and drawing money out ("drawing").
+     * Feeds the "float & capital" slice of the four-part split — money in the drawer that
+     * was never profit.
+     */
+    @Query(
+        "SELECT COALESCE(SUM(amount), 0) FROM cash_txns WHERE businessId = :businessId " +
+            "AND deleted = 0 AND type IN ('capital', 'loan', 'drawing')"
+    )
+    fun observeEquityCashSum(businessId: String): Flow<Double>
+
+    /**
+     * Cash spent buying stock, all time, as a POSITIVE figure ("purchase" rows are
+     * negative). The "stock money" slice of the split is the collected cost of goods sold
+     * LESS this — money already ploughed back into the shelves is no longer set aside.
+     */
+    @Query(
+        "SELECT -COALESCE(SUM(amount), 0) FROM cash_txns WHERE businessId = :businessId " +
+            "AND deleted = 0 AND type = 'purchase'"
+    )
+    fun observePurchaseCashSum(businessId: String): Flow<Double>
+
+    @Insert
+    suspend fun insert(txn: CashTxn)
+
+    @Insert
+    suspend fun insertAll(txns: List<CashTxn>)
+
+    @Query("SELECT * FROM cash_txns WHERE businessId = :businessId AND deleted = 0 ORDER BY createdAt DESC LIMIT :limit")
+    suspend fun recent(businessId: String, limit: Int = 100): List<CashTxn>
+
+    // ---- sync ----
+    @Query("SELECT * FROM cash_txns WHERE id = :id LIMIT 1")
+    suspend fun getById(id: String): CashTxn?
+
+    @Upsert
+    suspend fun upsert(txn: CashTxn)
+
+    @Query("SELECT * FROM cash_txns WHERE pendingSync = 1")
+    suspend fun pending(): List<CashTxn>
+
+    @Query("UPDATE cash_txns SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun markSynced(ids: List<String>)
+}
+
+@Dao
+interface DayCloseDao {
+    @Insert
+    suspend fun insert(close: DayClose)
+
+    /**
+     * The owner-visible close history, newest first. Deliberately NOT grouped: every
+     * close carries [DayClose.closedByName], so a cashier who is short again and again
+     * is visible by reading down the list.
+     */
+    @Query(
+        "SELECT * FROM day_closes WHERE businessId = :businessId AND deleted = 0 " +
+            "ORDER BY closedAt DESC LIMIT :limit"
+    )
+    fun observeForBusiness(businessId: String, limit: Int = 90): Flow<List<DayClose>>
+
+    /** The most recent close — "last closed <when>" on the cash card. */
+    @Query(
+        "SELECT * FROM day_closes WHERE businessId = :businessId AND deleted = 0 " +
+            "ORDER BY closedAt DESC LIMIT 1"
+    )
+    fun observeLatest(businessId: String): Flow<DayClose?>
+
+    // ---- sync-ready (no push/pull wired: the cloud has no `day_closes` table) ----
+    @Query("SELECT * FROM day_closes WHERE pendingSync = 1")
+    suspend fun pending(): List<DayClose>
+
+    @Query("UPDATE day_closes SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun markSynced(ids: List<String>)
+
+    @Query("DELETE FROM day_closes WHERE businessId = :businessId")
+    suspend fun wipe(businessId: String)
+}
+
+@Dao
+interface OutsideFundDao {
+    @Insert
+    suspend fun insert(fund: OutsideFund)
+
+    /** The outside-money ledger, newest first (owner injections, loans, drawings). */
+    @Query(
+        "SELECT * FROM outside_funds WHERE businessId = :businessId AND deleted = 0 " +
+            "ORDER BY createdAt DESC LIMIT :limit"
+    )
+    fun observeForBusiness(businessId: String, limit: Int = 100): Flow<List<OutsideFund>>
+
+    /**
+     * Running totals per kind and direction — the owner's "put in / taken out / net" and
+     * the shop's outstanding borrowings. One pass over the ledger, so the four figures
+     * can never disagree with each other.
+     */
+    @Query(
+        "SELECT " +
+            "COALESCE(SUM(CASE WHEN kind = 'capital' AND direction = 'in' THEN amount ELSE 0 END), 0) AS capitalIn, " +
+            "COALESCE(SUM(CASE WHEN kind = 'capital' AND direction = 'out' THEN amount ELSE 0 END), 0) AS capitalOut, " +
+            "COALESCE(SUM(CASE WHEN kind = 'loan' AND direction = 'in' THEN amount ELSE 0 END), 0) AS loanIn, " +
+            "COALESCE(SUM(CASE WHEN kind = 'loan' AND direction = 'out' THEN amount ELSE 0 END), 0) AS loanOut " +
+            "FROM outside_funds WHERE businessId = :businessId AND deleted = 0"
+    )
+    fun observeTotals(businessId: String): Flow<OutsideFundTotals>
+
+    // ---- sync-ready (no push/pull wired: the cloud has no `outside_funds` table) ----
+    @Query("SELECT * FROM outside_funds WHERE pendingSync = 1")
+    suspend fun pending(): List<OutsideFund>
+
+    @Query("UPDATE outside_funds SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun markSynced(ids: List<String>)
+
+    @Query("DELETE FROM outside_funds WHERE businessId = :businessId")
+    suspend fun wipe(businessId: String)
 }
 
 @Dao
@@ -667,9 +1218,16 @@ interface SupplierDao {
     @Upsert
     suspend fun upsert(supplier: Supplier)
 
-    /** Soft-delete (tombstone) so the row is hidden but recoverable. */
-    @Query("UPDATE suppliers SET deleted = 1, updatedAt = :at WHERE id = :id")
+    /** Soft-delete (tombstone) so the row is hidden but recoverable. Re-queues for sync. */
+    @Query("UPDATE suppliers SET deleted = 1, updatedAt = :at, pendingSync = 1 WHERE id = :id")
     suspend fun softDelete(id: String, at: Long)
+
+    // ---- sync ----
+    @Query("SELECT * FROM suppliers WHERE pendingSync = 1")
+    suspend fun pending(): List<Supplier>
+
+    @Query("UPDATE suppliers SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun markSynced(ids: List<String>)
 }
 
 @Dao
@@ -684,6 +1242,20 @@ interface PurchaseOrderDao {
 
     @Query("SELECT * FROM purchase_orders WHERE id = :id LIMIT 1")
     suspend fun getById(id: String): PurchaseOrder?
+
+    /** Open (placed/partial) POs that carry an ETA — drives the "has it arrived?" sweep. */
+    @Query(
+        "SELECT * FROM purchase_orders WHERE businessId = :businessId AND deleted = 0 " +
+            "AND status IN ('placed', 'partial') AND eta IS NOT NULL"
+    )
+    suspend fun openWithEtaOnce(businessId: String): List<PurchaseOrder>
+
+    /** Shop-wide accounts payable owed to suppliers (unpaid PO balances). */
+    @Query(
+        "SELECT COALESCE(SUM(payableRemainder), 0) FROM purchase_orders " +
+            "WHERE businessId = :businessId AND deleted = 0 AND status != 'cancelled'"
+    )
+    fun observeSupplierPayables(businessId: String): Flow<Double>
 
     @Query("SELECT * FROM purchase_order_items WHERE poId = :poId")
     suspend fun linesForPo(poId: String): List<PurchaseOrderLine>
@@ -700,7 +1272,24 @@ interface PurchaseOrderDao {
     @Upsert
     suspend fun upsertLine(line: PurchaseOrderLine)
 
-    /** Soft-delete the header (lines are left in place, hidden with the parent). */
-    @Query("UPDATE purchase_orders SET deleted = 1, updatedAt = :at WHERE id = :id")
+    /** Soft-delete the header (lines are left in place, hidden with the parent).
+     *  Re-queues for sync so the tombstone reaches the cloud. */
+    @Query("UPDATE purchase_orders SET deleted = 1, updatedAt = :at, pendingSync = 1 WHERE id = :id")
     suspend fun softDelete(id: String, at: Long)
+
+    // ---- sync ----
+    @Query("SELECT * FROM purchase_order_items WHERE id = :id LIMIT 1")
+    suspend fun getLineById(id: String): PurchaseOrderLine?
+
+    @Query("SELECT * FROM purchase_orders WHERE pendingSync = 1")
+    suspend fun pending(): List<PurchaseOrder>
+
+    @Query("UPDATE purchase_orders SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun markSynced(ids: List<String>)
+
+    @Query("SELECT * FROM purchase_order_items WHERE pendingSync = 1")
+    suspend fun pendingLines(): List<PurchaseOrderLine>
+
+    @Query("UPDATE purchase_order_items SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun markLinesSynced(ids: List<String>)
 }

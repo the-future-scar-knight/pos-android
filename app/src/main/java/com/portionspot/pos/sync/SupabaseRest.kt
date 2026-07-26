@@ -8,6 +8,21 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
+/**
+ * Raised instead of signing a request with the anon key when this device HAS a cloud
+ * session but no usable token for it.
+ *
+ * An anon-signed write is rejected by row-level security (Postgres 42501) on every
+ * table, which reads to the owner like a data/permissions problem while the app still
+ * looks signed in — and the rows just pile up unsynced. Failing the pass outright keeps
+ * the cause visible ("sign in again") and, because nothing reaches its `markSynced`,
+ * every queued row stays queued exactly as it does offline.
+ *
+ * It extends [IOException] so the sync engine treats it as an ordinary transport
+ * failure: the pass reports Failed and retries later.
+ */
+class SessionExpiredException : IOException("Session expired — sign in again")
+
 /** Result of a one-off connection check, so the UI can give a useful message. */
 sealed class ConnectionTest {
     object Ok : ConnectionTest()                       // reachable + tables present
@@ -26,9 +41,30 @@ sealed class ConnectionTest {
 class SupabaseRest(
     private val baseUrl: String,
     private val anonKey: String,
-    /** Signed-in user's JWT; RLS needs it — the anon key alone can do nothing. */
+    /**
+     * The identity to sign requests with. Three-valued on purpose (see [authed]):
+     *  - a JWT   → the signed-in user; RLS needs it, the anon key alone can do nothing.
+     *  - `null`  → this device has NO cloud session (local/phone-only mode, or the
+     *              unauthenticated connection probe), so the anon key IS the intended
+     *              identity and the request goes out as-is.
+     *  - [SESSION_UNAVAILABLE] → a session EXISTS but no token can be produced for it.
+     *              The request is refused rather than downgraded.
+     */
     private val accessToken: () -> String? = { null },
 ) {
+
+    companion object {
+        /**
+         * Sentinel the token provider returns for "a cloud session exists on this device
+         * but we cannot produce a token for it right now". Deliberately not a plausible
+         * JWT and not a legal HTTP header value, so it can never be sent by accident.
+         */
+        const val SESSION_UNAVAILABLE = "\u0000pos-session-unavailable"
+
+        /** The most recently added synced table — bump this whenever the setup script
+         *  gains a new one, so an out-of-date database is detected as needing setup. */
+        private const val PROBE_NEWEST = "staff_requests"
+    }
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
@@ -40,11 +76,25 @@ class SupabaseRest(
 
     private fun rest(table: String) = "$baseUrl/rest/v1/$table"
 
+    /**
+     * Is the database ready? Probes TWO tables, not one: `products` proves the project
+     * is reachable and the key is accepted, and [PROBE_NEWEST] proves the CURRENT setup
+     * script has been run. Without the second probe a project still carrying only the
+     * original five tables reports Ok, the setup sheet never appears, and every newer
+     * table then fails to sync on every pass. The script is idempotent, so re-running it
+     * to add what is missing is safe.
+     */
     fun test(): ConnectionTest {
-        val url = (rest("products").toHttpUrlOrNull()
+        val core = probeTable("products", "sku")
+        if (core !is ConnectionTest.Ok) return core
+        return probeTable(PROBE_NEWEST, "local_id")
+    }
+
+    private fun probeTable(table: String, column: String): ConnectionTest {
+        val url = (rest(table).toHttpUrlOrNull()
             ?: return ConnectionTest.Failed("That doesn't look like a valid URL"))
             .newBuilder()
-            .addQueryParameter("select", "sku")
+            .addQueryParameter("select", column)
             .addQueryParameter("limit", "1")
             .build()
         return try {
@@ -100,10 +150,42 @@ class SupabaseRest(
         }
     }
 
-    fun upsert(table: String, jsonArray: String, onConflict: String, ignoreDuplicates: Boolean = false) {
+    /**
+     * GET just the `id` column for the rows of [table] whose id is one of [ids].
+     * One round-trip for the whole batch — used to confirm an ignore-duplicates push
+     * actually landed (that resolution returns 201 even when the server dropped the
+     * row as a duplicate, so the HTTP status alone proves nothing).
+     */
+    fun selectIdsIn(table: String, ids: List<String>): String {
+        val list = ids.joinToString(",") { "\"" + it.replace("\"", "") + "\"" }
         val url = (rest(table).toHttpUrlOrNull() ?: throw IOException("Bad URL"))
             .newBuilder()
-            .addQueryParameter("on_conflict", onConflict)
+            .addQueryParameter("select", "id")
+            .addQueryParameter("id", "in.($list)")
+            .build()
+        client.newCall(Request.Builder().url(url).get().authed().build()).execute().use { resp ->
+            val body = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) throw IOException("verify $table: HTTP ${resp.code} $body")
+            return body
+        }
+    }
+
+    /**
+     * [onConflict] names the cloud UNIQUE constraint to resolve against. It may be a
+     * SINGLE column ("local_id", "sku") or a COMPOSITE key given as comma-separated
+     * columns ("business_id,dedupe_key" — the `notifications` table, where two devices
+     * computing the same alert must converge on ONE row). Whitespace around the commas
+     * is stripped and the joined value is passed through as one `on_conflict` query
+     * param, which is exactly the shape PostgREST expects.
+     */
+    fun upsert(table: String, jsonArray: String, onConflict: String, ignoreDuplicates: Boolean = false) {
+        val conflictKey = onConflict.split(",")
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .joinToString(",")
+        val url = (rest(table).toHttpUrlOrNull() ?: throw IOException("Bad URL"))
+            .newBuilder()
+            .addQueryParameter("on_conflict", conflictKey)
             .build()
         val resolution = if (ignoreDuplicates) "ignore-duplicates" else "merge-duplicates"
         val req = Request.Builder().url(url)
@@ -119,8 +201,65 @@ class SupabaseRest(
         }
     }
 
-    private fun Request.Builder.authed() = this
-        .header("apikey", anonKey)
-        .header("Authorization", "Bearer ${accessToken() ?: anonKey}")
-        .header("Accept", "application/json")
+    // ── Storage (product images) ──────────────────────────────────────────────
+    private fun storage(bucket: String, objectPath: String) =
+        "$baseUrl/storage/v1/object/$bucket/$objectPath"
+
+    /**
+     * Upload [bytes] to `<bucket>/<objectPath>`, overwriting any existing object
+     * (`x-upsert: true`). Returns true on success. RLS on storage.objects must allow
+     * the signed-in staff user to write the bucket. Throws on transport failure so the
+     * caller can decide whether to retry (the sync engine catches + leaves it pending).
+     */
+    fun uploadObject(bucket: String, objectPath: String, bytes: ByteArray, contentType: String): Boolean {
+        val url = storage(bucket, objectPath).toHttpUrlOrNull() ?: throw IOException("Bad URL")
+        val req = Request.Builder().url(url)
+            .post(bytes.toRequestBody(contentType.toMediaType()))
+            .authed()
+            .header("x-upsert", "true")
+            .header("Content-Type", contentType)
+            .build()
+        client.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) {
+                val body = resp.body?.string().orEmpty()
+                throw IOException("upload $bucket/$objectPath: HTTP ${resp.code} $body")
+            }
+            return true
+        }
+    }
+
+    /** Best-effort delete of a storage object; false on any non-success (never throws). */
+    fun deleteObject(bucket: String, objectPath: String): Boolean {
+        val url = storage(bucket, objectPath).toHttpUrlOrNull() ?: return false
+        return try {
+            client.newCall(Request.Builder().url(url).delete().authed().build()).execute()
+                .use { it.isSuccessful }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /** Public URL for an object in a PUBLIC bucket (no auth needed to read). */
+    fun publicUrl(bucket: String, objectPath: String): String =
+        "$baseUrl/storage/v1/object/public/$bucket/$objectPath"
+
+    /**
+     * Sign the request.
+     *
+     * The anon key is used ONLY when the provider says this device genuinely has no
+     * cloud session (`null`) — local/phone-only mode and the connection probe. It is
+     * never a silent stand-in for a session we failed to produce a token for: that used
+     * to turn an auth problem into what looked like a data problem (every write refused
+     * by RLS with Postgres 42501 while the UI still showed a signed-in user, and the
+     * rows piling up unsynced). That case throws [SessionExpiredException] instead, which
+     * fails the pass with a nameable cause and leaves every queued row queued.
+     */
+    private fun Request.Builder.authed(): Request.Builder {
+        val token = accessToken()
+        if (token == SESSION_UNAVAILABLE) throw SessionExpiredException()
+        return this
+            .header("apikey", anonKey)
+            .header("Authorization", "Bearer ${token ?: anonKey}")
+            .header("Accept", "application/json")
+    }
 }
