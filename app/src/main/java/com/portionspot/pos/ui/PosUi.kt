@@ -8479,19 +8479,28 @@ private fun DashboardScreen(vm: PosViewModel, business: Business) {
         }
         Spacer(Modifier.height(10.dp))
 
+        // Every tile says WHICH CLOCK it is on. Most are windowed by the range chips
+        // above; a couple are running balances that ignore the window entirely, and
+        // two of those used to sit un-labelled beside a windowed figure.
+        val periodLabel = range.label
+        val liveLabel = "Live balance"
+
         // KPI tiles.
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            DashKpiCard("Transactions", summary.count.toString(), Modifier.weight(1f))
-            DashKpiCard("Average sale", money(avgSale, currency), Modifier.weight(1f))
+            DashKpiCard("Transactions", summary.count.toString(), Modifier.weight(1f), sub = periodLabel)
+            DashKpiCard("Average sale", money(avgSale, currency), Modifier.weight(1f), sub = periodLabel)
         }
         Spacer(Modifier.height(10.dp))
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             if (showProfit) {
-                DashKpiCard("Gross profit", money(grossProfit, currency), Modifier.weight(1f), valueColor = t.success)
-                DashKpiCard("Margin", "${trimPct(marginPct)}%", Modifier.weight(1f))
+                DashKpiCard("Gross profit", money(grossProfit, currency), Modifier.weight(1f),
+                    valueColor = t.success, sub = periodLabel)
+                DashKpiCard("Margin", "${trimPct(marginPct)}%", Modifier.weight(1f), sub = periodLabel)
             } else {
-                DashKpiCard("Pending credit", money(pendingCredit, currency), Modifier.weight(1f), valueColor = t.warning)
-                DashKpiCard("Discounts", money(summary.discount, currency), Modifier.weight(1f))
+                // Outstanding customer debt is a running total, not a window figure.
+                DashKpiCard("Pending credit", money(pendingCredit, currency), Modifier.weight(1f),
+                    valueColor = t.warning, sub = liveLabel)
+                DashKpiCard("Discounts", money(summary.discount, currency), Modifier.weight(1f), sub = periodLabel)
             }
         }
         // Guide the owner to complete profit data (the #1 reason profit reads low/blank).
@@ -8511,15 +8520,21 @@ private fun DashboardScreen(vm: PosViewModel, business: Business) {
         // Accounting spine (B3): cash-on-hand + net profit AFTER expenses. Net profit is
         // DERIVED — gross profit less the expenses posted in this window — never a stored
         // pot, so recording an expense lowers it automatically.
+        //
+        // These two are on DIFFERENT CLOCKS and sit side by side: cash on hand is the
+        // opening float plus every cash movement ever (no date filter at all), while net
+        // profit only covers the selected range. Each carries its own period label so the
+        // pair can never be read as one comparison.
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             DashKpiCard("Cash on hand", money(cashOnHand, currency), Modifier.weight(1f),
-                valueColor = if (cashOnHand < 0) t.danger else t.inkPrimary)
+                valueColor = if (cashOnHand < 0) t.danger else t.inkPrimary, sub = liveLabel)
             if (showProfit) {
                 val netProfit = grossProfit - dashExpenses
                 DashKpiCard("Net profit", money(netProfit, currency), Modifier.weight(1f),
-                    valueColor = if (netProfit < 0) t.danger else t.success)
+                    valueColor = if (netProfit < 0) t.danger else t.success, sub = periodLabel)
             } else {
-                DashKpiCard("Expenses", money(dashExpenses, currency), Modifier.weight(1f), valueColor = t.danger)
+                DashKpiCard("Expenses", money(dashExpenses, currency), Modifier.weight(1f),
+                    valueColor = t.danger, sub = periodLabel)
             }
         }
         if (showProfit && dashExpenses > 0.0) {
@@ -8629,10 +8644,21 @@ private fun DashboardScreen(vm: PosViewModel, business: Business) {
     if (showZ) ZReportDialog(business, recent) { showZ = false }
 }
 
+/**
+ * One dashboard metric tile. [sub] is the PERIOD the figure covers ("Today",
+ * "Last 7 days", or "Live balance" for a running total that ignores the date chips) —
+ * without it, a windowed figure and an all-time one read as the same kind of number.
+ */
 @Composable
-private fun DashKpiCard(label: String, value: String, modifier: Modifier = Modifier, valueColor: Color? = null) {
+private fun DashKpiCard(
+    label: String,
+    value: String,
+    modifier: Modifier = Modifier,
+    valueColor: Color? = null,
+    sub: String? = null,
+) {
     // Shares the design-system metric tile so the dashboard matches every other screen.
-    PosMetricCard(label = label, value = value, modifier = modifier, accent = valueColor)
+    PosMetricCard(label = label, value = value, modifier = modifier, accent = valueColor, sub = sub)
 }
 
 /** Card with a bold title and arbitrary body, followed by spacing. */

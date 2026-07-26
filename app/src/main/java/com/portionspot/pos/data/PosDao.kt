@@ -243,14 +243,23 @@ interface SaleDao {
     )
     fun observeTopProducts(businessId: String, from: Long, to: Long, limit: Int = 5): Flow<List<TopProduct>>
 
-    /** Gross profit = SUM((soldPrice - currentCost) * qty), only for items that have a cost. */
+    /**
+     * Gross profit = SUM((soldPrice − costAtSaleTime) * qty), only for lines that have
+     * a cost to work from.
+     *
+     * The cost basis is the FROZEN `li.unitCost` captured at checkout, falling back to
+     * the live catalog `i.cost` only for lines that never captured one (rows written
+     * before the column existed, or pulled from the cloud, which carries no cost).
+     * Before this, the query read `i.cost` directly, so editing a product's cost price
+     * silently rewrote the profit of every past sale.
+     */
     @Query(
-        "SELECT COALESCE(SUM((li.unitPrice - i.cost) * li.qty), 0) " +
+        "SELECT COALESCE(SUM((li.unitPrice - COALESCE(li.unitCost, i.cost)) * li.qty), 0) " +
             "FROM sale_items li JOIN sales s ON li.saleId = s.id " +
             "JOIN items i ON li.itemId = i.id " +
             "WHERE s.businessId = :businessId AND s.deleted = 0 AND li.deleted = 0 " +
             "AND s.status = 'completed' AND s.soldAt >= :from AND s.soldAt < :to " +
-            "AND i.cost IS NOT NULL"
+            "AND COALESCE(li.unitCost, i.cost) IS NOT NULL"
     )
     fun observeGrossProfit(businessId: String, from: Long, to: Long): Flow<Double>
 
@@ -265,7 +274,9 @@ interface SaleDao {
             "JOIN items i ON li.itemId = i.id " +
             "WHERE s.businessId = :businessId AND s.deleted = 0 AND li.deleted = 0 " +
             "AND s.status = 'completed' AND s.soldAt >= :from AND s.soldAt < :to " +
-            "AND i.cost IS NOT NULL"
+            // Same costed-line filter as observeGrossProfit, so margin = profit / this
+            // keeps measuring the SAME set of lines.
+            "AND COALESCE(li.unitCost, i.cost) IS NOT NULL"
     )
     fun observeCostedRevenue(businessId: String, from: Long, to: Long): Flow<Double>
 
@@ -608,6 +619,14 @@ interface RefundDao {
     /** Money actually paid back so far on a refund. Outstanding = refundTotal − this. */
     @Query("SELECT COALESCE(SUM(amount), 0) FROM refund_payments WHERE refundId = :refundId")
     suspend fun paidSoFar(refundId: String): Double
+
+    /**
+     * Of that, the part handed back in PHYSICAL CASH — the only part that ever left the
+     * drawer, so the only part a void has to put back (card/mobile-money reversals never
+     * touched cash-on-hand).
+     */
+    @Query("SELECT COALESCE(SUM(amount), 0) FROM refund_payments WHERE refundId = :refundId AND method = 'cash'")
+    suspend fun cashPaidSoFar(refundId: String): Double
 
     /**
      * Units of a given sale line already returned across every prior refund — lets

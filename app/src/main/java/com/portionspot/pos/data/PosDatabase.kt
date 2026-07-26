@@ -658,6 +658,34 @@ val MIGRATION_29_30 = object : Migration(29, 30) {
     }
 }
 
+/**
+ * v30 → v31 — FREEZE COST OF GOODS AT SALE TIME. Adds `sale_items.unitCost`: the
+ * item's cost price captured the moment the line was rung up.
+ *
+ * Why: gross profit joined `items i` and used `i.cost` — the LIVE catalog cost — so
+ * editing a product's cost price silently rewrote the profit of every past sale. With
+ * the cost frozen on the line, history stops moving.
+ *
+ * Additive and nullable, so nothing is lost: the profit query prefers `li.unitCost`
+ * and falls back to `i.cost` only where the line has none (rows pulled from the cloud,
+ * which carries no cost column, keep reporting exactly as before).
+ *
+ * BACKFILL: existing lines take the item's CURRENT cost. That is an approximation, not
+ * the truth — the real cost at the time of those old sales was never recorded, and this
+ * is the best available stand-in. It is also exactly what those rows were already
+ * reporting, so the backfill moves no existing number; it only stops them moving again.
+ */
+val MIGRATION_30_31 = object : Migration(30, 31) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE sale_items ADD COLUMN unitCost REAL")
+        db.execSQL(
+            "UPDATE sale_items SET unitCost = " +
+                "(SELECT i.cost FROM items i WHERE i.id = sale_items.itemId) " +
+                "WHERE itemId IS NOT NULL"
+        )
+    }
+}
+
 @Database(
     entities = [
         Business::class,
@@ -682,7 +710,7 @@ val MIGRATION_29_30 = object : Migration(29, 30) {
         AuditEntry::class,
         StaffRequest::class
     ],
-    version = 30,
+    version = 31,
     exportSchema = false
 )
 abstract class PosDatabase : RoomDatabase() {
@@ -730,7 +758,7 @@ abstract class PosDatabase : RoomDatabase() {
                         MIGRATION_20_21, MIGRATION_21_22, MIGRATION_22_23,
                         MIGRATION_23_24, MIGRATION_24_25, MIGRATION_25_26,
                         MIGRATION_26_27, MIGRATION_27_28, MIGRATION_28_29,
-                        MIGRATION_29_30
+                        MIGRATION_29_30, MIGRATION_30_31
                     )
                     .fallbackToDestructiveMigration()
                     .build()

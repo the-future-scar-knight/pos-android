@@ -249,6 +249,21 @@ data class SaleLine(
     val name: String,                     // snapshot (item may change/delete later)
     val qty: Double = 1.0,
     val unitPrice: Double = 0.0,          // snapshot
+    /**
+     * COST OF GOODS, FROZEN AT SALE TIME — the [Item.cost] the product carried the
+     * moment this line was rung up. Without it, gross profit joined the LIVE catalog
+     * cost, so editing a product's cost price silently rewrote the profit of every
+     * past sale. Null means "not captured" (rows written before this column existed,
+     * or a line with no matching item); the profit query falls back to the catalog
+     * cost for exactly those rows.
+     *
+     * BASIS: cost of ONE STOCK UNIT — the same basis the profit query has always used
+     * against [unitPrice]. (Known pre-existing caveat, unchanged here: on a `box` line
+     * [unitPrice] is the price of a whole box while this is the cost of one unit, so a
+     * box line's margin reads high. Fixing that would move historical numbers and is a
+     * separate decision.)
+     */
+    val unitCost: Double? = null,
     val lineDiscount: Double = 0.0,
     @ColumnInfo(defaultValue = "0") val lineMarkup: Double = 0.0,
     val lineTax: Double = 0.0,
@@ -623,6 +638,11 @@ data class Expense(
  * the accounts-payable portion of a short-funded expense also creates no cash row —
  * only the cash actually paid drains the drawer.
  *
+ * Money handed BACK also drains it: a cash refund payout ("refund", −cash paid back)
+ * and change paid out on a balance the shop owed ("change_payout", −amount handed
+ * over). Change given at the till is NOT one of these — checkout already books cash in
+ * NET of it. Card/mobile-money reversals write no row: they never opened the drawer.
+ *
  * Append-only and immutable: a correction is a new "adjust" row, never an edit.
  * SYNCED: the cloud `cash_txns` table upserts on [localId].
  */
@@ -631,7 +651,7 @@ data class CashTxn(
     @PrimaryKey val id: String = newId(),
     val localId: String = id,
     val businessId: String,
-    val type: String,                     // sale | expense | payout | capital | adjust
+    val type: String,                     // sale | expense | purchase | refund | change_payout | payout | capital | adjust
     val amount: Double = 0.0,             // signed: + into the drawer, − out of it
     val source: String? = null,           // free note of the funding account, if useful
     val note: String? = null,

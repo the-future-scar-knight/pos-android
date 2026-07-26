@@ -1093,6 +1093,11 @@ class PosRepository(private val db: PosDatabase) {
             updatedAt = stamp,
             synced = false
         )
+        // Cost of goods FROZEN at sale time: profit must be computed against what the
+        // product cost WHEN IT SOLD, not against whatever the catalog says today. Read
+        // once per distinct item; null for an item that carries no cost.
+        val costByItem: Map<String, Double?> =
+            cart.map { it.itemId }.distinct().associateWith { itemDao.getById(it)?.cost }
         val lines = cart.map { c ->
             SaleLine(
                 saleId = saleId,
@@ -1103,6 +1108,7 @@ class PosRepository(private val db: PosDatabase) {
                 name = if (c.mode == "box") "${c.name} (Box of ${c.unitsPerLine})" else c.name,
                 qty = c.qty,
                 unitPrice = c.unitPrice,
+                unitCost = costByItem[c.itemId],
                 // Per-line tax is superseded by business-level VAT; keep lines tax-free.
                 lineTax = 0.0,
                 lineDiscount = c.lineDiscountApplied,
@@ -1354,6 +1360,10 @@ class PosRepository(private val db: PosDatabase) {
         val delta = newTotal - oldTotal
         val customerId = sale.customerId
 
+        // Same cost freeze as checkout: an edited receipt's lines capture the cost too,
+        // so a re-written line never falls back to the live catalog cost.
+        val costByItem: Map<String, Double?> =
+            cart.map { it.itemId }.distinct().associateWith { itemDao.getById(it)?.cost }
         val newLines = cart.map { c ->
             SaleLine(
                 saleId = saleId,
@@ -1362,6 +1372,7 @@ class PosRepository(private val db: PosDatabase) {
                 name = if (c.mode == "box") "${c.name} (Box of ${c.unitsPerLine})" else c.name,
                 qty = c.qty,
                 unitPrice = c.unitPrice,
+                unitCost = costByItem[c.itemId],
                 lineTax = 0.0,
                 lineDiscount = c.lineDiscountApplied,
                 lineMarkup = c.lineMarkupApplied,
@@ -1803,6 +1814,15 @@ class PosRepository(private val db: PosDatabase) {
      * silently lost money): the owed part settles as `change_paid` and the remainder
      * becomes customer DEBT — a `credit_owed` row noted "Over-paid change" — exactly
      * mirroring the over-given-change branch of [checkout]. Both rows commit together.
+     *
+     * CASH-ON-HAND: this is change handed over the counter, so the drawer loses the FULL
+     * [amount] — a single NEGATIVE `change_payout` [CashTxn]. Both halves of an over-pay
+     * physically leave the till, so the cash row is the whole amount even though the
+     * ledger splits it into `change_paid` + `credit_owed`.
+     *
+     * NO DOUBLE-COUNT: change handed back AT THE TILL is already netted out by [checkout]
+     * (`cashTendered − changeGivenActual`). This function only ever pays out change that
+     * was OWED — money [checkout] deliberately never subtracted because it never left.
      */
     suspend fun recordChangePayment(
         businessId: String,
@@ -1848,6 +1868,16 @@ class PosRepository(private val db: PosDatabase) {
                     )
                 )
             }
+            // The whole handed-over amount left the drawer — settled part AND any excess.
+            cashTxnDao.insert(
+                CashTxn(
+                    businessId = businessId, type = "change_payout", amount = -amount,
+                    source = "cash", note = note ?: "Change paid out",
+                    refType = "customer", refId = customerId,
+                    createdBy = cashierId, createdByName = cashierName,
+                    createdAt = stamp, updatedAt = stamp
+                )
+            )
         }
     }
 
@@ -1889,6 +1919,10 @@ class PosRepository(private val db: PosDatabase) {
      *    with a `return` [StockMovement] (damaged goods are refunded but not restocked).
      *  - [payouts] is the money handed back NOW (may be empty, partial, or split);
      *    each becomes a [RefundPayment] row carrying its method/currency/time.
+     *  - CASH-ON-HAND: the CASH portion of [payouts] physically leaves the drawer, so it
+     *    posts a NEGATIVE `refund` [CashTxn] in the same transaction. Card/mobile-money
+     *    reversals never touched the drawer and post nothing — the mirror of checkout,
+     *    which only counts cash tenders.
      *  - Any shortfall (refundTotal − paid-now) is booked as a `refund_owed` credit
      *    row when a [customer] is set, so it ages in Change & Credit like change owed.
      *    A walk-in (no customer) can't carry a balance — pay such refunds in full.
@@ -1964,10 +1998,27 @@ class PosRepository(private val db: PosDatabase) {
                 createdAt = stamp
             )
         }
+        // Only PHYSICAL cash moves cash-on-hand. A card/EcoCash reversal goes back the way
+        // it came and never opens the drawer.
+        val cashPaidNow = payoutRows.filter { it.method == "cash" }.sumOf { it.amount }
+        val receiptLabel = "#${sale.receiptNo ?: sale.id.take(8)}"
         db.withTransaction {
             refundDao.insert(refund)
             if (refundLines.isNotEmpty()) refundDao.insertLines(refundLines)
             payoutRows.forEach { refundDao.insertPayment(it) }
+            // Money handed back in cash LEAVES the drawer. Without this row the app's
+            // cash-on-hand stayed at its pre-refund figure forever (overstating cash).
+            if (cashPaidNow > CENT) {
+                cashTxnDao.insert(
+                    CashTxn(
+                        businessId = businessId, type = "refund", amount = -cashPaidNow,
+                        source = "cash", note = "Refund on $receiptLabel",
+                        refType = "refund", refId = refundId,
+                        createdBy = cashierId, createdByName = cashierName,
+                        createdAt = stamp, updatedAt = stamp
+                    )
+                )
+            }
             // Put returned goods back on the shelf (unless damaged). Box lines return
             // qty * unitsPerLine stock units — the multiplier applied once, same as
             // the checkout draw-down, only with the opposite sign.
@@ -2019,6 +2070,11 @@ class PosRepository(private val db: PosDatabase) {
      * "money over time, like change"). Writes a [RefundPayment] (records the method)
      * plus a `refund_paid` credit row that reduces the aged "we owe you" balance, and
      * flips the refund to `settled` once fully paid. Mirrors [recordChangePayment].
+     *
+     * CASH-ON-HAND: a CASH payout physically empties the drawer, so it also posts a
+     * NEGATIVE `refund` [CashTxn]. A card/mobile-money reversal posts none. This is the
+     * LATER half of the refund money — the at-refund-time half is booked in [createRefund],
+     * and each payout is booked exactly once, so the two can never double-count.
      */
     suspend fun recordRefundPayout(
         refundId: String,
@@ -2045,6 +2101,19 @@ class PosRepository(private val db: PosDatabase) {
                     createdAt = stamp
                 )
             )
+            // Cash actually handed over now leaves the drawer.
+            if (tender.method == "cash" && tender.amount > CENT) {
+                cashTxnDao.insert(
+                    CashTxn(
+                        businessId = refund.businessId, type = "refund", amount = -tender.amount,
+                        source = "cash",
+                        note = "Refund payout on #${refund.saleReceiptNo ?: refund.saleId.take(8)}",
+                        refType = "refund", refId = refundId,
+                        createdBy = cashierId, createdByName = cashierName,
+                        createdAt = stamp, updatedAt = stamp
+                    )
+                )
+            }
             if (refund.customerId != null) {
                 creditDao.insert(
                     CreditTxn(
@@ -2574,6 +2643,12 @@ class PosRepository(private val db: PosDatabase) {
      * restocked goods back down (a `adjust` movement) and settle any still-owed balance
      * with a `refund_paid` row so the customer's "we owe you" balance returns to zero.
      * Audit-logged.
+     *
+     * CASH-ON-HAND: a void reverses a payout, so any money that actually left the drawer
+     * comes back — a POSITIVE `adjust` [CashTxn] for the CASH already paid out on this
+     * refund (the entity's own rule: a correction is a new `adjust` row, never an edit).
+     * A refund still fully owed, or one reversed by card/mobile money, never touched cash,
+     * so nothing is written and the drawer is not inflated.
      */
     suspend fun voidRefund(refundId: String, cashierId: String? = null, cashierName: String? = null) {
         val r = refundDao.getById(refundId) ?: return
@@ -2594,6 +2669,21 @@ class PosRepository(private val db: PosDatabase) {
                         delta = -units, balanceAfter = newQty,
                         note = "Void refund #${r.saleReceiptNo ?: ""}".trim(),
                         createdBy = cashierId, createdByName = cashierName, createdAt = stamp
+                    )
+                )
+            }
+            // Put back only what actually left the drawer in cash. Nothing paid out (or
+            // paid out by card/EcoCash) => no cash row at all.
+            val cashPaidOut = refundDao.cashPaidSoFar(refundId)
+            if (cashPaidOut > CENT) {
+                cashTxnDao.insert(
+                    CashTxn(
+                        businessId = r.businessId, type = "adjust", amount = cashPaidOut,
+                        source = "cash",
+                        note = "Void refund on #${r.saleReceiptNo ?: r.saleId.take(8)}",
+                        refType = "refund", refId = refundId,
+                        createdBy = cashierId, createdByName = cashierName,
+                        createdAt = stamp, updatedAt = stamp
                     )
                 )
             }
