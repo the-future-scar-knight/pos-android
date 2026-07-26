@@ -1,6 +1,7 @@
 package com.portionspot.pos.auth
 
 import com.portionspot.pos.sync.Connection
+import com.portionspot.pos.sync.SupabaseRest
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -63,7 +64,18 @@ class StaffAdminClient(
     private val json = Json { ignoreUnknownKeys = true }
     private val jsonMedia = "application/json".toMediaType()
 
-    private fun bearer(): String = accessToken() ?: connection.anonKey
+    /** The admin console is read/write against `pos_staff`, never a local-row sync, so an
+     *  anon fallback here costs a failed request rather than silently-unsynced data. It
+     *  must still never forward [SupabaseRest.SESSION_UNAVAILABLE] — that value is a
+     *  signal, not a credential. */
+    private fun bearer(): String {
+        val token = accessToken()
+        return if (token.isNullOrBlank() || token == SupabaseRest.SESSION_UNAVAILABLE) {
+            connection.anonKey
+        } else {
+            token
+        }
+    }
 
     private fun Request.Builder.authed() = this
         .header("apikey", connection.anonKey)

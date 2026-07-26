@@ -164,6 +164,25 @@ class SessionVault(context: Context) {
     fun sessionFor(userId: String): CachedAuth? =
         load().accounts.firstOrNull { it.auth.userId == userId }?.auth
 
+    /**
+     * The session this device should be syncing with, WITHOUT needing the UI to have
+     * activated an account first: the flagged-active account, or — when nothing is
+     * flagged (the flag was cleared by [removeAccount], or a legacy blob never carried
+     * one) — the first account on the device.
+     *
+     * [AuthManager] restores its in-memory session asynchronously, so a sync pass can
+     * start before that finishes (most sharply: WorkManager waking the SyncWorker in a
+     * FRESH process). This is the read-through that lets the token layer recover the
+     * right identity on its own instead of silently falling back to the anon key.
+     */
+    fun activeOrAnySession(): CachedAuth? {
+        val data = load()
+        val flagged = data.activeUserId?.let { id ->
+            data.accounts.firstOrNull { it.auth.userId == id }?.auth
+        }
+        return flagged ?: data.accounts.firstOrNull()?.auth
+    }
+
     // ── account mutations ─────────────────────────────────────────────────
 
     /** Add or replace an account's session (preserving any existing PIN), optionally

@@ -8,6 +8,21 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
+/**
+ * Raised instead of signing a request with the anon key when this device HAS a cloud
+ * session but no usable token for it.
+ *
+ * An anon-signed write is rejected by row-level security (Postgres 42501) on every
+ * table, which reads to the owner like a data/permissions problem while the app still
+ * looks signed in — and the rows just pile up unsynced. Failing the pass outright keeps
+ * the cause visible ("sign in again") and, because nothing reaches its `markSynced`,
+ * every queued row stays queued exactly as it does offline.
+ *
+ * It extends [IOException] so the sync engine treats it as an ordinary transport
+ * failure: the pass reports Failed and retries later.
+ */
+class SessionExpiredException : IOException("Session expired — sign in again")
+
 /** Result of a one-off connection check, so the UI can give a useful message. */
 sealed class ConnectionTest {
     object Ok : ConnectionTest()                       // reachable + tables present
@@ -26,9 +41,30 @@ sealed class ConnectionTest {
 class SupabaseRest(
     private val baseUrl: String,
     private val anonKey: String,
-    /** Signed-in user's JWT; RLS needs it — the anon key alone can do nothing. */
+    /**
+     * The identity to sign requests with. Three-valued on purpose (see [authed]):
+     *  - a JWT   → the signed-in user; RLS needs it, the anon key alone can do nothing.
+     *  - `null`  → this device has NO cloud session (local/phone-only mode, or the
+     *              unauthenticated connection probe), so the anon key IS the intended
+     *              identity and the request goes out as-is.
+     *  - [SESSION_UNAVAILABLE] → a session EXISTS but no token can be produced for it.
+     *              The request is refused rather than downgraded.
+     */
     private val accessToken: () -> String? = { null },
 ) {
+
+    companion object {
+        /**
+         * Sentinel the token provider returns for "a cloud session exists on this device
+         * but we cannot produce a token for it right now". Deliberately not a plausible
+         * JWT and not a legal HTTP header value, so it can never be sent by accident.
+         */
+        const val SESSION_UNAVAILABLE = "\u0000pos-session-unavailable"
+
+        /** The most recently added synced table — bump this whenever the setup script
+         *  gains a new one, so an out-of-date database is detected as needing setup. */
+        private const val PROBE_NEWEST = "staff_requests"
+    }
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
@@ -78,12 +114,6 @@ class SupabaseRest(
         } catch (e: Exception) {
             ConnectionTest.Failed(e.message ?: "Could not reach the database")
         }
-    }
-
-    private companion object {
-        /** The most recently added synced table — bump this whenever the setup script
-         *  gains a new one, so an out-of-date database is detected as needing setup. */
-        const val PROBE_NEWEST = "staff_requests"
     }
 
     /** GET rows where `updated_at > cursor`, oldest-first, capped at [limit]. */
@@ -213,8 +243,23 @@ class SupabaseRest(
     fun publicUrl(bucket: String, objectPath: String): String =
         "$baseUrl/storage/v1/object/public/$bucket/$objectPath"
 
-    private fun Request.Builder.authed() = this
-        .header("apikey", anonKey)
-        .header("Authorization", "Bearer ${accessToken() ?: anonKey}")
-        .header("Accept", "application/json")
+    /**
+     * Sign the request.
+     *
+     * The anon key is used ONLY when the provider says this device genuinely has no
+     * cloud session (`null`) — local/phone-only mode and the connection probe. It is
+     * never a silent stand-in for a session we failed to produce a token for: that used
+     * to turn an auth problem into what looked like a data problem (every write refused
+     * by RLS with Postgres 42501 while the UI still showed a signed-in user, and the
+     * rows piling up unsynced). That case throws [SessionExpiredException] instead, which
+     * fails the pass with a nameable cause and leaves every queued row queued.
+     */
+    private fun Request.Builder.authed(): Request.Builder {
+        val token = accessToken()
+        if (token == SESSION_UNAVAILABLE) throw SessionExpiredException()
+        return this
+            .header("apikey", anonKey)
+            .header("Authorization", "Bearer ${token ?: anonKey}")
+            .header("Accept", "application/json")
+    }
 }

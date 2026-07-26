@@ -122,19 +122,33 @@ class AuthManager(
     @Volatile
     private var activeUserId: String? = null
 
+    /** Memoised "does this device have a cloud account at all?", so the hot token path
+     *  ([accessTokenOrNull], called per HTTP request) doesn't decrypt the vault every
+     *  time. Null = unknown, recomputed on next read; invalidated on every mutation. */
+    @Volatile
+    private var cachedHasCloudAccount: Boolean? = null
+
     init {
         scope.launch {
             withContext(Dispatchers.IO) {
-                activeUserId = vault.activeUserId()
-                currentAccessToken = vault.activeSession()?.accessToken
-                _state.value = if (vault.hasAnyAccount()) {
-                    AuthState.Picker(vault.accounts())
-                } else {
-                    AuthState.LoggedOut
+                // Restore the last-used session so a background pass (and the token layer)
+                // has an identity before any UI runs. Never CLOBBER a session another path
+                // already established: this restore is asynchronous and can land after a
+                // login, an unlock, or the read-through in [accessTokenOrNull].
+                val cached = runCatching { vault.activeOrAnySession() }.getOrNull()
+                if (activeUserId == null) activeUserId = cached?.userId
+                if (currentAccessToken == null) currentAccessToken = cached?.accessToken
+                val any = runCatching { vault.hasAnyAccount() }.getOrDefault(false)
+                cachedHasCloudAccount = any
+                if (_state.value is AuthState.Loading) {
+                    _state.value = if (any) AuthState.Picker(vault.accounts()) else AuthState.LoggedOut
                 }
             }
         }
     }
+
+    /** Forget the memoised account-presence answer after any vault mutation. */
+    private fun invalidateAccountCache() { cachedHasCloudAccount = null }
 
     // ── account picker / switching ────────────────────────────────────────
 
@@ -223,6 +237,10 @@ class AuthManager(
         vault.setActive(userId)
         activeUserId = userId
         currentAccessToken = session.accessToken
+        cachedHasCloudAccount = true
+        // A different account's session may well be healthy; clear the prompt and let the
+        // next [refreshIfNeeded] re-raise it if this one is dead too.
+        _reloginRequired.value = false
         _state.value = AuthState.Active(session.toUser())
     }
 
@@ -231,8 +249,10 @@ class AuthManager(
     suspend fun login(email: String, password: String): LoginResult =
         withContext(Dispatchers.IO) {
             when (val result = api.signIn(email.trim(), password)) {
+                // Covers both "no network" and a transient server-side failure (5xx / 429),
+                // which SupabaseAuth deliberately does NOT report as a rejected credential.
                 is AuthResult.Offline ->
-                    LoginResult.Error("No connection — signing in needs internet")
+                    LoginResult.Error("Couldn't reach the sign-in server — check your connection and try again")
                 is AuthResult.Rejected -> LoginResult.Error(result.message)
                 is AuthResult.Success -> {
                     val session = result.session
@@ -262,6 +282,7 @@ class AuthManager(
                     vault.resetPinFailures(userId)
                     activeUserId = userId
                     currentAccessToken = cached.accessToken
+                    cachedHasCloudAccount = true
                     _reloginRequired.value = false
 
                     _state.value = if (vault.hasPin(userId)) {
@@ -304,6 +325,7 @@ class AuthManager(
             val fails = vault.recordPinFailure(userId)
             if (fails >= MAX_PIN_ATTEMPTS) {
                 val remaining = vault.removeAccount(userId)
+                invalidateAccountCache()
                 if (userId == activeUserId) { activeUserId = null; currentAccessToken = null }
                 _state.value = if (remaining.isEmpty()) AuthState.LoggedOut else AuthState.Picker(remaining)
                 LoginResult.Error("Too many attempts — sign in with your password")
@@ -336,7 +358,7 @@ class AuthManager(
     // accounts entirely; all hashing runs on IO (PBKDF2 is heavy on the Sunmi).
 
     /** True if a cloud account has ever been provisioned on this device. */
-    fun hasCloudAccount(): Boolean = vault.hasAnyAccount()
+    fun hasCloudAccount(): Boolean = hasCloudSession()
 
     suspend fun hasLocalPin(): Boolean = withContext(Dispatchers.IO) { vault.hasLocalPin() }
 
@@ -349,8 +371,54 @@ class AuthManager(
 
     // ── tokens for the sync layer ─────────────────────────────────────────
 
-    /** Snapshot for request headers; may be stale, see [refreshIfNeeded]. */
-    fun accessTokenOrNull(): String? = currentAccessToken
+    /**
+     * A REAL access token for the account this device syncs as, or null if there simply
+     * isn't one. Reads through to the vault when the in-memory copy is missing, so a pass
+     * that starts before the asynchronous restore in [init] has finished — the ~45s
+     * foreground poll, the push-on-change debounce, the hot-poll, and most sharply the
+     * [com.portionspot.pos.sync.SyncWorker] waking a FRESH process — still gets the right
+     * identity. The token may be stale; [refreshIfNeeded] handles expiry.
+     */
+    private fun liveTokenOrNull(): String? {
+        // A server-refused refresh means the cached token is dead; don't resurrect it
+        // from the vault, and don't let anything fall back to anon (see accessTokenOrNull).
+        if (_reloginRequired.value) return null
+        currentAccessToken?.takeIf { it.isNotBlank() }?.let { return it }
+        val cached = runCatching {
+            activeUserId?.let { vault.sessionFor(it) } ?: vault.activeOrAnySession()
+        }.getOrNull() ?: return null
+        if (cached.accessToken.isBlank()) return null
+        activeUserId = cached.userId
+        currentAccessToken = cached.accessToken
+        return cached.accessToken
+    }
+
+    /** Has a cloud account ever been provisioned here? Memoised; see [cachedHasCloudAccount]. */
+    private fun hasCloudSession(): Boolean =
+        cachedHasCloudAccount ?: runCatching { vault.hasAnyAccount() }
+            .getOrDefault(false)
+            .also { cachedHasCloudAccount = it }
+
+    /**
+     * Identity for a sync request, in the three-valued contract
+     * [com.portionspot.pos.sync.SupabaseRest] expects:
+     *
+     *  - a JWT → sign with it (possibly stale; PostgREST answers 401 and the pass retries).
+     *  - `null` → this device has NO cloud account (local/phone-only mode). The anon key
+     *    is the correct, intended identity.
+     *  - [com.portionspot.pos.sync.SupabaseRest.SESSION_UNAVAILABLE] → an account EXISTS
+     *    but no token can be produced for it. The request must be REFUSED, never signed
+     *    with the anon key: an anon write is rejected by RLS on every table (Postgres
+     *    42501), which looks like a data problem, hides the auth problem, and leaves the
+     *    rows silently unsynced. Raising [reloginRequired] here is what puts the
+     *    "Session expired" banner in front of the user.
+     */
+    fun accessTokenOrNull(): String? {
+        liveTokenOrNull()?.let { return it }
+        if (!hasCloudSession()) return null
+        _reloginRequired.value = true
+        return com.portionspot.pos.sync.SupabaseRest.SESSION_UNAVAILABLE
+    }
 
     /**
      * Is the CURRENT device operating as an admin? Drives notification-audience gating
@@ -360,23 +428,42 @@ class AuthManager(
      * owner is always the admin (see MainActivity's LOCAL mode) — so a null session reads
      * as admin. Cheap enough to call per sync pass (a decrypt of the small vault blob).
      */
-    fun isDeviceAdmin(): Boolean = vault.activeSession()?.role?.let { it == "admin" } ?: true
+    fun isDeviceAdmin(): Boolean =
+        runCatching { vault.activeOrAnySession() }.getOrNull()?.role?.let { it == "admin" } ?: true
 
     /**
-     * Called before a sync pass. Refreshes the active account's access token when
-     * it's within a minute of expiry. Offline: keep what we have (sync only runs
-     * online anyway, and a failed pass just retries later — records stay queued).
-     * Server-rejected refresh: raise [reloginRequired]; never drop local data.
+     * Called before every sync pass: make sure a usable access token exists, refreshing
+     * proactively once we're inside [REFRESH_SKEW_SECONDS] of expiry (comfortably wider
+     * than the ~15-minute background cadence, so a token never dies between passes).
+     *
+     * It resolves the account from the VAULT rather than trusting the in-memory
+     * [activeUserId]. The old `activeUserId ?: return` was the silent-data-loss bug: the
+     * restore in [init] is asynchronous, so a pass arriving first — the SyncWorker waking
+     * a fresh process is the clean example — early-returned, left [currentAccessToken]
+     * null, and every write then went out signed with the ANON key. Postgres refused all
+     * of them with 42501, no refresh was ever attempted, and the UI still said "signed in".
+     *
+     * Offline is NOT a session failure: the cached token stays in place, the pass fails on
+     * the network, records stay queued, and we try again. Only a server verdict
+     * ([AuthResult.Rejected], i.e. a 4xx on the refresh grant) drops the dead token and
+     * raises [reloginRequired]. Local data is never touched either way.
      */
     suspend fun refreshIfNeeded() = withContext(Dispatchers.IO) {
         refreshMutex.withLock {
-            val userId = activeUserId ?: return@withLock
-            val cached = vault.sessionFor(userId) ?: return@withLock
+            val cached = (activeUserId?.let { vault.sessionFor(it) } ?: vault.activeOrAnySession())
+                ?: run { currentAccessToken = null; return@withLock }
+            val userId = cached.userId
+            activeUserId = userId
+            // Publish the cached token up front, so that even if the refresh below fails we
+            // send a REAL (if stale) JWT — rejected with 401 by PostgREST before it ever
+            // reaches Postgres — instead of degrading to the anon key.
+            if (cached.accessToken.isNotBlank()) currentAccessToken = cached.accessToken
+
             val now = System.currentTimeMillis() / 1000
-            if (now < cached.expiresAt - 60) {
-                currentAccessToken = cached.accessToken
-                return@withLock
-            }
+            val stillFresh = cached.accessToken.isNotBlank() &&
+                now < cached.expiresAt - REFRESH_SKEW_SECONDS
+            if (stillFresh && !_reloginRequired.value) return@withLock
+
             when (val result = api.refresh(cached.refreshToken)) {
                 is AuthResult.Success -> {
                     val s = result.session
@@ -389,8 +476,13 @@ class AuthManager(
                     currentAccessToken = updated.accessToken
                     _reloginRequired.value = false
                 }
-                is AuthResult.Rejected -> _reloginRequired.value = true
-                is AuthResult.Offline -> Unit // keep the stale token; retry next pass
+                is AuthResult.Rejected -> {
+                    // The server refused the refresh token: this session is dead. Drop the
+                    // token so nothing can keep signing writes with it, and prompt.
+                    currentAccessToken = null
+                    _reloginRequired.value = true
+                }
+                is AuthResult.Offline -> Unit // keep the cached token; retry next pass
             }
         }
     }
@@ -405,6 +497,7 @@ class AuthManager(
         val remaining = if (userId != null) vault.removeAccount(userId) else vault.accounts()
         activeUserId = null
         currentAccessToken = null
+        cachedHasCloudAccount = remaining.isNotEmpty()
         _reloginRequired.value = false
         _state.value = if (remaining.isEmpty()) AuthState.LoggedOut else AuthState.Picker(remaining)
     }
@@ -425,8 +518,10 @@ class AuthManager(
      * refresh.
      */
     suspend fun refreshCurrentPermissions() = withContext(Dispatchers.IO) {
+        // Same read-through as the sync path: don't give up just because the async restore
+        // in [init] hasn't populated the in-memory session yet.
+        val token = liveTokenOrNull() ?: return@withContext
         val userId = activeUserId ?: return@withContext
-        val token = currentAccessToken ?: return@withContext
         val profile = try {
             api.fetchStaffProfile(token, userId)
         } catch (_: Exception) {
@@ -450,5 +545,11 @@ class AuthManager(
 
     private companion object {
         const val MAX_PIN_ATTEMPTS = 5
+
+        /** Refresh this many seconds BEFORE the access token actually expires. Supabase
+         *  tokens live ~1h; the background sync cadence is ~15 min, so a 5-minute cushion
+         *  guarantees at least one pass gets to renew the token while it is still valid,
+         *  instead of the shop discovering it died between passes. */
+        const val REFRESH_SKEW_SECONDS = 300L
     }
 }
