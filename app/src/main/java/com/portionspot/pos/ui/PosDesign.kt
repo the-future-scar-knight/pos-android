@@ -1,8 +1,12 @@
 package com.portionspot.pos.ui
 
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.InteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -39,6 +43,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.TextStyle
@@ -57,6 +62,46 @@ import androidx.compose.ui.window.DialogProperties
  * phone sheet to a centred modal on a tablet/till. Built on [LocalPosTokens] so every
  * colour follows the active theme.
  */
+
+/**
+ * Scales a surface down while it is held. `Modifier.clickable` already draws a
+ * Material ripple, which is enough on a small control — but on a large surface
+ * (a product card, a cart row) the ripple is diffuse and easy to miss mid-shift,
+ * and the tile ends up feeling dead. A 3% scale is felt rather than seen.
+ *
+ * Runs inside [graphicsLayer] deliberately: the lambda re-reads `scale` on the
+ * layer pass, so a press does NOT recompose or re-measure the subtree. Doing the
+ * same thing with `Modifier.scale(s)` would recompose the card on every frame of
+ * the press — on a 2-column grid of 40 products that is the difference between
+ * free and janky.
+ *
+ * Pass the SAME [interactionSource] you gave to `clickable`, or the scale will
+ * never fire.
+ */
+@Composable
+fun Modifier.pressScale(
+    interactionSource: InteractionSource,
+    pressed: Float = defaultPressScale(),
+): Modifier {
+    if (LocalReduceMotion.current) return this
+    val isPressed by interactionSource.collectIsPressedAsState()
+    val scale by animateFloatAsState(
+        targetValue = if (isPressed) pressed else 1f,
+        animationSpec = tween(PosMotion.Press, easing = PosMotion.EnterEasing),
+        label = "pressScale",
+    )
+    return graphicsLayer { scaleX = scale; scaleY = scale }
+}
+
+/**
+ * Press depth scaled to the screen. A 3% squeeze is a *proportional* change, so on the
+ * Sunmi's 116dp card it moves ~3.5dp of edge — below the threshold where a thumb
+ * registers it, especially on that low-DPI panel. Compact goes to 6%; roomier screens
+ * keep the subtler 3% because the same percentage travels further on a bigger card.
+ */
+@Composable
+private fun defaultPressScale(): Float =
+    if (LocalPosDimens.current.widthClass == PosWidthClass.Compact) 0.94f else 0.97f
 
 /** Small uppercase section label — muted, for grouping. */
 @Composable

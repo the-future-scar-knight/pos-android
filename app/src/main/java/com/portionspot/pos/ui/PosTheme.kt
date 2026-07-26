@@ -1,6 +1,14 @@
 package com.portionspot.pos.ui
 
 import android.app.Activity
+import android.provider.Settings
+import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.Easing
+import androidx.compose.animation.core.FastOutLinearInEasing
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearOutSlowInEasing
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Typography
 import androidx.compose.material3.lightColorScheme
@@ -236,6 +244,72 @@ fun buildTokens(choice: ThemeChoice): PosTokens {
 
 val LocalPosTokens = staticCompositionLocalOf { buildTokens(DEFAULT_THEME) }
 
+// ── Motion ───────────────────────────────────────────────────────────────────
+// Motion values live here for the same reason colours do: literals scattered
+// across screens drift. Unlike [PosTokens] these are NOT themeable — motion is a
+// property of the app's character, not of the accent the shop picked, so this is
+// a plain object rather than another CompositionLocal.
+//
+// The durations are deliberately short. A cashier repeats a handful of actions
+// hundreds of times a shift on cheap hardware while a customer waits, so motion
+// here buys tactile confirmation and nothing else. Anything that reads as
+// decoration is a tax paid on every sale.
+
+object PosMotion {
+    /** Entrances. Compose's default [FastOutSlowInEasing] is an ease-IN-out — it
+     *  front-loads a slow start, which is exactly what makes UI feel sluggish. */
+    val EnterEasing: Easing = LinearOutSlowInEasing
+
+    /** On-screen movement between two known positions (slides, reorders). */
+    val MoveEasing: Easing = FastOutSlowInEasing
+
+    /** Exits. Accelerating out is correct; the user has already moved on. */
+    val ExitEasing: Easing = FastOutLinearInEasing
+
+    /** iOS-like drawer curve (from Ionic). For sheets and the side drawer. */
+    val DrawerEasing: Easing = CubicBezierEasing(0.32f, 0.72f, 0f, 1f)
+
+    /** Press feedback. Below ~100ms reads as a glitch; above ~160ms as lag. */
+    const val Press = 120
+
+    /** Controls: tabs, toggles, chips, pills. */
+    const val Control = 180
+
+    /** Surfaces: dialogs, sheets, the drawer. */
+    const val Surface = 240
+
+    /** Exits run shorter than their entrance — see [ExitEasing]. */
+    const val SurfaceExit = 160
+
+    /** Settle for surfaces. No bounce: this app counts money, and a springy
+     *  payment sheet reads as unserious. */
+    fun <T> surfaceSpring() = spring<T>(
+        dampingRatio = Spring.DampingRatioNoBouncy,
+        stiffness = Spring.StiffnessMediumLow,
+    )
+}
+
+/**
+ * True when the user has turned system animations off (Developer Options, or the
+ * accessibility "Remove animations" toggle). Android has no `prefers-reduced-motion`;
+ * the animator duration scale is the signal, and a scale of 0 means the platform is
+ * already skipping its own animations, so ours should follow.
+ *
+ * Read it once — it needs an app restart to change, and polling it per-frame would
+ * cost more than the animations it disables.
+ */
+val LocalReduceMotion = staticCompositionLocalOf { false }
+
+@Composable
+fun rememberReduceMotion(): Boolean {
+    val resolver = LocalContext.current.contentResolver
+    return remember {
+        runCatching {
+            Settings.Global.getFloat(resolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f) == 0f
+        }.getOrDefault(false)
+    }
+}
+
 // ── Responsive sizing ────────────────────────────────────────────────────────
 // The layout used to be frozen: a fixed 2-column grid and hard-coded card/text
 // sizes, so a big tablet till showed two giant cards while a small handheld
@@ -397,6 +471,7 @@ fun PosTheme(
     CompositionLocalProvider(
         LocalPosTokens provides tokens,
         LocalPosDimens provides dimens,
+        LocalReduceMotion provides rememberReduceMotion(),
     ) {
         MaterialTheme(
             colorScheme = colors,
