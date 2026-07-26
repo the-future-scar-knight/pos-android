@@ -244,7 +244,7 @@ interface SaleDao {
     fun observeTopProducts(businessId: String, from: Long, to: Long, limit: Int = 5): Flow<List<TopProduct>>
 
     /**
-     * Gross profit = SUM((soldPrice − costAtSaleTime) * qty), only for lines that have
+     * Gross profit = SUM((soldPrice − costOfWhatWasSold) * qty), only for lines that have
      * a cost to work from.
      *
      * The cost basis is the FROZEN `li.unitCost` captured at checkout, falling back to
@@ -252,9 +252,20 @@ interface SaleDao {
      * before the column existed, or pulled from the cloud, which carries no cost).
      * Before this, the query read `i.cost` directly, so editing a product's cost price
      * silently rewrote the profit of every past sale.
+     *
+     * ★ `unitsPerLine` matters and was missing: `unitPrice` is the price of ONE LINE-UNIT
+     * (a whole box on a box line) while the cost is per STOCK UNIT, so a box of 4 was
+     * charged one unit of cost instead of four. That overstated profit on every box sale
+     * by `cost * (unitsPerLine - 1) * qty` — on a $80 box of 4 units costing $15 each it
+     * reported $65 profit instead of $20. Multiplying the cost up to the line-unit fixes
+     * it. `NULLIF(...,0)` guards a stray 0 box size, which would otherwise zero the cost
+     * and overstate profit all over again. Piece and measured lines carry 1 and are
+     * unaffected.
      */
     @Query(
-        "SELECT COALESCE(SUM((li.unitPrice - COALESCE(li.unitCost, i.cost)) * li.qty), 0) " +
+        "SELECT COALESCE(SUM((li.unitPrice - " +
+            "COALESCE(li.unitCost, i.cost) * COALESCE(NULLIF(li.unitsPerLine, 0), 1)" +
+            ") * li.qty), 0) " +
             "FROM sale_items li JOIN sales s ON li.saleId = s.id " +
             "JOIN items i ON li.itemId = i.id " +
             "WHERE s.businessId = :businessId AND s.deleted = 0 AND li.deleted = 0 " +
