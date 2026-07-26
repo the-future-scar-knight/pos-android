@@ -337,6 +337,24 @@ interface SaleDao {
     @Upsert
     suspend fun upsertLines(lines: List<SaleLine>)
 
+    /**
+     * Apply a pulled EDIT to a sale that already exists locally: rewrite the row (same
+     * primary key — the local UUID that the lines, tenders, refunds, credit rows and the
+     * audit trail all point at) and swap its goods for [lines], which must already carry
+     * `saleId = sale.id`.
+     *
+     * ONE transaction on purpose. An edit can add, remove or re-quantify lines, so the
+     * replacement is delete-then-insert; doing that outside a transaction could leave a
+     * receipt showing money with none of its goods — or half of them — if the write is
+     * interrupted. Either the whole corrected receipt lands or nothing does.
+     */
+    @Transaction
+    suspend fun replaceSaleWithLines(sale: SaleEntity, lines: List<SaleLine>) {
+        hardDeleteLines(sale.id)
+        upsertSale(sale)
+        if (lines.isNotEmpty()) insertLines(lines)
+    }
+
     // ---- danger zone: wipe all sales data for a business ----
     @Query("DELETE FROM sales WHERE businessId = :businessId")
     suspend fun wipeSales(businessId: String)

@@ -807,9 +807,27 @@ class PosSyncEngine(
 
     /**
      * sales → sales + sale_items. id is the ref, line items come from the JSONB
-     * `items` column. Insert-once (matches the web's ignoreDuplicates) so re-pulling
-     * never double-writes lines. `type='return'` refunds and quotes/holds are skipped
-     * in Stage 1 — reconstructing them into the local refund tables is a later stage.
+     * `items` column. `type='return'` refunds and quotes/holds are skipped in Stage 1 —
+     * reconstructing them into the local refund tables is a later stage.
+     *
+     * MATCH FIRST, THEN DECIDE. A cloud sale is either brand new here (insert it) or it
+     * is a row this device already holds (fold the cloud values onto it). It is NEVER a
+     * second row: matching is by receipt REF first — which prefers the locally-created
+     * UUID row, the one that owns the lines, tenders, refunds and audit trail — and by
+     * cloud id second. That is the same identity test the old insert-once guards used,
+     * so duplicates remain impossible; what changed is what happens on a match.
+     *
+     * The old code `continue`d on a match, which made the pull INSERT-ONLY: a receipt
+     * edited on the till reached the cloud but never reached the other phones, so the
+     * admin kept seeing the old total forever. An existing row is now REWRITTEN IN PLACE
+     * (same primary key) whenever the cloud copy is genuinely newer, goods and all.
+     *
+     * LAST-WRITE-WINS, with unsynced local work protected: the cloud row must be
+     * STRICTLY newer than the local row to be applied. A local row that is still dirty
+     * (`synced = false`, i.e. its own edit has not gone up yet) therefore keeps winning
+     * for as long as its stamp is at or ahead of the cloud's — including the very common
+     * case of a device pulling back the row it just pushed, where the two stamps are
+     * equal and nothing is touched.
      */
     private suspend fun pullSales(api: SupabaseRest, bid: String): Int {
         val rows = syncJson.decodeFromString<List<SaleDto>>(
@@ -820,6 +838,7 @@ class PosSyncEngine(
         val skuToId = itemDao.allForBusinessOnce(bid)
             .filter { !it.sku.isNullOrBlank() }
             .associate { it.sku!!.lowercase() to it.id }
+        val resolveItemId: (String?) -> String? = { sku -> sku?.lowercase()?.let { skuToId[it] } }
         var applied = 0
         for (dto in rows) {
             if (dto.type != "sale") continue
@@ -827,14 +846,38 @@ class PosSyncEngine(
             // IDENTITY: the push side keys cloud sales by REF (see buildSalePush), so a
             // sale THIS device made returns with id = "0012" while it lives locally under
             // a UUID. Matching on id alone missed that and inserted a second local row —
-            // the dashboard then counted every till sale twice. Match on id OR receiptNo.
+            // the dashboard then counted every till sale twice. Match on receiptNo OR id.
             // A sale that genuinely originated elsewhere (web POS, ref "PSM-260526-6315")
             // matches neither and still imports normally.
-            if (saleDao.getSaleById(dto.id) != null) continue
-            if (saleDao.getSaleByReceiptNo(bid, ref) != null) continue
-            saleDao.upsertSale(dto.toSaleEntity(bid))
-            val lines = dto.toSaleLines(bid) { sku -> sku?.lowercase()?.let { skuToId[it] } }
-            if (lines.isNotEmpty()) saleDao.upsertLines(lines)
+            val local = saleDao.getSaleByReceiptNo(bid, ref) ?: saleDao.getSaleById(dto.id)
+
+            if (local == null) {
+                saleDao.upsertSale(dto.toSaleEntity(bid))
+                val lines = dto.toSaleLines(bid, resolveItemId = resolveItemId)
+                if (lines.isNotEmpty()) saleDao.upsertLines(lines)
+                applied++
+                continue
+            }
+
+            // Only a genuinely newer cloud copy may overwrite what is on this device.
+            if (IsoTime.toMillis(dto.cursorStamp()) <= local.updatedAt) continue
+
+            // The goods must end up matching the pulled receipt exactly (an edit can add,
+            // remove or re-quantify lines), so they are replaced wholesale rather than
+            // merged line by line. They hang off the LOCAL id, never the cloud one.
+            val newLines = dto.toSaleLines(bid, local.id, resolveItemId)
+            val merged = dto.mergeIntoSale(local)
+            // "Edited" is a local inference: the cloud `sales` table has no edited_at /
+            // edit_count column and this fix does not change the cloud schema. A newer
+            // cloud row whose money, state or goods actually differ IS the edit, so it
+            // carries the badge; a row that merely came back with a fresher stamp does
+            // not, and never inflates the count.
+            val oldLines = saleDao.linesForSale(local.id)
+            val changed = saleSignature(merged, newLines) != saleSignature(local, oldLines)
+            val next = if (changed) {
+                merged.copy(editedAt = merged.updatedAt, editCount = local.editCount + 1)
+            } else merged
+            saleDao.replaceSaleWithLines(next, newLines)
             applied++
         }
         config.setCursor("sales", rows.maxOf { it.cursorStamp() })

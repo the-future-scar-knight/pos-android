@@ -401,12 +401,23 @@ fun SaleDto.toSaleEntity(businessId: String): SaleEntity = SaleEntity(
     synced = true,
 )
 
-/** Materialise the JSONB line items into Room [SaleLine]s. [resolveItemId] maps a sku
- *  to the local item id so reports/profit joins work; unknown skus stay null. */
-fun SaleDto.toSaleLines(businessId: String, resolveItemId: (String?) -> String?): List<SaleLine> =
+/**
+ * Materialise the JSONB line items into Room [SaleLine]s. [resolveItemId] maps a sku
+ * to the local item id so reports/profit joins work; unknown skus stay null.
+ *
+ * [saleId] defaults to the cloud row's id (correct when the pull is INSERTING the sale
+ * under that id). When an incoming edit is being folded onto an EXISTING local sale the
+ * caller passes that sale's local UUID instead, so the replacement lines hang off the
+ * row that already owns the tenders, refunds and audit trail.
+ */
+fun SaleDto.toSaleLines(
+    businessId: String,
+    saleId: String = id,
+    resolveItemId: (String?) -> String?,
+): List<SaleLine> =
     items.map { li ->
         SaleLine(
-            saleId = id,
+            saleId = saleId,
             businessId = businessId,
             itemId = resolveItemId(li.sku),
             name = li.name,
@@ -419,6 +430,102 @@ fun SaleDto.toSaleLines(businessId: String, resolveItemId: (String?) -> String?)
             unitsPerLine = if (li.unitsPerLine < 1) 1 else li.unitsPerLine,
         )
     }
+
+/**
+ * Fold a pulled cloud sale onto the EXISTING local row it matches — the receipt-EDIT
+ * half of the pull, and the reason a corrected receipt reaches the other phones at all.
+ *
+ * The rules, all of which exist because this row is money:
+ *  - The local PRIMARY KEY never moves. The local UUID is referenced by sale lines,
+ *    tenders, refunds, credit rows and the audit trail, so the cloud row is folded ONTO
+ *    it; `id`, `businessId`, `receiptNo` and `soldAt` stay exactly as they were.
+ *  - The pulled values are AUTHORITATIVE and are only ever MAPPED — no total is
+ *    recomputed here. The single derivation is [paymentStatus], which the local model
+ *    stores as a flag where the cloud stores the amount still owing (see below).
+ *  - A field the cloud row does not carry (a web-written row that omits the column) falls
+ *    back to what the device already had, so a pull can never blank out local money.
+ *  - Local-only state the cloud has no column for — `validUntil`, `tendered`,
+ *    `paymentRef`, `serverCreatedAt`, `deleted`, and the edit markers — is preserved.
+ *    The caller stamps [SaleEntity.editedAt]/[SaleEntity.editCount] when the incoming
+ *    row actually differs (see [saleSignature]); the cloud schema has no column for them.
+ *  - `synced = true`: this row just came DOWN, so it must not bounce straight back up.
+ */
+fun SaleDto.mergeIntoSale(local: SaleEntity): SaleEntity {
+    // A money column that is absent OR unparseable must never become 0.0 on a device
+    // that already holds a figure — it keeps what it had.
+    fun money(raw: String?, fallback: Double): Double = raw?.toDoubleOrNull() ?: fallback
+    val paid = amountPaid?.toDoubleOrNull()
+    val given = changeGiven?.toDoubleOrNull()
+    val grand = grandTotal?.toDoubleOrNull()
+    // The cloud keeps "how much is still owing"; the local model keeps a paid/unpaid
+    // flag. Prefer the settlement arithmetic the till itself uses (total + change handed
+    // back - tendered), because the Android push does not populate `amount_owing`; fall
+    // back to the explicit column for rows written by the web POS, and keep the local
+    // flag when the row carries no settlement information at all.
+    val owing: Double? = when {
+        paid != null -> ((grand ?: local.total) + (given ?: 0.0) - paid).coerceAtLeast(0.0)
+        amountOwing != null -> amountOwing.toMoney()
+        else -> null
+    }
+    return local.copy(
+        receiptNo = local.receiptNo ?: ref ?: id,
+        status = status,
+        subtotal = money(subtotal, local.subtotal),
+        discountTotal = money(totalDiscount, local.discountTotal),
+        markupTotal = money(markupTotal, local.markupTotal),
+        taxTotal = money(vatAmount, local.taxTotal),
+        total = grand ?: local.total,
+        paymentMethod = payMethod?.ifBlank { null } ?: local.paymentMethod,
+        amountPaid = paid ?: local.amountPaid,
+        changeDue = given ?: local.changeDue,
+        changeOwed = this.changeOwed?.toDoubleOrNull() ?: local.changeOwed,
+        paymentStatus = owing?.let { if (it > MONEY_EPS) "unpaid" else "paid" } ?: local.paymentStatus,
+        note = notes?.ifBlank { null } ?: local.note,
+        customerId = customerId?.ifBlank { null } ?: local.customerId,
+        customerName = customerName?.ifBlank { null } ?: local.customerName,
+        createdBy = cashierId?.ifBlank { null } ?: local.createdBy,
+        createdByName = cashier?.ifBlank { null } ?: local.createdByName,
+        updatedAt = IsoTime.toMillis(cursorStamp()),
+        synced = true,
+    )
+}
+
+/** Half a cent: below this two money values are the same amount. */
+private const val MONEY_EPS = 0.005
+
+private fun cents(v: Double): Long = Math.round(v * 100.0)
+
+/**
+ * A stable fingerprint of everything a shop would call "the receipt": its money, its
+ * settlement, its state and its goods. Two sales with the same signature are the same
+ * receipt, whatever their row ids or timestamps.
+ *
+ * Used on the pull to tell a genuine receipt EDIT (badge it, bump the edit count) from a
+ * row that merely came back down with a fresher `updated_at`. Line ids and saleIds are
+ * deliberately not part of it — a pulled line is minted fresh every time.
+ */
+internal fun saleSignature(sale: SaleEntity, lines: List<SaleLine>): String {
+    val head = listOf(
+        sale.status,
+        sale.paymentStatus,
+        sale.paymentMethod,
+        cents(sale.subtotal), cents(sale.discountTotal), cents(sale.markupTotal),
+        cents(sale.taxTotal), cents(sale.total), cents(sale.amountPaid),
+        cents(sale.changeDue ?: 0.0), cents(sale.changeOwed ?: 0.0),
+        sale.customerId.orEmpty(), sale.note.orEmpty(),
+    ).joinToString("|")
+    val goods = lines
+        .map { l ->
+            listOf(
+                l.name.trim().lowercase(), cents(l.qty), cents(l.unitPrice),
+                cents(l.lineDiscount), cents(l.lineMarkup), cents(l.lineTotal),
+                l.mode, l.unitsPerLine.toString(),
+            ).joinToString(",")
+        }
+        .sorted()
+        .joinToString(";")
+    return "$head#$goods"
+}
 
 // ── push DTOs (Stage 2) ───────────────────────────────────────────────────────
 // The exact row shape the web writes (src/lib/sync.js pushSales). Stage 2 push is
