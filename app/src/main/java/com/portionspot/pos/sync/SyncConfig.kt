@@ -90,7 +90,12 @@ class SyncConfig(private val dao: SettingDao) {
             "notifications",
             // Append-only audit trail — receipt edits, till shortages/overages and
             // voids recorded on a cashier phone become visible on the admin phone.
-            "audit_log"
+            "audit_log",
+            // Admin approval channel (credit-limit requests). The engine already sets
+            // and reads a "staff_requests" cursor; listing it here is what makes that
+            // cursor get cleared on disconnect/reset like every other table — without
+            // it, a reconnect leaves a stale cursor and silently skips older requests.
+            "staff_requests"
         )
 
         private fun cursorKey(table: String) = "cursor_$table"

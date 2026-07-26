@@ -40,11 +40,25 @@ class SupabaseRest(
 
     private fun rest(table: String) = "$baseUrl/rest/v1/$table"
 
+    /**
+     * Is the database ready? Probes TWO tables, not one: `products` proves the project
+     * is reachable and the key is accepted, and [PROBE_NEWEST] proves the CURRENT setup
+     * script has been run. Without the second probe a project still carrying only the
+     * original five tables reports Ok, the setup sheet never appears, and every newer
+     * table then fails to sync on every pass. The script is idempotent, so re-running it
+     * to add what is missing is safe.
+     */
     fun test(): ConnectionTest {
-        val url = (rest("products").toHttpUrlOrNull()
+        val core = probeTable("products", "sku")
+        if (core !is ConnectionTest.Ok) return core
+        return probeTable(PROBE_NEWEST, "local_id")
+    }
+
+    private fun probeTable(table: String, column: String): ConnectionTest {
+        val url = (rest(table).toHttpUrlOrNull()
             ?: return ConnectionTest.Failed("That doesn't look like a valid URL"))
             .newBuilder()
-            .addQueryParameter("select", "sku")
+            .addQueryParameter("select", column)
             .addQueryParameter("limit", "1")
             .build()
         return try {
@@ -64,6 +78,12 @@ class SupabaseRest(
         } catch (e: Exception) {
             ConnectionTest.Failed(e.message ?: "Could not reach the database")
         }
+    }
+
+    private companion object {
+        /** The most recently added synced table — bump this whenever the setup script
+         *  gains a new one, so an out-of-date database is detected as needing setup. */
+        const val PROBE_NEWEST = "staff_requests"
     }
 
     /** GET rows where `updated_at > cursor`, oldest-first, capped at [limit]. */
