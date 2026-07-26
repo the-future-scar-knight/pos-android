@@ -1071,7 +1071,9 @@ private fun AdminBottomNav(current: AdminTab, alertsBadge: Int, onSelect: (Admin
 
 private val ALERT_CATS = listOf(
     "all" to "All", "inventory" to "Inventory", "sales" to "Sales",
-    "payments" to "Payments", "refunds" to "Refunds", "system" to "System"
+    // "cash" carries the till/safe events the owner asked to be told about: a completed
+    // day close (with any shortage), a float top-up, and the safe being opened.
+    "cash" to "Cash", "payments" to "Payments", "refunds" to "Refunds", "system" to "System"
 )
 
 /**
@@ -1297,6 +1299,7 @@ private fun NotificationCard(n: com.portionspot.pos.data.AppNotification, onClic
         "sales" -> Icons.Filled.Payments
         "refunds" -> Icons.Filled.AssignmentReturn
         "payments" -> Icons.Filled.Sms
+        "cash" -> Icons.Filled.AccountBalanceWallet
         else -> Icons.Filled.Sync
     }
     val unread = n.readAt == null
@@ -1356,8 +1359,16 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
     val discountsGiven by vm.discountsGiven.collectAsState()
     // Accounting spine (B3): cash position + expense approvals + recurring schedules.
     val cashOnHand by vm.cashOnHand.collectAsState()
+    // The two locations, so the funding picker can offer them in the right order (§4).
+    val tillBalance by vm.tillBalance.collectAsState()
+    val safeBalance by vm.safeBalance.collectAsState()
+    val isAdminSession by vm.isAdmin.collectAsState()
+    var fundingNotice by remember { mutableStateOf<String?>(null) }
     val payables by vm.payablesTotal.collectAsState()
-    val ownerContrib by vm.ownerContributions.collectAsState()
+    // Owner money now reads the OUTSIDE-FUNDS ledger, not the expense capital column:
+    // that column funds bills from outside the shop generally, so a LOAN would otherwise
+    // be reported here as the owner's own money.
+    val outsideTotals by vm.outsideFundTotals.collectAsState()
     val openingFloat by vm.openingFloat.collectAsState()
     val pendingExpenses by vm.pendingExpenses.collectAsState()
     val templates by vm.recurringTemplates.collectAsState()
@@ -1409,6 +1420,14 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
             }
         }
 
+        // ---- Till & safe (the owner's own cash model, §1–§6) ----
+        // Put FIRST in the cash area on purpose: "where is my money and how much of it is
+        // mine" is the question the owner opens this screen to answer. Closing the day,
+        // topping up the float and moving owner money all live in here, and every one of
+        // them is a button pressed on command — nothing in this section runs on a timer.
+        item { AdminSectionHeader("Till & safe") }
+        item { TillAndSafeSection(vm, currency) }
+
         // ---- Cash & expenses (accounting spine, B3) ----
         item { AdminSectionHeader("Cash & expenses") }
         item {
@@ -1427,7 +1446,10 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
                     }
                     TextButton(onClick = { editFloat = true }) { Text("Opening ${money(openingFloat, currency)}") }
                 }
-                Text("= opening float + cash from sales − cash paid out", color = t.inkTertiary, fontSize = 10.sp)
+                Text(
+                    "= till + safe. Opening float + cash from sales − cash paid out.",
+                    color = t.inkTertiary, fontSize = 10.sp
+                )
                 HorizontalDivider(Modifier.padding(vertical = 8.dp), color = t.surfaceBorder)
                 Row(Modifier.fillMaxWidth()) {
                     Column(Modifier.weight(1f)) {
@@ -1436,8 +1458,12 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
                             fontWeight = FontWeight.Bold, fontSize = 15.sp)
                     }
                     Column(Modifier.weight(1f)) {
-                        Text("Owner put in", color = t.inkTertiary, fontSize = 11.sp)
-                        Text(money(ownerContrib, currency), color = t.inkSecondary, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                        Text("Owner put in (net)", color = t.inkTertiary, fontSize = 11.sp)
+                        Text(
+                            money(outsideTotals.ownerNet, currency),
+                            color = if (outsideTotals.ownerNet < 0) t.danger else t.inkSecondary,
+                            fontWeight = FontWeight.Bold, fontSize = 15.sp
+                        )
                     }
                 }
             }
@@ -1487,9 +1513,10 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
                             onClick = {
-                                // If cash covers it, post straight from cash; otherwise raise
-                                // the shortfall dialog (§9.4: available / owner / abort).
-                                if (cashOnHand + 0.005 >= e.amount) vm.approveExpense(e.id, "cash")
+                                // The till alone covers it => post straight from the drawer,
+                                // no question asked. Anything else and the payer picks the
+                                // source: TILL → SAFE → OUTSIDE FUNDS → abort (§4).
+                                if (tillBalance + 0.005 >= e.amount) vm.approveExpense(e.id, "till")
                                 else approveFor = e
                             },
                             modifier = Modifier.weight(1f)
@@ -1945,12 +1972,34 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
         )
     }
 
-    // Shortfall dialog (§9.4): cash won't cover the expense being posted.
+    // §4 funding waterfall: the till alone won't cover this expense, so the payer chooses
+    // the source in the owner's own order — TILL → SAFE → OUTSIDE FUNDS → abort. Picking
+    // the SAFE is admin-approved every time; a non-admin's choice raises a request to the
+    // owner instead of posting (enforced in the ViewModel, surfaced here as a message).
     approveFor?.let { e ->
-        ExpenseShortfallDialog(
-            expense = e, cashOnHand = cashOnHand, currency = currency,
+        FundingSourceDialog(
+            title = "How is this paid?",
+            amount = e.amount,
+            till = tillBalance,
+            safe = safeBalance,
+            currency = currency,
+            isAdmin = isAdminSession,
             onDismiss = { approveFor = null },
-            onChoose = { mode -> vm.approveExpense(e.id, mode); approveFor = null }
+            onChoose = { mode ->
+                vm.approveExpense(e.id, mode) {
+                    fundingNotice = "Sent to the owner for approval — the safe can only be " +
+                        "opened by them. Once approved the cash moves into the till."
+                }
+                approveFor = null
+            }
+        )
+    }
+    fundingNotice?.let { msg ->
+        AlertDialog(
+            onDismissRequest = { fundingNotice = null },
+            title = { Text("Waiting on the owner") },
+            text = { Text(msg, color = t.inkSecondary, fontSize = 13.sp) },
+            confirmButton = { TextButton(onClick = { fundingNotice = null }) { Text("OK") } }
         )
     }
     // Opening cash float editor.
@@ -1979,47 +2028,6 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
             vm.submitExpense(cat, amt, date, desc, recurring, period); addExpense = false
         }
     }
-}
-
-/**
- * The 3-way shortfall prompt (§9.4) shown when cash-on-hand can't cover an expense being
- * posted: pay what cash there is (remainder → accounts payable), have the owner cover it
- * (owner capital; cash untouched), or abort and write nothing.
- */
-@Composable
-private fun ExpenseShortfallDialog(
-    expense: Expense,
-    cashOnHand: Double,
-    currency: String,
-    onDismiss: () -> Unit,
-    onChoose: (mode: String) -> Unit
-) {
-    val t = LocalPosTokens.current
-    val avail = cashOnHand.coerceAtLeast(0.0)
-    val remainder = (expense.amount - avail).coerceAtLeast(0.0)
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Not enough cash") },
-        text = {
-            Column {
-                Text(
-                    "${expense.category} costs ${money(expense.amount, currency)} but only " +
-                        "${money(avail, currency)} is in the drawer. How should it be funded?",
-                    color = t.inkSecondary, fontSize = 13.sp
-                )
-                Spacer(Modifier.height(12.dp))
-                Button(onClick = { onChoose("available") }, modifier = Modifier.fillMaxWidth()) {
-                    Text("Take ${money(avail, currency)} · owe ${money(remainder, currency)}")
-                }
-                Spacer(Modifier.height(6.dp))
-                OutlinedButton(onClick = { onChoose("capital") }, modifier = Modifier.fillMaxWidth()) {
-                    Text("Owner covers it (cash untouched)")
-                }
-            }
-        },
-        confirmButton = {},
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Abort") } }
-    )
 }
 
 /** Minimal single-amount editor dialog (opening float, recurring amount…). */
@@ -7781,6 +7789,11 @@ private fun PoCreateDialog(vm: PosViewModel, currency: String, onDismiss: () -> 
     val suppliers by vm.suppliers.collectAsState()
     val catalog by vm.items.collectAsState()
     val cashOnHand by vm.cashOnHand.collectAsState()
+    // Stock is paid for out of the same two pots as anything else (§4).
+    val tillBalance by vm.tillBalance.collectAsState()
+    val safeBalance by vm.safeBalance.collectAsState()
+    val isAdminSession by vm.isAdmin.collectAsState()
+    var poFundingNotice by remember { mutableStateOf<String?>(null) }
 
     var supplierId by remember { mutableStateOf<String?>(null) }
     var supplierName by remember { mutableStateOf("") }
@@ -7809,8 +7822,26 @@ private fun PoCreateDialog(vm: PosViewModel, currency: String, onDismiss: () -> 
 
     fun submit(mode: String) {
         val eta = etaDays?.let { System.currentTimeMillis() + it * 86_400_000L }
-        vm.createPurchaseOrder(supplierId, supplierName, notes, eta, lines.toList(), payNow, mode)
-        onDismiss()
+        // ★ The safe is admin-only (§4). Work out here, synchronously, whether this plan
+        // would open it — the ViewModel enforces the same rule, but deciding it in
+        // composition is what lets the form STAY OPEN and explain itself instead of
+        // vanishing while a request quietly goes to the owner.
+        val want = payNow.coerceIn(0.0, orderTotal)
+        val needsSafe = when (mode) {
+            "safe" -> want > 0.005
+            "waterfall", "available", "cash" -> want > tillBalance.coerceAtLeast(0.0) + 0.005
+            else -> false
+        }
+        vm.createPurchaseOrder(
+            supplierId, supplierName, notes, eta, lines.toList(), payNow, mode
+        )
+        if (needsSafe && !isAdminSession) {
+            poFundingNotice = "Sent to the owner for approval — only they can open the " +
+                "safe. Once they approve, the cash moves into the till and you can place " +
+                "this order from there."
+        } else {
+            onDismiss()
+        }
     }
 
     PosContainedForm(
@@ -7819,8 +7850,10 @@ private fun PoCreateDialog(vm: PosViewModel, currency: String, onDismiss: () -> 
         confirmLabel = "Place order",
         confirmEnabled = lines.isNotEmpty(),
         onConfirm = {
-            // Shortfall only when paying more cash than the drawer holds.
-            if (payNow.coerceAtMost(orderTotal) > cashOnHand + 0.005) shortfall = true else submit("cash")
+            // The TILL alone covers it => pay from the drawer, no question asked.
+            // Anything else and the payer picks the source (§4 waterfall).
+            if (payNow.coerceAtMost(orderTotal) > tillBalance + 0.005) shortfall = true
+            else submit("till")
         }
     ) {
         // Supplier picker (with create-on-the-fly).
@@ -7969,30 +8002,25 @@ private fun PoCreateDialog(vm: PosViewModel, currency: String, onDismiss: () -> 
         }
     }
     if (shortfall) {
-        val avail = cashOnHand.coerceAtLeast(0.0)
-        val want = payNow.coerceAtMost(orderTotal)
-        val remainder = (want - avail).coerceAtLeast(0.0)
+        FundingSourceDialog(
+            title = "How is this paid?",
+            amount = payNow.coerceAtMost(orderTotal),
+            till = tillBalance,
+            safe = safeBalance,
+            currency = currency,
+            isAdmin = isAdminSession,
+            onDismiss = { shortfall = false },
+            onChoose = { mode -> shortfall = false; submit(mode) }
+        )
+    }
+    poFundingNotice?.let { msg ->
         AlertDialog(
-            onDismissRequest = { shortfall = false },
-            title = { Text("Not enough cash") },
-            text = {
-                Column {
-                    Text(
-                        "Paying ${money(want, currency)} but only ${money(avail, currency)} is in the drawer. How should it be funded?",
-                        color = t.inkSecondary, fontSize = 13.sp
-                    )
-                    Spacer(Modifier.height(12.dp))
-                    Button(onClick = { shortfall = false; submit("available") }, modifier = Modifier.fillMaxWidth()) {
-                        Text("Take ${money(avail, currency)} · owe ${money(remainder, currency)}")
-                    }
-                    Spacer(Modifier.height(6.dp))
-                    OutlinedButton(onClick = { shortfall = false; submit("capital") }, modifier = Modifier.fillMaxWidth()) {
-                        Text("Owner covers it (cash untouched)")
-                    }
-                }
-            },
-            confirmButton = {},
-            dismissButton = { TextButton(onClick = { shortfall = false }) { Text("Abort") } }
+            onDismissRequest = { poFundingNotice = null },
+            title = { Text("Waiting on the owner") },
+            text = { Text(msg, color = t.inkSecondary, fontSize = 13.sp) },
+            confirmButton = {
+                TextButton(onClick = { poFundingNotice = null; onDismiss() }) { Text("OK") }
+            }
         )
     }
 }
@@ -8418,8 +8446,13 @@ private fun DashboardScreen(vm: PosViewModel, business: Business) {
     val summary by vm.dashSummary.collectAsState()
     val breakdown by vm.dashBreakdown.collectAsState()
     val topProducts by vm.dashTopProducts.collectAsState()
-    val grossProfit by vm.dashGrossProfit.collectAsState()
-    val costedRevenue by vm.dashCostedRevenue.collectAsState()
+    // ★ CASH BASIS (§5): revenue and profit now count money that has actually ARRIVED.
+    // An unpaid credit sale is not revenue; a repayment is revenue on the day it lands;
+    // cost of goods is pro-rated to the collected share. See CashBasis for the contract.
+    val cashBasis by vm.dashCashBasis.collectAsState()
+    val cashVariance by vm.dashCashVariance.collectAsState()
+    val grossProfit = cashBasis.grossProfit
+    val costedRevenue = cashBasis.costedRevenue
     val dashExpenses by vm.dashExpenses.collectAsState()
     val cashOnHand by vm.cashOnHand.collectAsState()
     val dailyBars by vm.dashDailyBars.collectAsState()
@@ -8466,15 +8499,26 @@ private fun DashboardScreen(vm: PosViewModel, business: Business) {
         }
         Spacer(Modifier.height(12.dp))
 
-        // Revenue hero (brand fill, like the web's accent gradient card).
+        // Revenue hero — MONEY COLLECTED, not money billed (§5). A sale on account is
+        // recorded, stocked and owed, but it is not revenue until the money arrives; when
+        // it does, it counts on that day. The billed-but-unpaid figure sits underneath as
+        // a figure, never as sales.
         Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = t.brand.s600)) {
             Column(Modifier.fillMaxWidth().padding(20.dp)) {
-                Text("Total revenue", color = t.inkOnBrand.copy(alpha = 0.85f), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                Text(money(summary.gross, currency), color = t.inkOnBrand, fontWeight = FontWeight.Black, fontSize = 32.sp)
+                Text("Money collected", color = t.inkOnBrand.copy(alpha = 0.85f), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                Text(money(cashBasis.revenue, currency), color = t.inkOnBrand, fontWeight = FontWeight.Black, fontSize = 32.sp)
                 Text(
                     "${summary.count} sale${if (summary.count == 1) "" else "s"} · ${range.label}",
                     color = t.inkOnBrand.copy(alpha = 0.85f), fontSize = 12.sp
                 )
+                if (cashBasis.uncollected > 0.005) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Plus ${money(cashBasis.uncollected, currency)} sold on credit and not " +
+                            "yet paid — it counts when the money comes in.",
+                        color = t.inkOnBrand.copy(alpha = 0.85f), fontSize = 11.sp
+                    )
+                }
             }
         }
         Spacer(Modifier.height(10.dp))
@@ -8529,7 +8573,10 @@ private fun DashboardScreen(vm: PosViewModel, business: Business) {
             DashKpiCard("Cash on hand", money(cashOnHand, currency), Modifier.weight(1f),
                 valueColor = if (cashOnHand < 0) t.danger else t.inkPrimary, sub = liveLabel)
             if (showProfit) {
-                val netProfit = grossProfit - dashExpenses
+                // ★ A day-close shortage is a real LOSS and an overage a real gain, so it
+                // belongs in net profit — but on its own line, never folded into gross
+                // profit, so a shortage reads as a shortage instead of eating margin.
+                val netProfit = grossProfit - dashExpenses + cashVariance
                 DashKpiCard("Net profit", money(netProfit, currency), Modifier.weight(1f),
                     valueColor = if (netProfit < 0) t.danger else t.success, sub = periodLabel)
             } else {
@@ -8537,10 +8584,33 @@ private fun DashboardScreen(vm: PosViewModel, business: Business) {
                     valueColor = t.danger, sub = periodLabel)
             }
         }
-        if (showProfit && dashExpenses > 0.0) {
+        if (kotlin.math.abs(cashVariance) > 0.005) {
             Spacer(Modifier.height(6.dp))
-            Text("Net profit = gross profit ${money(grossProfit, currency)} − expenses ${money(dashExpenses, currency)}",
-                color = t.inkTertiary, fontSize = 11.sp)
+            Text(
+                if (cashVariance < 0) "Cash short ${money(-cashVariance, currency)} — counted at close, taken off profit."
+                else "Cash over ${money(cashVariance, currency)} — counted at close, added to profit.",
+                color = if (cashVariance < 0) t.danger else t.warning,
+                fontSize = 11.sp, fontWeight = FontWeight.SemiBold
+            )
+        }
+        if (showProfit && (dashExpenses > 0.0 || kotlin.math.abs(cashVariance) > 0.005)) {
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "Net profit = gross profit ${money(grossProfit, currency)} − expenses " +
+                    "${money(dashExpenses, currency)}" +
+                    (if (kotlin.math.abs(cashVariance) > 0.005)
+                        " ${if (cashVariance < 0) "−" else "+"} cash ${if (cashVariance < 0) "short" else "over"} ${money(kotlin.math.abs(cashVariance), currency)}"
+                    else ""),
+                color = t.inkTertiary, fontSize = 11.sp
+            )
+        }
+        if (showProfit) {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "Profit counts goods sold AND paid for. Cost is shared out to match what " +
+                    "has been collected, so a part-paid sale never looks like a loss.",
+                color = t.inkTertiary, fontSize = 10.sp
+            )
         }
         Spacer(Modifier.height(12.dp))
 
@@ -8792,6 +8862,10 @@ private fun ReportsScreen(vm: PosViewModel, business: Business) {
     val breakdown by vm.reportBreakdown.collectAsState()
     val refunds by vm.reportRefunds.collectAsState()
     val fullyRefunded by vm.reportFullyRefunded.collectAsState()
+    // ★ CASH BASIS (§5): what was actually COLLECTED in this window, and the cost of the
+    // goods behind it. Billed-but-unpaid credit is reported separately, never as sales.
+    val cashBasis by vm.reportCashBasis.collectAsState()
+    val cashVariance by vm.reportCashVariance.collectAsState()
     // Net takings: refunded money comes off gross, and a fully-refunded sale stops
     // counting as a live sale (prompt §5). Gross stays visible in the breakdown.
     val netSales = (summary.gross - refunds).coerceAtLeast(0.0)
@@ -8847,6 +8921,35 @@ private fun ReportsScreen(vm: PosViewModel, business: Business) {
             if (netCount > 0) {
                 ReportStatRow("Average sale", money(netSales / netCount, currency))
             }
+        }
+        Spacer(Modifier.height(12.dp))
+
+        // ── §5 What actually came in, and what it cost ──
+        // The card above is BILLED value (what the receipts add up to). This one is CASH
+        // BASIS: money that arrived. The two differ by exactly the credit that has not
+        // been collected, which is why both are shown rather than one silently replacing
+        // the other.
+        PosFormCard {
+            PosSectionLabel("Money actually collected")
+            ReportStatRow("Collected in this period", money(cashBasis.revenue, currency))
+            ReportStatRow("Cost of what was sold", "-${money(cashBasis.cogs, currency)}")
+            HorizontalDivider(color = t.surfaceBorder)
+            ReportStatRow("Gross profit", money(cashBasis.grossProfit, currency))
+            if (kotlin.math.abs(cashVariance) > 0.005) {
+                ReportStatRow(
+                    if (cashVariance < 0) "Cash short at close" else "Cash over at close",
+                    (if (cashVariance < 0) "-" else "+") + money(kotlin.math.abs(cashVariance), currency)
+                )
+            }
+            if (cashBasis.uncollected > 0.005) {
+                ReportStatRow("Sold on credit, not yet paid", money(cashBasis.uncollected, currency))
+            }
+            Text(
+                "A sale counts when the money arrives, not when the receipt is written. " +
+                    "A later repayment counts on its own day, and the cost of the goods is " +
+                    "shared out to match — so nothing is ever counted twice.",
+                color = t.inkTertiary, fontSize = 10.sp
+            )
         }
         Spacer(Modifier.height(12.dp))
 

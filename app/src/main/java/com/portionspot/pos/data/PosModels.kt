@@ -630,29 +630,75 @@ data class Expense(
 )
 
 /**
- * One movement of physical CASH-ON-HAND (the till/drawer running balance). The
- * accounting spine (B3): cash-on-hand = opening float (a setting) + Σ of these
- * signed [amount]s. Cash comes IN from sales ("sale", +net cash tendered less change
- * handed back) and goes OUT for approved expenses ("expense", −[cashPortion]) or
- * ad-hoc payouts. Owner-capital-funded expenses create NO row here (cash untouched);
- * the accounts-payable portion of a short-funded expense also creates no cash row —
- * only the cash actually paid drains the drawer.
+ * WHERE the shop's cash physically sits. There is NO bank: the money is on-site in one
+ * of exactly two places, and every [CashTxn] belongs to one of them.
+ *
+ *  - [TILL] — the working float in the drawer. Only enough to make change. Sales cash
+ *    lands here and change/refund payouts leave from here.
+ *  - [SAFE] — the day's takings, moved out of the drawer at close of day. Taking money
+ *    back OUT of the safe needs the owner's say-so (see the `safe_withdrawal` staff
+ *    request), which is why it is a separate location and not just "more drawer".
+ *
+ * The two are balances over the SAME ledger — cash-on-hand stays `TILL + SAFE`, so every
+ * existing caller of the combined figure keeps reading the right number. Moving money
+ * between them is a TRANSFER (a matching `transfer_out`/`transfer_in` pair summing to
+ * zero): it is neither income nor expense and never changes the combined total.
+ */
+object CashLocation {
+    const val TILL = "till"
+    const val SAFE = "safe"
+
+    /** Human label for a stored location code (unknown/legacy reads as the till). */
+    fun label(code: String?): String = if (code == SAFE) "Safe" else "Till"
+
+    /** Normalise any stored/typed value to a known location (legacy rows = till). */
+    fun of(code: String?): String = if (code == SAFE) SAFE else TILL
+}
+
+/**
+ * One movement of physical CASH-ON-HAND. The accounting spine (B3): cash-on-hand =
+ * opening float (a setting) + Σ of these signed [amount]s. Cash comes IN from sales
+ * ("sale", +net cash tendered less change handed back) and goes OUT for approved
+ * expenses ("expense", −cashPortion) or ad-hoc payouts. Owner-capital-funded expenses
+ * create NO row here (cash untouched); the accounts-payable portion of a short-funded
+ * expense also creates no cash row — only the cash actually paid drains the drawer.
  *
  * Money handed BACK also drains it: a cash refund payout ("refund", −cash paid back)
  * and change paid out on a balance the shop owed ("change_payout", −amount handed
  * over). Change given at the till is NOT one of these — checkout already books cash in
  * NET of it. Card/mobile-money reversals write no row: they never opened the drawer.
  *
+ * TWO LOCATIONS ([location], local-only): the same ledger now answers "how much is in
+ * the drawer" and "how much is in the safe" separately, while the SUM over both stays
+ * the cash-on-hand every existing caller already reads. Types added for the till/safe
+ * model:
+ *  - "transfer_out" / "transfer_in" — the two halves of a move between locations. They
+ *    are written as a PAIR with equal and opposite amounts, so the combined balance is
+ *    provably unchanged (moving your own money is not income).
+ *  - "variance" — the close-of-day true-up to the physically counted cash. Signed:
+ *    negative = short, positive = over. Reported as a "cash short/over" line against
+ *    profit, never folded into gross profit.
+ *  - "drawing" — the owner taking money out (equity, NOT an expense: it must not reduce
+ *    profit). Mirrors the existing "capital" (owner putting money in).
+ *  - "loan" — outside borrowed money coming in (a liability to repay, not income).
+ *
  * Append-only and immutable: a correction is a new "adjust" row, never an edit.
- * SYNCED: the cloud `cash_txns` table upserts on [localId].
+ * SYNCED: the cloud `cash_txns` table upserts on [localId]. [location] is LOCAL-ONLY —
+ * the cloud table has no such column, so [com.portionspot.pos.sync.CashTxnDto] does not
+ * carry it and a pulled row keeps whatever this device already recorded (defaulting to
+ * the till, which is what every pre-split row was).
  */
 @Entity(tableName = "cash_txns", indices = [Index("businessId")])
 data class CashTxn(
     @PrimaryKey val id: String = newId(),
     val localId: String = id,
     val businessId: String,
-    val type: String,                     // sale | expense | purchase | refund | change_payout | payout | capital | adjust
-    val amount: Double = 0.0,             // signed: + into the drawer, − out of it
+    // sale | expense | purchase | refund | change_payout | payout | capital | adjust
+    // | transfer_out | transfer_in | variance | drawing | loan
+    val type: String,
+    val amount: Double = 0.0,             // signed: + into that location, − out of it
+    /** LOCAL-ONLY: which on-site location this movement happened in ([CashLocation]). */
+    @ColumnInfo(defaultValue = "till") val location: String = CashLocation.TILL,
     val source: String? = null,           // free note of the funding account, if useful
     val note: String? = null,
     val refType: String? = null,          // sale | expense | …
@@ -664,6 +710,125 @@ data class CashTxn(
     val deleted: Boolean = false,
     /** true => has unsynced local edits waiting to push to the cloud. */
     val pendingSync: Boolean = true
+)
+
+/**
+ * A permanent record of ONE close-of-day count (§2). Written only when the owner presses
+ * "Close the day" — never on a timer, never automatically.
+ *
+ * The counted figure WINS: [countedCash] is what was physically in the drawer, and the
+ * close writes a `variance` [CashTxn] for `counted − expected` so the ledger agrees with
+ * reality from that moment on. [variance] is kept here too so the history reads without
+ * recomputation, and so a repeat offender is visible per cashier ([closedByName]).
+ *
+ * [movedToSafe] is the excess over [floatTarget] the owner physically moved into the safe
+ * as part of the same confirmation; it is recorded in the cash ledger as a matching
+ * transfer PAIR, so the till and safe balances both move and the combined total does not.
+ *
+ * LOCAL-ONLY but sync-ready (carries [localId] / [updatedAt] / [pendingSync] like every
+ * other syncable entity). No push/pull is wired: the cloud schema has no `day_closes`.
+ */
+@Entity(tableName = "day_closes", indices = [Index("businessId"), Index("closedAt")])
+data class DayClose(
+    @PrimaryKey val id: String = newId(),
+    val localId: String = id,             // cloud upsert key, when sync is ever wired
+    val businessId: String,
+    /** Start-of-day millis for the trading day being closed (grouping key for history). */
+    val dayStart: Long,
+    /** The till balance the ledger expected before the count. */
+    val expectedCash: Double = 0.0,
+    /** What was physically counted. This wins — the ledger is trued up to it. */
+    val countedCash: Double = 0.0,
+    /** counted − expected. Negative = short (a loss), positive = over (a gain). */
+    val variance: Double = 0.0,
+    /** Excess physically moved from the till into the safe at this close. */
+    val movedToSafe: Double = 0.0,
+    /** The float target in force for this close (what was left in the till). */
+    val floatTarget: Double = 0.0,
+    /** Required when |variance| exceeds the admin's threshold; free text otherwise. */
+    val note: String? = null,
+    val closedBy: String? = null,
+    val closedByName: String? = null,
+    val closedAt: Long = now(),
+    val updatedAt: Long = now(),
+    val deleted: Boolean = false,
+    /** Local-only: true => has unsynced local edits to push (nothing pushes it yet). */
+    val pendingSync: Boolean = true
+)
+
+/**
+ * Money that came from OUTSIDE the shop, or went out of it to the owner (§4 + §6).
+ * Neither sales nor profit — this is the equity/liability side of the till-and-safe
+ * model, kept as its own append-only ledger so "put in" and "borrowed" can be totalled
+ * separately and never confused with takings.
+ *
+ * [kind]:
+ *  - "capital" — the OWNER's own money. Money in RAISES what the shop owes the owner;
+ *    money out (a drawing) pays some of that back. Never an expense, so it must never
+ *    reduce profit.
+ *  - "loan"    — money BORROWED from outside. A liability to repay; "out" is a repayment.
+ *
+ * [direction] is "in" (into the shop) or "out" (back to the owner / lender).
+ *
+ * A row is written whether or not shop CASH moved: paying a bill straight from outside
+ * funds never touches the drawer (and writes no [CashTxn]), while an injection or a
+ * drawing does. [refType]/[refId] tie the row to whatever it funded.
+ *
+ * LOCAL-ONLY but sync-ready ([localId] / [updatedAt] / [pendingSync]); no push/pull is
+ * wired — the cloud schema has no `outside_funds`.
+ */
+@Entity(tableName = "outside_funds", indices = [Index("businessId"), Index("createdAt")])
+data class OutsideFund(
+    @PrimaryKey val id: String = newId(),
+    val localId: String = id,
+    val businessId: String,
+    val kind: String = "capital",         // capital (owner's own) | loan (must be repaid)
+    val direction: String = "in",         // in (into the shop) | out (back to owner/lender)
+    val amount: Double = 0.0,             // always POSITIVE; [direction] carries the sign
+    val source: String? = null,           // "Owner", a lender's name, …
+    val note: String? = null,
+    val refType: String? = null,          // expense | purchase_order | cash
+    val refId: String? = null,
+    val createdBy: String? = null,
+    val createdByName: String? = null,
+    val createdAt: Long = now(),
+    val updatedAt: Long = now(),
+    val deleted: Boolean = false,
+    /** Local-only: true => has unsynced local edits to push (nothing pushes it yet). */
+    val pendingSync: Boolean = true
+)
+
+/** Running totals of outside money (read model for the owner's "put in / taken out"). */
+data class OutsideFundTotals(
+    val capitalIn: Double = 0.0,
+    val capitalOut: Double = 0.0,
+    val loanIn: Double = 0.0,
+    val loanOut: Double = 0.0
+) {
+    /** What the shop still owes the owner: put in less taken out. */
+    val ownerNet: Double get() = capitalIn - capitalOut
+    /** Borrowings still outstanding: taken less repaid. */
+    val loanOutstanding: Double get() = loanIn - loanOut
+}
+
+/**
+ * One completed sale reduced to exactly what CASH-BASIS revenue/profit needs (read
+ * model, see [CashBasis]). Deliberately NOT the whole [SaleEntity]: this is aggregated
+ * per sale in SQL so the Kotlin side can do the FIFO repayment attribution that SQL
+ * cannot express.
+ *
+ *  - [costedRevenue] = Σ `unitPrice * qty` over the lines that HAVE a cost.
+ *  - [lineProfit]    = Σ `(unitPrice − cost * unitsPerLine) * qty` over those same lines.
+ *    So the cost of goods on those lines is exactly `costedRevenue − lineProfit`.
+ */
+data class CashBasisSaleRow(
+    val id: String,
+    val soldAt: Long,
+    val total: Double,
+    val amountPaid: Double,
+    val customerId: String?,
+    val costedRevenue: Double,
+    val lineProfit: Double
 )
 
 /**

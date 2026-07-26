@@ -5,8 +5,14 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.portionspot.pos.data.Business
 import com.portionspot.pos.data.CartLine
+import com.portionspot.pos.data.CashBasis
+import com.portionspot.pos.data.CashBasisSaleRow
+import com.portionspot.pos.data.CashLocation
 import com.portionspot.pos.data.CashTxn
 import com.portionspot.pos.data.CreditTxn
+import com.portionspot.pos.data.DayClose
+import com.portionspot.pos.data.OutsideFund
+import com.portionspot.pos.data.OutsideFundTotals
 import com.portionspot.pos.data.Customer
 import com.portionspot.pos.data.CustomerWithBalance
 import com.portionspot.pos.data.Expense
@@ -128,6 +134,28 @@ class PosViewModel(
     private val _bootLoaded = MutableStateFlow(false)
     val bootLoaded: StateFlow<Boolean> = _bootLoaded.asStateFlow()
 
+    // ── Device-local cash settings ──
+    // Declared UP HERE, ahead of every flow that reads them, on purpose: a property
+    // initializer that reads a field declared further down sees null, and several of the
+    // cash flows below combine these DIRECTLY (not inside a deferred lambda). Keep them
+    // first. They must also stay above init{} — viewModelScope is Main.immediate, so the
+    // coroutines init{} launches run during construction (see the _shopPrefs note below).
+
+    /** Opening cash float (B3): the starting cash-on-hand the admin sets. It belongs to
+     *  the TILL — the float IS the drawer's starting money. */
+    private val _openingFloat = MutableStateFlow(0.0)
+    val openingFloat: StateFlow<Double> = _openingFloat.asStateFlow()
+
+    /** How much change money the owner wants left in the drawer after a close (§2/§3).
+     *  Settable INLINE in the close / top-up flows, never buried in Settings. */
+    private val _floatTarget = MutableStateFlow(PosRepository.DEFAULT_FLOAT_TARGET)
+    val floatTarget: StateFlow<Double> = _floatTarget.asStateFlow()
+
+    /** How far a close-of-day count may miss before a NOTE is required (§2). */
+    private val _varianceNoteThreshold =
+        MutableStateFlow(PosRepository.DEFAULT_VARIANCE_NOTE_THRESHOLD)
+    val varianceNoteThreshold: StateFlow<Double> = _varianceNoteThreshold.asStateFlow()
+
     // The signed-in cashier, pushed in from AuthGate (see MainActivity). Stamped onto
     // refunds now, and onto the other financial writes as Phase-2 wiring continues.
     private var currentCashierId: String? = null
@@ -154,6 +182,11 @@ class PosViewModel(
 
     /** Synchronous capability check for action handlers (the second, non-UI gate). */
     fun can(cap: Capability): Boolean = _currentIsAdmin.value || _currentPermissions.value.allows(cap)
+
+    /** Is the signed-in session an ADMIN? Drives the §4 safe gate in the UI: an admin
+     *  opens the safe inline, anyone else has to ask the owner. The real enforcement is
+     *  in the action handlers, which read [currentIsAdmin] directly. */
+    val isAdmin: StateFlow<Boolean> = _currentIsAdmin.asStateFlow()
 
     fun setCurrentCashier(
         id: String?,
@@ -278,6 +311,131 @@ class PosViewModel(
             .flatMapLatest { repo.cashTxnsFlow(it) }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
+    // ══════════════════════════════════════════════════════════════════════
+    //  TILL AND SAFE (§1–§6) — two on-site cash locations, no bank
+    // ══════════════════════════════════════════════════════════════════════
+
+    /** Live TILL balance = opening float + the movements booked to the drawer. */
+    val tillBalance: StateFlow<Double> =
+        businessId.filterNotNull()
+            .flatMapLatest { bid ->
+                combine(repo.tillBalanceFlow(bid), _openingFloat) { moved, float -> float + moved }
+            }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0.0)
+
+    /** Live SAFE balance — the day's takings, filled by closing the day. */
+    val safeBalance: StateFlow<Double> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.safeBalanceFlow(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0.0)
+
+    /** The close-of-day history, newest first — per cashier, so patterns are visible. */
+    val dayCloses: StateFlow<List<DayClose>> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.dayClosesFlow(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** The most recent close, for the "last closed …" line. */
+    val latestDayClose: StateFlow<DayClose?> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.latestDayCloseFlow(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    /** Owner / lender money ledger, newest first. */
+    val outsideFunds: StateFlow<List<OutsideFund>> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.outsideFundsFlow(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Running "put in / taken out / borrowed / repaid" totals. */
+    val outsideFundTotals: StateFlow<OutsideFundTotals> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.outsideFundTotalsFlow(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), OutsideFundTotals())
+
+    /**
+     * Raw cash-basis inputs (§5): every live completed sale with its costed economics,
+     * paired with the whole credit ledger. Unwindowed — a repayment today can settle a
+     * sale from last year, so [CashBasis] needs the full picture to attribute it.
+     */
+    private val cashBasisInputs: Flow<Pair<List<CashBasisSaleRow>, List<CreditTxn>>> =
+        businessId.filterNotNull().flatMapLatest { bid ->
+            combine(repo.cashBasisSalesFlow(bid), repo.creditLedgerFlow(bid)) { sales, ledger ->
+                sales to ledger
+            }
+        }
+
+    /**
+     * ALL-TIME cash-basis figures. Its [CashBasis.Period.cogs] is the cost of every good
+     * that has been sold AND collected — the "stock money" input to the four-part split.
+     */
+    private val cashBasisAllTime: StateFlow<CashBasis.Period> =
+        cashBasisInputs
+            .map { (sales, ledger) -> CashBasis.compute(sales, ledger, 0L, Long.MAX_VALUE) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), CashBasis.Period())
+
+    /** Everything the split needs off the cash ledger, gathered in one combine. */
+    private data class SplitInputs(
+        val tillMoves: Double = 0.0,
+        val safe: Double = 0.0,
+        val equityCash: Double = 0.0,
+        val purchaseCash: Double = 0.0,
+        val owedToCustomers: Double = 0.0
+    )
+
+    private val splitInputs: Flow<SplitInputs> =
+        businessId.filterNotNull().flatMapLatest { bid ->
+            combine(
+                repo.tillBalanceFlow(bid),
+                repo.safeBalanceFlow(bid),
+                repo.equityCashFlow(bid),
+                repo.purchaseCashFlow(bid),
+                repo.totalChangeOwedFlow(bid)
+            ) { till, safe, equity, purchases, owed -> SplitInputs(till, safe, equity, purchases, owed) }
+        }
+
+    /**
+     * §6 — "how much of this money is actually mine". The cash physically held (till +
+     * safe) split into four pots that ADD UP to it exactly:
+     *
+     *   float & capital + stock money + owed to customers + profit  =  till + safe
+     *
+     *  - float & capital = the opening float, plus owner injections and borrowings still
+     *    sitting in the cash, less anything drawn back out. Never profit.
+     *  - stock money     = the collected cost of goods sold that has NOT yet been spent
+     *    restocking. It must buy the next lot.
+     *  - owed to customers = change owed + unpaid refunds. NOT his money.
+     *  - profit          = the residual. Making it the residual is what guarantees the
+     *    four parts reconcile to the cent instead of nearly adding up.
+     *
+     * SCOPE, honestly: this splits cash that is HERE. It says nothing about unsold stock
+     * (no projected profit — the owner explicitly does not want it), and profit earned on
+     * an unpaid credit sale is real but is not yet cash, so it shows in
+     * [PosRepository.CashSplit.creditOutstanding], not in profit.
+     */
+    val cashSplit: StateFlow<PosRepository.CashSplit> =
+        combine(
+            splitInputs,
+            _openingFloat,
+            cashBasisAllTime,
+            customers
+        ) { inputs, float, allTime, custs ->
+            val till = float + inputs.tillMoves
+            // Float + outside money still in the cash. Clamped at zero: if the owner has
+            // drawn out more than they ever put in, the shop is not holding their money.
+            val floatCapital = (float + inputs.equityCash).coerceAtLeast(0.0)
+            // Cost of what has sold and been paid for, less what restocking already spent.
+            val stockMoney = (allTime.cogs - inputs.purchaseCash).coerceAtLeast(0.0)
+            PosRepository.CashSplit(
+                till = till,
+                safe = inputs.safe,
+                floatCapital = floatCapital,
+                stockMoney = stockMoney,
+                owedToCustomers = inputs.owedToCustomers.coerceAtLeast(0.0),
+                creditOutstanding = custs.sumOf { it.balance.coerceAtLeast(0.0) }
+            )
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), PosRepository.CashSplit())
+
     /** All (non-deleted) suppliers for the shop, A→Z by name. */
     val suppliers: StateFlow<List<Supplier>> =
         businessId.filterNotNull()
@@ -383,6 +541,53 @@ class PosViewModel(
             repo.postedExpensesBetweenFlow(bid, from, to)
         }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0.0)
 
+    /**
+     * ★ CASH-BASIS revenue / cost / profit for the dashboard window (§5).
+     *
+     * MEANING CHANGED, deliberately: an unpaid credit sale is NOT revenue. Only money
+     * actually collected counts, on the day it arrives, and the cost of goods is
+     * pro-rated to the collected share so a part-paid sale never reads as a loss. A later
+     * repayment lands as revenue on ITS day. See [CashBasis] for the full contract and
+     * the proof that a sale can never contribute more than it collected.
+     *
+     * [CashBasis.Period.uncollected] is the sale value billed in the window that has not
+     * arrived — surfaced as a figure/alert, never as sales.
+     */
+    val dashCashBasis: StateFlow<CashBasis.Period> =
+        combine(cashBasisInputs, _dashRange) { (sales, ledger), range ->
+            val (from, to) = rangeBounds(range)
+            CashBasis.compute(sales, ledger, from, to)
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), CashBasis.Period())
+
+    /**
+     * CASH SHORT / OVER in the dashboard window: the signed sum of close-of-day variances.
+     * A shortage counts as a LOSS against profit and an overage as a gain, but it is kept
+     * OUT of gross profit and reported on its own line, so a shortage reads as a shortage
+     * rather than quietly eating margin.
+     *
+     *   net profit = gross profit − expenses + cash short/over
+     */
+    val dashCashVariance: StateFlow<Double> =
+        dashKey.flatMapLatest { (bid, range) ->
+            val (from, to) = rangeBounds(range)
+            repo.cashVarianceFlow(bid, from, to)
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0.0)
+
+    /** Cash-basis figures for the REPORTS window (same meaning as [dashCashBasis]). */
+    val reportCashBasis: StateFlow<CashBasis.Period> =
+        combine(cashBasisInputs, _reportRange) { (sales, ledger), range ->
+            val (from, to) = rangeBounds(range)
+            CashBasis.compute(sales, ledger, from, to)
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), CashBasis.Period())
+
+    /** Cash short/over over the REPORTS window. */
+    val reportCashVariance: StateFlow<Double> =
+        combine(businessId.filterNotNull(), _reportRange) { bid, range -> bid to range }
+            .flatMapLatest { (bid, range) ->
+                val (from, to) = rangeBounds(range)
+                repo.cashVarianceFlow(bid, from, to)
+            }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0.0)
+
     /** saleId → refunded value, for the Receipts "refunded / partial refund" badge.
      *  Presentation only: the sale row and every money aggregate are untouched. */
     val refundedBySale: StateFlow<Map<String, Double>> =
@@ -446,12 +651,6 @@ class PosViewModel(
     private val _shopPrefs = MutableStateFlow(DEFAULT_SHOP_PREFS)
     val shopPrefs: StateFlow<ShopPrefs> = _shopPrefs.asStateFlow()
 
-    // Opening cash float (B3): the starting cash-on-hand the admin sets. Device-local;
-    // combined with the cash-ledger movements to give [cashOnHand]. Declared before
-    // init{} for the same reason as _shopPrefs above.
-    private val _openingFloat = MutableStateFlow(0.0)
-    val openingFloat: StateFlow<Double> = _openingFloat.asStateFlow()
-
     init {
         viewModelScope.launch {
             businessId.value = repo.ensureSeeded()
@@ -463,6 +662,10 @@ class PosViewModel(
         viewModelScope.launch { _themeChoice.value = loadTheme() }
         viewModelScope.launch { _shopPrefs.value = loadPrefs() }
         viewModelScope.launch { businessId.filterNotNull().collect { _openingFloat.value = repo.openingFloat(it) } }
+        viewModelScope.launch {
+            _floatTarget.value = repo.floatTarget()
+            _varianceNoteThreshold.value = repo.varianceNoteThreshold()
+        }
         viewModelScope.launch {
             _appMode.value = if (repo.getSetting(KEY_APP_MODE) == "cloud") AppMode.Cloud else AppMode.Local
             _onboarded.value = repo.getSetting(KEY_ONBOARDED) == "1"
@@ -1591,11 +1794,37 @@ class PosViewModel(
         }
     }
 
-    /** Approve (post) a pending expense with the chosen funding mode: cash | available |
-     *  capital (the shortfall decision from §9.4). */
-    fun approveExpense(id: String, mode: String) {
+    /**
+     * Approve (post) a pending expense with the chosen funding source — the §4 waterfall
+     * TILL → SAFE → OUTSIDE FUNDS → abort. [mode] is [PosRepository.planFunding]'s
+     * vocabulary: "till" | "safe" | "waterfall" | "capital" | "loan" | "none".
+     *
+     * ★ SAFE GATE, enforced here because this is where the session role lives: if the plan
+     * would open the safe and the person is NOT an admin, nothing is posted — a
+     * `safe_withdrawal` request goes to the owner instead. Once approved, the money lands
+     * in the till and the expense can be approved from the till normally. [onNeedsApproval]
+     * fires so the UI can say so.
+     */
+    fun approveExpense(
+        id: String, mode: String, outsideSource: String? = null,
+        onNeedsApproval: () -> Unit = {}
+    ) {
+        val bid = businessId.value ?: return
         viewModelScope.launch {
-            repo.approveExpense(id, mode, currentCashierId, currentCashierName)
+            val amount = pendingExpenses.value.firstOrNull { it.id == id }?.amount ?: 0.0
+            val (till, safe) = cashLocationsNow()
+            val plan = PosRepository.planFunding(amount, mode, till, safe)
+            if (plan.needsSafe && !currentIsAdmin) {
+                repo.requestSafeWithdrawal(
+                    businessId = bid, amount = plan.fromSafe,
+                    reason = "To pay an approved expense",
+                    targetType = "expense", targetId = id, targetName = "Expense",
+                    byId = currentCashierId, byName = currentCashierName
+                )
+                onNeedsApproval()
+                return@launch
+            }
+            repo.approveExpense(id, mode, currentCashierId, currentCashierName, outsideSource)
             nudgeSync("approveExpense")
         }
     }
@@ -1645,13 +1874,164 @@ class PosViewModel(
         viewModelScope.launch { repo.setOpeningFloat(amount) }
     }
 
-    /** Admin: record an ad-hoc cash top-up (+) or payout (−) against the drawer. */
-    fun recordCashAdjustment(amount: Double, note: String) {
+    /** Admin: record an ad-hoc cash top-up (+) or payout (−) in one location. */
+    fun recordCashAdjustment(amount: Double, note: String, location: String = CashLocation.TILL) {
         val bid = businessId.value ?: return
         viewModelScope.launch {
-            repo.recordCashAdjustment(bid, amount, note, currentCashierId, currentCashierName)
+            repo.recordCashAdjustment(bid, amount, note, currentCashierId, currentCashierName, location)
             nudgeSync("cashAdjustment")
         }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  TILL AND SAFE actions — every one of them ON COMMAND (§1)
+    // ══════════════════════════════════════════════════════════════════════
+    //  Nothing here is scheduled, nothing nags, nothing fires at a set hour. Closing the
+    //  day and topping up the float are BUTTONS the person presses when they choose. The
+    //  only automatic thing is the admin NOTIFICATION each one raises once it completes,
+    //  so the owner learns it happened even if someone else did it.
+
+    /** Read the figures the close-of-day sheet opens with (expected till, target, safe). */
+    suspend fun dayCloseProposal(): PosRepository.DayCloseProposal? =
+        businessId.value?.let { repo.dayCloseProposal(it) }
+
+    /** Read where the till sits against its target, for the top-up sheet. */
+    suspend fun floatTopUpProposal(): PosRepository.FloatTopUp? =
+        businessId.value?.let { repo.floatTopUpProposal(it) }
+
+    /**
+     * CLOSE THE DAY (§2) — the owner has counted the drawer and physically moved the
+     * excess. Trues the till up to [countedCash] (the count WINS), moves [moveToSafe]
+     * into the safe as a transfer pair, records a permanent [DayClose] and notifies the
+     * admin. [note] is required by the sheet when the variance exceeds
+     * [varianceNoteThreshold]; the repository does not re-police that, it records what it
+     * is given.
+     */
+    fun closeDay(
+        countedCash: Double,
+        moveToSafe: Double,
+        floatTarget: Double,
+        note: String?,
+        onDone: (DayClose?) -> Unit = {}
+    ) {
+        val bid = businessId.value ?: return
+        viewModelScope.launch {
+            val close = repo.closeDay(
+                businessId = bid, countedCash = countedCash, moveToSafe = moveToSafe,
+                floatTarget = floatTarget, note = note,
+                cashierId = currentCashierId, cashierName = currentCashierName
+            )
+            _floatTarget.value = floatTarget.coerceAtLeast(0.0)
+            nudgeSync("closeDay")
+            onDone(close)
+        }
+    }
+
+    /** TOP UP THE FLOAT (§3) — move [amount] from the safe into the till, on command. */
+    fun topUpFloat(amount: Double, onDone: (Double) -> Unit = {}) {
+        val bid = businessId.value ?: return
+        viewModelScope.launch {
+            val moved = repo.topUpFloat(bid, amount, currentCashierId, currentCashierName)
+            nudgeSync("topUpFloat")
+            onDone(moved)
+        }
+    }
+
+    /** Set the float target. Written from INSIDE the close / top-up flows by design. */
+    fun setFloatTarget(amount: Double) {
+        _floatTarget.value = amount.coerceAtLeast(0.0)
+        viewModelScope.launch { repo.setFloatTarget(amount) }
+    }
+
+    /** Admin: how far a close may miss before a note is demanded. */
+    fun setVarianceNoteThreshold(amount: Double) {
+        _varianceNoteThreshold.value = amount.coerceAtLeast(0.0)
+        viewModelScope.launch { repo.setVarianceNoteThreshold(amount) }
+    }
+
+    /**
+     * ★ THE SAFE GATE (§4). Opening the safe needs the owner's approval EVERY TIME.
+     *
+     *  - An ADMIN on their own device approves inline: the money moves straight away.
+     *  - Anyone else raises a `safe_withdrawal` request through the existing
+     *    `staff_requests` channel; it lands in the admin's Alerts feed on the other phone,
+     *    and the ADMIN's device applies it (idempotently, via the `applied` flag) exactly
+     *    like the credit-limit flow.
+     *
+     * Returns true when the money moved now, false when a request was raised instead —
+     * so the caller can tell the user which of the two happened.
+     */
+    fun takeFromSafe(amount: Double, reason: String?, onDone: (Boolean) -> Unit = {}) {
+        val bid = businessId.value ?: return
+        viewModelScope.launch {
+            if (currentIsAdmin) {
+                val moved = repo.withdrawFromSafe(bid, amount, reason, currentCashierId, currentCashierName)
+                nudgeSync("safeWithdrawal")
+                onDone(moved > 0.0)
+            } else {
+                repo.requestSafeWithdrawal(
+                    businessId = bid, amount = amount, reason = reason,
+                    byId = currentCashierId, byName = currentCashierName
+                )
+                onDone(false)
+            }
+        }
+    }
+
+    /** Owner / lender money coming IN as cash (§4). Never sales, never profit. */
+    fun recordOutsideCashIn(
+        amount: Double, kind: String, source: String?, note: String?,
+        location: String = CashLocation.SAFE
+    ) {
+        val bid = businessId.value ?: return
+        if (amount <= 0.0) return
+        viewModelScope.launch {
+            repo.recordOutsideCashIn(
+                bid, amount, kind, source, note, location, currentCashierId, currentCashierName
+            )
+            nudgeSync("outsideCashIn")
+        }
+    }
+
+    /**
+     * TAKE MONEY OUT (§6) — the owner drawing cash. Reduces cash and reduces what the shop
+     * owes the owner. ★ It is NOT an expense and does NOT reduce profit.
+     */
+    fun recordOwnerDrawing(
+        amount: Double, location: String = CashLocation.SAFE, note: String?,
+        onDone: (Double) -> Unit = {}
+    ) {
+        val bid = businessId.value ?: return
+        if (amount <= 0.0) return
+        viewModelScope.launch {
+            val taken = repo.recordOwnerDrawing(
+                bid, amount, location, note, currentCashierId, currentCashierName
+            )
+            nudgeSync("ownerDrawing")
+            onDone(taken)
+        }
+    }
+
+    /** Repay borrowed money out of shop cash (a liability going down, not an expense). */
+    fun recordLoanRepayment(
+        amount: Double, location: String = CashLocation.SAFE, source: String?, note: String?,
+        onDone: (Double) -> Unit = {}
+    ) {
+        val bid = businessId.value ?: return
+        if (amount <= 0.0) return
+        viewModelScope.launch {
+            val paid = repo.recordLoanRepayment(
+                bid, amount, location, source, note, currentCashierId, currentCashierName
+            )
+            nudgeSync("loanRepayment")
+            onDone(paid)
+        }
+    }
+
+    /** Live till + safe balances, read once (the funding pickers need them synchronously). */
+    suspend fun cashLocationsNow(): Pair<Double, Double> {
+        val bid = businessId.value ?: return 0.0 to 0.0
+        return repo.tillBalanceOnce(bid) to repo.safeBalanceOnce(bid)
     }
 
     // ---- Suppliers --------------------------------------------------------
@@ -1703,16 +2083,34 @@ class PosViewModel(
         eta: Long?,
         lines: List<PurchaseOrderLine>,
         payNow: Double,
-        fundingMode: String
+        fundingMode: String,
+        outsideSource: String? = null,
+        onNeedsApproval: () -> Unit = {}
     ) {
         val bid = businessId.value ?: return
         if (lines.isEmpty()) return
         if (!can(Capability.MANAGE_EXPENSES_ORDERS)) return
         viewModelScope.launch {
+            // ★ SAME SAFE GATE as expense approval (§4): a non-admin cannot open the safe
+            // to pay a supplier. The order is NOT placed — the money has to arrive in the
+            // till first, so the whole order can then be paid for as one honest record.
+            val total = lines.sumOf { it.qty * it.unitCost }
+            val (till, safe) = cashLocationsNow()
+            val plan = PosRepository.planFunding(payNow.coerceIn(0.0, total), fundingMode, till, safe)
+            if (plan.needsSafe && !currentIsAdmin) {
+                repo.requestSafeWithdrawal(
+                    businessId = bid, amount = plan.fromSafe,
+                    reason = "To pay for stock from ${supplierName.trim().ifBlank { "a supplier" }}",
+                    targetType = "purchase_order", targetName = "Stock purchase",
+                    byId = currentCashierId, byName = currentCashierName
+                )
+                onNeedsApproval()
+                return@launch
+            }
             repo.createPurchaseOrder(
                 bid, supplierId, supplierName.trim(),
                 notes?.trim()?.ifBlank { null }, eta, lines, payNow, fundingMode,
-                currentCashierId, currentCashierName
+                currentCashierId, currentCashierName, outsideSource
             )
             nudgeSync("createPurchaseOrder")
         }

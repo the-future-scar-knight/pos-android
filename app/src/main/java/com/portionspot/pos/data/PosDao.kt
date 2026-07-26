@@ -291,6 +291,41 @@ interface SaleDao {
     )
     fun observeCostedRevenue(businessId: String, from: Long, to: Long): Flow<Double>
 
+    /**
+     * Every live COMPLETED sale reduced to its CASH-BASIS inputs (§5): what it billed,
+     * what was settled at the till, and the costed-line economics behind it.
+     *
+     * ★ MEANING: this query recognises NOTHING on its own — it is raw input to
+     * [CashBasis], which decides what counts as revenue and when. It is unwindowed on
+     * purpose: a repayment made TODAY can settle a sale from last year, so the collected
+     * revenue of any window depends on sales outside it. The FIFO attribution that
+     * repayments need cannot be expressed in SQL, so the aggregation stops here.
+     *
+     * `costedRevenue` and `lineProfit` cover only lines that HAVE a cost (frozen
+     * `li.unitCost`, falling back to the live `i.cost` for rows written before the column
+     * existed) — the same costed-line filter the gross-profit query uses, so margin stays
+     * measured over one consistent set of lines. `unitsPerLine` multiplies the per-STOCK-
+     * UNIT cost up to the LINE-UNIT price (a box line prices a whole box), guarded by
+     * `NULLIF(...,0)` so a stray zero pack size can't zero the cost.
+     */
+    @Query(
+        "SELECT s.id AS id, s.soldAt AS soldAt, s.total AS total, " +
+            "s.amountPaid AS amountPaid, s.customerId AS customerId, " +
+            "COALESCE((SELECT SUM(li.unitPrice * li.qty) FROM sale_items li " +
+            "  JOIN items i ON li.itemId = i.id " +
+            "  WHERE li.saleId = s.id AND li.deleted = 0 " +
+            "  AND COALESCE(li.unitCost, i.cost) IS NOT NULL), 0) AS costedRevenue, " +
+            "COALESCE((SELECT SUM((li.unitPrice - " +
+            "    COALESCE(li.unitCost, i.cost) * COALESCE(NULLIF(li.unitsPerLine, 0), 1)" +
+            "  ) * li.qty) FROM sale_items li " +
+            "  JOIN items i ON li.itemId = i.id " +
+            "  WHERE li.saleId = s.id AND li.deleted = 0 " +
+            "  AND COALESCE(li.unitCost, i.cost) IS NOT NULL), 0) AS lineProfit " +
+            "FROM sales s WHERE s.businessId = :businessId AND s.deleted = 0 " +
+            "AND s.status = 'completed'"
+    )
+    fun observeCashBasisSales(businessId: String): Flow<List<CashBasisSaleRow>>
+
     /** Bare (timestamp,total) rows since [from], bucketed in-app into the 7-day chart. */
     @Query(
         "SELECT soldAt AS soldAt, total AS total FROM sales " +
@@ -1000,7 +1035,19 @@ interface CashTxnDao {
     )
     fun observeForBusiness(businessId: String): Flow<List<CashTxn>>
 
-    /** Net of all cash movements — added to the opening float for cash-on-hand. */
+    /** Movements in ONE location only (newest first) — the till or safe statement. */
+    @Query(
+        "SELECT * FROM cash_txns WHERE businessId = :businessId AND deleted = 0 " +
+            "AND location = :location ORDER BY createdAt DESC LIMIT :limit"
+    )
+    fun observeForLocation(businessId: String, location: String, limit: Int = 100): Flow<List<CashTxn>>
+
+    /**
+     * Net of ALL cash movements, both locations — added to the opening float for
+     * cash-on-hand. Unchanged by the till/safe split ON PURPOSE: a transfer is written as
+     * a matching `transfer_out`/`transfer_in` pair that sums to zero, so this figure (and
+     * every existing caller of it) still reads total cash held on the premises.
+     */
     @Query("SELECT COALESCE(SUM(amount), 0) FROM cash_txns WHERE businessId = :businessId AND deleted = 0")
     fun observeMovementsSum(businessId: String): Flow<Double>
 
@@ -1008,8 +1055,65 @@ interface CashTxnDao {
     @Query("SELECT COALESCE(SUM(amount), 0) FROM cash_txns WHERE businessId = :businessId AND deleted = 0")
     suspend fun movementsSumOnce(businessId: String): Double
 
+    /**
+     * Net movements in ONE location. The TILL balance additionally carries the opening
+     * float (the float IS the drawer's starting money); the SAFE starts empty and is
+     * filled only by transfers in. Both are computed in the repository so the two
+     * balances can never disagree with the combined total.
+     */
+    @Query(
+        "SELECT COALESCE(SUM(amount), 0) FROM cash_txns " +
+            "WHERE businessId = :businessId AND deleted = 0 AND location = :location"
+    )
+    fun observeLocationSum(businessId: String, location: String): Flow<Double>
+
+    /** Same per-location net, read once (funding decisions need it synchronously). */
+    @Query(
+        "SELECT COALESCE(SUM(amount), 0) FROM cash_txns " +
+            "WHERE businessId = :businessId AND deleted = 0 AND location = :location"
+    )
+    suspend fun locationSumOnce(businessId: String, location: String): Double
+
+    /**
+     * CASH SHORT / OVER for a window: the signed sum of close-of-day `variance` rows.
+     * Negative = the drawer came up short (a real loss); positive = over (a gain). Kept
+     * OUT of gross profit deliberately — it is a separate line so a shortage is visible
+     * as a shortage rather than quietly eating margin.
+     */
+    @Query(
+        "SELECT COALESCE(SUM(amount), 0) FROM cash_txns WHERE businessId = :businessId " +
+            "AND deleted = 0 AND type = 'variance' AND createdAt >= :from AND createdAt < :to"
+    )
+    fun observeVarianceSum(businessId: String, from: Long, to: Long): Flow<Double>
+
+    /**
+     * Net of the movements that are EQUITY / OUTSIDE money rather than trading: the owner
+     * putting cash in ("capital"), borrowing ("loan") and drawing money out ("drawing").
+     * Feeds the "float & capital" slice of the four-part split — money in the drawer that
+     * was never profit.
+     */
+    @Query(
+        "SELECT COALESCE(SUM(amount), 0) FROM cash_txns WHERE businessId = :businessId " +
+            "AND deleted = 0 AND type IN ('capital', 'loan', 'drawing')"
+    )
+    fun observeEquityCashSum(businessId: String): Flow<Double>
+
+    /**
+     * Cash spent buying stock, all time, as a POSITIVE figure ("purchase" rows are
+     * negative). The "stock money" slice of the split is the collected cost of goods sold
+     * LESS this — money already ploughed back into the shelves is no longer set aside.
+     */
+    @Query(
+        "SELECT -COALESCE(SUM(amount), 0) FROM cash_txns WHERE businessId = :businessId " +
+            "AND deleted = 0 AND type = 'purchase'"
+    )
+    fun observePurchaseCashSum(businessId: String): Flow<Double>
+
     @Insert
     suspend fun insert(txn: CashTxn)
+
+    @Insert
+    suspend fun insertAll(txns: List<CashTxn>)
 
     @Query("SELECT * FROM cash_txns WHERE businessId = :businessId AND deleted = 0 ORDER BY createdAt DESC LIMIT :limit")
     suspend fun recent(businessId: String, limit: Int = 100): List<CashTxn>
@@ -1026,6 +1130,78 @@ interface CashTxnDao {
 
     @Query("UPDATE cash_txns SET pendingSync = 0 WHERE id IN (:ids)")
     suspend fun markSynced(ids: List<String>)
+}
+
+@Dao
+interface DayCloseDao {
+    @Insert
+    suspend fun insert(close: DayClose)
+
+    /**
+     * The owner-visible close history, newest first. Deliberately NOT grouped: every
+     * close carries [DayClose.closedByName], so a cashier who is short again and again
+     * is visible by reading down the list.
+     */
+    @Query(
+        "SELECT * FROM day_closes WHERE businessId = :businessId AND deleted = 0 " +
+            "ORDER BY closedAt DESC LIMIT :limit"
+    )
+    fun observeForBusiness(businessId: String, limit: Int = 90): Flow<List<DayClose>>
+
+    /** The most recent close — "last closed <when>" on the cash card. */
+    @Query(
+        "SELECT * FROM day_closes WHERE businessId = :businessId AND deleted = 0 " +
+            "ORDER BY closedAt DESC LIMIT 1"
+    )
+    fun observeLatest(businessId: String): Flow<DayClose?>
+
+    // ---- sync-ready (no push/pull wired: the cloud has no `day_closes` table) ----
+    @Query("SELECT * FROM day_closes WHERE pendingSync = 1")
+    suspend fun pending(): List<DayClose>
+
+    @Query("UPDATE day_closes SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun markSynced(ids: List<String>)
+
+    @Query("DELETE FROM day_closes WHERE businessId = :businessId")
+    suspend fun wipe(businessId: String)
+}
+
+@Dao
+interface OutsideFundDao {
+    @Insert
+    suspend fun insert(fund: OutsideFund)
+
+    /** The outside-money ledger, newest first (owner injections, loans, drawings). */
+    @Query(
+        "SELECT * FROM outside_funds WHERE businessId = :businessId AND deleted = 0 " +
+            "ORDER BY createdAt DESC LIMIT :limit"
+    )
+    fun observeForBusiness(businessId: String, limit: Int = 100): Flow<List<OutsideFund>>
+
+    /**
+     * Running totals per kind and direction — the owner's "put in / taken out / net" and
+     * the shop's outstanding borrowings. One pass over the ledger, so the four figures
+     * can never disagree with each other.
+     */
+    @Query(
+        "SELECT " +
+            "COALESCE(SUM(CASE WHEN kind = 'capital' AND direction = 'in' THEN amount ELSE 0 END), 0) AS capitalIn, " +
+            "COALESCE(SUM(CASE WHEN kind = 'capital' AND direction = 'out' THEN amount ELSE 0 END), 0) AS capitalOut, " +
+            "COALESCE(SUM(CASE WHEN kind = 'loan' AND direction = 'in' THEN amount ELSE 0 END), 0) AS loanIn, " +
+            "COALESCE(SUM(CASE WHEN kind = 'loan' AND direction = 'out' THEN amount ELSE 0 END), 0) AS loanOut " +
+            "FROM outside_funds WHERE businessId = :businessId AND deleted = 0"
+    )
+    fun observeTotals(businessId: String): Flow<OutsideFundTotals>
+
+    // ---- sync-ready (no push/pull wired: the cloud has no `outside_funds` table) ----
+    @Query("SELECT * FROM outside_funds WHERE pendingSync = 1")
+    suspend fun pending(): List<OutsideFund>
+
+    @Query("UPDATE outside_funds SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun markSynced(ids: List<String>)
+
+    @Query("DELETE FROM outside_funds WHERE businessId = :businessId")
+    suspend fun wipe(businessId: String)
 }
 
 @Dao

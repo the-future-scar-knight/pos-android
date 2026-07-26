@@ -38,6 +38,8 @@ class PosRepository(private val db: PosDatabase) {
     private val notificationDao = db.notificationDao()
     private val auditDao = db.auditDao()
     private val staffRequestDao = db.staffRequestDao()
+    private val dayCloseDao = db.dayCloseDao()
+    private val outsideFundDao = db.outsideFundDao()
 
     /**
      * Fire-and-forget hook the DI container points at [com.portionspot.pos.sync.SyncManager.requestSync],
@@ -326,9 +328,767 @@ class PosRepository(private val db: PosDatabase) {
         settingDao.get(KEY_OPENING_FLOAT)?.toDoubleOrNull() ?: 0.0
 
     /** Cash-on-hand right now = opening float + net movements. Used for the shortfall
-     *  check the moment an expense is being posted. */
+     *  check the moment an expense is being posted.
+     *
+     *  ★ MEANING UNCHANGED by the till/safe split: this is still ALL the cash the shop
+     *  holds, because it sums both locations and a transfer between them nets to zero.
+     *  It equals [tillBalanceOnce] + [safeBalanceOnce], always. */
     suspend fun cashOnHandOnce(businessId: String): Double =
         openingFloat(businessId) + cashTxnDao.movementsSumOnce(businessId)
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  TILL AND SAFE — two on-site cash locations, one ledger
+    // ══════════════════════════════════════════════════════════════════════════
+    //
+    //  The shop has NO BANK. Its money sits in exactly two places:
+    //    • the TILL — a working float, only enough to make change;
+    //    • the SAFE — the day's takings.
+    //
+    //  Both balances come off the SAME append-only `cash_txns` ledger via
+    //  [CashTxn.location], so they can never drift from each other or from the
+    //  combined cash-on-hand figure every existing caller reads. The opening float
+    //  belongs to the TILL (the float IS the drawer's starting money); the safe starts
+    //  empty and is filled by transfers.
+    //
+    //  Routing of the movements that already existed:
+    //    sale cash, change payouts, refund payouts → TILL (they happen at the counter)
+    //    expenses / purchases                      → whichever location paid (§4)
+    //
+    //  NOTHING here runs on a timer. Closing the day and topping up the float are
+    //  BUTTONS, pressed when the person decides (§1).
+
+    /** Live TILL balance = opening float + net of the movements booked to the till. */
+    fun tillBalanceFlow(businessId: String): Flow<Double> =
+        cashTxnDao.observeLocationSum(businessId, CashLocation.TILL)
+
+    /** Live SAFE balance = net of the movements booked to the safe (starts empty). */
+    fun safeBalanceFlow(businessId: String): Flow<Double> =
+        cashTxnDao.observeLocationSum(businessId, CashLocation.SAFE)
+
+    /** Movements in one location, newest first — the till or safe statement. */
+    fun cashTxnsForLocationFlow(businessId: String, location: String): Flow<List<CashTxn>> =
+        cashTxnDao.observeForLocation(businessId, CashLocation.of(location))
+
+    /** Till balance right now (the float top-up and funding decisions need it). */
+    suspend fun tillBalanceOnce(businessId: String): Double =
+        openingFloat(businessId) + cashTxnDao.locationSumOnce(businessId, CashLocation.TILL)
+
+    /** Safe balance right now. */
+    suspend fun safeBalanceOnce(businessId: String): Double =
+        cashTxnDao.locationSumOnce(businessId, CashLocation.SAFE)
+
+    /** The owner's float target — how much change money to keep in the drawer. */
+    suspend fun floatTarget(): Double =
+        settingDao.get(KEY_FLOAT_TARGET)?.toDoubleOrNull() ?: DEFAULT_FLOAT_TARGET
+
+    /** Set the float target. Settable INLINE in the close / top-up flows, by design. */
+    suspend fun setFloatTarget(amount: Double) =
+        putSetting(KEY_FLOAT_TARGET, amount.coerceAtLeast(0.0).toString())
+
+    /** How far a close may miss before a note is required. */
+    suspend fun varianceNoteThreshold(): Double =
+        settingDao.get(KEY_VARIANCE_NOTE_THRESHOLD)?.toDoubleOrNull()
+            ?: DEFAULT_VARIANCE_NOTE_THRESHOLD
+
+    suspend fun setVarianceNoteThreshold(amount: Double) =
+        putSetting(KEY_VARIANCE_NOTE_THRESHOLD, amount.coerceAtLeast(0.0).toString())
+
+    /**
+     * Move cash between the shop's own two locations. Written as a matching PAIR of rows
+     * — `transfer_out` (negative, [from]) and `transfer_in` (positive, [to]) — for one
+     * reason: moving your own money between your own pockets is NEITHER INCOME NOR
+     * EXPENSE, so the pair must sum to exactly zero and leave cash-on-hand untouched.
+     * Both rows are inserted in the caller's transaction; a half-written transfer that
+     * created or destroyed money is therefore impossible.
+     */
+    private suspend fun writeTransfer(
+        businessId: String,
+        from: String,
+        to: String,
+        amount: Double,
+        note: String,
+        refType: String? = null,
+        refId: String? = null,
+        cashierId: String? = null,
+        cashierName: String? = null,
+        stamp: Long = now()
+    ) {
+        if (amount <= CENT || from == to) return
+        cashTxnDao.insertAll(
+            listOf(
+                CashTxn(
+                    businessId = businessId, type = "transfer_out", amount = -amount,
+                    location = from, source = CashLocation.label(from), note = note,
+                    refType = refType, refId = refId,
+                    createdBy = cashierId, createdByName = cashierName,
+                    createdAt = stamp, updatedAt = stamp
+                ),
+                CashTxn(
+                    businessId = businessId, type = "transfer_in", amount = amount,
+                    location = to, source = CashLocation.label(from), note = note,
+                    refType = refType, refId = refId,
+                    createdBy = cashierId, createdByName = cashierName,
+                    createdAt = stamp, updatedAt = stamp
+                )
+            )
+        )
+    }
+
+    // ---- §2 CLOSE THE DAY (on command, never on a timer) ------------------
+
+    /** What the close-day sheet needs before the owner types anything. */
+    data class DayCloseProposal(
+        val expectedTill: Double,
+        val floatTarget: Double,
+        val safeBalance: Double,
+        val noteThreshold: Double
+    )
+
+    /** Read the figures the close-of-day flow opens with. Pure read — closes nothing. */
+    suspend fun dayCloseProposal(businessId: String): DayCloseProposal = DayCloseProposal(
+        expectedTill = tillBalanceOnce(businessId),
+        floatTarget = floatTarget(),
+        safeBalance = safeBalanceOnce(businessId),
+        noteThreshold = varianceNoteThreshold()
+    )
+
+    /**
+     * CLOSE THE DAY (§2). Pressed by a person who has just counted the drawer and
+     * physically moved the excess — never fired on a schedule.
+     *
+     * Everything commits in ONE transaction, so the ledger can never end up trued-up but
+     * not transferred (or vice versa):
+     *
+     *  1. TRUE UP. `variance = counted − expected`, written as a signed `variance`
+     *     [CashTxn] against the TILL. **The counted figure wins** — that is the owner's
+     *     explicit choice, so after this row the ledger says exactly what was in the
+     *     drawer. A shortage is a NEGATIVE row (money genuinely gone), an overage
+     *     positive.
+     *  2. MOVE THE EXCESS. [moveToSafe] leaves the till and lands in the safe as a
+     *     matching transfer pair — both balances move, the combined total does not.
+     *  3. RECORD IT PERMANENTLY. A [DayClose] row keeps expected / counted / variance /
+     *     moved / target plus WHO closed, so the owner can see a repeat offender.
+     *  4. AUDIT. A shortage or overage also lands in the append-only audit trail.
+     *
+     * The variance is a LOSS (or gain) against profit and is reported as its own "cash
+     * short/over" line — see [cashVarianceFlow]. It is deliberately NOT folded into gross
+     * profit: a shortage is a shortage, not a margin problem.
+     *
+     * [note] is required by the caller when `|variance|` exceeds [varianceNoteThreshold];
+     * below that the owner is not made to type. Returns the recorded close, or null when
+     * there is no business/nothing to record.
+     */
+    suspend fun closeDay(
+        businessId: String,
+        countedCash: Double,
+        moveToSafe: Double,
+        floatTarget: Double,
+        note: String?,
+        dayStart: Long = startOfDay(now()),
+        cashierId: String? = null,
+        cashierName: String? = null
+    ): DayClose? {
+        val stamp = now()
+        val expected = tillBalanceOnce(businessId)
+        val counted = countedCash.coerceAtLeast(0.0)
+        val variance = counted - expected
+        // Never move more than was actually counted, and never a negative amount.
+        val moved = moveToSafe.coerceIn(0.0, counted)
+        val target = floatTarget.coerceAtLeast(0.0)
+        val close = DayClose(
+            businessId = businessId, dayStart = dayStart,
+            expectedCash = expected, countedCash = counted, variance = variance,
+            movedToSafe = moved, floatTarget = target,
+            note = note?.trim()?.ifBlank { null },
+            closedBy = cashierId, closedByName = cashierName,
+            closedAt = stamp, updatedAt = stamp
+        )
+        db.withTransaction {
+            // 1. True the till up to what was physically counted.
+            if (kotlin.math.abs(variance) > CENT) {
+                cashTxnDao.insert(
+                    CashTxn(
+                        businessId = businessId, type = "variance", amount = variance,
+                        location = CashLocation.TILL, source = "day close",
+                        note = (if (variance < 0) "Cash short at close" else "Cash over at close") +
+                            (close.note?.let { " — $it" } ?: ""),
+                        refType = "day_close", refId = close.id,
+                        createdBy = cashierId, createdByName = cashierName,
+                        createdAt = stamp, updatedAt = stamp
+                    )
+                )
+            }
+            // 2. Move the excess takings out of the drawer and into the safe.
+            writeTransfer(
+                businessId = businessId,
+                from = CashLocation.TILL, to = CashLocation.SAFE, amount = moved,
+                note = "Day close — takings to safe",
+                refType = "day_close", refId = close.id,
+                cashierId = cashierId, cashierName = cashierName, stamp = stamp
+            )
+            // 3. The permanent, per-cashier record.
+            dayCloseDao.insert(close)
+            // 4. Audit trail (a discrepancy is a sensitive event).
+            if (kotlin.math.abs(variance) > CENT) {
+                logAudit(
+                    AuditEntry(
+                        businessId = businessId,
+                        action = if (variance < 0) "till_short" else "till_over",
+                        entityType = "day_close", entityId = close.id,
+                        summary = (if (variance < 0) "Till short " else "Till over ") +
+                            fmtMoney(kotlin.math.abs(variance)) +
+                            " at close (counted ${fmtMoney(counted)} vs ${fmtMoney(expected)})" +
+                            (close.note?.let { " — $it" } ?: ""),
+                        meta = fmtMoney(variance),
+                        createdBy = cashierId, createdByName = cashierName
+                    )
+                )
+            }
+            logAudit(
+                AuditEntry(
+                    businessId = businessId, action = "day_closed",
+                    entityType = "day_close", entityId = close.id,
+                    summary = "Day closed · counted ${fmtMoney(counted)} · " +
+                        "${fmtMoney(moved)} to safe · ${fmtMoney(target)} left in till",
+                    createdBy = cashierId, createdByName = cashierName
+                )
+            )
+        }
+        setFloatTarget(target)
+        notifyCashEvent(
+            businessId = businessId,
+            dedupeKey = "dayclose:${close.id}",
+            title = "Day closed",
+            body = "Counted ${fmtMoney(counted)}" +
+                (if (kotlin.math.abs(variance) > CENT)
+                    " · ${if (variance < 0) "short" else "over"} ${fmtMoney(kotlin.math.abs(variance))}"
+                else " · balanced") +
+                " · ${fmtMoney(moved)} moved to the safe" +
+                (cashierName?.let { " · by $it" } ?: ""),
+            severity = if (kotlin.math.abs(variance) > CENT) "warn" else "info",
+            refType = "day_close", refId = close.id, at = stamp
+        )
+        return close
+    }
+
+    /** The close history, newest first — per-cashier, so a repeat offender shows up. */
+    fun dayClosesFlow(businessId: String): Flow<List<DayClose>> =
+        dayCloseDao.observeForBusiness(businessId)
+
+    /** The most recent close, for the "last closed …" line on the cash card. */
+    fun latestDayCloseFlow(businessId: String): Flow<DayClose?> =
+        dayCloseDao.observeLatest(businessId)
+
+    /** Signed CASH SHORT/OVER for a window — the profit line day-close variances feed. */
+    fun cashVarianceFlow(businessId: String, from: Long, to: Long): Flow<Double> =
+        cashTxnDao.observeVarianceSum(businessId, from, to)
+
+    // ---- §3 TOP UP THE FLOAT (on command) --------------------------------
+
+    /** What the top-up sheet opens with: where the till is against its target. */
+    data class FloatTopUp(
+        val till: Double,
+        val target: Double,
+        val safe: Double
+    ) {
+        /** How far the till is below target — 0 when it needs nothing. */
+        val shortfall: Double get() = (target - till).coerceAtLeast(0.0)
+        /** What the safe can actually supply toward that shortfall. */
+        val available: Double get() = shortfall.coerceAtMost(safe.coerceAtLeast(0.0))
+    }
+
+    suspend fun floatTopUpProposal(businessId: String): FloatTopUp = FloatTopUp(
+        till = tillBalanceOnce(businessId),
+        target = floatTarget(),
+        safe = safeBalanceOnce(businessId)
+    )
+
+    /**
+     * TOP UP THE FLOAT (§3) — move [amount] from the safe into the till, on command.
+     * A pure transfer: safe down, till up, combined cash unchanged. Audited and notified
+     * so the owner learns their safe was opened even if someone else pressed it.
+     * Returns the amount actually moved (clamped to what the safe holds).
+     */
+    suspend fun topUpFloat(
+        businessId: String,
+        amount: Double,
+        cashierId: String? = null,
+        cashierName: String? = null
+    ): Double {
+        val stamp = now()
+        val safe = safeBalanceOnce(businessId).coerceAtLeast(0.0)
+        val moved = amount.coerceIn(0.0, safe)
+        if (moved <= CENT) return 0.0
+        db.withTransaction {
+            writeTransfer(
+                businessId = businessId,
+                from = CashLocation.SAFE, to = CashLocation.TILL, amount = moved,
+                note = "Float top-up",
+                cashierId = cashierId, cashierName = cashierName, stamp = stamp
+            )
+            logAudit(
+                AuditEntry(
+                    businessId = businessId, action = "float_topup", entityType = "cash",
+                    summary = "Moved ${fmtMoney(moved)} from the safe into the till",
+                    meta = fmtMoney(moved),
+                    createdBy = cashierId, createdByName = cashierName
+                )
+            )
+        }
+        notifyCashEvent(
+            businessId = businessId,
+            dedupeKey = "floattopup:$stamp",
+            title = "Float topped up",
+            body = "${fmtMoney(moved)} moved from the safe into the till" +
+                (cashierName?.let { " · by $it" } ?: ""),
+            severity = "info", refType = "cash", refId = null, at = stamp
+        )
+        return moved
+    }
+
+    /**
+     * Persist + push an admin-facing alert for a completed cash event (§1: "when a close
+     * or a float top-up COMPLETES, notify the admin"). `pushedAt` is stamped so the phone
+     * that PERFORMED the action does not buzz itself; the owner's admin phone fires it
+     * once after the pull, exactly like the staff-request channel.
+     */
+    private suspend fun notifyCashEvent(
+        businessId: String,
+        dedupeKey: String,
+        title: String,
+        body: String,
+        severity: String,
+        refType: String?,
+        refId: String?,
+        at: Long
+    ) {
+        upsertNotificationByKey(
+            AppNotification(
+                businessId = businessId, category = "cash", severity = severity,
+                title = title, body = body, dedupeKey = dedupeKey, audience = "admin",
+                refType = refType, refId = refId,
+                eventAt = at, createdAt = at, pushedAt = at,
+                updatedAt = at, pendingSync = true
+            )
+        )
+        nudgeSync("cash-event")
+    }
+
+    /** Start-of-day millis for [at], in the device's timezone. */
+    private fun startOfDay(at: Long): Long {
+        val c = java.util.Calendar.getInstance().apply {
+            timeInMillis = at
+            set(java.util.Calendar.HOUR_OF_DAY, 0)
+            set(java.util.Calendar.MINUTE, 0)
+            set(java.util.Calendar.SECOND, 0)
+            set(java.util.Calendar.MILLISECOND, 0)
+        }
+        return c.timeInMillis
+    }
+
+    // ---- §4 FUNDING WATERFALL: TILL → SAFE → OUTSIDE FUNDS → abort -------
+
+    /**
+     * How one payment is going to be funded. The four parts always sum to the amount
+     * being paid, so a plan can be checked by addition and never silently loses money.
+     *
+     *  - [fromTill] / [fromSafe] — shop cash, by location. Taking from the SAFE needs the
+     *    owner's approval every time (see [requestSafeWithdrawal]); the VM enforces that
+     *    before a plan with [fromSafe] is ever executed by a non-admin.
+     *  - [outside] — money from outside the shop, of [outsideKind]:
+     *      "capital" = the OWNER's own money (raises what the shop owes the owner),
+     *      "loan"    = BORROWED (a liability to repay).
+     *    Neither is sales and neither is profit. Outside funds pay the payee directly, so
+     *    they move no shop cash and write no [CashTxn] — only an [OutsideFund] row.
+     *  - [payable] — nothing left to pay with; the shop now owes the payee.
+     */
+    data class FundingPlan(
+        val fromTill: Double = 0.0,
+        val fromSafe: Double = 0.0,
+        val outside: Double = 0.0,
+        val outsideKind: String? = null,
+        val payable: Double = 0.0
+    ) {
+        /** Shop cash leaving the premises under this plan. */
+        val cash: Double get() = fromTill + fromSafe
+        /** Does this plan open the safe? (⇒ needs admin approval when a cashier asks.) */
+        val needsSafe: Boolean get() = fromSafe > 0.005
+        val total: Double get() = fromTill + fromSafe + outside + payable
+    }
+
+    /** Build a plan against the CURRENT live balances. */
+    private suspend fun planFundingNow(businessId: String, amount: Double, mode: String): FundingPlan =
+        planFunding(amount, mode, tillBalanceOnce(businessId), safeBalanceOnce(businessId))
+
+    /**
+     * Write the cash side of a [FundingPlan]: one negative [CashTxn] per location that
+     * actually paid, plus an [OutsideFund] row when outside money covered part of it.
+     * Called INSIDE the caller's transaction so a payment and its funding land together.
+     */
+    private suspend fun postFunding(
+        businessId: String,
+        plan: FundingPlan,
+        type: String,
+        note: String,
+        refType: String?,
+        refId: String?,
+        outsideSource: String?,
+        cashierId: String?,
+        cashierName: String?,
+        stamp: Long
+    ) {
+        if (plan.fromTill > CENT) {
+            cashTxnDao.insert(
+                CashTxn(
+                    businessId = businessId, type = type, amount = -plan.fromTill,
+                    location = CashLocation.TILL, source = "till", note = note,
+                    refType = refType, refId = refId,
+                    createdBy = cashierId, createdByName = cashierName,
+                    createdAt = stamp, updatedAt = stamp
+                )
+            )
+        }
+        if (plan.fromSafe > CENT) {
+            cashTxnDao.insert(
+                CashTxn(
+                    businessId = businessId, type = type, amount = -plan.fromSafe,
+                    location = CashLocation.SAFE, source = "safe", note = note,
+                    refType = refType, refId = refId,
+                    createdBy = cashierId, createdByName = cashierName,
+                    createdAt = stamp, updatedAt = stamp
+                )
+            )
+        }
+        if (plan.outside > CENT) {
+            // Outside money pays the payee directly — it never enters the drawer, so
+            // there is no cash row, only the equity/liability record.
+            outsideFundDao.insert(
+                OutsideFund(
+                    businessId = businessId,
+                    kind = plan.outsideKind ?: "capital", direction = "in",
+                    amount = plan.outside,
+                    source = outsideSource ?: if (plan.outsideKind == "loan") "Loan" else "Owner",
+                    note = note, refType = refType, refId = refId,
+                    createdBy = cashierId, createdByName = cashierName,
+                    createdAt = stamp, updatedAt = stamp
+                )
+            )
+        }
+    }
+
+    // ---- §4 SAFE WITHDRAWAL: reuse the admin approval channel ------------
+
+    /**
+     * A cashier asks the owner to open the safe. Raised through the SAME `staff_requests`
+     * channel as the credit-limit gate (type `"safe_withdrawal"`), so it lands in the
+     * admin's Alerts feed on the other phone, syncs like every other request, and carries
+     * the amount + reason.
+     *
+     * Deliberately NOT "pay the bill from the safe on approval". Approving MOVES the money
+     * from the safe into the till — which is what physically happens when the owner opens
+     * the safe — and the payment then proceeds from a till that has the cash. That keeps
+     * the approved action tiny, self-contained and safely repeatable.
+     */
+    suspend fun requestSafeWithdrawal(
+        businessId: String,
+        amount: Double,
+        reason: String?,
+        targetType: String? = null,
+        targetId: String? = null,
+        targetName: String? = null,
+        byId: String? = null,
+        byName: String? = null
+    ): StaffRequest? {
+        if (amount <= CENT) return null
+        return submitStaffRequest(
+            type = "safe_withdrawal",
+            targetType = targetType ?: "cash",
+            targetId = targetId,
+            targetName = targetName ?: "Safe withdrawal",
+            amount = amount,
+            note = reason,
+            byId = byId,
+            byName = byName
+        )
+    }
+
+    /**
+     * Take [amount] out of the safe and put it in the till. The one place a safe
+     * withdrawal is executed, used by BOTH paths:
+     *  - an ADMIN acting on their own device, approving inline;
+     *  - an admin approving a cashier's `safe_withdrawal` request from the Alerts feed
+     *    (see [decideStaffRequest], which calls this and then sets `applied` so a re-pull
+     *    of the decided row can never move the money twice).
+     *
+     * Records a transfer pair (combined cash unchanged), audits WHO opened the safe and
+     * notifies the admin feed. Returns what actually moved, clamped to the safe balance.
+     */
+    suspend fun withdrawFromSafe(
+        businessId: String,
+        amount: Double,
+        reason: String?,
+        cashierId: String? = null,
+        cashierName: String? = null
+    ): Double {
+        val stamp = now()
+        val safe = safeBalanceOnce(businessId).coerceAtLeast(0.0)
+        val moved = amount.coerceIn(0.0, safe)
+        if (moved <= CENT) return 0.0
+        db.withTransaction {
+            writeTransfer(
+                businessId = businessId,
+                from = CashLocation.SAFE, to = CashLocation.TILL, amount = moved,
+                note = "Safe withdrawal" + (reason?.takeIf { it.isNotBlank() }?.let { " — $it" } ?: ""),
+                cashierId = cashierId, cashierName = cashierName, stamp = stamp
+            )
+            logAudit(
+                AuditEntry(
+                    businessId = businessId, action = "safe_withdrawal", entityType = "cash",
+                    summary = "Took ${fmtMoney(moved)} out of the safe" +
+                        (reason?.takeIf { it.isNotBlank() }?.let { " — $it" } ?: ""),
+                    meta = fmtMoney(moved),
+                    createdBy = cashierId, createdByName = cashierName
+                )
+            )
+        }
+        notifyCashEvent(
+            businessId = businessId,
+            dedupeKey = "safewithdrawal:$stamp",
+            title = "Safe opened",
+            body = "${fmtMoney(moved)} taken out of the safe" +
+                (reason?.takeIf { it.isNotBlank() }?.let { " · $it" } ?: "") +
+                (cashierName?.let { " · by $it" } ?: ""),
+            severity = "warn", refType = "cash", refId = null, at = stamp
+        )
+        return moved
+    }
+
+    // ---- §4 / §6 OUTSIDE FUNDS + OWNER DRAWINGS --------------------------
+
+    /** The outside-money ledger (owner injections, loans, drawings), newest first. */
+    fun outsideFundsFlow(businessId: String): Flow<List<OutsideFund>> =
+        outsideFundDao.observeForBusiness(businessId)
+
+    /** Running "put in / taken out / borrowed / repaid" totals for the owner. */
+    fun outsideFundTotalsFlow(businessId: String): Flow<OutsideFundTotals> =
+        outsideFundDao.observeTotals(businessId)
+
+    /**
+     * Money coming INTO the shop from outside as CASH (§4): the owner topping the business
+     * up out of their own pocket ([kind] = "capital") or a borrowing ([kind] = "loan").
+     * Neither is sales and neither is profit — the cash row exists so the drawer/safe is
+     * right, and the [OutsideFund] row is what the totals read, so it can never be counted
+     * as takings. Lands in [location] (default: the safe, where takings live).
+     */
+    suspend fun recordOutsideCashIn(
+        businessId: String,
+        amount: Double,
+        kind: String,
+        source: String?,
+        note: String?,
+        location: String = CashLocation.SAFE,
+        cashierId: String? = null,
+        cashierName: String? = null
+    ) {
+        if (amount <= CENT) return
+        val stamp = now()
+        val loan = kind == "loan"
+        val where = CashLocation.of(location)
+        db.withTransaction {
+            cashTxnDao.insert(
+                CashTxn(
+                    businessId = businessId, type = if (loan) "loan" else "capital",
+                    amount = amount, location = where,
+                    source = source ?: if (loan) "Loan" else "Owner",
+                    note = note ?: if (loan) "Borrowed funds in" else "Owner money in",
+                    refType = "outside_fund",
+                    createdBy = cashierId, createdByName = cashierName,
+                    createdAt = stamp, updatedAt = stamp
+                )
+            )
+            outsideFundDao.insert(
+                OutsideFund(
+                    businessId = businessId, kind = if (loan) "loan" else "capital",
+                    direction = "in", amount = amount,
+                    source = source ?: if (loan) "Loan" else "Owner", note = note,
+                    refType = "cash",
+                    createdBy = cashierId, createdByName = cashierName,
+                    createdAt = stamp, updatedAt = stamp
+                )
+            )
+            logAudit(
+                AuditEntry(
+                    businessId = businessId, action = if (loan) "loan_in" else "capital_in",
+                    entityType = "cash",
+                    summary = (if (loan) "Borrowed " else "Owner put in ") + fmtMoney(amount) +
+                        " into the ${CashLocation.label(where).lowercase()}",
+                    meta = fmtMoney(amount),
+                    createdBy = cashierId, createdByName = cashierName
+                )
+            )
+        }
+    }
+
+    /**
+     * TAKE MONEY OUT (§6) — the owner drawing cash from the business. The exact mirror of
+     * a capital injection:
+     *  - cash goes DOWN (a negative `drawing` [CashTxn] in the chosen location);
+     *  - an [OutsideFund] row `kind="capital", direction="out"` reduces what the shop owes
+     *    the owner.
+     *
+     * ★ A DRAWING IS NOT AN EXPENSE and MUST NOT REDUCE PROFIT. It is not written to
+     * `expenses`, so it never reaches the posted-expense total that net profit subtracts.
+     * It shows up only where it belongs: less cash held, and a smaller "net put in".
+     * Returns what was actually taken, clamped to the balance in that location.
+     */
+    suspend fun recordOwnerDrawing(
+        businessId: String,
+        amount: Double,
+        location: String = CashLocation.SAFE,
+        note: String?,
+        cashierId: String? = null,
+        cashierName: String? = null
+    ): Double {
+        if (amount <= CENT) return 0.0
+        val where = CashLocation.of(location)
+        val available = (if (where == CashLocation.SAFE) safeBalanceOnce(businessId)
+        else tillBalanceOnce(businessId)).coerceAtLeast(0.0)
+        val taken = amount.coerceAtMost(available)
+        if (taken <= CENT) return 0.0
+        val stamp = now()
+        db.withTransaction {
+            cashTxnDao.insert(
+                CashTxn(
+                    businessId = businessId, type = "drawing", amount = -taken,
+                    location = where, source = "Owner",
+                    note = note ?: "Owner drawing", refType = "outside_fund",
+                    createdBy = cashierId, createdByName = cashierName,
+                    createdAt = stamp, updatedAt = stamp
+                )
+            )
+            outsideFundDao.insert(
+                OutsideFund(
+                    businessId = businessId, kind = "capital", direction = "out",
+                    amount = taken, source = "Owner", note = note, refType = "cash",
+                    createdBy = cashierId, createdByName = cashierName,
+                    createdAt = stamp, updatedAt = stamp
+                )
+            )
+            logAudit(
+                AuditEntry(
+                    businessId = businessId, action = "owner_drawing", entityType = "cash",
+                    summary = "Owner took out ${fmtMoney(taken)} from the " +
+                        CashLocation.label(where).lowercase() +
+                        (note?.takeIf { it.isNotBlank() }?.let { " — $it" } ?: ""),
+                    meta = fmtMoney(taken),
+                    createdBy = cashierId, createdByName = cashierName
+                )
+            )
+        }
+        return taken
+    }
+
+    /** Repay part of a borrowing from shop cash (a liability going down, not an expense). */
+    suspend fun recordLoanRepayment(
+        businessId: String,
+        amount: Double,
+        location: String = CashLocation.SAFE,
+        source: String?,
+        note: String?,
+        cashierId: String? = null,
+        cashierName: String? = null
+    ): Double {
+        if (amount <= CENT) return 0.0
+        val where = CashLocation.of(location)
+        val available = (if (where == CashLocation.SAFE) safeBalanceOnce(businessId)
+        else tillBalanceOnce(businessId)).coerceAtLeast(0.0)
+        val paid = amount.coerceAtMost(available)
+        if (paid <= CENT) return 0.0
+        val stamp = now()
+        db.withTransaction {
+            cashTxnDao.insert(
+                CashTxn(
+                    businessId = businessId, type = "loan", amount = -paid,
+                    location = where, source = source ?: "Loan",
+                    note = note ?: "Loan repayment", refType = "outside_fund",
+                    createdBy = cashierId, createdByName = cashierName,
+                    createdAt = stamp, updatedAt = stamp
+                )
+            )
+            outsideFundDao.insert(
+                OutsideFund(
+                    businessId = businessId, kind = "loan", direction = "out",
+                    amount = paid, source = source ?: "Loan", note = note, refType = "cash",
+                    createdBy = cashierId, createdByName = cashierName,
+                    createdAt = stamp, updatedAt = stamp
+                )
+            )
+            logAudit(
+                AuditEntry(
+                    businessId = businessId, action = "loan_repaid", entityType = "cash",
+                    summary = "Repaid ${fmtMoney(paid)} of borrowed money",
+                    meta = fmtMoney(paid),
+                    createdBy = cashierId, createdByName = cashierName
+                )
+            )
+        }
+        return paid
+    }
+
+    // ---- §5 CASH-BASIS revenue / profit inputs ---------------------------
+
+    /**
+     * Raw per-sale input to [CashBasis] — see that object for what "revenue" now means.
+     * Unwindowed on purpose: a repayment today can settle a sale from last year.
+     */
+    fun cashBasisSalesFlow(businessId: String): Flow<List<CashBasisSaleRow>> =
+        saleDao.observeCashBasisSales(businessId)
+
+    // ---- §6 THE SPLIT: how much of this money is actually mine -----------
+
+    /**
+     * The cash held (till + safe) split into the four pots the owner thinks in (§6).
+     *
+     *  - [floatCapital]   — the float plus outside money still sitting in the cash: the
+     *                       opening float, owner injections and borrowings, less anything
+     *                       the owner has drawn back out. **Never profit.**
+     *  - [stockMoney]     — the cost of the goods already SOLD AND COLLECTED that has not
+     *                       yet been ploughed back into the shelves. It must buy the next
+     *                       lot. (Collected cost of goods, less cash already spent on
+     *                       purchases; floored at zero once the restocking has caught up.)
+     *  - [owedToCustomers]— change owed plus unpaid refunds. **Explicitly NOT the owner's
+     *                       money** — it is sitting in the drawer waiting to be handed
+     *                       back, and must never inflate his figures.
+     *  - [profit]         — what is genuinely his to take. Deliberately the RESIDUAL, so
+     *                       the four parts add up to the cash actually held, to the cent.
+     *
+     * SCOPE, stated honestly: this splits CASH THAT IS HERE. It says nothing about the
+     * value of unsold stock (the owner explicitly does not want projected profit on goods
+     * that have not sold), and money still owed on credit is profit EARNED but not yet
+     * cash HELD — it shows in [creditOutstanding], not in [profit].
+     */
+    data class CashSplit(
+        val till: Double = 0.0,
+        val safe: Double = 0.0,
+        val floatCapital: Double = 0.0,
+        val stockMoney: Double = 0.0,
+        val owedToCustomers: Double = 0.0,
+        val creditOutstanding: Double = 0.0
+    ) {
+        val held: Double get() = till + safe
+        /** The residual — what is left once the other three pots are set aside. */
+        val profit: Double get() = held - floatCapital - stockMoney - owedToCustomers
+    }
+
+    // ---- misc cash reads --------------------------------------------------
+
+    /** Equity/outside cash sitting in the drawer + safe (capital + loans − drawings). */
+    fun equityCashFlow(businessId: String): Flow<Double> =
+        cashTxnDao.observeEquityCashSum(businessId)
+
+    /** Cash already spent buying stock, all time, as a positive figure. */
+    fun purchaseCashFlow(businessId: String): Flow<Double> =
+        cashTxnDao.observePurchaseCashSum(businessId)
 
     /**
      * SUBMIT an expense for admin approval (prompt §9.2). Anyone may submit; the row
@@ -409,41 +1169,49 @@ class PosRepository(private val db: PosDatabase) {
 
     /**
      * APPROVE (post) a pending expense with a chosen funding [mode] — the double-entry-
-     * lite split (prompt §9.4). Modes:
-     *  - "cash"      → pay it all from cash-on-hand (cashPortion = amount, cash-out row).
-     *  - "available" → pay what cash there is, remainder → accounts payable (cash → 0).
-     *  - "capital"   → the owner covers it; cash untouched (capitalPortion = amount).
+     * lite split (prompt §9.4), now aware of the two cash locations (§4).
+     *
+     * The payer picks the SOURCE, and the order money is reached for is
+     * **TILL → SAFE → OUTSIDE FUNDS → abort**. [mode] is passed straight to
+     * [planFunding], which documents every value; the plan's cash side is posted per
+     * location, its outside side becomes an [OutsideFund] row (owner capital or a loan),
+     * and anything left over is accounts payable.
+     *
+     * The stored [Expense.capitalPortion] now means "funded from OUTSIDE the shop's cash";
+     * WHICH outside source (the owner's own money vs borrowed) is recorded on the
+     * [OutsideFund] row, so the two running totals stay separable.
+     *
+     * ★ Opening the SAFE needs the owner's approval every time. This function does not
+     * know who is asking — the caller (the ViewModel, which holds the session role) either
+     * is an admin, or must route through [requestSafeWithdrawal] first.
+     *
      * A recurring submission additionally becomes a SCHEDULE (a separate template row)
      * so future periods auto-post. Audited. All writes are atomic.
      */
     suspend fun approveExpense(
-        id: String, mode: String, cashierId: String? = null, cashierName: String? = null
+        id: String, mode: String, cashierId: String? = null, cashierName: String? = null,
+        outsideSource: String? = null
     ) {
         val e = expenseDao.getById(id) ?: return
         if (e.status != "pending" || e.deleted) return
         val stamp = now()
+        val plan = planFundingNow(e.businessId, e.amount, mode)
         db.withTransaction {
-            val onHand = cashOnHandOnce(e.businessId).coerceAtLeast(0.0)
-            val (cash, payable, capital) = splitFunding(e.amount, mode, onHand)
             val posted = e.copy(
                 status = "approved", approvedBy = cashierId, approvedByName = cashierName,
                 approvedAt = stamp, postedAt = stamp,
-                cashPortion = cash, payablePortion = payable, capitalPortion = capital,
+                cashPortion = plan.cash, payablePortion = plan.payable,
+                capitalPortion = plan.outside,
                 updatedAt = stamp, pendingSync = true
             )
             expenseDao.upsert(posted)
             clearPendingExpenseNotice(e.businessId, e.id)
-            if (cash > CENT) {
-                cashTxnDao.insert(
-                    CashTxn(
-                        businessId = e.businessId, type = "expense", amount = -cash,
-                        source = fundingLabel(mode), note = "${e.category} · ${e.description ?: "expense"}",
-                        refType = "expense", refId = e.id,
-                        createdBy = cashierId, createdByName = cashierName,
-                        createdAt = stamp, updatedAt = stamp
-                    )
-                )
-            }
+            postFunding(
+                businessId = e.businessId, plan = plan, type = "expense",
+                note = "${e.category} · ${e.description ?: "expense"}",
+                refType = "expense", refId = e.id, outsideSource = outsideSource,
+                cashierId = cashierId, cashierName = cashierName, stamp = stamp
+            )
             // A recurring approval spins up the schedule template (not itself a cost).
             if (e.recurring && e.recurrencePeriod != null) {
                 expenseDao.upsert(
@@ -462,8 +1230,8 @@ class PosRepository(private val db: PosDatabase) {
                 AuditEntry(
                     businessId = e.businessId, action = "expense_approved", entityType = "expense",
                     entityId = e.id,
-                    summary = "Approved ${e.category} ${fmtMoney(e.amount)} via ${fundingLabel(mode)}" +
-                        (if (payable > CENT) " (${fmtMoney(payable)} owed)" else ""),
+                    summary = "Approved ${e.category} ${fmtMoney(e.amount)} via ${fundingLabel(plan)}" +
+                        (if (plan.payable > CENT) " (${fmtMoney(plan.payable)} owed)" else ""),
                     createdBy = cashierId, createdByName = cashierName
                 )
             )
@@ -499,18 +1267,23 @@ class PosRepository(private val db: PosDatabase) {
     suspend fun setOpeningFloat(amount: Double) =
         putSetting(KEY_OPENING_FLOAT, amount.coerceAtLeast(0.0).toString())
 
-    /** Record an ad-hoc cash payout / drawer adjustment (admin), audited. */
+    /** Record an ad-hoc cash payout / drawer adjustment (admin), audited. [location]
+     *  says WHICH pot moved; it defaults to the till, which is where an ad-hoc
+     *  over-the-counter correction happens. */
     suspend fun recordCashAdjustment(
         businessId: String, amount: Double, note: String,
-        cashierId: String? = null, cashierName: String? = null
+        cashierId: String? = null, cashierName: String? = null,
+        location: String = CashLocation.TILL
     ) {
         if (kotlin.math.abs(amount) < CENT) return
         val stamp = now()
+        val where = CashLocation.of(location)
         db.withTransaction {
             cashTxnDao.insert(
                 CashTxn(
                     businessId = businessId, type = if (amount < 0) "payout" else "adjust",
-                    amount = amount, source = "manual", note = note.ifBlank { "Cash adjustment" },
+                    amount = amount, location = where,
+                    source = "manual", note = note.ifBlank { "Cash adjustment" },
                     createdBy = cashierId, createdByName = cashierName,
                     createdAt = stamp, updatedAt = stamp
                 )
@@ -518,7 +1291,8 @@ class PosRepository(private val db: PosDatabase) {
             logAudit(
                 AuditEntry(
                     businessId = businessId, action = "cash_adjust", entityType = "cash",
-                    summary = "Cash ${if (amount < 0) "payout" else "top-up"} ${fmtMoney(kotlin.math.abs(amount))} — ${note.ifBlank { "manual" }}",
+                    summary = "${CashLocation.label(where)} ${if (amount < 0) "payout" else "top-up"} " +
+                        "${fmtMoney(kotlin.math.abs(amount))} — ${note.ifBlank { "manual" }}",
                     meta = fmtMoney(amount), createdBy = cashierId, createdByName = cashierName
                 )
             )
@@ -537,30 +1311,29 @@ class PosRepository(private val db: PosDatabase) {
         val due = expenseDao.dueTemplates(businessId, now)
         val posted = ArrayList<Pair<Expense, String>>()
         for (tpl in due) {
+            // Unattended posting policy: run the ordinary TILL → SAFE → payable waterfall.
+            // The owner set this schedule up themselves and every draw is audited and
+            // notified, so it is their standing instruction rather than an unapproved
+            // hand in the safe; if neither location covers it, the balance is simply owed.
+            val plan = planFundingNow(businessId, tpl.amount, "waterfall")
             db.withTransaction {
-                val onHand = cashOnHandOnce(businessId).coerceAtLeast(0.0)
-                // Default policy for unattended posting: pay from cash, remainder → payable.
-                val mode = if (onHand + CENT >= tpl.amount) "cash" else "available"
-                val (cash, payable, capital) = splitFunding(tpl.amount, mode, onHand)
                 val child = Expense(
                     businessId = businessId, category = tpl.category, amount = tpl.amount,
                     date = ymd(now), description = tpl.description, status = "approved",
                     templateId = tpl.id, recurring = false, isTemplate = false,
                     approvedAt = now, postedAt = now,
-                    cashPortion = cash, payablePortion = payable, capitalPortion = capital,
+                    cashPortion = plan.cash, payablePortion = plan.payable,
+                    capitalPortion = plan.outside,
                     approvedByName = "Auto (recurring)"
                 )
                 expenseDao.upsert(child)
-                if (cash > CENT) {
-                    cashTxnDao.insert(
-                        CashTxn(
-                            businessId = businessId, type = "expense", amount = -cash,
-                            source = "recurring", note = "${tpl.category} (recurring)",
-                            refType = "expense", refId = child.id,
-                            createdAt = now, updatedAt = now
-                        )
-                    )
-                }
+                postFunding(
+                    businessId = businessId, plan = plan, type = "expense",
+                    note = "${tpl.category} (recurring)",
+                    refType = "expense", refId = child.id, outsideSource = null,
+                    cashierId = null, cashierName = "Auto (recurring)", stamp = now
+                )
+                val payable = plan.payable
                 expenseDao.upsert(
                     tpl.copy(
                         lastRunAt = now, nextRunAt = nextRun(now, tpl.recurrencePeriod ?: "monthly"),
@@ -632,21 +1405,14 @@ class PosRepository(private val db: PosDatabase) {
         return row
     }
 
-    /** Split a posted expense [amount] across cash / payable / capital for the chosen
-     *  funding [mode], honouring the [onHand] ceiling. Returns (cash, payable, capital). */
-    private fun splitFunding(amount: Double, mode: String, onHand: Double): Triple<Double, Double, Double> = when (mode) {
-        "capital" -> Triple(0.0, 0.0, amount)
-        "available" -> {
-            val cash = amount.coerceAtMost(onHand.coerceAtLeast(0.0))
-            Triple(cash, (amount - cash).coerceAtLeast(0.0), 0.0)
-        }
-        else -> Triple(amount, 0.0, 0.0)   // "cash"
-    }
-
-    private fun fundingLabel(mode: String): String = when (mode) {
-        "capital" -> "owner capital"
-        "available" -> "cash + payable"
-        else -> "cash"
+    /** Human summary of where a payment's money actually came from, for the audit trail. */
+    private fun fundingLabel(plan: FundingPlan): String {
+        val parts = ArrayList<String>(4)
+        if (plan.fromTill > CENT) parts += "till"
+        if (plan.fromSafe > CENT) parts += "safe"
+        if (plan.outside > CENT) parts += if (plan.outsideKind == "loan") "a loan" else "owner money"
+        if (plan.payable > CENT) parts += "credit"
+        return if (parts.isEmpty()) "nothing" else parts.joinToString(" + ")
     }
 
     /** Next auto-post instant for a period, from [from]. */
@@ -693,14 +1459,17 @@ class PosRepository(private val db: PosDatabase) {
      * (a "+N pending" badge) while its current sellable stock is untouched.
      *
      * PAYMENT (§10.3) — buying stock is a CASH → INVENTORY asset purchase, NOT an expense:
-     * [payNow] cash drains the drawer through a `cash_txns` "purchase" row (never an
+     * the cash paid drains the shop's cash through `cash_txns` "purchase" rows (never an
      * `expenses` row, so it never reduces derived net profit — the goods only affect profit
-     * later via cost-of-goods-sold when sold). [fundingMode] mirrors B3's shortfall choice:
-     *  - "cash"      → pay [payNow] fully from cash.
-     *  - "available" → pay what cash there is, remainder → supplier accounts payable.
-     *  - "capital"   → owner covers [payNow] out of pocket (cash untouched).
-     * Whatever of the order total isn't covered becomes `payableRemainder` (money owed to
-     * the supplier).
+     * later via cost-of-goods-sold when sold).
+     *
+     * FUNDING (§4) follows the same **TILL → SAFE → OUTSIDE FUNDS → abort** waterfall as
+     * every other payment: [fundingMode] is passed to [planFunding] (see it for the full
+     * vocabulary — "till", "safe", "waterfall", "capital", "loan", "none", legacy "cash").
+     * The cash side posts per location, the outside side becomes an [OutsideFund] row, and
+     * whatever of the order total isn't covered becomes `payableRemainder` (money owed to
+     * the supplier). [PurchaseOrder.capitalPaid] now means "paid from outside funds"; which
+     * kind of outside money it was lives on the [OutsideFund] row.
      */
     suspend fun createPurchaseOrder(
         businessId: String,
@@ -712,7 +1481,8 @@ class PosRepository(private val db: PosDatabase) {
         payNow: Double,
         fundingMode: String,
         cashierId: String? = null,
-        cashierName: String? = null
+        cashierName: String? = null,
+        outsideSource: String? = null
     ): String {
         val stamp = now()
         val total = lines.sumOf { it.qty * it.unitCost }
@@ -728,17 +1498,13 @@ class PosRepository(private val db: PosDatabase) {
             sentAt = stamp,
             updatedAt = stamp
         )
+        val want = payNow.coerceIn(0.0, total)
+        val plan = planFundingNow(businessId, want, fundingMode)
         db.withTransaction {
-            val onHand = cashOnHandOnce(businessId).coerceAtLeast(0.0)
-            val want = payNow.coerceIn(0.0, total)
-            val cash: Double
-            val capital: Double
-            when (fundingMode) {
-                "capital" -> { cash = 0.0; capital = want }
-                "available" -> { cash = want.coerceAtMost(onHand); capital = 0.0 }
-                "none" -> { cash = 0.0; capital = 0.0 }
-                else -> { cash = want; capital = 0.0 }   // "cash"
-            }
+            val cash = plan.cash
+            val capital = plan.outside
+            // Anything the up-front payment didn't cover is owed to the supplier — both
+            // the deliberate shortfall (payNow < total) and any waterfall remainder.
             val payable = (total - cash - capital).coerceAtLeast(0.0)
 
             // Persist the header + its lines (stamping the new PO id), pre-creating /
@@ -786,18 +1552,12 @@ class PosRepository(private val db: PosDatabase) {
             )
             poDao.insertLines(savedLines)
 
-            if (cash > CENT) {
-                cashTxnDao.insert(
-                    CashTxn(
-                        businessId = businessId, type = "purchase", amount = -cash,
-                        source = fundingLabel(fundingMode),
-                        note = "PO ${po.ref} · ${supplierName.ifBlank { "supplier" }}",
-                        refType = "purchase_order", refId = po.id,
-                        createdBy = cashierId, createdByName = cashierName,
-                        createdAt = stamp, updatedAt = stamp
-                    )
-                )
-            }
+            postFunding(
+                businessId = businessId, plan = plan, type = "purchase",
+                note = "PO ${po.ref} · ${supplierName.ifBlank { "supplier" }}",
+                refType = "purchase_order", refId = po.id, outsideSource = outsideSource,
+                cashierId = cashierId, cashierName = cashierName, stamp = stamp
+            )
             logAudit(
                 AuditEntry(
                     businessId = businessId, action = "purchase_created",
@@ -922,34 +1682,34 @@ class PosRepository(private val db: PosDatabase) {
     }
 
     /**
-     * Settle (part of) a supplier's accounts payable on a PO from cash-on-hand. [mode]:
-     * "cash" pays the whole remaining balance; "available" pays only what cash there is
-     * (the rest stays owed). Drains the drawer via a `cash_txns` "purchase" row (still an
-     * asset purchase, never an expense). Atomic. No-op if nothing is owed / no cash.
+     * Settle (part of) a supplier's accounts payable on a PO. [mode] is the funding choice
+     * from [planFunding] — the same TILL → SAFE → OUTSIDE waterfall as any other payment;
+     * "waterfall" pays only what the two locations actually hold and leaves the rest owed.
+     * Drains cash via `cash_txns` "purchase" rows (still an asset purchase, never an
+     * expense). Atomic. No-op if nothing is owed / nothing can be paid.
      */
     suspend fun recordSupplierPayment(
-        poId: String, mode: String, cashierId: String? = null, cashierName: String? = null
+        poId: String, mode: String, cashierId: String? = null, cashierName: String? = null,
+        outsideSource: String? = null
     ) {
         val po = poDao.getById(poId) ?: return
         val remainder = po.payableRemainder
         if (remainder <= CENT) return
         val stamp = now()
+        val plan = planFundingNow(po.businessId, remainder, mode)
+        val pay = plan.cash + plan.outside
+        if (pay <= CENT) return
         db.withTransaction {
-            val onHand = cashOnHandOnce(po.businessId).coerceAtLeast(0.0)
-            val pay = if (mode == "available") remainder.coerceAtMost(onHand) else remainder
-            if (pay <= CENT) return@withTransaction
-            cashTxnDao.insert(
-                CashTxn(
-                    businessId = po.businessId, type = "purchase", amount = -pay,
-                    source = "supplier payment", note = "PO ${po.ref} balance",
-                    refType = "purchase_order", refId = po.id,
-                    createdBy = cashierId, createdByName = cashierName,
-                    createdAt = stamp, updatedAt = stamp
-                )
+            postFunding(
+                businessId = po.businessId, plan = plan, type = "purchase",
+                note = "PO ${po.ref} balance",
+                refType = "purchase_order", refId = po.id, outsideSource = outsideSource,
+                cashierId = cashierId, cashierName = cashierName, stamp = stamp
             )
             poDao.upsert(
                 po.copy(
-                    cashPaid = po.cashPaid + pay,
+                    cashPaid = po.cashPaid + plan.cash,
+                    capitalPaid = po.capitalPaid + plan.outside,
                     payableRemainder = (remainder - pay).coerceAtLeast(0.0),
                     updatedAt = stamp, pendingSync = true
                 )
@@ -958,7 +1718,8 @@ class PosRepository(private val db: PosDatabase) {
                 AuditEntry(
                     businessId = po.businessId, action = "purchase_payment",
                     entityType = "purchase_order", entityId = po.id,
-                    summary = "Paid ${fmtMoney(pay)} to ${po.supplierName.ifBlank { "supplier" }} on ${po.ref}",
+                    summary = "Paid ${fmtMoney(pay)} to ${po.supplierName.ifBlank { "supplier" }} " +
+                        "on ${po.ref} from ${fundingLabel(plan)}",
                     createdBy = cashierId, createdByName = cashierName
                 )
             )
@@ -1149,12 +1910,16 @@ class PosRepository(private val db: PosDatabase) {
             // Cash-on-hand ledger (B3): only PHYSICAL cash moves the drawer. Net cash in
             // = cash tenders received − change actually handed back. Mobile-money/card
             // tenders don't touch cash-on-hand. Skip a zero net (e.g. a card-only sale).
+            //
+            // LOCATION (§4): a sale happens at the counter, so its cash lands in the TILL.
+            // It only reaches the safe when the owner closes the day and moves it there.
             val cashTendered = tenders.filter { it.method == "cash" }.sumOf { it.amount }
             val netCashIn = cashTendered - changeGivenActual
             if (kotlin.math.abs(netCashIn) > CENT) {
                 cashTxnDao.insert(
                     CashTxn(
                         businessId = businessId, type = "sale", amount = netCashIn,
+                        location = CashLocation.TILL,
                         source = "cash", note = "Sale #$receiptNo",
                         refType = "sale", refId = saleId,
                         createdBy = cashierId, createdByName = cashierName,
@@ -1869,9 +2634,11 @@ class PosRepository(private val db: PosDatabase) {
                 )
             }
             // The whole handed-over amount left the drawer — settled part AND any excess.
+            // Change is handed over the counter, so it comes out of the TILL (§4).
             cashTxnDao.insert(
                 CashTxn(
                     businessId = businessId, type = "change_payout", amount = -amount,
+                    location = CashLocation.TILL,
                     source = "cash", note = note ?: "Change paid out",
                     refType = "customer", refId = customerId,
                     createdBy = cashierId, createdByName = cashierName,
@@ -2012,6 +2779,8 @@ class PosRepository(private val db: PosDatabase) {
                 cashTxnDao.insert(
                     CashTxn(
                         businessId = businessId, type = "refund", amount = -cashPaidNow,
+                        // Handed back over the counter, so it comes out of the TILL (§4).
+                        location = CashLocation.TILL,
                         source = "cash", note = "Refund on $receiptLabel",
                         refType = "refund", refId = refundId,
                         createdBy = cashierId, createdByName = cashierName,
@@ -2106,6 +2875,7 @@ class PosRepository(private val db: PosDatabase) {
                 cashTxnDao.insert(
                     CashTxn(
                         businessId = refund.businessId, type = "refund", amount = -tender.amount,
+                        location = CashLocation.TILL,   // over the counter, out of the drawer
                         source = "cash",
                         note = "Refund payout on #${refund.saleReceiptNo ?: refund.saleId.take(8)}",
                         refType = "refund", refId = refundId,
@@ -2543,6 +3313,13 @@ class PosRepository(private val db: PosDatabase) {
      * is marked pendingSync and rides the ordinary customer sync out to every device — then
      * records [StaffRequest.applied]=true. This is IDEMPOTENT: the pending-status guard above
      * plus the `applied` flag stop any double-application if the decided row is re-pulled.
+     *
+     * ★ The same machinery now carries `safe_withdrawal` (§4): approving one moves the
+     * approved amount OUT OF THE SAFE AND INTO THE TILL via [withdrawFromSafe] — the
+     * physical act of the owner opening the safe — so the cashier can then pay from a
+     * drawer that has the money. Because MONEY MOVES here, idempotency is not optional:
+     * the `status != "pending"` guard at the top and the `applied` flag mean a re-pulled
+     * decided row can never open the safe twice.
      */
     suspend fun decideStaffRequest(
         id: String, approve: Boolean, byId: String?, byName: String?, approvedAmount: Double? = null
@@ -2560,6 +3337,17 @@ class PosRepository(private val db: PosDatabase) {
                 saveCustomer(cust.copy(creditLimit = effAmount))
                 applied = true
             }
+        }
+        if (approve && !req.applied && req.type == "safe_withdrawal" && (effAmount ?: 0.0) > CENT) {
+            // Open the safe for exactly the approved amount and put it in the till, so
+            // the requester can pay from the drawer. Clamped to what the safe holds.
+            val moved = withdrawFromSafe(
+                businessId = req.businessId,
+                amount = effAmount ?: 0.0,
+                reason = req.note ?: req.targetName,
+                cashierId = byId, cashierName = byName
+            )
+            applied = moved > CENT
         }
         val decided = req.copy(
             status = if (approve) "approved" else "denied",
@@ -2679,6 +3467,8 @@ class PosRepository(private val db: PosDatabase) {
                 cashTxnDao.insert(
                     CashTxn(
                         businessId = r.businessId, type = "adjust", amount = cashPaidOut,
+                        // The payout left the drawer, so the reversal goes back into it.
+                        location = CashLocation.TILL,
                         source = "cash",
                         note = "Void refund on #${r.saleReceiptNo ?: r.saleId.take(8)}",
                         refType = "refund", refId = refundId,
@@ -2744,7 +3534,12 @@ class PosRepository(private val db: PosDatabase) {
     /** Count of local rows not yet pushed to the cloud — feeds the "not synced" alert.
      *  B3/B4 excluded expenses, cash, suppliers and purchase orders while they were
      *  local-only; they sync now, so leaving them out would UNDER-report and make the
-     *  indicator lie. All five are counted. */
+     *  indicator lie. All five are counted.
+     *
+     *  `day_closes` and `outside_funds` are deliberately EXCLUDED: they are sync-READY but
+     *  no push is wired (the cloud schema has no such tables), so their rows stay
+     *  `pendingSync = 1` forever. Counting them would pin the "not synced" alert on
+     *  permanently and teach the owner to ignore it. */
     suspend fun pendingSyncCount(): Int =
         businessDao.pending().size + itemDao.pending().size + saleDao.pendingSales().size +
             customerDao.pending().size + creditDao.pending().size + refundDao.pending().size +
@@ -2768,11 +3563,84 @@ class PosRepository(private val db: PosDatabase) {
         // Opening cash float (B3): the starting cash-on-hand the admin sets.
         const val KEY_OPENING_FLOAT = "cash_opening_float"
 
+        /**
+         * The TILL FLOAT TARGET (§2/§3): how much change money the owner wants left in
+         * the drawer after a close, and the level "Top up float" brings it back to. Set
+         * inline in the close/top-up flows — deliberately NOT buried in Settings, because
+         * it is a decision the owner makes while looking at the actual cash.
+         */
+        const val KEY_FLOAT_TARGET = "cash_float_target"
+        /** Default float target when the owner has never set one. */
+        const val DEFAULT_FLOAT_TARGET = 100.0
+
+        /**
+         * How far a close-of-day count may miss before a NOTE is required (§2). Small
+         * rounding noise should not force typing; a real discrepancy should. Admin-set.
+         */
+        const val KEY_VARIANCE_NOTE_THRESHOLD = "cash_variance_note_threshold"
+        /** Default: anything over a dollar has to be explained. */
+        const val DEFAULT_VARIANCE_NOTE_THRESHOLD = 1.0
+
         /** Permanent per-device receipt prefix (see [deviceCode]). Write-once. */
         const val KEY_DEVICE_CODE = "device_receipt_code"
         /** Confusable-free alphabet — no I, O, 0 or 1, so a code is safe to read aloud. */
         private const val DEVICE_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
         private const val DEVICE_CODE_LEN = 3
+
+        /**
+         * Build the funding plan for [amount] under [mode], given the two live balances.
+         *
+         * ON THE COMPANION, not the instance, ON PURPOSE: this function decides where
+         * every dollar of a payment comes from, so it must be checkable WITHOUT a
+         * database. [com.portionspot.pos.data.CashFundingTest] calls it directly and
+         * asserts that every plan accounts for exactly the amount being paid — a plan
+         * that did not add up would silently create or destroy money in the ledger.
+         *
+         * Modes, mirroring the order the owner actually reaches for money
+         * (**TILL → SAFE → OUTSIDE FUNDS → abort**):
+         *  - "till"      — take it all from the drawer (the caller offers this only when
+         *                  the drawer covers it).
+         *  - "safe"      — take it all from the safe (admin-approved, every time).
+         *  - "waterfall" — TILL first, then SAFE, then whatever is left becomes PAYABLE.
+         *                  This is the "take what's available" path, now aware of BOTH
+         *                  locations.
+         *  - "capital"   — the owner covers it out of pocket (shop cash untouched).
+         *  - "loan"      — borrowed money covers it (a liability; shop cash untouched).
+         *  - "none"      — pay nothing now; the whole amount is owed.
+         *  - "cash"      — LEGACY, kept working: pay the FULL amount from shop cash,
+         *                  drawer first and the remainder from the safe. It never creates
+         *                  a payable, which is exactly what it did before the split.
+         *
+         * A negative balance (an over-drawn drawer) supplies nothing — it is clamped to
+         * zero rather than treated as spendable.
+         */
+        fun planFunding(amount: Double, mode: String, till: Double, safe: Double): FundingPlan {
+            val want = amount.coerceAtLeast(0.0)
+            if (want <= CENT) return FundingPlan()
+            val t = till.coerceAtLeast(0.0)
+            val s = safe.coerceAtLeast(0.0)
+            return when (mode) {
+                "capital" -> FundingPlan(outside = want, outsideKind = "capital")
+                "loan" -> FundingPlan(outside = want, outsideKind = "loan")
+                "none" -> FundingPlan(payable = want)
+                "safe" -> FundingPlan(fromSafe = want)
+                "till" -> FundingPlan(fromTill = want)
+                "available", "waterfall" -> {
+                    val fromTill = want.coerceAtMost(t)
+                    val fromSafe = (want - fromTill).coerceAtMost(s)
+                    FundingPlan(
+                        fromTill = fromTill,
+                        fromSafe = fromSafe,
+                        payable = (want - fromTill - fromSafe).coerceAtLeast(0.0)
+                    )
+                }
+                // "cash" (legacy): the whole amount comes out of shop cash, drawer first.
+                else -> {
+                    val fromTill = want.coerceAtMost(t)
+                    FundingPlan(fromTill = fromTill, fromSafe = want - fromTill)
+                }
+            }
+        }
     }
 
     // ---- reports: tender breakdown from actual split amounts --------------

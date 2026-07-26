@@ -686,6 +686,135 @@ val MIGRATION_30_31 = object : Migration(30, 31) {
     }
 }
 
+/**
+ * v31 → v32 — TWO CASH LOCATIONS (till + safe). Adds `cash_txns.location`.
+ *
+ * The shop has no bank: its cash sits on-site in exactly two places, a working TILL float
+ * and a SAFE holding the day's takings. Rather than a second ledger (which would drift),
+ * the existing append-only ledger gains a location per movement. Cash-on-hand keeps its
+ * meaning — the SUM over both locations — because a move between them is written as a
+ * matching `transfer_out`/`transfer_in` PAIR that nets to zero.
+ *
+ * BACKFILL: every existing row defaults to 'till'. That is not a guess — before this
+ * version there was only the drawer, so all historical cash was till cash. The safe
+ * starts empty and fills on the first close of day.
+ *
+ * LOCAL-ONLY: the cloud `cash_txns` table has no `location`, so the column is absent from
+ * CashTxnDto and never pushed; a pulled row keeps whatever this device recorded.
+ */
+val MIGRATION_31_32 = object : Migration(31, 32) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE cash_txns ADD COLUMN location TEXT NOT NULL DEFAULT 'till'")
+    }
+}
+
+/**
+ * v32 → v33 — CLOSE THE DAY. Adds the `day_closes` table: one permanent row per counted
+ * close, holding what the ledger expected, what was physically counted, the variance
+ * between them, how much was moved into the safe and who closed.
+ *
+ * The variance is kept here as well as in the ledger (as a `variance` cash row) because
+ * the two answer different questions: the ledger keeps the BALANCE right, this keeps the
+ * HISTORY — including per-cashier attribution, so a repeat offender is visible.
+ *
+ * Brand-new table, so nothing existing is touched. Sync-ready (localId / updatedAt /
+ * pendingSync) but deliberately NOT wired to push or pull: the cloud schema has no
+ * `day_closes` and this phase does not change it.
+ */
+val MIGRATION_32_33 = object : Migration(32, 33) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS day_closes (" +
+                "id TEXT NOT NULL PRIMARY KEY, " +
+                "localId TEXT NOT NULL DEFAULT '', " +
+                "businessId TEXT NOT NULL, " +
+                "dayStart INTEGER NOT NULL, " +
+                "expectedCash REAL NOT NULL DEFAULT 0, " +
+                "countedCash REAL NOT NULL DEFAULT 0, " +
+                "variance REAL NOT NULL DEFAULT 0, " +
+                "movedToSafe REAL NOT NULL DEFAULT 0, " +
+                "floatTarget REAL NOT NULL DEFAULT 0, " +
+                "note TEXT, " +
+                "closedBy TEXT, " +
+                "closedByName TEXT, " +
+                "closedAt INTEGER NOT NULL, " +
+                "updatedAt INTEGER NOT NULL, " +
+                "deleted INTEGER NOT NULL DEFAULT 0, " +
+                "pendingSync INTEGER NOT NULL DEFAULT 1)"
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_day_closes_businessId ON day_closes (businessId)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_day_closes_closedAt ON day_closes (closedAt)")
+    }
+}
+
+/**
+ * v33 → v34 — OUTSIDE FUNDS (owner capital, loans, drawings). Adds `outside_funds`: the
+ * equity/liability ledger that sits beside the cash ledger, so money from outside the
+ * shop can never be mistaken for takings.
+ *
+ * BACKFILL matters here. Owner-funded money was already being recorded, just scattered:
+ * `expenses.capitalPortion` (a bill the owner covered out of pocket) and
+ * `purchase_orders.capitalPaid` (stock the owner paid for). Both are copied in as
+ * `kind='capital', direction='in'` rows carrying their source ref, so the owner's running
+ * "put in" total is CONTINUOUS across the upgrade instead of resetting to zero on a
+ * number they have been watching. Nothing is deleted or moved — the source columns stay
+ * exactly as they are; this is the one ledger that now totals them.
+ *
+ * `pendingSync = 0` on the backfilled rows: they are reconstructions of history, not new
+ * facts, so they should never queue for an upload that (deliberately) does not exist.
+ *
+ * Sync-ready but NOT wired to push/pull — the cloud schema has no `outside_funds`.
+ */
+val MIGRATION_33_34 = object : Migration(33, 34) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS outside_funds (" +
+                "id TEXT NOT NULL PRIMARY KEY, " +
+                "localId TEXT NOT NULL DEFAULT '', " +
+                "businessId TEXT NOT NULL, " +
+                "kind TEXT NOT NULL DEFAULT 'capital', " +
+                "direction TEXT NOT NULL DEFAULT 'in', " +
+                "amount REAL NOT NULL DEFAULT 0, " +
+                "source TEXT, " +
+                "note TEXT, " +
+                "refType TEXT, " +
+                "refId TEXT, " +
+                "createdBy TEXT, " +
+                "createdByName TEXT, " +
+                "createdAt INTEGER NOT NULL, " +
+                "updatedAt INTEGER NOT NULL, " +
+                "deleted INTEGER NOT NULL DEFAULT 0, " +
+                "pendingSync INTEGER NOT NULL DEFAULT 1)"
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_outside_funds_businessId ON outside_funds (businessId)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_outside_funds_createdAt ON outside_funds (createdAt)")
+
+        // Backfill 1: bills the owner covered out of pocket.
+        db.execSQL(
+            "INSERT INTO outside_funds (" +
+                "id, localId, businessId, kind, direction, amount, source, note, " +
+                "refType, refId, createdBy, createdByName, createdAt, updatedAt, deleted, pendingSync) " +
+                "SELECT 'of-exp-' || e.id, 'of-exp-' || e.id, e.businessId, 'capital', 'in', " +
+                "e.capitalPortion, 'Owner', 'Covered ' || e.category, 'expense', e.id, " +
+                "e.approvedBy, e.approvedByName, COALESCE(e.postedAt, e.createdAt), " +
+                "COALESCE(e.postedAt, e.createdAt), 0, 0 " +
+                "FROM expenses e WHERE e.deleted = 0 AND e.isTemplate = 0 " +
+                "AND e.status = 'approved' AND e.capitalPortion > 0"
+        )
+        // Backfill 2: stock the owner paid for.
+        db.execSQL(
+            "INSERT INTO outside_funds (" +
+                "id, localId, businessId, kind, direction, amount, source, note, " +
+                "refType, refId, createdBy, createdByName, createdAt, updatedAt, deleted, pendingSync) " +
+                "SELECT 'of-po-' || p.id, 'of-po-' || p.id, p.businessId, 'capital', 'in', " +
+                "p.capitalPaid, 'Owner', 'Covered ' || p.ref, 'purchase_order', p.id, " +
+                "NULL, NULL, p.createdAt, p.createdAt, 0, 0 " +
+                "FROM purchase_orders p WHERE p.deleted = 0 AND p.status != 'cancelled' " +
+                "AND p.capitalPaid > 0"
+        )
+    }
+}
+
 @Database(
     entities = [
         Business::class,
@@ -708,9 +837,11 @@ val MIGRATION_30_31 = object : Migration(30, 31) {
         MobileMoneyReceipt::class,
         AppNotification::class,
         AuditEntry::class,
-        StaffRequest::class
+        StaffRequest::class,
+        DayClose::class,
+        OutsideFund::class
     ],
-    version = 31,
+    version = 34,
     exportSchema = false
 )
 abstract class PosDatabase : RoomDatabase() {
@@ -731,6 +862,8 @@ abstract class PosDatabase : RoomDatabase() {
     abstract fun notificationDao(): NotificationDao
     abstract fun auditDao(): AuditDao
     abstract fun staffRequestDao(): StaffRequestDao
+    abstract fun dayCloseDao(): DayCloseDao
+    abstract fun outsideFundDao(): OutsideFundDao
 
     companion object {
         @Volatile
@@ -758,7 +891,8 @@ abstract class PosDatabase : RoomDatabase() {
                         MIGRATION_20_21, MIGRATION_21_22, MIGRATION_22_23,
                         MIGRATION_23_24, MIGRATION_24_25, MIGRATION_25_26,
                         MIGRATION_26_27, MIGRATION_27_28, MIGRATION_28_29,
-                        MIGRATION_29_30, MIGRATION_30_31
+                        MIGRATION_29_30, MIGRATION_30_31, MIGRATION_31_32,
+                        MIGRATION_32_33, MIGRATION_33_34
                     )
                     .fallbackToDestructiveMigration()
                     .build()
