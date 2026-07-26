@@ -60,14 +60,27 @@ internal object IsoTime {
     private const val PATTERN = "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"
     const val EPOCH = "1970-01-01T00:00:00.000Z"
 
+    private val FRACTION = Regex("""\.(\d+)""")
+
     private fun formatter() = SimpleDateFormat(PATTERN, Locale.US)
         .apply { timeZone = TimeZone.getTimeZone("UTC") }
 
     fun toIso(millis: Long): String = formatter().format(Date(millis))
 
+    /**
+     * Force the fractional-seconds part to exactly 3 digits. Postgres/PostgREST emit
+     * microseconds ("...:02.123456+00:00"), but SimpleDateFormat's `SSS` greedily eats
+     * every fraction digit and treats the lot as MILLISECONDS — ".123456" would parse
+     * as +123 seconds, ".999999" as nearly +17 minutes. Padding/truncating here keeps
+     * the parsed instant honest. A timestamp has no other '.', so the regex is safe.
+     */
+    private fun normalizeFraction(iso: String): String =
+        FRACTION.replace(iso) { m -> "." + m.groupValues[1].padEnd(3, '0').take(3) }
+
     /** Parse the several timestamp shapes PostgREST emits (with/without millis or zone). */
     fun toMillis(iso: String?): Long {
         if (iso.isNullOrBlank()) return 0L
+        val normalized = normalizeFraction(iso)
         val patterns = listOf(
             PATTERN,
             "yyyy-MM-dd'T'HH:mm:ss'Z'",
@@ -79,7 +92,7 @@ internal object IsoTime {
             runCatching {
                 SimpleDateFormat(p, Locale.US)
                     .apply { timeZone = TimeZone.getTimeZone("UTC") }
-                    .parse(iso)?.time
+                    .parse(normalized)?.time
             }.getOrNull()?.let { return it }
         }
         return 0L
