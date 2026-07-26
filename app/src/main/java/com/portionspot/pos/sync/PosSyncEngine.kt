@@ -44,6 +44,14 @@ sealed class SyncOutcome {
 private data class PushResult(val pushed: Int, val errors: List<String>)
 
 /**
+ * Postgres "new row violates row-level security policy". On a staff-gated database
+ * (one where writes require a signed-in staff account) this is what EVERY table
+ * returns when the device is pushing with only the anon key — i.e. connected to the
+ * database but not signed in.
+ */
+private const val PG_RLS_VIOLATION = "42501"
+
+/**
  * Two-way sync against the user's own Supabase. Local Room is always the
  * source of truth; this just mirrors it to/from the cloud:
  *
@@ -145,11 +153,22 @@ class PosSyncEngine(
         // table name and swallowed so the remaining tables still get their turn. Only
         // the block that reaches its own markSynced marks its rows clean, so a failed
         // table's rows stay pending and retry next pass.
+        // Tables the database REFUSED on row-level-security grounds. Collected apart from
+        // real errors because they all share ONE cause and one fix: every table failing
+        // this way produced its own wall of raw Postgres JSON, which told the owner
+        // nothing. They are collapsed into a single actionable line below.
+        val rlsBlocked = mutableListOf<String>()
+
         suspend fun pushTable(table: String, block: suspend () -> Int) {
             try {
                 n += block()
             } catch (e: Exception) {
-                errors.add("$table: ${e.message ?: e.javaClass.simpleName}")
+                val raw = e.message ?: e.javaClass.simpleName
+                if (raw.contains(PG_RLS_VIOLATION) || raw.contains("row-level security", true)) {
+                    rlsBlocked += table
+                } else {
+                    errors.add("$table: $raw")
+                }
             }
         }
 
@@ -436,6 +455,24 @@ class PosSyncEngine(
             )
             auditDao.markSynced(rows.map { it.id })
             rows.size
+        }
+
+        // One cause, one line. A staff-gated database refuses EVERY table the same way,
+        // so reporting each one separately buried the actual problem — and the fix — in
+        // a wall of Postgres JSON. Nothing is lost either way: a refused table never
+        // reaches its markSynced, so its rows stay pending and go up once this is fixed.
+        if (rlsBlocked.isNotEmpty()) {
+            val held = "${rlsBlocked.size} table(s) held back, nothing lost"
+            errors.add(
+                0,
+                if (accessToken() == null) {
+                    "Not signed in — this database only accepts uploads from a signed-in " +
+                        "staff account. Sign in under Settings, then tap Sync now ($held)."
+                } else {
+                    "Your staff account cannot upload to this database — it may have been " +
+                        "deactivated, or it is not on the shop's staff list ($held)."
+                }
+            )
         }
 
         return PushResult(n, errors)
