@@ -120,6 +120,31 @@ data class Item(
     val pendingSync: Boolean = true
 )
 
+/**
+ * A free-form, user-defined attribute attached to an [Item] — e.g.
+ * key="car" value="Honda Fit", key="brand" value="NewBlu", key="part_number" value="A111K".
+ *
+ * One item can carry MANY rows with the SAME [key] (a brake pad that fits both a
+ * Honda Fit and a Toyota Vitz gets two rows with key="car"), which is how a part
+ * fitting multiple cars is modelled without a rigid per-attribute join table.
+ * Search/filter just matches against ([key], [value]) pairs for a business.
+ */
+@Entity(
+    tableName = "item_attributes",
+    indices = [Index("businessId"), Index("itemId"), Index(value = ["businessId", "key", "value"])]
+)
+data class ItemAttribute(
+    @PrimaryKey val id: String = newId(),
+    val businessId: String,
+    val itemId: String,
+    val key: String,          // user-typed attribute name, e.g. "car", "brand", "part_number"
+    val value: String,        // user-typed value, e.g. "Honda Fit", "NewBlu", "A111K"
+    val updatedAt: Long = now(),
+    val deleted: Boolean = false,
+    /** Local-only: true => has unsynced local edits to push. Never sent to cloud. */
+    val pendingSync: Boolean = true
+)
+
 /** A COMPLETED receipt (frozen snapshot). The live cart stays in memory. */
 @Entity(
     tableName = "sales",

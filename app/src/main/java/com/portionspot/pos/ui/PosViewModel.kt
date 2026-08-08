@@ -11,6 +11,7 @@ import com.portionspot.pos.data.CustomerWithBalance
 import com.portionspot.pos.data.Expense
 import com.portionspot.pos.data.Supplier
 import com.portionspot.pos.data.Item
+import com.portionspot.pos.data.ItemAttribute
 import com.portionspot.pos.data.AppNotification
 import com.portionspot.pos.data.AuditEntry
 import com.portionspot.pos.data.CashierDay
@@ -105,6 +106,24 @@ class PosViewModel(
         businessId.filterNotNull()
             .flatMapLatest { repo.itemsFlow(it) }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Custom attributes (car, brand, part number, ...) grouped by item id. */
+    val itemAttributes: StateFlow<Map<String, List<ItemAttribute>>> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.itemAttributesFlow(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyMap())
+
+    /** Every attribute key used so far, e.g. ["car", "brand", "part_number"] — for autocomplete. */
+    val itemAttributeKeys: StateFlow<List<String>> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.itemAttributeKeysFlow(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Replace an item's full attribute set, e.g. [("car", "Honda Fit"), ("brand", "NewBlu")]. */
+    fun saveItemAttributes(itemId: String, attrs: List<Pair<String, String>>) {
+        val bid = businessId.value ?: return
+        viewModelScope.launch { repo.saveAttributesForItem(itemId, bid, attrs) }
+    }
 
     val recentSales: StateFlow<List<SaleEntity>> =
         businessId.filterNotNull()

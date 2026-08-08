@@ -316,10 +316,33 @@ val MIGRATION_14_15 = object : Migration(14, 15) {
     }
 }
 
+val MIGRATION_15_16 = object : Migration(15, 16) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS item_attributes (" +
+                "id TEXT NOT NULL PRIMARY KEY, " +
+                "businessId TEXT NOT NULL, " +
+                "itemId TEXT NOT NULL, " +
+                "key TEXT NOT NULL, " +
+                "value TEXT NOT NULL, " +
+                "updatedAt INTEGER NOT NULL, " +
+                "deleted INTEGER NOT NULL DEFAULT 0, " +
+                "pendingSync INTEGER NOT NULL DEFAULT 1)"
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_item_attributes_businessId ON item_attributes (businessId)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_item_attributes_itemId ON item_attributes (itemId)")
+        db.execSQL(
+            "CREATE INDEX IF NOT EXISTS index_item_attributes_businessId_key_value " +
+                "ON item_attributes (businessId, key, value)"
+        )
+    }
+}
+
 @Database(
     entities = [
         Business::class,
         Item::class,
+        ItemAttribute::class,
         SaleEntity::class,
         SaleLine::class,
         SalePayment::class,
@@ -338,12 +361,13 @@ val MIGRATION_14_15 = object : Migration(14, 15) {
         AppNotification::class,
         AuditEntry::class
     ],
-    version = 15,
+    version = 16,
     exportSchema = false
 )
 abstract class PosDatabase : RoomDatabase() {
     abstract fun businessDao(): BusinessDao
     abstract fun itemDao(): ItemDao
+    abstract fun itemAttributeDao(): ItemAttributeDao
     abstract fun saleDao(): SaleDao
     abstract fun salePaymentDao(): SalePaymentDao
     abstract fun stockMovementDao(): StockMovementDao
@@ -379,7 +403,7 @@ abstract class PosDatabase : RoomDatabase() {
                     .addMigrations(
                         MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9,
                         MIGRATION_9_10, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14,
-                        MIGRATION_14_15
+                        MIGRATION_14_15, MIGRATION_15_16
                     )
                     .fallbackToDestructiveMigration()
                     .build()

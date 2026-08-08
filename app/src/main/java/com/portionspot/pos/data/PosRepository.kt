@@ -7,6 +7,7 @@ import com.portionspot.pos.notify.NotifThresholds
 import com.portionspot.pos.notify.NotificationEngine
 import com.portionspot.pos.sms.ParsedPayment
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.map
 
 /** Half-a-cent tolerance for money comparisons (guards Double rounding on totals). */
 private const val CENT = 0.005
@@ -19,6 +20,7 @@ class PosRepository(private val db: PosDatabase) {
 
     private val businessDao = db.businessDao()
     private val itemDao = db.itemDao()
+    private val itemAttributeDao = db.itemAttributeDao()
     private val saleDao = db.saleDao()
     private val paymentDao = db.salePaymentDao()
     private val movementDao = db.stockMovementDao()
@@ -44,6 +46,26 @@ class PosRepository(private val db: PosDatabase) {
 
     fun itemsFlow(businessId: String): Flow<List<Item>> =
         itemDao.observeForBusiness(businessId)
+
+    /**
+     * Custom attributes (car, brand, part number, ...) grouped by item id, for the
+     * item editor and for search/filter to match against alongside name/sku/barcode.
+     */
+    fun itemAttributesFlow(businessId: String): Flow<Map<String, List<ItemAttribute>>> =
+        itemAttributeDao.observeForBusiness(businessId).map { rows -> rows.groupBy { it.itemId } }
+
+    /** Every distinct attribute key ever used by this business — powers the editor's key suggestions. */
+    fun itemAttributeKeysFlow(businessId: String): Flow<List<String>> =
+        itemAttributeDao.observeKeysForBusiness(businessId)
+
+    /** Replace an item's full set of (key, value) attributes in one go. */
+    suspend fun saveAttributesForItem(itemId: String, businessId: String, attrs: List<Pair<String, String>>) {
+        val rows = attrs
+            .map { (k, v) -> k.trim() to v.trim() }
+            .filter { (k, v) -> k.isNotEmpty() && v.isNotEmpty() }
+            .map { (k, v) -> ItemAttribute(businessId = businessId, itemId = itemId, key = k, value = v) }
+        itemAttributeDao.replaceForItem(itemId, businessId, rows, now())
+    }
 
     fun recentSalesFlow(businessId: String): Flow<List<SaleEntity>> =
         saleDao.observeRecent(businessId)

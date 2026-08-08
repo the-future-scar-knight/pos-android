@@ -31,6 +31,48 @@ interface BusinessDao {
 }
 
 @Dao
+interface ItemAttributeDao {
+    /** All live attribute rows for a business — used by search/filter and the item editor. */
+    @Query("SELECT * FROM item_attributes WHERE businessId = :businessId AND deleted = 0")
+    fun observeForBusiness(businessId: String): Flow<List<ItemAttribute>>
+
+    @Query("SELECT * FROM item_attributes WHERE itemId = :itemId AND deleted = 0")
+    suspend fun forItemOnce(itemId: String): List<ItemAttribute>
+
+    @Query("SELECT DISTINCT key FROM item_attributes WHERE businessId = :businessId AND deleted = 0 ORDER BY key COLLATE NOCASE ASC")
+    fun observeKeysForBusiness(businessId: String): Flow<List<String>>
+
+    @Upsert
+    suspend fun upsertAll(attrs: List<ItemAttribute>)
+
+    /**
+     * Replace every attribute row for one item with [attrs] (tombstones the rest).
+     * Simplest correct way to save "the current set of attributes" from an editor UI
+     * without having to diff row-by-row.
+     */
+    @Transaction
+    suspend fun replaceForItem(itemId: String, businessId: String, attrs: List<ItemAttribute>, at: Long) {
+        val existing = forItemOnce(itemId)
+        val tombstones = existing.map { it.copy(deleted = true, updatedAt = at, pendingSync = true) }
+        if (tombstones.isNotEmpty()) upsertAll(tombstones)
+        val fresh = attrs.map {
+            it.copy(businessId = businessId, itemId = itemId, updatedAt = at, deleted = false, pendingSync = true)
+        }
+        if (fresh.isNotEmpty()) upsertAll(fresh)
+    }
+
+    // ---- sync ----
+    @Query("SELECT * FROM item_attributes WHERE pendingSync = 1")
+    suspend fun pending(): List<ItemAttribute>
+
+    @Query("UPDATE item_attributes SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun markSynced(ids: List<String>)
+
+    @Query("DELETE FROM item_attributes WHERE businessId = :businessId")
+    suspend fun wipe(businessId: String)
+}
+
+@Dao
 interface ItemDao {
     @Query(
         "SELECT * FROM items WHERE businessId = :businessId AND deleted = 0 AND isActive = 1 " +

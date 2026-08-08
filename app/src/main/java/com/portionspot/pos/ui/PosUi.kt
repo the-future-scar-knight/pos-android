@@ -1704,13 +1704,15 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
     val categories = remember(items) {
         listOf("All") + items.mapNotNull { it.category?.trim()?.takeIf { c -> c.isNotEmpty() } }.distinct()
     }
+    val attributesByItem by vm.itemAttributes.collectAsState()
     val q = search.trim().lowercase()
-    val filtered = remember(items, q, selectedCat) {
+    val filtered = remember(items, attributesByItem, q, selectedCat) {
         items.filter { it.isActive && !it.deleted }.filter { item ->
             val matchesSearch = q.isEmpty() ||
                 item.name.lowercase().contains(q) ||
                 (item.sku?.lowercase()?.contains(q) == true) ||
-                (item.barcode?.lowercase()?.contains(q) == true)
+                (item.barcode?.lowercase()?.contains(q) == true) ||
+                (attributesByItem[item.id]?.any { it.value.lowercase().contains(q) } == true)
             val matchesCat = q.isNotEmpty() || selectedCat == "All" ||
                 (item.category?.equals(selectedCat, ignoreCase = true) == true)
             matchesSearch && matchesCat
@@ -1722,7 +1724,7 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
         Column(Modifier.fillMaxWidth().background(t.surface1).padding(horizontal = 12.dp, vertical = 8.dp)) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.weight(1f)) {
-                    SearchField(value = search, onValue = { search = it }, onClear = { search = "" })
+                    SearchField(value = search, onValue = { search = it }, onClear = { search = "" }, placeholder = "Search name, SKU, brand, part #, car…")
                 }
                 Spacer(Modifier.width(8.dp))
                 FilledTonalIconButton(onClick = { scanning = true }) {
@@ -1964,7 +1966,12 @@ private fun StockBadge(item: Item) {
 
 /** Search/scan field — pill input matching the web `search-input-wrap`. */
 @Composable
-private fun SearchField(value: String, onValue: (String) -> Unit, onClear: () -> Unit) {
+private fun SearchField(
+    value: String,
+    onValue: (String) -> Unit,
+    onClear: () -> Unit,
+    placeholder: String = "Search or scan SKU…"
+) {
     val t = LocalPosTokens.current
     Row(
         Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(t.surface3)
@@ -1976,7 +1983,7 @@ private fun SearchField(value: String, onValue: (String) -> Unit, onClear: () ->
         Spacer(Modifier.width(8.dp))
         Box(Modifier.weight(1f)) {
             if (value.isEmpty()) {
-                Text("Search or scan SKU…", color = t.inkTertiary, fontSize = 13.sp)
+                Text(placeholder, color = t.inkTertiary, fontSize = 13.sp)
             }
             BasicTextField(
                 value = value,
@@ -3313,25 +3320,32 @@ private fun shareReceipt(
 private fun ItemsScreen(vm: PosViewModel, currency: String) {
     val t = LocalPosTokens.current
     val items by vm.items.collectAsState()
+    val attributesByItem by vm.itemAttributes.collectAsState()
     var showAdd by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<Item?>(null) }
     var search by remember { mutableStateOf("") }
 
     val q = search.trim().lowercase()
-    val shown = remember(items, q) {
+    val shown = remember(items, attributesByItem, q) {
         if (q.isEmpty()) items
         else items.filter { item ->
             item.name.lowercase().contains(q) ||
                 (item.sku?.lowercase()?.contains(q) == true) ||
                 (item.barcode?.lowercase()?.contains(q) == true) ||
-                (item.category?.lowercase()?.contains(q) == true)
+                (item.category?.lowercase()?.contains(q) == true) ||
+                (attributesByItem[item.id]?.any {
+                    it.key.lowercase().contains(q) || it.value.lowercase().contains(q)
+                } == true)
         }
     }
 
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
             Column(Modifier.fillMaxWidth().background(t.surface1).padding(horizontal = 12.dp, vertical = 8.dp)) {
-                SearchField(value = search, onValue = { search = it }, onClear = { search = "" })
+                SearchField(
+                    value = search, onValue = { search = it }, onClear = { search = "" },
+                    placeholder = "Search name, SKU, brand, part #, car…"
+                )
             }
             HorizontalDivider(color = t.surfaceBorder)
             if (shown.isEmpty()) {
