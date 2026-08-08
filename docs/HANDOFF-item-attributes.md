@@ -2,7 +2,10 @@
 
 **Status: IN PROGRESS — code does not build yet.** Local Room + repo + ViewModel +
 search wiring is done. The item add/edit dialog UI (the actual place a user types
-in attributes) is NOT done yet. Do that next, in `PosUi.kt`.
+in attributes) is NOT done yet. Do that next, in `PosUi.kt`. Cloud/Supabase side
+(table + sync) is blocked pending the real production schema — see the
+"Supabase — status as of 2026-08-08 (session 2)" section below before doing
+anything there.
 
 ## Context / decisions already made with the user
 Business: a motor-spares shop. They want to tag stock items with free-form
@@ -123,12 +126,10 @@ Plan (not yet implemented):
 
 ## Not started / deliberately deferred (told to the user)
 
-- **Supabase schema**: no `item_attributes` table SQL added to
-  `pos-supabase-schema.sql` / `supabase-setup.sql` yet. User said they'll give
-  Supabase project access "later" — do this once that happens. Mirror the
-  Room columns (`business_id`, `item_id`, `key`, `value`, `updated_at`,
-  `deleted`), snake_case per the existing schema convention, plus an index on
-  `(business_id, key, value)` for filter performance.
+- **Supabase schema**: see the detailed "Supabase — status as of 2026-08-08
+  (session 2)" section above — this is now the current plan, superseding this
+  bullet. Short version: bridge on `sku`, table name `product_attributes`,
+  blocked on seeing the real production schema first.
 - **Sync engine** (`app/src/main/java/com/portionspot/pos/sync/PosSyncEngine.kt`):
   NOT wired at all. Push is currently hand-listed per table (`products`,
   `customers`, `credit_transactions`, `mobile_money_receipts`, ...) and push is
@@ -143,7 +144,113 @@ Plan (not yet implemented):
   tree (check `app/src/test/java/com/portionspot/pos/sync` and sibling dirs for
   the pattern used by `MIGRATION_14_15` if one exists) — worth adding one.
 
-## How to pick this up
+## Supabase — status as of 2026-08-08 (session 2)
+
+The user gave project details: URL `https://ucgvvxlhdooevngtraje.supabase.co`,
+anon/publishable key `sb_publishable_yRhr2E9xuAvoGX7_8pyy-g_1WskC6w3` (both in
+`Supabase.txt` they uploaded — treat as sensitive, same as any credential).
+
+**Important finding: this repo has TWO different possible cloud schemas, and
+they do NOT match each other.**
+
+1. `supabase-setup.sql` in the repo root defines a self-contained schema:
+   `businesses`, `items` (text PK, one row per product), `sales`, `customers`,
+   `credit_transactions`, `sale_items`, `payment_intents`. This looks like a
+   standalone "just this Android app" setup path.
+
+2. `app/src/main/java/com/portionspot/pos/sync/PosSyncEngine.kt` (the code
+   that actually runs) instead pushes/pulls tables named `products` (bridged
+   by **`sku`**, not id — see `itemDao.pending().filter { sku not blank }` and
+   `api.upsert("products", ..., "sku")`), plus `customers`, `sales`,
+   `credit_transactions`, `mobile_money_receipts`. See `Dtos.kt`'s
+   `ProductDto`/`ProductPushDto` for the exact column names it expects
+   (`stock_boxes`, `stock_units`, `low_stock_threshold`, `retail_price`,
+   `cost_price`, etc. — snake_case, some money fields as strings). **This
+   schema is NOT defined anywhere in this repo** — it's presumed to already
+   exist in whatever Supabase project gets connected.
+
+**Confirmed with the user: their real project (`ucgvvxlhdooevngtraje`) already
+has an existing, separate web POS's live tables** — so it's schema #2 above
+(or something close to it), not the standalone `supabase-setup.sql` one. Do
+NOT run `supabase-setup.sql` against this project without checking first —
+it could clash with or be redundant against tables that already exist.
+
+**Blocked on: reading the real schema.** This sandbox's bash network egress
+is allowlisted (github/npm/pypi-type domains only) and does NOT include
+`*.supabase.co`, so `curl`/`web_fetch` against the project fail with
+`host_not_allowed`. Confirmed via:
+```
+curl -s -D - "https://ucgvvxlhdooevngtraje.supabase.co/rest/v1/" -H "apikey: ..."
+→ HTTP 403, x-deny-reason: host_not_allowed
+```
+**Next session should either:**
+- Ask the user to add `ucgvvxlhdooevngtraje.supabase.co` to network egress
+  settings so it can query directly, or
+- Ask the user to run this in the Supabase SQL editor and paste the result:
+  ```sql
+  select table_name, column_name, data_type, is_nullable
+  from information_schema.columns
+  where table_schema = 'public'
+  order by table_name, ordinal_position;
+  ```
+  Specifically need to confirm: does `products.sku` have a `unique`
+  constraint? (Required for it to safely be the bridge key for the new
+  attributes table below.)
+
+### Proposed cloud table design for the new attributes feature
+
+Discussed with the user and they liked this direction — **not yet created in
+the real database, and not yet reflected in any `.sql` file in the repo.**
+Do both once the real schema is confirmized.
+
+Bridge by **`sku`**, matching how `products` already syncs (by sku, not a
+UUID/bigint id either side owns) — no new id-resolution logic needed, and it
+matches how the sync engine already thinks about products.
+
+```sql
+create table if not exists public.product_attributes (
+    id          bigint generated always as identity primary key,
+    business_id text not null,
+    sku         text not null,        -- bridges to products.sku
+    key         text not null,        -- "car", "brand", "part_number", ...
+    value       text not null,        -- "Honda Fit", "NewBlu", "A111K", ...
+    updated_at  timestamptz not null default now(),
+    deleted     boolean not null default false,
+    unique (sku, key, value)
+);
+
+create index idx_product_attributes_sku       on public.product_attributes (sku);
+create index idx_product_attributes_key_value on public.product_attributes (business_id, key, value);
+```
+
+Rationale (for whoever picks this up — don't relitigate unless new info shows
+up from the real schema dump):
+- **Not JSONB on `products`**: an `attributes jsonb` column would need an
+  array-of-objects to support "fits multiple cars", can't cleanly express a
+  uniqueness constraint on one (attribute, value) pair, and every edit is a
+  read-modify-write of the whole blob (race-prone with two writers: web POS +
+  Android). A side table gives row-level upserts for free.
+- **Not a normalized `vehicles` + join table**: would only fit the "car"
+  attribute; the user explicitly wants fully custom attribute names (decision
+  #1, above), so a fixed vehicles schema is too narrow.
+- **Multi-value per key is just multiple rows**: a part fitting a Honda Fit
+  AND a Toyota Vitz is two rows, `(sku,'car','Honda Fit')` and
+  `(sku,'car','Toyota Vitz')`. No special-casing for "some attributes are
+  single-valued, some aren't."
+- **Search** becomes `select distinct sku from product_attributes where
+  business_id = ? and value ilike '%query%'`, joined back to `products`. If
+  search volume gets heavy, a `pg_trgm` GIN index on `value` would speed up
+  `ilike '%...%'`; not needed for v1.
+
+**Local Room side note:** the local `ItemAttribute` entity (already built,
+see below) currently keys by `itemId` (Android's local UUID), not `sku`,
+because that's the natural key on-device. When wiring the actual sync
+push/pull for this table, follow the same pattern `PosSyncEngine` already
+uses for products: resolve `itemId ↔ sku` via `itemDao.allForBusinessOnce(bid)`
+(there's already a `skuById` map built for this exact purpose in `push()`)
+rather than trying to sync raw `itemId`s to the cloud.
+
+
 
 ```
 git clone https://github.com/the-future-scar-knight/pos-android.git
