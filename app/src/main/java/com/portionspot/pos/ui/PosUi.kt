@@ -216,6 +216,8 @@ import com.portionspot.pos.data.RefundLineInput
 import com.portionspot.pos.data.RefundPayment
 import com.portionspot.pos.data.RefundWithLines
 import com.portionspot.pos.data.computeRefundTotal
+import com.portionspot.pos.data.returnedLineValue
+import com.portionspot.pos.data.saleGoodsValue
 import com.portionspot.pos.data.SaleEntity
 import com.portionspot.pos.data.StaffRequest
 import com.portionspot.pos.data.SaleLine
@@ -9769,8 +9771,12 @@ private fun RefundDialog(
     }
 
     val ls = lines
-    val returnedSubtotal = ls?.sumOf { (returnQty[it.id] ?: 0.0) * it.unitPrice } ?: 0.0
-    val refundTotal = computeRefundTotal(returnedSubtotal, sale.subtotal, sale.total).refundTotal
+    // Must mirror PosRepository.createRefund exactly, or the dialog quotes one figure and
+    // the till hands over another: each line net of its OWN discount/markup, measured
+    // against the sale's goods value on the same basis (NOT the gross sale.subtotal).
+    val returnedSubtotal = ls?.sumOf { returnedLineValue(it, returnQty[it.id] ?: 0.0) } ?: 0.0
+    val refundTotal =
+        computeRefundTotal(returnedSubtotal, saleGoodsValue(ls.orEmpty()), sale.total).refundTotal
     val payoutNow = (payoutText.toDoubleOrNull() ?: refundTotal).coerceIn(0.0, refundTotal)
     val outstanding = (refundTotal - payoutNow).coerceAtLeast(0.0)
     val canOwe = sale.customerId != null

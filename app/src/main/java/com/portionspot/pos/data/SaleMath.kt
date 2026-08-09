@@ -52,3 +52,78 @@ fun computeSaleTotals(
         total = taxableBase + taxTotal
     )
 }
+
+/**
+ * What a sale actually made, on the lines that HAVE a cost recorded.
+ *
+ *  - [costTotal]      cost of goods for the costed lines, at the price frozen at sale time.
+ *  - [costedRevenue]  those same lines' take AFTER their share of the whole-sale
+ *                     discount — the honest margin denominator.
+ *  - [discountShare]  the costed lines' pro-rata slice of the whole-sale discount.
+ *  - [profit]         costedRevenue − costTotal. Signed: a line sold below cost is a
+ *                     real loss and says so.
+ */
+data class SaleMargin(
+    val costTotal: Double,
+    val costedRevenue: Double,
+    val discountShare: Double,
+    val profit: Double
+)
+
+/**
+ * The single source of truth for margin — one function behind the dashboard's gross
+ * profit, the margin denominator and the cash-basis recognition in [CashBasis], because
+ * when those disagree the shop has three profit figures and no way to tell which is right.
+ *
+ * Everything is VAT-EXCLUSIVE. VAT is collected for ZIMRA, never earned.
+ *
+ * WHAT THE INPUTS MEAN
+ *  - [allLinesNet]     Σ over every live line of `unitPrice×qty − lineDiscount + lineMarkup`.
+ *                      The goods value the customer was billed for, before any whole-sale
+ *                      discount. NOT [SaleEntity.subtotal], which is gross of both.
+ *  - [costedLinesNet]  the same measure over only the lines carrying a cost.
+ *  - [costedLinesCost] Σ over those lines of `unitCost × unitsPerLine × qty`. The
+ *                      multiplier lifts a per-STOCK-UNIT cost to the LINE-UNIT price a
+ *                      box line is sold at, exactly once.
+ *  - [saleNetTake]     `total − taxTotal` — the VAT-exclusive money actually billed. The
+ *                      whole-sale discount is recovered as `allLinesNet − saleNetTake`
+ *                      rather than read off `discountTotal`, because `discountTotal` also
+ *                      contains the per-item discounts that are ALREADY off the lines;
+ *                      subtracting it whole would count them twice.
+ *
+ * THREE RULES, EACH OF WHICH THIS APP GOT WRONG BEFORE
+ *
+ *  - Only COSTED lines count. A line with no cost price is not zero-cost, it is
+ *    unknown, and booking it as pure profit flatters the figure.
+ *
+ *  - Line-level discounts and markups are part of the take. The old report SQL summed
+ *    a bare `unitPrice × qty`, so a discount the cashier gave cost the shop nothing in
+ *    the figures and a markup earned it nothing.
+ *
+ *  - The whole-sale discount is shared PRO-RATA with the costed lines. Taking all of it
+ *    off understates margin whenever part of a sale is uncosted; taking none of it off —
+ *    which is what the old SQL did — overstates it on every discounted sale.
+ *
+ *  - With nothing costed at all the answer is ZERO, not minus the discount. A sale whose
+ *    profit is unknown made no known profit; it did not make a loss.
+ */
+fun computeSaleMargin(
+    allLinesNet: Double,
+    costedLinesNet: Double,
+    costedLinesCost: Double,
+    saleNetTake: Double
+): SaleMargin {
+    if (costedLinesNet <= 0.0) return SaleMargin(0.0, 0.0, 0.0, 0.0)
+    // Floored: a total rounded UP at checkout would otherwise read as a negative
+    // discount and inflate profit by the rounding.
+    val wholeSaleDiscount = (allLinesNet - saleNetTake).coerceAtLeast(0.0)
+    val discountShare =
+        if (allLinesNet > 0.0) wholeSaleDiscount * (costedLinesNet / allLinesNet) else 0.0
+    val costedRevenue = costedLinesNet - discountShare
+    return SaleMargin(
+        costTotal = costedLinesCost,
+        costedRevenue = costedRevenue,
+        discountShare = discountShare,
+        profit = costedRevenue - costedLinesCost
+    )
+}

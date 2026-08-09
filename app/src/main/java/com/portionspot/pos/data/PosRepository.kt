@@ -7,6 +7,7 @@ import com.portionspot.pos.notify.NotifThresholds
 import com.portionspot.pos.notify.NotificationEngine
 import com.portionspot.pos.sms.ParsedPayment
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.map
 
 /** Half-a-cent tolerance for money comparisons (guards Double rounding on totals). */
 private const val CENT = 0.005
@@ -111,16 +112,26 @@ class PosRepository(private val db: PosDatabase) {
     fun topProductsFlow(businessId: String, from: Long, to: Long, limit: Int = 5): Flow<List<TopProduct>> =
         saleDao.observeTopProducts(businessId, from, to, limit)
 
+    /**
+     * Gross profit for the window: each sale's margin resolved by [computeSaleMargin],
+     * then summed. Per sale rather than in one SQL aggregate because the whole-sale
+     * discount has to be shared pro-rata with that sale's own costed lines — a shop-wide
+     * SUM cannot express it, and the old query simply left the discount out.
+     */
     fun grossProfitFlow(businessId: String, from: Long, to: Long): Flow<Double> =
-        saleDao.observeGrossProfit(businessId, from, to)
+        saleDao.observeSaleMargins(businessId, from, to)
+            .map { rows -> rows.sumOf { it.margin().profit } }
 
     /** Refunded value per sale (for the Receipts "refunded" badge). Presentation only. */
     fun refundedBySaleFlow(businessId: String): Flow<List<SaleRefundSum>> =
         refundDao.observeRefundedBySale(businessId)
 
-    /** Revenue of costed lines only — the honest denominator for the margin figure. */
+    /** Revenue of costed lines only — the honest denominator for the margin figure.
+     *  Same rows and same allocation as [grossProfitFlow], so `profit / this` measures
+     *  one consistent set of lines with one consistent discount treatment. */
     fun costedRevenueFlow(businessId: String, from: Long, to: Long): Flow<Double> =
-        saleDao.observeCostedRevenue(businessId, from, to)
+        saleDao.observeSaleMargins(businessId, from, to)
+            .map { rows -> rows.sumOf { it.margin().costedRevenue } }
 
     /**
      * Danger zone: wipe this DEVICE's re-pullable data (sales, catalog, customers and
@@ -1042,7 +1053,7 @@ class PosRepository(private val db: PosDatabase) {
      * Unwindowed on purpose: a repayment today can settle a sale from last year.
      */
     fun cashBasisSalesFlow(businessId: String): Flow<List<CashBasisSaleRow>> =
-        saleDao.observeCashBasisSales(businessId)
+        saleDao.observeAllSaleMargins(businessId).map { rows -> rows.map { it.toCashBasisRow() } }
 
     // ---- §6 THE SPLIT: how much of this money is actually mine -----------
 
@@ -2680,8 +2691,11 @@ class PosRepository(private val db: PosDatabase) {
      *
      *  - Writes the immutable [Refund] header + its returned [RefundLine]s. The
      *    original sale is never edited — this is a reversal linked back to it.
-     *  - [refundTotal] is computed proportionally from the sale (carries discount +
-     *    VAT — see [computeRefundTotal]); the multiplier is applied exactly once.
+     *  - [refundTotal] is computed proportionally from the sale (carries the whole-sale
+     *    discount + VAT — see [computeRefundTotal]); the multiplier is applied exactly
+     *    once. Each returned line is valued by [returnedLineValue], so the line's OWN
+     *    discount or cashier markup goes back with it instead of being smeared across
+     *    every other line of the sale.
      *  - Restocks each returned line that is [RefundLineInput.restock] and tracked,
      *    with a `return` [StockMovement] (damaged goods are refunded but not restocked).
      *  - [payouts] is the money handed back NOW (may be empty, partial, or split);
@@ -2709,9 +2723,14 @@ class PosRepository(private val db: PosDatabase) {
         val stamp = now()
         val refundId = newId()
 
-        // Returned goods' pre-adjustment value; ratio folds in the sale's discount+VAT.
-        val returnedSubtotal = lines.sumOf { it.saleLine.unitPrice * it.qtyReturned }
-        val refundTotal = computeRefundTotal(returnedSubtotal, sale.subtotal, sale.total).refundTotal
+        // Returned goods valued net of each line's OWN discount/markup, measured against
+        // the whole sale on the SAME basis; the ratio then folds in the whole-sale
+        // discount + VAT. Both sides must use returnedLineValue — sale.subtotal is the
+        // GROSS goods value (per-item adjustments live in the sale's discount/markup
+        // totals), so pairing it with a net numerator would break a full return.
+        val returnedSubtotal = lines.sumOf { returnedLineValue(it.saleLine, it.qtyReturned) }
+        val goodsValue = saleGoodsValue(saleDao.linesForSale(sale.id))
+        val refundTotal = computeRefundTotal(returnedSubtotal, goodsValue, sale.total).refundTotal
 
         val paidNow = payouts.filter { it.amount != 0.0 }.sumOf { it.amount }
         val outstanding = (refundTotal - paidNow).coerceAtLeast(0.0)
@@ -2743,7 +2762,10 @@ class PosRepository(private val db: PosDatabase) {
                 name = inp.saleLine.name,
                 qty = inp.qtyReturned,
                 unitPrice = inp.saleLine.unitPrice,
-                lineTotal = inp.saleLine.unitPrice * inp.qtyReturned,
+                // What this line was actually worth back, net of its own discount/markup
+                // — the same figure that fed refundTotal, so the printed refund slip and
+                // the money handed over cannot disagree.
+                lineTotal = returnedLineValue(inp.saleLine, inp.qtyReturned),
                 mode = inp.saleLine.mode,
                 unitsPerLine = inp.saleLine.unitsPerLine,
                 restock = inp.restock,

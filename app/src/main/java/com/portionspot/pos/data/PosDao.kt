@@ -244,87 +244,88 @@ interface SaleDao {
     fun observeTopProducts(businessId: String, from: Long, to: Long, limit: Int = 5): Flow<List<TopProduct>>
 
     /**
-     * Gross profit = SUM((soldPrice − costOfWhatWasSold) * qty), only for lines that have
-     * a cost to work from.
+     * Every live COMPLETED sale in the window reduced to the RAW INGREDIENTS of its
+     * margin. It decides nothing on its own — [computeSaleMargin] does, and it is the
+     * only place that does, so the dashboard, the margin denominator and the cash-basis
+     * figures cannot drift apart into three different profits.
      *
-     * The cost basis is the FROZEN `li.unitCost` captured at checkout, falling back to
-     * the live catalog `i.cost` only for lines that never captured one (rows written
-     * before the column existed, or pulled from the cloud, which carries no cost).
-     * Before this, the query read `i.cost` directly, so editing a product's cost price
-     * silently rewrote the profit of every past sale.
+     * WHY THE ALLOCATION IS NOT IN SQL. A sale's whole-sale discount has to be shared
+     * pro-rata with the costed lines, which needs the sale's own totals alongside a
+     * per-line aggregate. Expressing that inline made the query unreadable and, worse,
+     * untestable — nothing here can be exercised without a device. Aggregating in SQL
+     * (cheap) and allocating in a pure function (unit-tested) keeps both properties.
      *
-     * ★ `unitsPerLine` matters and was missing: `unitPrice` is the price of ONE LINE-UNIT
-     * (a whole box on a box line) while the cost is per STOCK UNIT, so a box of 4 was
-     * charged one unit of cost instead of four. That overstated profit on every box sale
-     * by `cost * (unitsPerLine - 1) * qty` — on a $80 box of 4 units costing $15 each it
-     * reported $65 profit instead of $20. Multiplying the cost up to the line-unit fixes
-     * it. `NULLIF(...,0)` guards a stray 0 box size, which would otherwise zero the cost
-     * and overstate profit all over again. Piece and measured lines carry 1 and are
-     * unaffected.
+     * THE THREE AGGREGATES
+     *
+     *  - `allLinesNet` — Σ `unitPrice*qty − lineDiscount + lineMarkup` over EVERY live
+     *    line. No join to `items`: an ad-hoc line with no catalogue row is still goods
+     *    the customer was billed for, and leaving it out would hand its share of the
+     *    whole-sale discount to the costed lines. Line discounts and markups belong in
+     *    here because the take is what was CHARGED — the old SQL summed a bare
+     *    `unitPrice*qty`, so a cashier's discount cost the shop nothing in the figures
+     *    and a cashier's markup earned it nothing.
+     *
+     *  - `costedLinesNet` — the same measure over lines that HAVE a cost to work from:
+     *    the FROZEN `li.unitCost` captured at checkout, falling back to the live
+     *    `i.cost` only for lines that never captured one (rows written before the
+     *    column existed, or pulled from the cloud, which carries no cost). Before the
+     *    freeze, the query read `i.cost` directly, so editing a product's cost price
+     *    silently rewrote the profit of every past sale.
+     *
+     *  - `costedLinesCost` — Σ `cost × unitsPerLine × qty` over those same lines.
+     *    `unitPrice` is the price of ONE LINE-UNIT (a whole box on a box line) while
+     *    the cost is per STOCK UNIT, so a box of 4 was once charged one unit of cost
+     *    instead of four, overstating profit by `cost * (unitsPerLine - 1) * qty`.
+     *    `NULLIF(...,0)` guards a stray 0 box size, which would otherwise zero the cost
+     *    and overstate profit all over again. Piece and measured lines carry 1.
      */
     @Query(
-        "SELECT COALESCE(SUM((li.unitPrice - " +
-            "COALESCE(li.unitCost, i.cost) * COALESCE(NULLIF(li.unitsPerLine, 0), 1)" +
-            ") * li.qty), 0) " +
-            "FROM sale_items li JOIN sales s ON li.saleId = s.id " +
-            "JOIN items i ON li.itemId = i.id " +
-            "WHERE s.businessId = :businessId AND s.deleted = 0 AND li.deleted = 0 " +
-            "AND s.status = 'completed' AND s.soldAt >= :from AND s.soldAt < :to " +
-            "AND COALESCE(li.unitCost, i.cost) IS NOT NULL"
-    )
-    fun observeGrossProfit(businessId: String, from: Long, to: Long): Flow<Double>
-
-    /**
-     * Revenue of only those sold lines whose item has a cost — the correct margin
-     * denominator when the catalog is partially costed (profit is computed over the
-     * same costed lines, so margin = profit / this stays honest).
-     */
-    @Query(
-        "SELECT COALESCE(SUM(li.unitPrice * li.qty), 0) " +
-            "FROM sale_items li JOIN sales s ON li.saleId = s.id " +
-            "JOIN items i ON li.itemId = i.id " +
-            "WHERE s.businessId = :businessId AND s.deleted = 0 AND li.deleted = 0 " +
-            "AND s.status = 'completed' AND s.soldAt >= :from AND s.soldAt < :to " +
-            // Same costed-line filter as observeGrossProfit, so margin = profit / this
-            // keeps measuring the SAME set of lines.
-            "AND COALESCE(li.unitCost, i.cost) IS NOT NULL"
-    )
-    fun observeCostedRevenue(businessId: String, from: Long, to: Long): Flow<Double>
-
-    /**
-     * Every live COMPLETED sale reduced to its CASH-BASIS inputs (§5): what it billed,
-     * what was settled at the till, and the costed-line economics behind it.
-     *
-     * ★ MEANING: this query recognises NOTHING on its own — it is raw input to
-     * [CashBasis], which decides what counts as revenue and when. It is unwindowed on
-     * purpose: a repayment made TODAY can settle a sale from last year, so the collected
-     * revenue of any window depends on sales outside it. The FIFO attribution that
-     * repayments need cannot be expressed in SQL, so the aggregation stops here.
-     *
-     * `costedRevenue` and `lineProfit` cover only lines that HAVE a cost (frozen
-     * `li.unitCost`, falling back to the live `i.cost` for rows written before the column
-     * existed) — the same costed-line filter the gross-profit query uses, so margin stays
-     * measured over one consistent set of lines. `unitsPerLine` multiplies the per-STOCK-
-     * UNIT cost up to the LINE-UNIT price (a box line prices a whole box), guarded by
-     * `NULLIF(...,0)` so a stray zero pack size can't zero the cost.
-     */
-    @Query(
-        "SELECT s.id AS id, s.soldAt AS soldAt, s.total AS total, " +
+        "SELECT s.id AS id, s.soldAt AS soldAt, s.total AS total, s.taxTotal AS taxTotal, " +
             "s.amountPaid AS amountPaid, s.customerId AS customerId, " +
-            "COALESCE((SELECT SUM(li.unitPrice * li.qty) FROM sale_items li " +
-            "  JOIN items i ON li.itemId = i.id " +
+            "COALESCE((SELECT SUM(li.unitPrice * li.qty - li.lineDiscount + li.lineMarkup) " +
+            "  FROM sale_items li " +
+            "  WHERE li.saleId = s.id AND li.deleted = 0), 0) AS allLinesNet, " +
+            "COALESCE((SELECT SUM(li.unitPrice * li.qty - li.lineDiscount + li.lineMarkup) " +
+            "  FROM sale_items li JOIN items i ON li.itemId = i.id " +
             "  WHERE li.saleId = s.id AND li.deleted = 0 " +
-            "  AND COALESCE(li.unitCost, i.cost) IS NOT NULL), 0) AS costedRevenue, " +
-            "COALESCE((SELECT SUM((li.unitPrice - " +
-            "    COALESCE(li.unitCost, i.cost) * COALESCE(NULLIF(li.unitsPerLine, 0), 1)" +
-            "  ) * li.qty) FROM sale_items li " +
-            "  JOIN items i ON li.itemId = i.id " +
+            "  AND COALESCE(li.unitCost, i.cost) IS NOT NULL), 0) AS costedLinesNet, " +
+            "COALESCE((SELECT SUM(COALESCE(li.unitCost, i.cost) " +
+            "    * COALESCE(NULLIF(li.unitsPerLine, 0), 1) * li.qty) " +
+            "  FROM sale_items li JOIN items i ON li.itemId = i.id " +
             "  WHERE li.saleId = s.id AND li.deleted = 0 " +
-            "  AND COALESCE(li.unitCost, i.cost) IS NOT NULL), 0) AS lineProfit " +
+            "  AND COALESCE(li.unitCost, i.cost) IS NOT NULL), 0) AS costedLinesCost " +
+            "FROM sales s WHERE s.businessId = :businessId AND s.deleted = 0 " +
+            "AND s.status = 'completed' AND s.soldAt >= :from AND s.soldAt < :to"
+    )
+    fun observeSaleMargins(businessId: String, from: Long, to: Long): Flow<List<SaleMarginRow>>
+
+    /**
+     * [observeSaleMargins] with no date window — raw input to [CashBasis] (§5).
+     *
+     * ★ Unwindowed on purpose: a repayment made TODAY can settle a sale from last year,
+     * so the collected revenue of any window depends on sales outside it. The FIFO
+     * attribution that repayments need cannot be expressed in SQL, so the aggregation
+     * stops here and [CashBasis] decides what counts as revenue and when.
+     */
+    @Query(
+        "SELECT s.id AS id, s.soldAt AS soldAt, s.total AS total, s.taxTotal AS taxTotal, " +
+            "s.amountPaid AS amountPaid, s.customerId AS customerId, " +
+            "COALESCE((SELECT SUM(li.unitPrice * li.qty - li.lineDiscount + li.lineMarkup) " +
+            "  FROM sale_items li " +
+            "  WHERE li.saleId = s.id AND li.deleted = 0), 0) AS allLinesNet, " +
+            "COALESCE((SELECT SUM(li.unitPrice * li.qty - li.lineDiscount + li.lineMarkup) " +
+            "  FROM sale_items li JOIN items i ON li.itemId = i.id " +
+            "  WHERE li.saleId = s.id AND li.deleted = 0 " +
+            "  AND COALESCE(li.unitCost, i.cost) IS NOT NULL), 0) AS costedLinesNet, " +
+            "COALESCE((SELECT SUM(COALESCE(li.unitCost, i.cost) " +
+            "    * COALESCE(NULLIF(li.unitsPerLine, 0), 1) * li.qty) " +
+            "  FROM sale_items li JOIN items i ON li.itemId = i.id " +
+            "  WHERE li.saleId = s.id AND li.deleted = 0 " +
+            "  AND COALESCE(li.unitCost, i.cost) IS NOT NULL), 0) AS costedLinesCost " +
             "FROM sales s WHERE s.businessId = :businessId AND s.deleted = 0 " +
             "AND s.status = 'completed'"
     )
-    fun observeCashBasisSales(businessId: String): Flow<List<CashBasisSaleRow>>
+    fun observeAllSaleMargins(businessId: String): Flow<List<SaleMarginRow>>
 
     /** Bare (timestamp,total) rows since [from], bucketed in-app into the 7-day chart. */
     @Query(

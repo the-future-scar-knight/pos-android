@@ -265,7 +265,13 @@ object EscPos {
         line("Items returned:")
         lines.forEach { ln ->
             cmd(ESC, 0x45, 0x01); line(ln.name.take(w)); cmd(ESC, 0x45, 0x00)
-            line(twoCol("  x${trimQty(ln.qty)} @ ${fmt(ln.unitPrice, cur)}", fmt(ln.lineTotal, cur), w))
+            // lineTotal is what actually went back: net of the line's own discount and
+            // inclusive of any cashier markup. So it is NOT qty x unitPrice, and printing
+            // the raw unitPrice beside it would read as bad arithmetic at the counter.
+            // Derive the rate from the amount instead — the same convention the sale
+            // receipt uses, which also keeps markup un-itemised.
+            val shownUnit = if (ln.qty != 0.0) ln.lineTotal / ln.qty else ln.unitPrice
+            line(twoCol("  x${trimQty(ln.qty)} @ ${fmt(shownUnit, cur)}", fmt(ln.lineTotal, cur), w))
             if (!ln.restock) line("  (not restocked)")
         }
         line(dashes(w))

@@ -385,7 +385,7 @@ data class RefundLine(
     val name: String,                      // snapshot
     val qty: Double = 1.0,                 // line-units returned
     val unitPrice: Double = 0.0,           // snapshot
-    val lineTotal: Double = 0.0,           // pre-adjustment returned value (unitPrice * qty)
+    val lineTotal: Double = 0.0,           // returned value NET of the line's own discount/markup
     val mode: String = "retail",           // box | wholesale | retail (snapshot)
     val unitsPerLine: Int = 1,             // stock units per line-unit (box size), for restock
     val restock: Boolean = true,           // false => damaged, do NOT return to stock
@@ -812,13 +812,44 @@ data class OutsideFundTotals(
 }
 
 /**
- * One completed sale reduced to exactly what CASH-BASIS revenue/profit needs (read
- * model, see [CashBasis]). Deliberately NOT the whole [SaleEntity]: this is aggregated
- * per sale in SQL so the Kotlin side can do the FIFO repayment attribution that SQL
- * cannot express.
+ * One completed sale reduced to the RAW INGREDIENTS of its margin (read model, see
+ * [SaleDao.observeSaleMargins]). Aggregated per sale in SQL; the allocation that turns
+ * these into a profit lives in [computeSaleMargin], which is pure and unit-tested.
  *
- *  - [costedRevenue] = Σ `unitPrice * qty` over the lines that HAVE a cost.
- *  - [lineProfit]    = Σ `(unitPrice − cost * unitsPerLine) * qty` over those same lines.
+ * Nothing here is a figure to show a user. Call [margin] first.
+ */
+data class SaleMarginRow(
+    val id: String,
+    val soldAt: Long,
+    val total: Double,
+    val taxTotal: Double,
+    val amountPaid: Double,
+    val customerId: String?,
+    /** Σ `unitPrice*qty − lineDiscount + lineMarkup` over every live line. */
+    val allLinesNet: Double,
+    /** The same, over lines carrying a cost. */
+    val costedLinesNet: Double,
+    /** Σ `cost × unitsPerLine × qty` over those costed lines. */
+    val costedLinesCost: Double
+)
+
+/** This sale's margin — the whole-sale discount shared pro-rata with the costed lines.
+ *  `total − taxTotal` is the VAT-exclusive money billed; VAT is never earned. */
+fun SaleMarginRow.margin(): SaleMargin = computeSaleMargin(
+    allLinesNet = allLinesNet,
+    costedLinesNet = costedLinesNet,
+    costedLinesCost = costedLinesCost,
+    saleNetTake = total - taxTotal
+)
+
+/**
+ * One completed sale reduced to exactly what CASH-BASIS revenue/profit needs (read
+ * model, see [CashBasis]), so the Kotlin side can do the FIFO repayment attribution
+ * that SQL cannot express.
+ *
+ *  - [costedRevenue] = the costed lines' take, after their pro-rata share of the
+ *    whole-sale discount.
+ *  - [lineProfit]    = that take less the cost of those goods.
  *    So the cost of goods on those lines is exactly `costedRevenue − lineProfit`.
  */
 data class CashBasisSaleRow(
@@ -830,6 +861,20 @@ data class CashBasisSaleRow(
     val costedRevenue: Double,
     val lineProfit: Double
 )
+
+/** Same sale, seen as [CashBasis] needs it — margin resolved once, by the one function. */
+fun SaleMarginRow.toCashBasisRow(): CashBasisSaleRow {
+    val m = margin()
+    return CashBasisSaleRow(
+        id = id,
+        soldAt = soldAt,
+        total = total,
+        amountPaid = amountPaid,
+        customerId = customerId,
+        costedRevenue = m.costedRevenue,
+        lineProfit = m.profit
+    )
+}
 
 /**
  * A goods supplier / vendor. Purchase orders denormalise the supplier's name onto
