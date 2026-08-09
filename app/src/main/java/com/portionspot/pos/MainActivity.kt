@@ -27,6 +27,7 @@ import com.portionspot.pos.ui.AppRoot
 import com.portionspot.pos.ui.CrashReportScreen
 import com.portionspot.pos.ui.CrashReporter
 import com.portionspot.pos.ui.LocalGate
+import com.portionspot.pos.ui.PosDeepLink
 import com.portionspot.pos.ui.PosTheme
 import com.portionspot.pos.ui.PosViewModel
 
@@ -39,6 +40,13 @@ class MainActivity : ComponentActivity() {
     // onCreate and updated by onNewIntent so a tap on the mobile-money notification
     // deep-links to the Mobile Money screen whether the app was cold or already open.
     private val openTarget = mutableStateOf<String?>(null)
+
+    // WHICH RECORD that notification was about ("Low stock: brake pads" → that item).
+    // Every alert already carries refType/refId (NotificationEngine stamps them); Notifier
+    // now passes them through, and this is where a tap turns back into a screen + a row.
+    // Also settable from inside the app: tapping a card in the admin Alerts feed routes
+    // through here so in-app and system taps land in exactly the same place.
+    private val openRecord = mutableStateOf<PosDeepLink?>(null)
 
     /**
      * Pin the app's font scale to 1.0 regardless of the device's system Font-size
@@ -57,13 +65,30 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        openTarget.value = intent.getStringExtra(Notifier.EXTRA_OPEN)
+        readOpenExtras(intent)
+    }
+
+    /** Pull the deep-link extras off a launch/tap intent. Split out so the cold-start
+     *  path (onCreate) and the already-running path (onNewIntent) can never drift. */
+    private fun readOpenExtras(intent: Intent?) {
+        openTarget.value = intent?.getStringExtra(Notifier.EXTRA_OPEN)
+        val refType = intent?.getStringExtra(Notifier.EXTRA_REF_TYPE)
+        openRecord.value =
+            if (refType.isNullOrBlank()) null
+            else PosDeepLink(refType, intent?.getStringExtra(Notifier.EXTRA_REF_ID))
+    }
+
+    /** A deep link is spent once the screen has it — clearing both keys stops the
+     *  LaunchedEffects re-firing (and re-opening a sheet the owner just closed). */
+    private fun consumeOpen() {
+        openTarget.value = null
+        openRecord.value = null
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        openTarget.value = intent?.getStringExtra(Notifier.EXTRA_OPEN)
+        readOpenExtras(intent)
 
         // If the previous run crashed, show the captured report instead of the app
         // so the tester can read/share it (no USB/logcat required). "Continue"
@@ -109,25 +134,34 @@ class MainActivity : ComponentActivity() {
                     appMode == AppMode.Local -> LocalGate(vm) {
                         LaunchedEffect(Unit) { vm.setCurrentCashier(LOCAL_OWNER_ID, "Owner", isAdmin = true) }
                         val open by openTarget
-                        val wantMobileMoney = open == Notifier.OPEN_MOBILE_MONEY
-                        val wantAdminAlerts = open == Notifier.OPEN_ADMIN_ALERTS
+                        val record by openRecord
+                        val wantMobileMoney =
+                            open == Notifier.OPEN_MOBILE_MONEY || record?.refType == "mm_receipt"
+                        // A record beats the feed: if the alert names a row, open the row.
+                        val wantAdminAlerts = open == Notifier.OPEN_ADMIN_ALERTS && record == null
                         // Start in the POS; the top-bar admin button flips to the panel.
                         var adminMode by rememberSaveable { mutableStateOf(false) }
                         LaunchedEffect(wantAdminAlerts) { if (wantAdminAlerts) adminMode = true }
-                        LaunchedEffect(wantMobileMoney) { if (wantMobileMoney) adminMode = false }
+                        // Records live on the POS-shell screens (Inventory, Receipts,
+                        // Customers, …), so a record link always drops out of the panel.
+                        LaunchedEffect(record, wantMobileMoney) {
+                            if (record != null || wantMobileMoney) adminMode = false
+                        }
                         if (adminMode) {
                             AdminRoot(
                                 vm,
                                 onExitToCashier = { adminMode = false },
                                 openAlerts = wantAdminAlerts,
-                                onOpenConsumed = { openTarget.value = null }
+                                onOpenRecord = { openRecord.value = it },
+                                onOpenConsumed = { consumeOpen() }
                             )
                         } else {
                             AppRoot(
                                 vm,
                                 onExitToAdmin = { adminMode = true },
                                 openMobileMoney = wantMobileMoney,
-                                onOpenConsumed = { openTarget.value = null }
+                                deepLink = record,
+                                onOpenConsumed = { consumeOpen() }
                             )
                         }
                     }
@@ -136,37 +170,55 @@ class MainActivity : ComponentActivity() {
                     // per-cashier PIN, staff management, attribution, sync. Backing out
                     // of login (no account yet) returns to local mode.
                     else -> AuthGate(container.authManager, onExitToLocal = { vm.useLocalMode() }) { user ->
-                        LaunchedEffect(user.id, user.permissions) {
+                        // ★ user.role is a key, not just a passenger. A role-only demotion
+                        // (admin -> cashier with an identical permissions map) re-emits
+                        // AuthState and recomposes this branch into the cashier shell, but
+                        // without the role in the key list the effect never restarts — so
+                        // _currentIsAdmin stayed true and vm.can(...) kept waving the
+                        // demoted admin through every capability check in the handlers.
+                        LaunchedEffect(user.id, user.role, user.permissions) {
                             vm.setCurrentCashier(user.id, user.displayName, user.isAdmin, user.permissions)
                         }
                         val open by openTarget
-                        val wantMobileMoney = open == Notifier.OPEN_MOBILE_MONEY
-                        val wantAdminAlerts = open == Notifier.OPEN_ADMIN_ALERTS
+                        val record by openRecord
+                        val wantMobileMoney =
+                            open == Notifier.OPEN_MOBILE_MONEY || record?.refType == "mm_receipt"
+                        val wantAdminAlerts = open == Notifier.OPEN_ADMIN_ALERTS && record == null
                         // Admins land in the admin shell but can drop into the cashier
                         // POS to make a sale, then jump back. Cashiers only ever see the POS.
                         if (user.isAdmin) {
                             var cashierMode by remember(user.id) { mutableStateOf(false) }
-                            LaunchedEffect(wantMobileMoney) { if (wantMobileMoney) cashierMode = true }
+                            // Same rule as local mode: the records an alert points at are
+                            // POS-shell screens, so a record link switches into the POS.
+                            LaunchedEffect(record, wantMobileMoney) {
+                                if (record != null || wantMobileMoney) cashierMode = true
+                            }
                             if (cashierMode) {
                                 AppRoot(
                                     vm,
                                     onExitToAdmin = { cashierMode = false },
                                     openMobileMoney = wantMobileMoney,
-                                    onOpenConsumed = { openTarget.value = null }
+                                    deepLink = record,
+                                    onOpenConsumed = { consumeOpen() }
                                 )
                             } else {
                                 AdminRoot(
                                     vm,
                                     onExitToCashier = { cashierMode = true },
                                     openAlerts = wantAdminAlerts,
-                                    onOpenConsumed = { openTarget.value = null }
+                                    onOpenRecord = { openRecord.value = it },
+                                    onOpenConsumed = { consumeOpen() }
                                 )
                             }
                         } else {
+                            // A cashier never reaches the admin shell, so an alert aimed at
+                            // them ("all"/"cashier" audience) resolves to the POS screen for
+                            // its record — or, if it names none, to a plain launch.
                             AppRoot(
                                 vm,
                                 openMobileMoney = wantMobileMoney,
-                                onOpenConsumed = { openTarget.value = null }
+                                deepLink = record,
+                                onOpenConsumed = { consumeOpen() }
                             )
                         }
                     }

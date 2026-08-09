@@ -66,6 +66,45 @@ class NotificationEngineTest {
         assertNull(cs.firstOrNull { it.refId == ok.id })
     }
 
+    /** ★ A measured product (kg/L/m) keeps its on-hand in [Item.stockMeasured] and leaves
+     *  stockQty at 0 by design, so the engine reading stockQty called a full drum of oil
+     *  "Out of stock". These four pin the [com.portionspot.pos.data.onHand] reading and
+     *  the deliberate refusal to invent a default threshold for a measured unit. */
+    private fun measured(name: String, unit: String, onHand: Double, reorder: Double) = Item(
+        businessId = "b", name = name, productType = "measured", unit = unit,
+        trackStock = true, pricePerUnit = 2.5,
+        stockQty = 0.0, stockMeasured = onHand, reorderLevel = reorder
+    )
+
+    @Test fun measured_item_with_stock_raises_no_inventory_alert() {
+        val oil = measured("Cooking oil", "L", onHand = 12.5, reorder = 2.0)
+        assertTrue(NotificationEngine.compute(snap(items = listOf(oil))).none { it.refId == oil.id })
+    }
+
+    @Test fun measured_item_below_its_reorder_level_still_warns() {
+        val oil = measured("Cooking oil", "L", onHand = 1.5, reorder = 2.0)
+        val c = NotificationEngine.compute(snap(items = listOf(oil))).single()
+        assertEquals("lowstock:${oil.id}", c.dedupeKey)
+        assertEquals("warn", c.severity)
+        // Reads in the item's own unit, not a bare count.
+        assertTrue(c.body, c.body.contains("1.5 L"))
+    }
+
+    @Test fun measured_item_at_zero_is_out_of_stock() {
+        val oil = measured("Cooking oil", "L", onHand = 0.0, reorder = 2.0)
+        val c = NotificationEngine.compute(snap(items = listOf(oil))).single()
+        assertEquals("outstock:${oil.id}", c.dedupeKey)
+        assertEquals("danger", c.severity)
+        assertTrue(c.pushWorthy)
+    }
+
+    @Test fun measured_item_without_a_reorder_level_never_goes_low() {
+        // 5 m of hose and 5 kg of oil are not the same threshold, so the count-based
+        // default must not apply — only an owner-set level in the item's unit does.
+        val hose = measured("Garden hose", "m", onHand = 2.0, reorder = 0.0)
+        assertTrue(NotificationEngine.compute(snap(items = listOf(hose))).none { it.refId == hose.id })
+    }
+
     @Test fun unsynced_only_fires_when_stale_and_pending() {
         assertTrue(NotificationEngine.compute(snap(pendingSync = 2, lastSync = now - 10 * HOUR)).any { it.dedupeKey == "unsynced" })
         assertTrue(NotificationEngine.compute(snap(pendingSync = 0, lastSync = now - 10 * HOUR)).none { it.dedupeKey == "unsynced" })

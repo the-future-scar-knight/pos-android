@@ -65,15 +65,58 @@ class SyncManager(
     @Volatile
     private var hotUntil: Long = 0L
 
+    /** When the signed-in user's own `pos_staff` grants were last re-read (see
+     *  [refreshPermissions]). Coalesces the several triggers that can land together. */
+    @Volatile
+    private var lastPermissionCheckAt: Long = 0L
+
     init {
         // Flush the moment the device comes back online (offline→online) if anything is
         // queued. Seeded emit is the current state, so we only act on a real transition.
         scope.launch {
             var wasOnline = ConnectivityObserver.currentlyOnline(appContext)
             ConnectivityObserver.onlineFlow(appContext).collect { online ->
-                if (online && !wasOnline) requestSync("reconnect")
+                if (online && !wasOnline) {
+                    requestSync("reconnect")
+                    // Regaining signal is the first chance to hear about a capability the
+                    // owner revoked while this phone was dark. It must NOT ride on
+                    // [requestSync], which does nothing when no local rows are queued —
+                    // a till that has sold nothing since it went offline still has to be
+                    // told its cashier lost a permission.
+                    refreshPermissions()
+                }
                 wasOnline = online
             }
+        }
+    }
+
+    /**
+     * Re-read the signed-in staff member's own capability grants from the cloud.
+     *
+     * Hung off EVERY successful pass (poll, manual, on-connect) and off reconnect, not
+     * just app-foreground: a shop till lives in the foreground from open to close and
+     * never restarts, so foreground-only meant a permission the owner revoked at 10am
+     * did not land until someone tapped "Sync now" or backgrounded the app. One small
+     * GET, coalesced to at most once per [PERMISSION_MIN_GAP_MS], entirely off the write
+     * path — if it fails, [com.portionspot.pos.auth.AuthManager.refreshCurrentPermissions]
+     * keeps the cached grants and the till carries on.
+     */
+    private suspend fun refreshPermissions() {
+        val now = System.currentTimeMillis()
+        if (now - lastPermissionCheckAt < PERMISSION_MIN_GAP_MS) return
+        if (!config.isConfigured()) return
+        if (!ConnectivityObserver.currentlyOnline(appContext)) return
+        lastPermissionCheckAt = now
+        val app = appContext.applicationContext as? PosApp ?: return
+        // runCatching also covers the narrow window where PosApp.container isn't assigned
+        // yet (this manager is built inside the container's own constructor).
+        runCatching {
+            // A phone that has been dark for hours comes back holding a dead access token,
+            // and a 401 reads (correctly) as "couldn't ask" rather than as a verdict — which
+            // would leave the revoked grants live for another cycle. Renewing first is a
+            // no-op while the token is still fresh and makes the reconnect land first try.
+            app.container.authManager.refreshIfNeeded()
+            app.container.authManager.refreshCurrentPermissions()
         }
     }
 
@@ -210,6 +253,9 @@ class SyncManager(
                 outcome.pushed, outcome.pulled, System.currentTimeMillis(), outcome.pushErrors
             )
             afterPull(outcome.pulled)
+            // A pass that reached the server is also a chance to hear about a capability
+            // the owner revoked — independent of whether any ROW came down.
+            refreshPermissions()
         }
     }
 
@@ -266,7 +312,10 @@ class SyncManager(
             is SyncOutcome.Failed -> SyncStatus.Error(outcome.message)
             SyncOutcome.NotConfigured -> SyncStatus.Idle
         }
-        if (outcome is SyncOutcome.Success) afterPull(outcome.pulled)
+        if (outcome is SyncOutcome.Success) {
+            afterPull(outcome.pulled)
+            refreshPermissions()
+        }
         return outcome
     }
 
@@ -296,5 +345,11 @@ class SyncManager(
         /** Loosened coalescing gap during a hot window — small enough to let the ~6s cadence
          *  through, large enough that two triggers in quick succession still collapse. */
         const val HOT_MIN_GAP_MS = 4_000L
+
+        /** Minimum gap between two permission re-reads (~30s). Deliberately shorter than
+         *  [POLL_MS] so every foreground pass carries one — a revoked capability should
+         *  die within a poll cycle, not a shift — while a burst of triggers (reconnect +
+         *  poll + a manual tap) still costs a single request. */
+        const val PERMISSION_MIN_GAP_MS = 30_000L
     }
 }

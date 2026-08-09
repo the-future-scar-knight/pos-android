@@ -65,11 +65,27 @@ interface ItemDao {
     @Upsert
     suspend fun upsertAll(items: List<Item>)
 
-    /** Items at or below their reorder level (and tracking stock). Low-stock card. */
+    /**
+     * Items at or below their reorder level (and tracking stock). Low-stock card.
+     *
+     * ★ The on-hand column depends on the product type, and reading the wrong one is the
+     * same fault that had [NotificationEngine] announcing every full drum of oil as out of
+     * stock: a measured product (kg/L/m) keeps its real quantity in `stockMeasured` and
+     * deliberately leaves `stockQty` at 0, so a bare `stockQty <= reorderLevel` matched
+     * every measured item unconditionally. This mirrors the Kotlin [onHand] accessor,
+     * which a query cannot call.
+     *
+     * `reorderLevel > 0` matters too: without it an item that has simply RUN OUT (0 on
+     * hand, no level ever set) matched `0 <= 0` and read as "low", which is a different
+     * condition with a different fix. No reorder level set means the owner has not said
+     * what low means for this product, so it is not low — it is only ever out.
+     */
     @Query(
         "SELECT * FROM items WHERE businessId = :businessId AND deleted = 0 AND isActive = 1 " +
-            "AND trackStock = 1 AND stockQty <= reorderLevel " +
-            "ORDER BY stockQty ASC"
+            "AND trackStock = 1 AND reorderLevel > 0 " +
+            "AND (CASE WHEN productType = 'measured' THEN stockMeasured ELSE stockQty END) " +
+            "    <= reorderLevel " +
+            "ORDER BY (CASE WHEN productType = 'measured' THEN stockMeasured ELSE stockQty END) ASC"
     )
     fun observeLowStock(businessId: String): Flow<List<Item>>
 

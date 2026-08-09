@@ -31,9 +31,17 @@
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
     <uses-permission android:name="android.permission.READ_SMS" />
 
-    <!-- Post the "payment received — verify" notification (Android 13+ needs a
-         runtime grant; declaration alone is not enough). -->
+    <!-- Post the "payment received — verify" notification and the admin alerts
+         (Android 13+ needs a runtime grant; declaration alone is not enough). The
+         runtime ask lives in the app shell (NotificationAccessBar), NOT on the Mobile
+         Money screen — an owner who never opened that screen was never asked, so
+         nothing ever posted. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Vibrate on an alert. Without this the channel's enableVibration(true) and the
+         pre-Oreo builder's setVibrate() are both ignored, and a till in a noisy shop
+         gets a notification nobody feels. Install-time permission, no prompt. -->
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <!-- Keep delivering payment SMS + admin alerts in the background: ask the owner to
          exempt the app from Doze / battery optimization (§6/§8). Standard for a POS;

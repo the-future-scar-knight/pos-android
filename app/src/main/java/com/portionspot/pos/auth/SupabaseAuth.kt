@@ -132,6 +132,25 @@ class SupabaseAuth(
         }
     }
 
+    /**
+     * The three-valued form of [fetchStaffProfile], for the periodic permission refresh.
+     *
+     * That caller cannot use the nullable form: `null` there means "200 OK, no row" while
+     * an exception means "couldn't ask", and folding both into null is exactly how a
+     * staff member deleted in the console kept their capability grants forever — the
+     * device could not tell the deletion from a dropped signal. Here a reached-server
+     * verdict is [StaffProfileFetch.Missing] and everything else — no network, a 401 on a
+     * stale token, a 5xx, an unparseable body — is [StaffProfileFetch.Unreachable], which
+     * the caller must treat as "keep what you have".
+     */
+    fun fetchStaffProfileResult(accessToken: String, userId: String): StaffProfileFetch =
+        try {
+            val profile = fetchStaffProfile(accessToken, userId)
+            if (profile == null) StaffProfileFetch.Missing else StaffProfileFetch.Found(profile)
+        } catch (_: Exception) {
+            StaffProfileFetch.Unreachable
+        }
+
     private fun tokenGrant(grantType: String, body: String): AuthResult {
         val url = ("$baseUrl/auth/v1/token".toHttpUrlOrNull()
             ?: return AuthResult.Offline("Bad server URL"))

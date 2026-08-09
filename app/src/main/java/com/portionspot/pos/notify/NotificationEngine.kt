@@ -7,6 +7,8 @@ import com.portionspot.pos.data.MobileMoneyReceipt
 import com.portionspot.pos.data.PurchaseOrder
 import com.portionspot.pos.data.Refund
 import com.portionspot.pos.data.SaleEntity
+import com.portionspot.pos.data.isMeasured
+import com.portionspot.pos.data.onHand
 import java.util.Locale
 
 /**
@@ -79,10 +81,18 @@ object NotificationEngine {
         val out = ArrayList<NotifCandidate>()
 
         // ---- Inventory: out of stock, then low stock ----
-        // Wording is product-type aware (§ Box/Set/Piece): a set reads "2 sets left",
-        // a piece "4 pieces left", a box item just "5 left" (the count carries it).
+        // ★ On-hand is read through [onHand], NEVER the raw stockQty. A measured product
+        // (sold by a decimal quantity of kg/L/m) parks its real on-hand in stockMeasured
+        // and deliberately leaves stockQty at 0 — so testing stockQty announced every
+        // full drum of oil as "Out of stock", the false alarms the owner was getting.
+        // [onHand] is the same accessor the dashboard's out/low counters use, so the feed
+        // and the dashboard can no longer disagree about the same shelf.
+        // Wording is product-type aware (§ Box/Set/Piece): a set reads "2 sets left", a
+        // piece "4 pieces left", a measured item its own unit "1.5 kg left", and a box
+        // item just "5 left" (the count carries it).
         for (it in s.trackedItems) {
-            if (it.stockQty <= 0.0) {
+            val qty = it.onHand
+            if (qty <= 0.0) {
                 val noun = stockNoun(it, 0.0)
                 out += NotifCandidate(
                     "inventory", "danger", "Out of stock",
@@ -90,12 +100,24 @@ object NotificationEngine {
                     "outstock:${it.id}", "item", it.id, s.nowMs, pushWorthy = true
                 )
             } else {
-                val level = if (it.reorderLevel > 0.0) it.reorderLevel else t.lowStockDefault
-                if (it.stockQty <= level) {
-                    val noun = stockNoun(it, it.stockQty)
+                // ★ [NotifThresholds.lowStockDefault] is a bare COUNT, which only carries
+                // meaning for counted types (boxes, sets, pieces). On a measured item the
+                // same 5 would mean 5 kg of cooking oil and 5 m of hose alike — two
+                // thresholds that share a number and nothing else, one of them absurd. So
+                // a measured item alerts only against the reorder level its owner typed in
+                // that item's own unit ("Reorder at (kg)" in the product form); with none
+                // set, a level of 0 keeps it quiet instead of guessing. Running out is
+                // still running out, so the zero branch above applies to every type.
+                val level = when {
+                    it.reorderLevel > 0.0 -> it.reorderLevel
+                    it.isMeasured -> 0.0
+                    else -> t.lowStockDefault
+                }
+                if (qty <= level) {
+                    val noun = qtyNoun(it, qty)
                     out += NotifCandidate(
                         "inventory", "warn", "Low stock",
-                        "${it.name}: ${trimQty(it.stockQty)}${noun?.let { n -> " $n" } ?: ""} left.",
+                        "${it.name}: ${trimQty(qty)}${noun?.let { n -> " $n" } ?: ""} left.",
                         "lowstock:${it.id}", "item", it.id, s.nowMs, pushWorthy = true
                     )
                 }
@@ -201,10 +223,18 @@ object NotificationEngine {
         if (q == q.toLong().toDouble()) q.toLong().toString() else q.toString()
 
     /** Stock noun for the item's product type, singular/plural by [qty]; null for box/
-     *  unit items where the bare count already reads naturally ("5 left"). */
+     *  unit items where the bare count already reads naturally ("5 left"). Measured items
+     *  are counted nowhere here on purpose — they read in their unit, see [qtyNoun]. */
     private fun stockNoun(item: Item, qty: Double): String? = when (item.productType) {
         "set" -> if (qty == 1.0) "set" else "sets"
         "piece" -> if (qty == 1.0) "piece" else "pieces"
         else -> null
     }
+
+    /** Noun for a REMAINING quantity: a measured item reads in its own unit ("1.5 kg
+     *  left"), every other type falls back to [stockNoun]. Deliberately NOT used on the
+     *  out-of-stock line, where "no kg in stock" would read wrong — a measured item that
+     *  hits zero simply "has run out". */
+    private fun qtyNoun(item: Item, qty: Double): String? =
+        if (item.isMeasured) item.unit.trim().ifBlank { null } else stockNoun(item, qty)
 }

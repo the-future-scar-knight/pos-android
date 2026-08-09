@@ -8,6 +8,7 @@ import android.content.Intent
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.provider.CallLog
+import android.provider.Settings
 import android.os.Build
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -42,6 +43,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -73,6 +75,7 @@ import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.automirrored.filled.ViewList
 import androidx.compose.material.icons.filled.Inventory2
 import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.NotificationsOff
 import androidx.compose.material.icons.filled.Payments
 import androidx.compose.material.icons.filled.People
 import androidx.compose.material.icons.filled.PointOfSale
@@ -128,6 +131,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.collectAsState
@@ -145,6 +149,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.core.app.NotificationManagerCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -313,6 +321,29 @@ private fun screenIcon(s: Screen): androidx.compose.ui.graphics.vector.ImageVect
     Screen.Refunds -> Icons.Filled.AssignmentReturn
     Screen.MobileMoney -> Icons.Filled.Sms
     Screen.Settings -> Icons.Filled.Settings
+}
+
+/**
+ * A notification tap resolved to a record — "open the thing this alert is about".
+ * [refType] is the vocabulary NotificationEngine already stamps on every alert
+ * (item | sale | refund | customer | purchase_order | mm_receipt | device) and [refId]
+ * the row's id (null for device-level alerts, which have a screen but no record).
+ * Carried from MainActivity into [AppRoot], which is the shell every signed-in person
+ * can reach — deliberately not the admin one, so a cashier is never sent somewhere they
+ * would only be bounced out of.
+ */
+data class PosDeepLink(val refType: String, val refId: String?)
+
+/** Where a [PosDeepLink.refType] lives in the POS shell; null = we can't land on it. */
+private fun screenForRef(refType: String): Screen? = when (refType) {
+    "item" -> Screen.Items
+    "sale" -> Screen.Receipts
+    "refund" -> Screen.Refunds
+    "customer" -> Screen.Customers
+    "purchase_order" -> Screen.Purchases
+    "mm_receipt" -> Screen.MobileMoney
+    "device" -> Screen.Sync
+    else -> null
 }
 
 fun money(amount: Double, currency: String = "USD"): String {
@@ -496,6 +527,9 @@ fun AppRoot(
     // Set when launched from a mobile-money notification (§6.2). Jumps to the
     // Mobile Money screen once, then calls [onOpenConsumed] so it doesn't re-fire.
     openMobileMoney: Boolean = false,
+    // Set when launched from any other alert: the record to land on ("Low stock: brake
+    // pads" → the Inventory screen with that product open). Consumed the same way.
+    deepLink: PosDeepLink? = null,
     onOpenConsumed: () -> Unit = {}
 ) {
     val t = LocalPosTokens.current
@@ -513,8 +547,26 @@ fun AppRoot(
     LaunchedEffect(caps) { if (!screenVisible(screen)) screen = Screen.Sell }
 
     LaunchedEffect(openMobileMoney) {
-        if (openMobileMoney) { screen = Screen.MobileMoney; onOpenConsumed() }
+        // A payment notification sets BOTH this and the record link; let the link's effect
+        // below do the consuming in that case, so clearing the intent can never race it.
+        if (openMobileMoney) { screen = Screen.MobileMoney; if (deepLink == null) onOpenConsumed() }
     }
+
+    // The record a notification asked us to land on. Held HERE rather than read straight
+    // off [deepLink] because consuming the intent (so a rotation doesn't re-fire it) must
+    // not close the sheet we just opened; each screen clears it once it has opened the row.
+    var linked by remember { mutableStateOf<PosDeepLink?>(null) }
+    LaunchedEffect(deepLink) {
+        val dl = deepLink ?: return@LaunchedEffect
+        // A cashier whose admin revoked a screen still gets the alert; send them to the
+        // screen only if they can see it, otherwise leave them where they are.
+        screenForRef(dl.refType)?.let { target -> if (screenVisible(target)) screen = target }
+        linked = dl
+        onOpenConsumed()
+    }
+    /** The id to open on [type]'s screen, or null when the link points elsewhere. */
+    val linkedId: (String) -> String? = { type -> linked?.takeIf { it.refType == type }?.refId }
+    val clearLink: () -> Unit = { linked = null }
 
     val currency = business?.currency ?: "USD"
     val shopName = business?.name ?: "Spot POS"
@@ -548,28 +600,36 @@ fun AppRoot(
                 )
             }
         ) { padding ->
-            Box(Modifier.fillMaxSize().padding(padding).background(t.canvasBrush)) {
-                if (business == null) {
-                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        CircularProgressIndicator()
+            Column(Modifier.fillMaxSize().padding(padding).background(t.canvasBrush)) {
+                // Asks for POST_NOTIFICATIONS once, and says so out loud when alerts are
+                // switched off — the owner should never be silently un-notified.
+                NotificationAccessBar()
+                Box(Modifier.fillMaxWidth().weight(1f)) {
+                    if (business == null) {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            CircularProgressIndicator()
+                        }
+                    } else if (!screenVisible(screen)) {
+                        NoPermissionScreen()
+                    } else when (screen) {
+                        Screen.Sell -> SellScreen(vm, business!!, printer)
+                        Screen.Dashboard -> DashboardScreen(vm, business!!)
+                        Screen.Items -> ItemsScreen(vm, currency, linkedId("item"), clearLink)
+                        Screen.Customers -> CustomersScreen(vm, currency, linkedId("customer"), clearLink)
+                        Screen.Credit -> ChangeCreditScreen(vm, currency)
+                        Screen.Expenses -> ExpensesScreen(vm, currency)
+                        Screen.Suppliers -> SuppliersScreen(vm)
+                        Screen.Purchases -> PurchaseOrdersScreen(vm, currency, linkedId("purchase_order"), clearLink)
+                        Screen.Reports -> ReportsScreen(vm, business!!)
+                        Screen.Receipts -> ReceiptsScreen(vm, business!!, printer, linkedId("sale"), clearLink)
+                        // Refunds and Sync land on the SCREEN only: the row's own actions
+                        // there are money moves (record a payout, push a sync), and a
+                        // notification tap must never pre-open one of those.
+                        Screen.Refunds -> RefundsScreen(vm, business!!, printer)
+                        Screen.MobileMoney -> MobileMoneyScreen(vm, currency, linkedId("mm_receipt"), clearLink)
+                        Screen.Sync -> SyncScreen(vm)
+                        Screen.Settings -> SettingsScreen(vm, business!!, printer)
                     }
-                } else if (!screenVisible(screen)) {
-                    NoPermissionScreen()
-                } else when (screen) {
-                    Screen.Sell -> SellScreen(vm, business!!, printer)
-                    Screen.Dashboard -> DashboardScreen(vm, business!!)
-                    Screen.Items -> ItemsScreen(vm, currency)
-                    Screen.Customers -> CustomersScreen(vm, currency)
-                    Screen.Credit -> ChangeCreditScreen(vm, currency)
-                    Screen.Expenses -> ExpensesScreen(vm, currency)
-                    Screen.Suppliers -> SuppliersScreen(vm)
-                    Screen.Purchases -> PurchaseOrdersScreen(vm, currency)
-                    Screen.Reports -> ReportsScreen(vm, business!!)
-                    Screen.Receipts -> ReceiptsScreen(vm, business!!, printer)
-                    Screen.Refunds -> RefundsScreen(vm, business!!, printer)
-                    Screen.MobileMoney -> MobileMoneyScreen(vm, currency)
-                    Screen.Sync -> SyncScreen(vm)
-                    Screen.Settings -> SettingsScreen(vm, business!!, printer)
                 }
             }
         }
@@ -627,6 +687,113 @@ private fun NoPermissionScreen() {
     }
 }
 
+// ─────────────────── NOTIFICATION ACCESS (§6.2 / §8 delivery) ───────────────────
+
+private const val NOTIF_PREFS = "notif_access"
+private const val NOTIF_ASKED_KEY = "post_notifications_asked"
+
+/**
+ * The one place the app asks for POST_NOTIFICATIONS, and the one place it admits when
+ * alerts are off. It used to be asked for on the Mobile Money screen, bundled with the
+ * two SMS permissions: an owner who never opened that screen was NEVER asked, so on
+ * Android 13+ areNotificationsEnabled() stayed false and both Notifier entry points
+ * returned silently — no low-stock alert, no payment prompt, and no hint why. Bundled
+ * with SMS it also got denied as one lump. So: ask here, where every session lands
+ * (this bar is rendered by both the POS and the admin shell), ask ONCE ever (a
+ * SharedPreferences flag, so a "no" is respected rather than nagged at every launch),
+ * and if alerts are off for ANY reason — denied, or switched off in system settings
+ * later — show a dismissible strip with a one-tap route to the settings screen.
+ */
+@Composable
+private fun NotificationAccessBar() {
+    val t = LocalPosTokens.current
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var blocked by remember { mutableStateOf(!NotificationManagerCompat.from(context).areNotificationsEnabled()) }
+    var dismissed by rememberSaveable { mutableStateOf(false) }
+
+    val permLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { blocked = !NotificationManagerCompat.from(context).areNotificationsEnabled() }
+
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            val prefs = context.getSharedPreferences(NOTIF_PREFS, Context.MODE_PRIVATE)
+            if (!prefs.getBoolean(NOTIF_ASKED_KEY, false)) {
+                // Mark BEFORE launching: the system dialog only ever appears twice, and a
+                // silent no-op third ask must not be mistaken for "not asked yet".
+                prefs.edit().putBoolean(NOTIF_ASKED_KEY, true).apply()
+                permLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+    }
+
+    // Re-read on every resume — the fix for this bar is a trip to system settings, and we
+    // must notice when the owner comes back having flipped the switch.
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                blocked = !NotificationManagerCompat.from(context).areNotificationsEnabled()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    if (!blocked || dismissed) return
+
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .background(t.warning.copy(alpha = 0.14f))
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            Icons.Filled.NotificationsOff, contentDescription = null,
+            tint = t.warning, modifier = Modifier.size(18.dp)
+        )
+        Spacer(Modifier.width(8.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                "Alerts are off on this phone",
+                color = t.inkPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold
+            )
+            Text(
+                "You won't be told about low stock or payments to verify.",
+                color = t.inkSecondary, fontSize = 11.sp
+            )
+        }
+        TextButton(onClick = { openNotificationSettings(context) }) { Text("Turn on") }
+        IconButton(onClick = { dismissed = true }, modifier = Modifier.size(32.dp)) {
+            Icon(
+                Icons.Filled.Close, contentDescription = "Dismiss",
+                tint = t.inkTertiary, modifier = Modifier.size(16.dp)
+            )
+        }
+    }
+}
+
+/**
+ * Jump to this app's notification settings. Deliberately not another permission request:
+ * by the time the bar is showing, the runtime ask has already been spent (or the owner
+ * turned alerts off in settings, which no in-app dialog can undo). Falls back to the
+ * app-details page on pre-O, where the per-app notification screen doesn't exist.
+ */
+private fun openNotificationSettings(context: Context) {
+    val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+            .putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+    } else {
+        Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+            .setData(Uri.fromParts("package", context.packageName, null))
+    }
+    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    runCatching { context.startActivity(intent) }
+}
+
 // ─────────────────── MOBILE MONEY RECONCILIATION (Phase 5, §6) ───────────────────
 
 private enum class MmTab(val label: String) {
@@ -640,7 +807,14 @@ private enum class MmTab(val label: String) {
  * it to the customer's account; a walk-in sale payment is simply acknowledged.
  */
 @Composable
-private fun MobileMoneyScreen(vm: PosViewModel, currency: String) {
+private fun MobileMoneyScreen(
+    vm: PosViewModel,
+    currency: String,
+    // Set when a "payment received — verify" notification was tapped: the receipt to put
+    // under the owner's thumb rather than dropping him on a three-tab list.
+    openReceiptId: String? = null,
+    onOpened: () -> Unit = {}
+) {
     val t = LocalPosTokens.current
     val needs by vm.mmNeedsVerification.collectAsState()
     val unmatched by vm.mmUnmatched.collectAsState()
@@ -649,9 +823,13 @@ private fun MobileMoneyScreen(vm: PosViewModel, currency: String) {
     var tab by remember { mutableStateOf(MmTab.NEEDS) }
     var verifyTarget by remember { mutableStateOf<MobileMoneyReceipt?>(null) }
     var undoTarget by remember { mutableStateOf<MobileMoneyReceipt?>(null) }
+    var highlightId by remember { mutableStateOf<String?>(null) }
+    val listState = rememberLazyListState()
 
-    // Ask for SMS + notification permissions on first visit (declaration ≠ grant on
-    // 13+). If denied, reconciliation just stays empty — nothing else breaks.
+    // Ask for the SMS permissions on first visit (declaration ≠ grant on 23+). If denied,
+    // reconciliation just stays empty — nothing else breaks. POST_NOTIFICATIONS used to be
+    // bundled in here; it lives in NotificationAccessBar now, because an owner who never
+    // opened this screen was never asked and so never got a single notification.
     val context = LocalContext.current
     val permLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -665,13 +843,25 @@ private fun MobileMoneyScreen(vm: PosViewModel, currency: String) {
                 add(Manifest.permission.RECEIVE_SMS)
             if (context.checkSelfPermission(Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED)
                 add(Manifest.permission.READ_SMS)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-                context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-            ) add(Manifest.permission.POST_NOTIFICATIONS)
         }
         if (wanted.isNotEmpty()) permLauncher.launch(wanted.toTypedArray())
         // Already granted from a prior visit → pull anything that arrived while closed.
         else vm.backfillSmsInbox(context.applicationContext)
+    }
+
+    // Deep link: open the BUCKET the payment is actually in (it may already have been
+    // verified from another phone by the time he taps) and mark it for the scroll below.
+    LaunchedEffect(openReceiptId, needs, unmatched, verified) {
+        val id = openReceiptId ?: return@LaunchedEffect
+        val bucket = when {
+            needs.any { it.id == id } -> MmTab.NEEDS
+            unmatched.any { it.id == id } -> MmTab.UNMATCHED
+            verified.any { it.id == id } -> MmTab.DONE
+            else -> return@LaunchedEffect
+        }
+        tab = bucket
+        highlightId = id
+        onOpened()
     }
 
     // Surface the result of an inbox scan (messages caught while the app was closed).
@@ -685,6 +875,25 @@ private fun MobileMoneyScreen(vm: PosViewModel, currency: String) {
                 Toast.LENGTH_LONG
             ).show()
             vm.clearSmsBackfillNote()
+        }
+    }
+
+    val list = when (tab) {
+        MmTab.NEEDS -> needs
+        MmTab.UNMATCHED -> unmatched
+        MmTab.DONE -> verified
+    }
+    // Scroll the linked payment into view once its bucket is on screen. Keyed on the list
+    // too because the row may only arrive with the next flow emission — but done ONCE per
+    // link, so a later refresh doesn't yank the list back while he is reading it.
+    var scrolledFor by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(highlightId, list) {
+        val id = highlightId ?: return@LaunchedEffect
+        if (scrolledFor == id) return@LaunchedEffect
+        val idx = list.indexOfFirst { it.id == id }
+        if (idx >= 0) {
+            scrolledFor = id
+            runCatching { listState.animateScrollToItem(idx) }
         }
     }
 
@@ -708,17 +917,13 @@ private fun MobileMoneyScreen(vm: PosViewModel, currency: String) {
         )
         Spacer(Modifier.height(10.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            MmTabChip(MmTab.NEEDS, tab, needs.size) { tab = it }
-            MmTabChip(MmTab.UNMATCHED, tab, unmatched.size) { tab = it }
-            MmTabChip(MmTab.DONE, tab, verified.size) { tab = it }
+            // Switching bucket by hand drops the deep-link highlight — he's moved on.
+            MmTabChip(MmTab.NEEDS, tab, needs.size) { tab = it; highlightId = null }
+            MmTabChip(MmTab.UNMATCHED, tab, unmatched.size) { tab = it; highlightId = null }
+            MmTabChip(MmTab.DONE, tab, verified.size) { tab = it; highlightId = null }
         }
         Spacer(Modifier.height(10.dp))
 
-        val list = when (tab) {
-            MmTab.NEEDS -> needs
-            MmTab.UNMATCHED -> unmatched
-            MmTab.DONE -> verified
-        }
         if (list.isEmpty()) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -737,6 +942,7 @@ private fun MobileMoneyScreen(vm: PosViewModel, currency: String) {
         } else {
             LazyColumn(
                 Modifier.fillMaxSize(),
+                state = listState,
                 // Clear the floating cart (bottom-anchored pill) so it can't sit over the last row.
                 contentPadding = PaddingValues(bottom = 96.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -744,6 +950,7 @@ private fun MobileMoneyScreen(vm: PosViewModel, currency: String) {
                 items(list, key = { it.id }) { r ->
                     MmReceiptCard(
                         r = r,
+                        highlight = r.id == highlightId,
                         onVerify = { verifyTarget = r },
                         onLogAsSale = { vm.verifyMobileMoney(r.id, null, "sale") },
                         onIgnore = { vm.ignoreMobileMoney(r.id) },
@@ -796,7 +1003,10 @@ private fun MmReceiptCard(
     onVerify: () -> Unit,
     onLogAsSale: () -> Unit,
     onIgnore: () -> Unit,
-    onUndo: () -> Unit
+    onUndo: () -> Unit,
+    // True for the payment a notification tap pointed at: a heavier brand-coloured edge,
+    // so "which one was it warning me about" is answered without reading amounts.
+    highlight: Boolean = false
 ) {
     val t = LocalPosTokens.current
     val who = r.matchedCustomerName ?: r.senderName ?: r.senderPhone ?: "Unknown sender"
@@ -804,8 +1014,12 @@ private fun MmReceiptCard(
         Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
-            .background(t.surface1)
-            .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
+            .background(if (highlight) t.surface2 else t.surface1)
+            .border(
+                if (highlight) 2.dp else 1.dp,
+                if (highlight) t.brand.s600 else t.surfaceBorder,
+                RoundedCornerShape(12.dp)
+            )
             .padding(14.dp)
     ) {
         Column(Modifier.fillMaxWidth()) {
@@ -972,6 +1186,10 @@ fun AdminRoot(
     vm: PosViewModel,
     onExitToCashier: () -> Unit,
     openAlerts: Boolean = false,
+    // Tapping an alert CARD in the feed asks the host to open that record. It goes back
+    // up to MainActivity rather than being handled here so an in-app tap and a system
+    // notification tap travel the same road — the POS shell, which holds those screens.
+    onOpenRecord: (PosDeepLink) -> Unit = {},
     onOpenConsumed: () -> Unit = {}
 ) {
     val t = LocalPosTokens.current
@@ -999,18 +1217,23 @@ fun AdminRoot(
             topBar = { AdminTopBar(business?.name ?: "Admin", onExitToCashier, business?.logoUri) },
             bottomBar = { AdminBottomNav(current = tab, alertsBadge = unread, onSelect = { tab = it }) }
         ) { padding ->
-            Box(Modifier.fillMaxSize().padding(padding).background(t.canvasBrush)) {
-                if (business == null) {
-                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        CircularProgressIndicator()
+            Column(Modifier.fillMaxSize().padding(padding).background(t.canvasBrush)) {
+                // The admin phone is the one that most needs alerts to work — same bar,
+                // same one-time ask, whichever shell the session happens to be in.
+                NotificationAccessBar()
+                Box(Modifier.fillMaxWidth().weight(1f)) {
+                    if (business == null) {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            CircularProgressIndicator()
+                        }
+                    } else when (tab) {
+                        AdminTab.Dashboard -> DashboardScreen(vm, business!!)
+                        AdminTab.Reports -> ReportsScreen(vm, business!!)
+                        AdminTab.Inventory -> ItemsScreen(vm, currency)
+                        AdminTab.Alerts -> AdminAlertsScreen(vm, currency, onOpenRecord)
+                        AdminTab.Manage -> AdminManageScreen(vm, currency)
+                        AdminTab.Settings -> SettingsScreen(vm, business!!, printer)
                     }
-                } else when (tab) {
-                    AdminTab.Dashboard -> DashboardScreen(vm, business!!)
-                    AdminTab.Reports -> ReportsScreen(vm, business!!)
-                    AdminTab.Inventory -> ItemsScreen(vm, currency)
-                    AdminTab.Alerts -> AdminAlertsScreen(vm, currency)
-                    AdminTab.Manage -> AdminManageScreen(vm, currency)
-                    AdminTab.Settings -> SettingsScreen(vm, business!!, printer)
                 }
             }
         }
@@ -1086,7 +1309,11 @@ private val ALERT_CATS = listOf(
  * is current without waiting for the periodic worker.
  */
 @Composable
-private fun AdminAlertsScreen(vm: PosViewModel, currency: String) {
+private fun AdminAlertsScreen(
+    vm: PosViewModel,
+    currency: String,
+    onOpenRecord: (PosDeepLink) -> Unit = {}
+) {
     val t = LocalPosTokens.current
     val all by vm.notifications.collectAsState()
     val requests by vm.pendingRequests.collectAsState()
@@ -1151,7 +1378,18 @@ private fun AdminAlertsScreen(vm: PosViewModel, currency: String) {
                 }
             } else {
                 items(shown, key = { it.id }) { n ->
-                    NotificationCard(n, onClick = { if (n.readAt == null) vm.markNotificationRead(n.id) })
+                    NotificationCard(
+                        n,
+                        onClick = {
+                            if (n.readAt == null) vm.markNotificationRead(n.id)
+                            // Same destination as tapping the system notification: the row
+                            // it is about, when the alert names one we can land on.
+                            val ref = n.refType
+                            if (ref != null && screenForRef(ref) != null) {
+                                onOpenRecord(PosDeepLink(ref, n.refId))
+                            }
+                        }
+                    )
                 }
             }
         }
@@ -4612,6 +4850,25 @@ private fun trimPct(p: Double): String =
 /** At/below this on-hand quantity a tracked item is flagged "low" (Stage A: fixed). */
 private const val LOW_STOCK_THRESHOLD = 5.0
 
+/**
+ * The quantity at or below which an item counts as LOW — the single rule behind the
+ * inventory badge and the dashboard tile, and deliberately identical to the one
+ * [com.portionspot.pos.notify.NotificationEngine] applies. When these drifted apart the
+ * app contradicted itself about the same shelf, which is exactly how the owner ended up
+ * with "Low stock" alerts for products that were plainly full.
+ *
+ * ★ A measured item (kg/L/m) gets NO default. The bare 5 means five of something, and
+ * five litres of cooking oil next to five metres of hose share a number and nothing else
+ * — one of them is absurd whichever number you pick. The product form gives measured
+ * items their own "Reorder at (kg)" field, so with none set the item is never low; it is
+ * only ever OUT, which is unambiguous in any unit.
+ */
+private fun lowStockLevel(item: Item): Double = when {
+    item.reorderLevel > 0.0 -> item.reorderLevel
+    item.isMeasured -> 0.0
+    else -> LOW_STOCK_THRESHOLD
+}
+
 /** Drops the trailing ".0" so 12.0 -> "12" but 1.5 stays "1.5". */
 private fun trimQty(q: Double): String =
     if (q % 1.0 == 0.0) q.toInt().toString() else q.toString()
@@ -5273,7 +5530,13 @@ private fun shareReceipt(
 // ───────────────────────── ITEMS ─────────────────────────
 
 @Composable
-private fun ItemsScreen(vm: PosViewModel, currency: String) {
+private fun ItemsScreen(
+    vm: PosViewModel,
+    currency: String,
+    // Set when a "Low stock"/"Out of stock" notification was tapped: the product to land on.
+    openItemId: String? = null,
+    onOpened: () -> Unit = {}
+) {
     val t = LocalPosTokens.current
     val items by vm.items.collectAsState()
     val business by vm.business.collectAsState()
@@ -5283,6 +5546,25 @@ private fun ItemsScreen(vm: PosViewModel, currency: String) {
     var showPriceList by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<Item?>(null) }
     var search by remember { mutableStateOf("") }
+
+    // Deep link. Keyed on [items] as well because the catalogue arrives a frame or two
+    // after the screen does. Someone without MANAGE_INVENTORY can't be dropped into the
+    // edit sheet, so the list is filtered down to the product instead — they still land
+    // on the thing they were warned about. A row that no longer exists just gives up.
+    LaunchedEffect(openItemId, items) {
+        val id = openItemId ?: return@LaunchedEffect
+        val target = items.firstOrNull { it.id == id }
+        if (target == null) {
+            if (items.isNotEmpty()) onOpened()
+            return@LaunchedEffect
+        }
+        if (canManageInventory) {
+            editing = target
+        } else {
+            search = target.name
+        }
+        onOpened()
+    }
 
     val q = search.trim().lowercase()
     val shown = remember(items, q) {
@@ -5353,8 +5635,9 @@ private fun ItemsScreen(vm: PosViewModel, currency: String) {
                                         // Measured items count in their decimal unit; box/piece in whole units.
                                         val onHand = item.onHand
                                         val out = onHand <= 0.0
-                                        // Per-item reorder level wins; fall back to the global default.
-                                        val threshold = if (item.reorderLevel > 0.0) item.reorderLevel else LOW_STOCK_THRESHOLD
+                                        // Per-item reorder level wins; fall back to the global
+                                        // default, except on a measured item — see lowStockLevel.
+                                        val threshold = lowStockLevel(item)
                                         val low = !out && onHand <= threshold
                                         val (label, tint) = when {
                                             out -> "Out of stock" to MaterialTheme.colorScheme.error
@@ -6118,7 +6401,13 @@ private fun StockHistoryDialog(vm: PosViewModel, item: Item, onDismiss: () -> Un
 // ───────────────────────── CUSTOMERS ─────────────────────────
 
 @Composable
-private fun CustomersScreen(vm: PosViewModel, currency: String) {
+private fun CustomersScreen(
+    vm: PosViewModel,
+    currency: String,
+    // Set when an "Aging debt" / "Over credit limit" notification was tapped.
+    openCustomerId: String? = null,
+    onOpened: () -> Unit = {}
+) {
     val t = LocalPosTokens.current
     val ctx = LocalContext.current
     val customers by vm.customers.collectAsState()
@@ -6128,6 +6417,19 @@ private fun CustomersScreen(vm: PosViewModel, currency: String) {
     // Non-null => open the Add dialog pre-filled from a contact pick or a recent call.
     var prefill by remember { mutableStateOf<PickedContact?>(null) }
     var search by remember { mutableStateOf("") }
+
+    // Deep link: open the account the alert was about (the detail sheet is where the debt,
+    // its age and the "record payment" action live). Same wait-for-the-flow shape as Inventory.
+    LaunchedEffect(openCustomerId, customers) {
+        val id = openCustomerId ?: return@LaunchedEffect
+        val target = customers.firstOrNull { it.customer.id == id }
+        if (target == null) {
+            if (customers.isNotEmpty()) onOpened()
+            return@LaunchedEffect
+        }
+        selected = target.customer
+        onOpened()
+    }
 
     val totalOutstanding = customers.sumOf { it.balance }
     val q = search.trim().lowercase()
@@ -7493,7 +7795,13 @@ private fun PoStatusBadge(status: String) {
  * card opens its detail sheet, from which a sent PO can be received.
  */
 @Composable
-private fun PurchaseOrdersScreen(vm: PosViewModel, currency: String) {
+private fun PurchaseOrdersScreen(
+    vm: PosViewModel,
+    currency: String,
+    // Set when an "Order arriving / overdue — arrived?" notification was tapped.
+    openPoId: String? = null,
+    onOpened: () -> Unit = {}
+) {
     val t = LocalPosTokens.current
     val pos by vm.purchaseOrders.collectAsState()
     val payables by vm.supplierPayables.collectAsState()
@@ -7505,6 +7813,20 @@ private fun PurchaseOrdersScreen(vm: PosViewModel, currency: String) {
     var creating by remember { mutableStateOf(false) }
     var detail by remember { mutableStateOf<PurchaseOrderWithLines?>(null) }
     var receiving by remember { mutableStateOf<PurchaseOrderWithLines?>(null) }
+
+    // Deep link: open that order's detail sheet — the same one the "arrivals due" banner
+    // below opens, from which he confirms what actually arrived.
+    LaunchedEffect(openPoId, pos) {
+        val id = openPoId ?: return@LaunchedEffect
+        val target = pos.firstOrNull { it.po.id == id }
+        if (target == null) {
+            if (pos.isNotEmpty()) onOpened()
+            return@LaunchedEffect
+        }
+        statusFilter = "all"
+        detail = target
+        onOpened()
+    }
 
     val counts = remember(pos) {
         mapOf(
@@ -8467,8 +8789,7 @@ private fun DashboardScreen(vm: PosViewModel, business: Business) {
     // Health figures, computed from the live catalog/ledger (like the web).
     val outStock = items.count { it.trackStock && it.onHand <= 0.0 }
     val lowStock = items.count {
-        it.trackStock && it.onHand > 0.0 &&
-            it.onHand <= (if (it.reorderLevel > 0.0) it.reorderLevel else LOW_STOCK_THRESHOLD)
+        it.trackStock && it.onHand > 0.0 && it.onHand <= lowStockLevel(it)
     }
     val noCost = items.count { it.cost == null }
     val pendingCredit = customers.sumOf { it.balance.coerceAtLeast(0.0) }
@@ -8997,7 +9318,14 @@ private fun ReportStatRow(label: String, value: String) {
 // ───────────────────────── RECEIPTS ─────────────────────────
 
 @Composable
-private fun ReceiptsScreen(vm: PosViewModel, business: Business, printer: PrinterUi) {
+private fun ReceiptsScreen(
+    vm: PosViewModel,
+    business: Business,
+    printer: PrinterUi,
+    // Set when a "Large sale" notification was tapped: the receipt to open.
+    openSaleId: String? = null,
+    onOpened: () -> Unit = {}
+) {
     val t = LocalPosTokens.current
     val currency = business.currency
     val caps by vm.allowedCaps.collectAsState()
@@ -9012,6 +9340,20 @@ private fun ReceiptsScreen(vm: PosViewModel, business: Business, printer: Printe
     var detailFor by remember { mutableStateOf<SaleEntity?>(null) }
     var editFor by remember { mutableStateOf<SaleEntity?>(null) }
     var showQuotes by remember { mutableStateOf(false) }
+
+    // Deep link: open that receipt's detail sheet. [recentSales] is a window, not the whole
+    // ledger — an older sale simply lands the owner on the Receipts list, which is honest.
+    LaunchedEffect(openSaleId, sales) {
+        val id = openSaleId ?: return@LaunchedEffect
+        val target = sales.firstOrNull { it.id == id }
+        if (target == null) {
+            if (sales.isNotEmpty()) onOpened()
+            return@LaunchedEffect
+        }
+        showQuotes = false
+        detailFor = target
+        onOpened()
+    }
 
     Column(Modifier.fillMaxSize()) {
         Column(Modifier.padding(12.dp)) {

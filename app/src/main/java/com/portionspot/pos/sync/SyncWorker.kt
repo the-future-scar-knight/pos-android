@@ -47,6 +47,14 @@ class SyncWorker(appContext: Context, params: WorkerParameters) :
                     // unique REPLACE work, so kicking it every background pull is safe.
                     AdminNotificationWorker.runNow(applicationContext)
                 }
+                // A pass that reached the server is also the moment to re-read the signed-in
+                // staff member's own capability grants, so an admin's revocation lands on
+                // this ~15-minute cadence even while the app is backgrounded or the till has
+                // been sitting on the same screen since the shop opened. Independent of
+                // `pulled` — a permission change is not a row this device syncs. Failures are
+                // swallowed: refreshCurrentPermissions keeps the cached grants when it can't
+                // reach the truth, and a sync pass must not be retried over it.
+                runCatching { container.authManager.refreshCurrentPermissions() }
                 Result.success()
             }
             SyncOutcome.NotConfigured -> Result.success()   // nothing to do yet

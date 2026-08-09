@@ -122,6 +122,17 @@ class AuthManager(
     @Volatile
     private var activeUserId: String? = null
 
+    /**
+     * Consecutive "server answered, no such staff row" sightings per account, for the
+     * two-strike rule in [PermissionRefresh]. Deliberately IN MEMORY and not persisted:
+     * the count exists to distinguish a genuinely deleted row (which is still missing on
+     * the next pass, minutes later) from a one-off empty read after a `pos_staff` rebuild
+     * or an RLS change, and a process restart is a perfectly good moment to start that
+     * judgement over. Persisting it would only make a stale strike outlive the condition
+     * that caused it. Keyed by user id so one cashier's strike can't revoke another.
+     */
+    private val missingStrikes = java.util.concurrent.ConcurrentHashMap<String, Int>()
+
     /** Memoised "does this device have a cloud account at all?", so the hot token path
      *  ([accessTokenOrNull], called per HTTP request) doesn't decrypt the vault every
      *  time. Null = unknown, recomputed on next read; invalidated on every mutation. */
@@ -510,33 +521,93 @@ class AuthManager(
     }
 
     /**
-     * Re-fetch the ACTIVE account's own `pos_staff` row and update its cached role +
-     * permissions, so an admin's change to a cashier's grants reaches that cashier's
-     * device. Offline (fetch throws) or a not-found row ⇒ keep whatever is cached; we
-     * never sign the user out or clear grants from a transient failure. If the live
-     * [AuthState.Active] is this user, re-emit it so the UI (and [PosUser.permissions])
-     * refresh.
+     * Re-fetch the ACTIVE account's own `pos_staff` row and reconcile the cached session
+     * with it, so a change the owner makes in the console — a capability revoked, a
+     * demotion out of admin, a deactivation, a deletion — actually reaches the cashier's
+     * phone. A till sits in the foreground all day and never restarts, so this must NOT
+     * hang off app-start alone; it is driven by every successful sync pass and by
+     * regaining connectivity (see [com.portionspot.pos.sync.SyncManager] and
+     * [com.portionspot.pos.sync.SyncWorker]) as well as foreground and the manual button.
+     *
+     * The fail-safe rule lives in [PermissionRefresh] (pure, unit-tested): a network
+     * failure keeps the cached grants because a shop on a dead cell must keep selling; a
+     * REACHED server that no longer knows this person — row gone, or `active = false` —
+     * removes the account from the device. Never the other way around: a revocation may
+     * arrive late, but a stale cache must never widen a cashier's powers.
+     *
+     * Nothing here is on a write path and nothing touches Room; the worst case is one
+     * small GET that fails and changes nothing.
      */
     suspend fun refreshCurrentPermissions() = withContext(Dispatchers.IO) {
         // Same read-through as the sync path: don't give up just because the async restore
         // in [init] hasn't populated the in-memory session yet.
         val token = liveTokenOrNull() ?: return@withContext
         val userId = activeUserId ?: return@withContext
-        val profile = try {
-            api.fetchStaffProfile(token, userId)
-        } catch (_: Exception) {
-            return@withContext // offline / transient — keep cached grants
-        } ?: return@withContext
         val cached = vault.sessionFor(userId) ?: return@withContext
-        val updated = cached.copy(
-            role = profile.role,
-            displayName = profile.displayName.ifBlank { cached.displayName },
-            permissions = Permissions.jsonToKeyMap(profile.permissions),
-        )
-        vault.updateSession(userId, updated)
-        val s = _state.value
-        if (s is AuthState.Active && s.user.id == userId) {
-            _state.value = AuthState.Active(updated.toUser())
+        val fetched = api.fetchStaffProfileResult(token, userId)
+        val verdict = PermissionRefresh.verdict(fetched, cached.displayName, missingStrikes[userId] ?: 0)
+        when (verdict) {
+            // Not evidence either way, so the strike count deliberately STANDS rather than
+            // resetting — an unreachable pass must not let a deleted row start over.
+            PermissionVerdict.KeepCached -> Unit
+            // First sighting of a missing row: bank the strike and keep selling. Only a
+            // second consecutive sighting removes the account (see PermissionRefresh).
+            PermissionVerdict.AwaitConfirmation ->
+                missingStrikes[userId] = (missingStrikes[userId] ?: 0) + 1
+            PermissionVerdict.RevokeAccount -> {
+                missingStrikes.remove(userId)
+                revokeAccount(userId)
+            }
+            is PermissionVerdict.Adopt -> {
+                // The server showed us a live row: whatever we thought was missing is not.
+                missingStrikes.remove(userId)
+                val updated = PermissionRefresh.applyTo(verdict, cached)
+                // Unchanged on the overwhelming majority of passes: skip the vault
+                // re-encrypt (and the state churn) rather than rewriting it every ~45s.
+                if (updated != cached) {
+                    vault.updateSession(userId, updated)
+                    val s = _state.value
+                    if (s is AuthState.Active && s.user.id == userId) {
+                        // Re-emit so AuthGate recomposes and pushes the new grants into the
+                        // ViewModel — a revocation must land without the cashier logging out.
+                        _state.value = AuthState.Active(updated.toUser())
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Drop a staff member the server no longer recognises off this device, mid-shift if
+     * need be. Deliberately the full account removal rather than a quiet downgrade: the
+     * vault holds an offline-unlock PIN, so leaving the account in place would let a
+     * deactivated cashier keep unlocking the till offline indefinitely. Re-adding needs a
+     * fresh online password login, and [login] already refuses an inactive profile — so a
+     * deactivation made in error self-heals as soon as the owner reverses it.
+     *
+     * Local Room data is untouched (same contract as [signOut]); unsynced sales stay
+     * queued and flush under whichever account signs in next.
+     */
+    private fun revokeAccount(userId: String) {
+        val remaining = vault.removeAccount(userId)
+        invalidateAccountCache()
+        if (userId == activeUserId) {
+            activeUserId = null
+            currentAccessToken = null
+        }
+        // This is not a dead-token situation, so the "session expired" banner would be a
+        // lie; the picker/login screen below is the honest surface.
+        _reloginRequired.value = false
+        val onScreen = when (val s = _state.value) {
+            is AuthState.Active -> s.user.id == userId
+            is AuthState.PinSetup -> s.user.id == userId
+            is AuthState.Locked -> s.account.userId == userId
+            // The picker lists accounts by value; one just disappeared, so re-emit it.
+            is AuthState.Picker -> true
+            else -> false
+        }
+        if (onScreen) {
+            _state.value = if (remaining.isEmpty()) AuthState.LoggedOut else AuthState.Picker(remaining)
         }
     }
 
