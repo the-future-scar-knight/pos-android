@@ -21,7 +21,21 @@ enum class Capability(val key: String) {
     MANAGE_INVENTORY("manage_inventory"),
     MANAGE_EXPENSES_ORDERS("manage_expenses_orders"),
     VIEW_REPORTS("view_reports"),
-    MANAGE_STAFF("manage_staff");
+    MANAGE_STAFF("manage_staff"),
+
+    // ── Cash (§ till & safe). Split three ways rather than one "manage cash" grant,
+    // because these carry very different risk: counting the drawer at closing is the
+    // routine end of a shift, while money LEAVING the business is not a cashier's call
+    // at all — TAKE MONEY OUT has no capability on purpose and stays admin-only.
+    /** Count the till, record the variance and move the day's excess to the safe. */
+    CLOSE_DAY("close_day"),
+    /** Refill the till float. Drawing from the SAFE still needs the admin's per-withdrawal
+     *  approval through the existing staff_requests channel, so this grant lets a cashier
+     *  ASK and top up from what is already to hand — it does not open the safe. */
+    TOP_UP_FLOAT("top_up_float"),
+    /** Record cash put INTO the business (owner funds, a loan). Only ever increases what
+     *  the shop holds and what it owes; the matching way out is admin-only. */
+    RECORD_MONEY_IN("record_money_in");
 
     /** Short human label for the admin permission editor. */
     val label: String
@@ -34,6 +48,9 @@ enum class Capability(val key: String) {
             MANAGE_EXPENSES_ORDERS -> "Expenses & purchase orders"
             VIEW_REPORTS -> "View reports & dashboard"
             MANAGE_STAFF -> "Manage staff"
+            CLOSE_DAY -> "Close the day"
+            TOP_UP_FLOAT -> "Top up the till float"
+            RECORD_MONEY_IN -> "Put money in"
         }
 
     companion object {
@@ -73,6 +90,17 @@ data class Permissions(val granted: Map<Capability, Boolean> = emptyMap()) {
             Capability.MANAGE_EXPENSES_ORDERS to false,
             Capability.VIEW_REPORTS to false,
             Capability.MANAGE_STAFF to false,
+            // ★ ON by default, unlike the other money-touching grants. The shop's whole
+            // reason for wanting these is that a cashier could not shut up shop without
+            // phoning the owner to come and do it — a default of false would leave every
+            // existing cashier exactly as stuck until the owner remembered to go and flip
+            // three switches. None of the three can move money OUT of the business: the
+            // close records a count, the float top-up shuffles cash the shop already
+            // holds (and still needs approval to open the safe), and money in only ever
+            // adds. Each stays revocable per cashier from the staff console.
+            Capability.CLOSE_DAY to true,
+            Capability.TOP_UP_FLOAT to true,
+            Capability.RECORD_MONEY_IN to true,
         )
 
         val EMPTY = Permissions(emptyMap())

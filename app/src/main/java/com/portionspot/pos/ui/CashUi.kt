@@ -36,6 +36,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.portionspot.pos.auth.Capability
 import com.portionspot.pos.data.CashLocation
 import com.portionspot.pos.data.DayClose
 import com.portionspot.pos.data.PosRepository
@@ -45,12 +46,17 @@ import java.util.Locale
 import kotlin.math.abs
 
 /**
- * THE OWNER'S OWN CASH MODEL (§1–§6) — the admin console's cash section.
+ * THE OWNER'S OWN CASH MODEL (§1–§6) — the cash section, rendered in BOTH shells.
  *
  * The shop has no bank. Its money sits in two places on the premises: a working TILL
- * float and a SAFE holding the day's takings. This screen is where the owner sees both,
- * moves money between them, closes the day, and answers the question he actually cares
- * about — "how much of this money is actually mine?"
+ * float and a SAFE holding the day's takings. This is where the owner sees both, moves
+ * money between them, closes the day, and answers the question he actually cares about —
+ * "how much of this money is actually mine?"
+ *
+ * It is also the cashier's closing screen. Everything gated to the owner (taking money
+ * out, the profit split, his own money in and out) is hidden by capability inside
+ * [TillAndSafeSection] rather than by living in a separate admin-only file — see the
+ * note there for why one component beats two copies.
  *
  * ★ ON COMMAND, NEVER ON A TIMER. There is no scheduled prompt anywhere in here and
  * nothing nags. "Close the day" and "Top up float" are BUTTONS, pressed when the person
@@ -66,12 +72,32 @@ private fun parseMoney(s: String): Double? = s.trim().replace(',', '.').toDouble
 private fun fmt2(v: Double): String = String.format(Locale.US, "%.2f", v)
 
 /**
- * The whole till-and-safe block. Rendered as one `item {}` inside the admin console's
- * LazyColumn, so it keeps the console's scroll behaviour and its card styling.
+ * The whole till-and-safe block. Rendered as one `item {}` inside a LazyColumn, so it
+ * keeps the host screen's scroll behaviour and card styling.
+ *
+ * ★ ONE component, TWO shells. It sits in the admin console AND on the cashier's own
+ * cash screen, gated per action rather than forked into two copies — a second copy is
+ * how the cashier's version quietly drifts into showing something it shouldn't. The
+ * shop's problem was that closing the day lived behind the admin panel, so a cashier
+ * finishing a shift had to phone the owner to come and shut up shop.
+ *
+ * What a cashier can reach is decided by capability, not by which shell they are in:
+ *  - [Capability.CLOSE_DAY], [Capability.TOP_UP_FLOAT], [Capability.RECORD_MONEY_IN]
+ *    are grantable, and default ON (see [Permissions.CASHIER_DEFAULTS]).
+ *  - TAKE MONEY OUT has no capability at all and is admin-only, deliberately: it is the
+ *    one command here that lets cash LEAVE the business.
+ *  - The profit split and the owner's own money in/out are the OWNER'S position, not
+ *    shop operations, so they stay admin-only too — a cashier closing the till has no
+ *    business reading how much of the drawer is the owner's profit.
  */
 @Composable
 fun TillAndSafeSection(vm: PosViewModel, currency: String) {
     val t = LocalPosTokens.current
+    val caps by vm.allowedCaps.collectAsState()
+    val isAdmin by vm.isAdmin.collectAsState()
+    val canClose = isAdmin || Capability.CLOSE_DAY in caps
+    val canTopUp = isAdmin || Capability.TOP_UP_FLOAT in caps
+    val canMoneyIn = isAdmin || Capability.RECORD_MONEY_IN in caps
     val till by vm.tillBalance.collectAsState()
     val safe by vm.safeBalance.collectAsState()
     val target by vm.floatTarget.collectAsState()
@@ -115,23 +141,40 @@ fun TillAndSafeSection(vm: PosViewModel, currency: String) {
             color = t.inkTertiary, fontSize = 11.sp
         )
 
-        // ── The two commands. Pressed when the person chooses; never scheduled. ──
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(
-                onClick = { showClose = true },
-                modifier = Modifier.weight(1f),
-                colors = ButtonDefaults.buttonColors(containerColor = t.brand.s600, contentColor = t.inkOnBrand)
-            ) { Text("Close the day") }
-            OutlinedButton(onClick = { showTopUp = true }, modifier = Modifier.weight(1f)) {
-                Text("Top up float")
+        // ── The commands. Pressed when the person chooses; never scheduled. A button the
+        // signed-in person cannot use is not rendered at all rather than shown disabled:
+        // a dead button on a till invites a cashier to keep pressing it and then ring the
+        // owner about it, which is the exact phone call this section exists to stop.
+        if (canClose || canTopUp) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (canClose) {
+                    Button(
+                        onClick = { showClose = true },
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(containerColor = t.brand.s600, contentColor = t.inkOnBrand)
+                    ) { Text("Close the day") }
+                }
+                if (canTopUp) {
+                    OutlinedButton(onClick = { showTopUp = true }, modifier = Modifier.weight(1f)) {
+                        Text("Top up float")
+                    }
+                }
             }
         }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = { moneyIn = true }, modifier = Modifier.weight(1f)) {
-                Text("Put money in")
-            }
-            OutlinedButton(onClick = { moneyOut = true }, modifier = Modifier.weight(1f)) {
-                Text("Take money out")
+        if (canMoneyIn || isAdmin) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (canMoneyIn) {
+                    OutlinedButton(onClick = { moneyIn = true }, modifier = Modifier.weight(1f)) {
+                        Text("Put money in")
+                    }
+                }
+                // Admin-only, and not grantable. This is the one command that takes cash
+                // OUT of the business; a drawing is the owner's decision, never a shift's.
+                if (isAdmin) {
+                    OutlinedButton(onClick = { moneyOut = true }, modifier = Modifier.weight(1f)) {
+                        Text("Take money out")
+                    }
+                }
             }
         }
         lastClose?.let { c ->
@@ -148,10 +191,16 @@ fun TillAndSafeSection(vm: PosViewModel, currency: String) {
         toast?.let { Text(it, color = t.warning, fontSize = 12.sp, fontWeight = FontWeight.SemiBold) }
 
         // ── §6 THE SPLIT: how much of this money is actually mine ──
-        CashSplitCard(split, currency)
+        // Admin-only. This answers the OWNER's question ("how much of what is in the
+        // drawer is profit, and how much must buy the next lot"), not a shift question.
+        // A cashier counting the till has no business reading the owner's position, and
+        // showing it would leak the shop's margin to anyone who closes up.
+        if (isAdmin) {
+            CashSplitCard(split, currency)
 
-        // ── The owner's own money in and out ──
-        OwnerMoneyCard(totals, currency)
+            // ── The owner's own money in and out ──
+            OwnerMoneyCard(totals, currency)
+        }
 
         // ── Close history, per cashier, so a repeat offender is visible ──
         if (closes.isNotEmpty()) {

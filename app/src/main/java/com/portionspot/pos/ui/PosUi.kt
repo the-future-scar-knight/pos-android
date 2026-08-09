@@ -283,6 +283,7 @@ private enum class Screen(val label: String, val short: String) {
     Receipts("Receipts", "Receipts"),
     Refunds("Refunds", "Refunds"),
     MobileMoney("Mobile Money", "MoMo"),
+    Cash("Till & Safe", "Cash"),
     Settings("Settings", "Settings"),
 }
 
@@ -294,6 +295,10 @@ private enum class Screen(val label: String, val short: String) {
  */
 private fun Screen.viewCap(): com.portionspot.pos.auth.Capability? = when (this) {
     Screen.Dashboard, Screen.Reports -> com.portionspot.pos.auth.Capability.VIEW_REPORTS
+    // Gated on CLOSE_DAY specifically, not on "holds any cash grant": revoking the
+    // close takes the whole screen away, balances included, so a cashier who is not
+    // trusted to shut up shop is not shown how much is sitting in the safe either.
+    Screen.Cash -> com.portionspot.pos.auth.Capability.CLOSE_DAY
     else -> null
 }
 
@@ -303,7 +308,7 @@ private val OVERFLOW_SCREENS =
     listOf(
         Screen.Dashboard, Screen.Customers, Screen.Credit,
         Screen.Expenses, Screen.Suppliers, Screen.Purchases, Screen.Receipts,
-        Screen.Refunds, Screen.MobileMoney, Screen.Settings
+        Screen.Refunds, Screen.MobileMoney, Screen.Cash, Screen.Settings
     )
 
 private fun screenIcon(s: Screen): androidx.compose.ui.graphics.vector.ImageVector = when (s) {
@@ -320,6 +325,7 @@ private fun screenIcon(s: Screen): androidx.compose.ui.graphics.vector.ImageVect
     Screen.Receipts -> Icons.AutoMirrored.Filled.ReceiptLong
     Screen.Refunds -> Icons.Filled.AssignmentReturn
     Screen.MobileMoney -> Icons.Filled.Sms
+    Screen.Cash -> Icons.Filled.AccountBalanceWallet
     Screen.Settings -> Icons.Filled.Settings
 }
 
@@ -343,6 +349,11 @@ private fun screenForRef(refType: String): Screen? = when (refType) {
     "purchase_order" -> Screen.Purchases
     "mm_receipt" -> Screen.MobileMoney
     "device" -> Screen.Sync
+    // Cash events (a day closed, a float topped up, owner money moved) land on Till &
+    // Safe. The row itself is not pre-opened: like Refunds and Sync, everything actionable
+    // on that screen moves real money. `day_close` also carries a refId, but the close
+    // history is right there in the section, so the screen alone answers "what happened".
+    "cash", "day_close" -> Screen.Cash
     else -> null
 }
 
@@ -617,6 +628,7 @@ fun AppRoot(
                         Screen.Items -> ItemsScreen(vm, currency, linkedId("item"), clearLink)
                         Screen.Customers -> CustomersScreen(vm, currency, linkedId("customer"), clearLink)
                         Screen.Credit -> ChangeCreditScreen(vm, currency)
+                        Screen.Cash -> CashScreen(vm, currency)
                         Screen.Expenses -> ExpensesScreen(vm, currency)
                         Screen.Suppliers -> SuppliersScreen(vm)
                         Screen.Purchases -> PurchaseOrdersScreen(vm, currency, linkedId("purchase_order"), clearLink)
@@ -7586,6 +7598,42 @@ private fun ExpenseModal(
                 }
             }
         }
+    }
+}
+
+// ───────────────────────── TILL & SAFE (cashier) ─────────────────────────
+
+/**
+ * The cashier's own Till & Safe screen — the same [TillAndSafeSection] the admin console
+ * renders, on the shell a cashier can actually reach.
+ *
+ * ★ WHY IT EXISTS. Closing the day lived only inside the admin console, so a cashier
+ * finishing a shift could not count the drawer and shut up shop: they had to phone the
+ * owner to come and do it, or borrow the owner's login. Which commands appear is decided
+ * inside the section by capability, not here — see [TillAndSafeSection]. Taking money OUT
+ * of the business stays admin-only and is not grantable at all.
+ *
+ * The screen itself is hidden entirely from a cashier without [Capability.CLOSE_DAY]
+ * (see `Screen.viewCap`), so revoking the close also stops them reading the safe balance.
+ */
+@Composable
+private fun CashScreen(vm: PosViewModel, currency: String) {
+    val t = LocalPosTokens.current
+    LazyColumn(
+        Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 12.dp, bottom = 96.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        item {
+            Column {
+                Text("Till & Safe", color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 22.sp)
+                Text(
+                    "Count the drawer and close the day without calling the owner.",
+                    color = t.inkTertiary, fontSize = 12.sp
+                )
+            }
+        }
+        item { TillAndSafeSection(vm, currency) }
     }
 }
 
