@@ -34,7 +34,7 @@ class SyncConfig(private val dao: SettingDao) {
         dao.delete(KEY_URL)
         dao.delete(KEY_KEY)
         // Forget where we were so a future reconnect re-pulls from scratch.
-        TABLES.forEach { dao.delete(cursorKey(it)) }
+        resetCursors()
         dao.delete(KEY_LAST_SYNC)
         dao.delete(KEY_LAST_UPLOAD)
         dao.delete(KEY_LAST_DOWNLOAD)
@@ -49,14 +49,34 @@ class SyncConfig(private val dao: SettingDao) {
 
     suspend fun setPushEnabled(on: Boolean) = dao.put(Setting(KEY_PUSH, on.toString()))
 
+    /**
+     * The SHOP's business id, learned from the cloud `businesses` row on first connect.
+     *
+     * A device generates its own business uuid on first run, long before it has ever seen
+     * a database. Push that id and the rows upload with a 2xx and are then invisible to
+     * every other client, because the web filters by ITS business — no error, nothing to
+     * find, just takings that quietly belong to nobody.
+     *
+     * Kept as a separate value rather than rewriting the local row's primary key: the
+     * local id is referenced by every item, sale and customer on the device, and moving a
+     * primary key to fix a wire field would be a mass repoint of the whole database to
+     * solve a problem that only exists at the boundary.
+     */
+    suspend fun cloudBusinessId(): String? = dao.get(KEY_CLOUD_BID)?.trim()?.ifBlank { null }
+
+    suspend fun setCloudBusinessId(id: String) = dao.put(Setting(KEY_CLOUD_BID, id.trim()))
+
     suspend fun cursor(table: String): String = dao.get(cursorKey(table)) ?: IsoTime.EPOCH
 
     suspend fun setCursor(table: String, value: String) =
         dao.put(Setting(cursorKey(table), value))
 
     /** Forget every pull cursor so the next sync re-pulls the whole shared dataset
-     *  from scratch (used after a local-data reset). Connection is left intact. */
-    suspend fun resetCursors() = TABLES.forEach { dao.delete(cursorKey(it)) }
+     *  from scratch (used after a local-data reset). Connection is left intact.
+     *  Sweeps the pre-repoint cursor names too, so an upgraded device doesn't keep a
+     *  cursor for a table this build no longer knows about. */
+    suspend fun resetCursors() =
+        (TABLES + LEGACY_CURSOR_TABLES).distinct().forEach { dao.delete(cursorKey(it)) }
 
     suspend fun lastSyncAt(): Long? = dao.get(KEY_LAST_SYNC)?.toLongOrNull()
 
@@ -79,22 +99,83 @@ class SyncConfig(private val dao: SettingDao) {
         const val KEY_LAST_UPLOAD = "last_upload_at"
         const val KEY_LAST_DOWNLOAD = "last_download_at"
         const val KEY_PUSH = "sync_push_enabled"
+        const val KEY_CLOUD_BID = "cloud_business_id"
 
-        /** Cloud tables Android syncs (the shared web-POS schema). */
+        /**
+         * Cloud tables Android syncs — the REAL web-POS schema, verified against the live
+         * project rather than recalled.
+         *
+         * Every name here is the cloud's, and several differ from the Room table of the
+         * same data: local `credit_transactions` is cloud `credit_txns`, local `cash_txns`
+         * is cloud `cash_movements`, local `audit_log` is cloud `audit_entries`. The
+         * mapping lives in Dtos.kt; this list exists so each table gets a pull cursor and
+         * so `clearConnection`/`resetCursors` can forget every one of them.
+         *
+         * ★ There is no `products`. The catalogue is `items`, and it always was on the web
+         * side. Pointing a till at a table the shared database does not have is how you get
+         * two catalogues that both work and never see each other.
+         */
         val TABLES = listOf(
-            "products", "customers", "sales", "credit_transactions", "mobile_money_receipts",
-            // Accounting spine + supplier orders (owner-approved for cloud sync).
-            "expenses", "cash_txns", "suppliers", "purchase_orders", "purchase_order_items",
-            // Admin alert feed — so a condition a cashier phone notices reaches the
-            // owner's admin phone (upserts on the composite business_id,dedupe_key).
-            "notifications",
-            // Append-only audit trail — receipt edits, till shortages/overages and
-            // voids recorded on a cashier phone become visible on the admin phone.
-            "audit_log",
-            // Admin approval channel (credit-limit requests). The engine already sets
-            // and reads a "staff_requests" cursor; listing it here is what makes that
-            // cursor get cleared on disconnect/reset like every other table — without
-            // it, a reconnect leaves a stale cursor and silently skips older requests.
+            // ── Till core ──
+            // items is PULL-ONLY: the web owns the catalogue. Stock is not written here
+            // either — `stock_movements` is the authority and `items.stock_qty` is a
+            // derived cache every device recomputes after a pull.
+            "items",
+            "customers",
+            // A sale is three rows, not one JSON blob: the header plus its line and tender
+            // children. They carry their own cursors so a pull that dies part-way resumes
+            // where it stopped instead of re-reading every sale the shop has ever made.
+            "sales", "sale_items", "sale_payments",
+            // Refunds are FIRST-CLASS on the web now — real tables, not negative-total
+            // sales rows. That also restores the refund→sale link the old shared schema
+            // dropped, so a returned line can finally be traced to what it came off.
+            "refunds", "refund_items", "refund_payments",
+            "credit_txns",
+            "stock_movements",
+            "mobile_money_receipts",
+            // ── Cash: one drawer, one shift ──
+            // cash_sessions is unique per BUSINESS while open, not per till (see the merge
+            // rule in PosSyncEngine): the shop has one physical drawer, so it has exactly
+            // one thing to count.
+            "cash_sessions", "cash_movements",
+            // ── Accounting spine + supplier orders ──
+            "expenses", "suppliers", "purchase_orders", "purchase_order_items",
+            // Append-only audit trail — receipt edits, till shortages/overages and voids
+            // recorded on a cashier phone become visible on the owner's phone.
+            "audit_entries",
+            // Roster + per-staff permission revocations (staff.permissions jsonb).
+            "staff"
+        )
+
+        /**
+         * Local Room tables with NO cloud home, listed so it is a decision rather than an
+         * oversight. Each is device-local until the web grows a table for it:
+         *
+         *  - `notifications`   the alert feed. Cross-device alerting needs a shared table;
+         *                      until then an alert raised on a cashier phone stays there.
+         *  - `staff_requests`  the admin⇄cashier approval channel (credit-limit asks).
+         *  - `day_closes`      the till/safe day-close record. Its cloud analogue is
+         *                      `cash_sessions`, but the two are not the same shape —
+         *                      mapping them is its own piece of work.
+         *  - `outside_funds`   owner money vs loan. No cloud column expresses the split.
+         *  - `settings`        device settings (printer, theme). Deliberately never synced.
+         */
+        val LOCAL_ONLY_TABLES = listOf(
+            "notifications", "staff_requests", "day_closes", "outside_funds", "settings"
+        )
+
+        /**
+         * Cursor keys written by builds that predate the repoint. A device upgrading into
+         * this build already has `cursor_products`, `cursor_credit_transactions` and the
+         * rest sitting in its settings store; because those names are no longer in
+         * [TABLES], nothing would ever clear them again. They are harmless but they are
+         * also a lie about what this device has seen, and a stale cursor is exactly the
+         * kind of thing that later looks like "the sync silently skipped older rows".
+         *
+         * Listed only for cleanup — never for reading.
+         */
+        private val LEGACY_CURSOR_TABLES = listOf(
+            "products", "credit_transactions", "cash_txns", "audit_log", "notifications",
             "staff_requests"
         )
 

@@ -18,6 +18,48 @@ import com.portionspot.pos.data.SalePaymentDao
 import com.portionspot.pos.data.StaffRequestDao
 import com.portionspot.pos.data.SupplierDao
 import com.portionspot.pos.media.ProductImages
+// The NEW wire contract (sync.wire) — the shapes the shared web schema actually has.
+// Imported explicitly rather than star-imported so it is obvious at a glance which
+// mappers are the repointed ones while the old sync-package DTOs are still being
+// retired around them.
+// Three names exist in BOTH packages while the old contract is being retired, so they
+// are aliased rather than star-imported: an ambiguous `SaleDto` would silently resolve
+// to the old JSONB shape and push a sale the shared schema cannot read. The aliases go
+// away with Dtos.kt.
+import com.portionspot.pos.sync.wire.CustomerDto as WireCustomerDto
+import com.portionspot.pos.sync.wire.SaleDto as WireSaleDto
+import com.portionspot.pos.sync.wire.CreditDto as WireCreditDto
+import com.portionspot.pos.data.CashSessionDao
+import com.portionspot.pos.data.StockMovementDao
+import com.portionspot.pos.data.planSessionMerge
+import com.portionspot.pos.sync.wire.RefundDto
+import com.portionspot.pos.sync.wire.RefundItemDto
+import com.portionspot.pos.sync.wire.RefundPaymentDto
+import com.portionspot.pos.sync.wire.toRefund
+import com.portionspot.pos.sync.wire.toRefundLine
+import com.portionspot.pos.sync.wire.toRefundPayment
+import com.portionspot.pos.sync.wire.StockMovementDto
+import com.portionspot.pos.sync.wire.toStockMovement
+import com.portionspot.pos.sync.wire.CashSessionDto
+import com.portionspot.pos.sync.wire.toCashSession
+import com.portionspot.pos.sync.wire.ItemDto
+import com.portionspot.pos.sync.wire.SaleItemDto
+import com.portionspot.pos.sync.wire.SalePaymentDto
+import com.portionspot.pos.sync.wire.toItem
+import com.portionspot.pos.sync.wire.toCustomer
+import com.portionspot.pos.sync.wire.toSaleEntity
+import com.portionspot.pos.sync.wire.mergeIntoSale
+import com.portionspot.pos.sync.wire.toSaleLine
+import com.portionspot.pos.sync.wire.toSalePayment
+import com.portionspot.pos.sync.wire.toCreditTxn
+import com.portionspot.pos.sync.wire.RefundItemPushDto
+import com.portionspot.pos.sync.wire.RefundPaymentPushDto
+import com.portionspot.pos.sync.wire.SaleItemPushDto
+import com.portionspot.pos.sync.wire.SalePaymentPushDto
+import com.portionspot.pos.sync.wire.SalePushDto
+import com.portionspot.pos.sync.wire.buildSalePush
+import com.portionspot.pos.sync.wire.toPush
+import com.portionspot.pos.sync.wire.toReceiptPush
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.decodeFromString
@@ -51,6 +93,10 @@ private data class PushResult(val pushed: Int, val errors: List<String>)
  */
 private const val PG_RLS_VIOLATION = "42501"
 
+/** Just the `id` of a cloud `businesses` row — see [PosSyncEngine.adoptBusinessId]. */
+@kotlinx.serialization.Serializable
+private data class BusinessIdRow(val id: String = "")
+
 /**
  * Two-way sync against the user's own Supabase. Local Room is always the
  * source of truth; this just mirrors it to/from the cloud:
@@ -78,6 +124,8 @@ class PosSyncEngine(
     private val notificationDao: NotificationDao,
     private val auditDao: AuditDao,
     private val staffRequestDao: StaffRequestDao,
+    private val cashSessionDao: CashSessionDao,
+    private val stockMovementDao: StockMovementDao,
     private val config: SyncConfig,
     /** Current signed-in user's JWT for RLS; null falls back to anon (denied). */
     private val accessToken: () -> String? = { null },
@@ -89,6 +137,13 @@ class PosSyncEngine(
         ensureFreshToken()
         val api = SupabaseRest(conn.url, conn.anonKey, accessToken)
         try {
+            // BEFORE the push, not inside the pull: the push stamps every row with the
+            // shop's business id, and the pass order is push-then-pull. Left until the
+            // pull, the very first sync on a new device would refuse to upload and report
+            // an error, then adopt, and only succeed on the second pass — an avoidable
+            // failure the owner would see and have no way to interpret. Cheap to call
+            // every pass; it returns immediately once the id is known.
+            adoptBusinessId(api)
             // Push each table independently (one table failing no longer aborts the
             // whole pass), then pull. Per-table push failures ride back on Success so
             // the UI can name the table and error instead of a blanket "Sync failed".
@@ -113,52 +168,70 @@ class PosSyncEngine(
      * the owner can SEE work is queued. Read-only.
      */
     suspend fun pendingUploadCount(): Int = withContext(Dispatchers.IO) {
-        itemDao.pending().count { !it.sku.isNullOrBlank() && !it.deleted } +
-            customerDao.pending().size +
-            creditDao.pending().size +
-            mobileMoneyDao.pending().size +
+        // ★ Counts ONLY what [push] actually sends. It used to include every pending
+        // table, which meant the badge promised uploads that could not happen — the
+        // number never reached zero and stopped meaning anything. A queue indicator that
+        // never empties is worse than none: the owner learns to ignore it, and then it
+        // cannot tell them when something really is stuck.
+        //
+        // Items are absent because the catalogue is pull-only (the web owns it).
+        customerDao.pending().size +
             saleDao.pendingSales().count { it.status == "completed" } +
             refundDao.pending().size +
-            expenseDao.pending().size +
-            cashTxnDao.pending().size +
-            supplierDao.pending().size +
-            poDao.pending().size +
-            poDao.pendingLines().size +
-            notificationDao.pending().size +
-            auditDao.pending().size +
-            staffRequestDao.pending().size
+            creditDao.pending().size +
+            mobileMoneyDao.pending().size
     }
 
-    // ── push (Stage 2) ──────────────────────────────────────────────────────
+    // ── push ────────────────────────────────────────────────────────────────
     /**
      * Push local data up — but ONLY when [SyncConfig.pushEnabled] is on (default OFF),
-     * so the repoint ships pull-only and no local/test data can reach the shared prod
-     * DB until the owner opts in. Scope is the APPEND-ONLY tables: completed sales and
-     * refunds (as `type='return'` rows), both upserted with ignore-duplicates so a
-     * re-push never rewrites an existing shared row. Products and customers/credit push
-     * (overwrite / derived-balance risk) are separate later sub-stages.
+     * so a freshly repointed device ships pull-only and nothing local can reach the
+     * shared production database until the owner opts in.
+     *
+     * ── DUPLICATE HANDLING IS OPT-IN PER TABLE ────────────────────────────────
+     *
+     * Every table here upserts on `id`, and `id` is a uuid this device minted, so a
+     * re-push overwrites THIS DEVICE'S OWN ROW and can never touch anyone else's. That
+     * makes merge-duplicates the correct resolution nearly everywhere, and it is the
+     * default below.
+     *
+     * ignore-duplicates is used for exactly ONE table — `mobile_money_receipts` — where
+     * `(business_id, txn_code)` is a genuine idempotency key: the same SMS read twice is
+     * the same receipt, and dropping the second copy is right. Anywhere else, "silently
+     * skip the row that is already there" means a money row vanishes with no error, no
+     * retry and nothing to find afterwards, which is the worst failure this engine can
+     * have because it looks exactly like success.
+     *
+     * Order matters: customers before the sales, refunds and credit rows that reference
+     * them, and each sale header before its own lines and tenders.
      */
     private suspend fun push(api: SupabaseRest): PushResult {
         if (!config.pushEnabled()) return PushResult(0, emptyList())
         val bid = businessDao.getOnce()?.id ?: return PushResult(0, emptyList())
-        // local itemId → sku, so pushed line items carry the cloud product reference.
-        val skuById = itemDao.allForBusinessOnce(bid)
-            .filter { !it.sku.isNullOrBlank() }
-            .associate { it.id to it.sku!! }
-        val skuOf: (String?) -> String? = { itemId -> itemId?.let { skuById[it] } }
+        // ★ Every row goes up stamped with the SHOP's business id, not this device's.
+        // Until that has been learned from the cloud (see [adoptBusinessId]) nothing is
+        // pushed at all: uploading under a locally-invented id would succeed, return 2xx,
+        // and produce rows no other client can see. Refusing to push is recoverable;
+        // silently orphaning a day's takings is not.
+        val cloudBid = config.cloudBusinessId()
+            ?: return PushResult(
+                0,
+                listOf(
+                    "Waiting to identify this shop's database before uploading — " +
+                        "pull once while online, then try again."
+                )
+            )
         var n = 0
         val errors = mutableListOf<String>()
-
-        // Run one table's push in isolation: a thrown failure is recorded against the
-        // table name and swallowed so the remaining tables still get their turn. Only
-        // the block that reaches its own markSynced marks its rows clean, so a failed
-        // table's rows stay pending and retry next pass.
         // Tables the database REFUSED on row-level-security grounds. Collected apart from
-        // real errors because they all share ONE cause and one fix: every table failing
-        // this way produced its own wall of raw Postgres JSON, which told the owner
-        // nothing. They are collapsed into a single actionable line below.
+        // real errors because they all share ONE cause and one fix; collapsed into a
+        // single actionable line at the end rather than a wall of raw Postgres JSON.
         val rlsBlocked = mutableListOf<String>()
 
+        // Run one table's push in isolation: a thrown failure is recorded against the
+        // table name and swallowed so the remaining tables still get their turn. Only a
+        // block that reaches its own markSynced marks its rows clean, so a failed table's
+        // rows stay pending and retry next pass.
         suspend fun pushTable(table: String, block: suspend () -> Int) {
             try {
                 n += block()
@@ -172,301 +245,162 @@ class PosSyncEngine(
             }
         }
 
-        // products — only locally-edited items that carry a sku (the cloud conflict key).
-        // First resolve any pending product image: upload the local copy to Storage and
-        // swap in the resulting public URL. An item whose upload fails is dropped from
-        // THIS push (its row stays pending) so it retries next pass instead of shipping
-        // a device-local path as image_url.
-        pushTable("products") {
-            val pendingProducts = itemDao.pending().filter { !it.sku.isNullOrBlank() && !it.deleted }
-            val products = pendingProducts.mapNotNull { item ->
-                if (!item.imagePending) return@mapNotNull item
-                val bytes = ProductImages.readBytes(item.imageLocalPath)
-                if (bytes == null) {
-                    // Removed image, or the local file vanished: clear the flag and push the
-                    // (possibly null) image_url as-is so the cleared state reaches the cloud.
-                    val cleared = item.copy(imagePending = false)
-                    itemDao.upsert(cleared)
-                    cleared
-                } else {
-                    try {
-                        val path = ProductImages.objectPath(bid, item.id)
-                        api.uploadObject("product-images", path, bytes, ProductImages.CONTENT_TYPE)
-                        val uploaded = item.copy(
-                            imageUrl = api.publicUrl("product-images", path),
-                            imagePending = false,
-                        )
-                        itemDao.upsert(uploaded)
-                        uploaded
-                    } catch (_: Exception) {
-                        null   // leave pending; skip this cycle and retry on the next sync
-                    }
-                }
-            }
-            if (products.isEmpty()) return@pushTable 0
-            api.upsert("products", syncJson.encodeToString(products.map { it.toProductPush() }), "sku")
-            itemDao.markSynced(products.map { it.id })
-            products.size
-        }
-
-        // customers (upsert on local_id; balance/credit_limit deliberately not sent).
+        // customers — upsert on the Android uuid, which IS the cloud primary key now.
+        // No `local_id` bridge and nothing to resolve: the row goes up under the id it
+        // already has, so a sale referencing it can never arrive before its customer.
         pushTable("customers") {
-            val customers = customerDao.pending()
-            if (customers.isEmpty()) return@pushTable 0
-            api.upsert("customers", syncJson.encodeToString(customers.map { it.toCustomerPush() }), "local_id")
-            customerDao.markSynced(customers.map { it.id })
-            customers.size
-        }
-
-        // staff_requests — the admin⇄cashier approval channel. AFTER customers, since a
-        // request may reference a customer as its target. RLS SPLITS this into two upserts
-        // on the SAME conflict key `local_id` (see partitionStaffRequestPush + the DTO
-        // header): a still-PENDING cashier row goes up IGNORE-DUPLICATES (a cashier device
-        // may only INSERT under RLS — a merge would be rejected every cycle), while a
-        // DECIDED row (only ever written by an admin device, which passes the UPDATE policy)
-        // goes up MERGE-DUPLICATES so the decision overwrites the shared row. Both halves
-        // mark their own rows synced, mirroring the sales fresh/edited split.
-        pushTable("staff_requests") {
-            val rows = staffRequestDao.pending()
+            val rows = customerDao.pending()
             if (rows.isEmpty()) return@pushTable 0
-            val (insertOnce, merge) = partitionStaffRequestPush(rows)
-            if (insertOnce.isNotEmpty()) {
-                api.upsert(
-                    "staff_requests",
-                    syncJson.encodeToString(insertOnce.map { it.toStaffRequestPush() }),
-                    "local_id", ignoreDuplicates = true
-                )
-            }
-            if (merge.isNotEmpty()) {
-                api.upsert(
-                    "staff_requests",
-                    syncJson.encodeToString(merge.map { it.toStaffRequestPush() }),
-                    "local_id", ignoreDuplicates = false
-                )
-            }
-            staffRequestDao.markSynced(rows.map { it.id })
+            api.upsert("customers", syncJson.encodeToString(rows.map { it.toPush().copy(businessId = cloudBid) }), "id")
+            customerDao.markSynced(rows.map { it.id })
             rows.size
         }
 
-        // credit — after customers, so every referenced customer has a cloud bigint id
-        // to resolve customer_id to.
-        //
-        // NEVER silently drop a money row (the old mapNotNull did, forever):
-        //   • blank/no customer (walk-in change) → push with customer_id = null (nullable
-        //     cloud column), so it reaches the DB instead of rotting as pending.
-        //   • a real customer that hasn't synced up THIS pass → leave the row pending
-        //     (don't mark it synced) AND raise a visible warning; it retries next pass.
-        pushTable("credit_transactions") {
-            val credit = creditDao.pending()
-            if (credit.isEmpty()) return@pushTable 0
-            val localToCloud = customerIdMap(api).entries.associate { (cloud, local) -> local to cloud }
-            val pushable = mutableListOf<Pair<com.portionspot.pos.data.CreditTxn, CreditPushDto>>()
-            var unresolved = 0
-            for (c in credit) {
-                val hasCustomer = !c.customerId.isBlank()
-                if (!hasCustomer) {
-                    // Walk-in change/refund: no customer to resolve — push with null.
-                    pushable.add(c to c.toCreditPush(null, null))
-                    continue
-                }
-                val cloudCid = localToCloud[c.customerId]
-                if (cloudCid == null) {
-                    // Referenced customer isn't up yet: keep this row pending, retry later.
-                    unresolved++
-                    continue
-                }
-                pushable.add(c to c.toCreditPush(cloudCid, null))
-            }
-            if (unresolved > 0) {
-                errors.add(
-                    "credit_transactions: $unresolved row(s) waiting on their customer to sync — will retry"
-                )
-            }
-            if (pushable.isEmpty()) return@pushTable 0
-            api.upsert("credit_transactions", syncJson.encodeToString(pushable.map { it.second }), "local_id")
-            creditDao.markSynced(pushable.map { it.first.id })
-            pushable.size
-        }
-
-        // mobile-money receipts (upsert on txn_code — idempotent).
-        pushTable("mobile_money_receipts") {
-            val mm = mobileMoneyDao.pending()
-            if (mm.isEmpty()) return@pushTable 0
-            api.upsert("mobile_money_receipts", syncJson.encodeToString(mm.map { it.toPush() }), "txn_code")
-            mobileMoneyDao.markSynced(mm.map { it.id })
-            mm.size
-        }
-
+        // sales — the header, then its lines, then its tenders. A sale is three rows on
+        // the shared schema, not one row with a JSON blob, which is what makes the
+        // per-line cost and markup readable by the other client at all.
         pushTable("sales") {
             val sales = saleDao.pendingSales().filter { it.status == "completed" }
             if (sales.isEmpty()) return@pushTable 0
-            // Tombstoned lines (removed by a B5 in-place edit) must not reach the cloud
-            // item JSON — only what the receipt says NOW.
-            suspend fun dtoFor(s: SaleEntity) = buildSalePush(
-                s,
-                saleDao.allLinesForSale(s.id).filter { !it.deleted },
-                salePaymentDao.forSale(s.id),
-                skuOf
-            )
-            // A never-edited sale is append-only: ignore-duplicates so a re-push can
-            // never rewrite a shared row. An EDITED receipt is the deliberate exception —
-            // it must overwrite its own cloud row (same id) or the correction is lost, so
-            // it goes up with merge-duplicates. Split into two calls, same conflict key.
-            val (edited, fresh) = sales.partition { it.editedAt != null }
-            if (fresh.isNotEmpty()) {
-                api.upsert(
-                    "sales", syncJson.encodeToString(fresh.map { dtoFor(it) }),
-                    "id", ignoreDuplicates = true
-                )
+
+            val headers = mutableListOf<SalePushDto>()
+            val lines = mutableListOf<SaleItemPushDto>()
+            val tenders = mutableListOf<SalePaymentPushDto>()
+            for (s in sales) {
+                val all = saleDao.allLinesForSale(s.id)
+                // The HEADER's money is derived from the LIVE lines only — a line
+                // tombstoned by an in-place receipt edit is not part of what the receipt
+                // says now, and counting it would put goods on the cloud row that the
+                // printed receipt does not have.
+                headers += buildSalePush(s, all.filter { !it.deleted }).copy(businessId = cloudBid)
+                // The LINE rows go up in full, tombstones included, carrying their
+                // `deleted` flag — that is how the removal itself reaches the other
+                // devices. Dropping them here would leave the deleted line alive in the
+                // cloud forever.
+                lines += all.map { it.toPush().copy(businessId = cloudBid) }
+                tenders += salePaymentDao.forSale(s.id).map { it.toPush().copy(businessId = cloudBid) }
             }
-            if (edited.isNotEmpty()) {
-                api.upsert(
-                    "sales", syncJson.encodeToString(edited.map { dtoFor(it) }),
-                    "id", ignoreDuplicates = false
-                )
+
+            api.upsert("sales", syncJson.encodeToString(headers), "id")
+            if (lines.isNotEmpty()) {
+                api.upsert("sale_items", syncJson.encodeToString(lines), "id")
             }
-            // Defence in depth: ignore-duplicates returns 201 even when the server
-            // DROPPED a row because that id already existed, so a successful HTTP call
-            // is not proof the money landed. Read the ids back once for the whole batch
-            // (one extra GET per sync, not per sale) and warn loudly if any is missing —
-            // that would mean a ref collision, which the device-coded ref format
-            // (`K7Q-0013`) exists to prevent.
-            if (fresh.isNotEmpty() && fresh.size <= VERIFY_MAX) {
-                val wanted = fresh.map { it.receiptNo ?: it.id }
-                val present = syncJson
-                    .decodeFromString<List<IdRow>>(api.selectIdsIn("sales", wanted))
-                    .map { it.id }
-                    .toSet()
-                val missing = wanted.filterNot { it in present }
-                if (missing.isNotEmpty()) {
-                    errors.add(
-                        "sales: ${missing.size} sale(s) did not land in the cloud " +
-                            "(${missing.take(3).joinToString()}) — receipt reference already taken"
-                    )
-                }
+            if (tenders.isNotEmpty()) {
+                api.upsert("sale_payments", syncJson.encodeToString(tenders), "id")
             }
+            // Only mark clean once all three landed: the upserts above throw on failure,
+            // so reaching this line means the whole sale is up, not just its header. A
+            // header without its lines would read as a sale of nothing.
             sales.forEach { saleDao.markSaleSynced(it.id) }
             sales.size
         }
 
+        // refunds — first-class rows now, not `type='return'` sales with negative totals.
+        // `refunds.sale_id` and `refund_items.sale_line_id` carry the link back to the
+        // original receipt, which the old shared schema had no column for and dropped.
         pushTable("refunds") {
             val refunds = refundDao.pending()
             if (refunds.isEmpty()) return@pushTable 0
-            val dtos = refunds.map { r -> buildRefundPush(r, refundDao.linesFor(r.id), skuOf) }
-            api.upsert("sales", syncJson.encodeToString(dtos), "id", ignoreDuplicates = true)
+
+            val headers = refunds.map { it.toPush().copy(businessId = cloudBid) }
+            val lines = mutableListOf<RefundItemPushDto>()
+            val payouts = mutableListOf<RefundPaymentPushDto>()
+            for (r in refunds) {
+                lines += refundDao.linesFor(r.id).map { it.toPush().copy(businessId = cloudBid) }
+                payouts += refundDao.paymentsFor(r.id).map { it.toPush().copy(businessId = cloudBid) }
+            }
+
+            api.upsert("refunds", syncJson.encodeToString(headers), "id")
+            if (lines.isNotEmpty()) {
+                api.upsert("refund_items", syncJson.encodeToString(lines), "id")
+            }
+            if (payouts.isNotEmpty()) {
+                api.upsert("refund_payments", syncJson.encodeToString(payouts), "id")
+            }
             refundDao.markSynced(refunds.map { it.id })
             refunds.size
         }
 
-        // ── accounting spine + supplier orders (owner-approved for the cloud) ──
-        // All five upsert on `local_id`, so a re-push overwrites this device's own row
-        // and never anyone else's. Each block is isolated: one failing table records a
-        // warning and leaves its rows pending, the rest still go up.
-
-        // expenses — approvals, funding splits and recurring schedules.
-        pushTable("expenses") {
-            val rows = expenseDao.pending()
+        // credit_txns — note the table name. The cloud column `customer_id` is a plain
+        // uuid FK, so the old bigint→local_id translation (and the whole class of "this
+        // row is waiting on its customer to sync" warnings it needed) is gone.
+        pushTable("credit_txns") {
+            val rows = creditDao.pending()
             if (rows.isEmpty()) return@pushTable 0
-            api.upsert("expenses", syncJson.encodeToString(rows.map { it.toExpensePush() }), "local_id")
-            expenseDao.markSynced(rows.map { it.id })
+            api.upsert("credit_txns", syncJson.encodeToString(rows.map { it.toPush().copy(businessId = cloudBid) }), "id")
+            creditDao.markSynced(rows.map { it.id })
             rows.size
         }
 
-        // cash_txns — the append-only cash-on-hand ledger.
-        pushTable("cash_txns") {
-            val rows = cashTxnDao.pending()
-            if (rows.isEmpty()) return@pushTable 0
-            api.upsert("cash_txns", syncJson.encodeToString(rows.map { it.toCashTxnPush() }), "local_id")
-            cashTxnDao.markSynced(rows.map { it.id })
-            rows.size
-        }
-
-        // ORDER MATTERS from here: suppliers → purchase_orders → purchase_order_items,
-        // so a PO's supplier (and a line's PO) is already up when the child arrives.
-        pushTable("suppliers") {
-            val rows = supplierDao.pending()
-            if (rows.isEmpty()) return@pushTable 0
-            api.upsert("suppliers", syncJson.encodeToString(rows.map { it.toSupplierPush() }), "local_id")
-            supplierDao.markSynced(rows.map { it.id })
-            rows.size
-        }
-
-        pushTable("purchase_orders") {
-            val rows = poDao.pending()
+        // mobile_money_receipts — THE ONE TABLE where ignore-duplicates is correct.
+        // `(business_id, txn_code)` is a real idempotency key: the same provider SMS read
+        // twice is the same receipt, so skipping the second copy loses nothing. This is
+        // the only place in this engine where a dropped row is not a lost fact.
+        pushTable("mobile_money_receipts") {
+            val rows = mobileMoneyDao.pending()
             if (rows.isEmpty()) return@pushTable 0
             api.upsert(
-                "purchase_orders",
-                syncJson.encodeToString(rows.map { it.toPurchaseOrderPush() }),
-                "local_id"
+                "mobile_money_receipts",
+                syncJson.encodeToString(rows.map { it.toReceiptPush().copy(businessId = cloudBid) }),
+                "business_id,txn_code",
+                ignoreDuplicates = true,
             )
-            poDao.markSynced(rows.map { it.id })
+            mobileMoneyDao.markSynced(rows.map { it.id })
             rows.size
         }
 
-        // PO lines last. A line has no clock of its own, so its cloud timestamps come
-        // from its parent PO's updatedAt (falling back to now for an orphan line, which
-        // still keeps the pull cursor moving forward).
-        pushTable("purchase_order_items") {
-            val rows = poDao.pendingLines()
-            if (rows.isEmpty()) return@pushTable 0
-            val stampFor = HashMap<String, Long>()
-            val dtos = rows.map { line ->
-                val stamp = stampFor.getOrPut(line.poId) {
-                    poDao.getById(line.poId)?.updatedAt ?: System.currentTimeMillis()
-                }
-                line.toPurchaseOrderLinePush(stamp)
-            }
-            api.upsert("purchase_order_items", syncJson.encodeToString(dtos), "local_id")
-            poDao.markLinesSynced(rows.map { it.id })
-            rows.size
-        }
-
-        // notifications — the admin alert feed. THE ONLY TABLE THAT DOES NOT CONFLICT
-        // ON local_id: the cloud unique constraint is (business_id, dedupe_key), so two
-        // phones that independently compute "low stock: rice" converge on ONE cloud row
-        // that gets updated, instead of one duplicate row per device. pushed_at is not
-        // in the DTO at all — it is device-local heads-up state.
-        pushTable("notifications") {
-            val rows = notificationDao.pending()
+        // stock_movements — the stock ledger, and the ONLY way a till's stock reaches
+        // anyone else. The catalogue is pull-only, so a till never edits the product; it
+        // appends a movement and every device recomputes on-hand from the ledger. Without
+        // this block a sale drew down one till and no other till ever heard.
+        pushTable("stock_movements") {
+            val rows = stockMovementDao.pending()
             if (rows.isEmpty()) return@pushTable 0
             api.upsert(
-                "notifications",
-                syncJson.encodeToString(rows.map { it.toNotificationPush() }),
-                "business_id,dedupe_key"
+                "stock_movements",
+                syncJson.encodeToString(rows.map { it.toPush().copy(businessId = cloudBid) }),
+                "id",
             )
-            notificationDao.markSynced(rows.map { it.id })
+            stockMovementDao.markSynced(rows.map { it.id })
             rows.size
         }
 
-        // audit_log — the append-only trail (receipt edits, till shortages/overages,
-        // voids) so the admin phone sees what happened on the cashier phones.
-        // IGNORE-DUPLICATES on `local_id`, exactly like sales: the cloud table has NO
-        // UPDATE policy (an audit trail must not be rewritable after the fact), so a
-        // merge-duplicates upsert would be rejected by RLS and surface as a per-table
-        // failure every cycle. The rows are immutable anyway — insert-once is correct.
-        pushTable("audit_log") {
-            val rows = auditDao.pending()
+        // cash_sessions — the shift itself. Pushed AFTER the sales and refunds that
+        // reference it so the shop's own cash-up never sees a takings row pointing at a
+        // shift the cloud has not been told about yet.
+        //
+        // `variance` is GENERATED on the cloud and is absent from the DTO. A merged-away
+        // shift goes up here too, carrying its closed status and its note, which is how
+        // the other tills learn the conflict was settled and stop trying to settle it.
+        pushTable("cash_sessions") {
+            val rows = cashSessionDao.pending()
             if (rows.isEmpty()) return@pushTable 0
-            api.upsert(
-                "audit_log",
-                syncJson.encodeToString(rows.map { it.toAuditPush() }),
-                "local_id",
-                ignoreDuplicates = true
-            )
-            auditDao.markSynced(rows.map { it.id })
+            api.upsert("cash_sessions", syncJson.encodeToString(rows.map { it.toPush().copy(businessId = cloudBid) }), "id")
+            cashSessionDao.markSynced(rows.map { it.id })
             rows.size
         }
 
-        // One cause, one line. A staff-gated database refuses EVERY table the same way,
-        // so reporting each one separately buried the actual problem — and the fix — in
-        // a wall of Postgres JSON. Nothing is lost either way: a refused table never
-        // reaches its markSynced, so its rows stay pending and go up once this is fixed.
+        // ── Deliberately NOT pushed, so this is a decision and not an oversight ──
+        //
+        // No cloud table exists for these at all, and inventing one from a till would
+        // stand up a second schema beside the web's:
+        //   notifications · staff_requests · day_closes · outside_funds
+        //
+        // These DO exist on the cloud but their rows are keyed by a plain uuid with no
+        // `local_id` column, so the old push shape is simply wrong for them and they
+        // need uuid-keyed DTOs of their own before they can go up:
+        //   expenses · suppliers · purchase_orders · purchase_order_items
+        //   audit_log → audit_entries · cash_txns → cash_movements + cash_sessions
+        //
+        // `cash_txns` in particular must wait for the one-open-session-per-shop merge
+        // rule: pushing movements that point at a session the cloud has never heard of
+        // would silently omit them from the shop's cash-up.
+
         if (rlsBlocked.isNotEmpty()) {
-            val held = "${rlsBlocked.size} table(s) held back, nothing lost"
+            val held = rlsBlocked.joinToString(", ")
             errors.add(
-                0,
                 if (accessToken() == null) {
-                    "Not signed in — this database only accepts uploads from a signed-in " +
+                    "This device is not signed in, so the database refused the upload from a " +
                         "staff account. Sign in under Settings, then tap Sync now ($held)."
                 } else {
                     "Your staff account cannot upload to this database — it may have been " +
@@ -479,30 +413,321 @@ class PosSyncEngine(
     }
 
     // ── pull ──────────────────────────────────────────────────────────────
-    /** Pull the shared catalog/customers/sales onto this device. Read-only: nothing
-     *  is ever written to the cloud here, so a mapping bug can't corrupt prod data. */
+    /**
+     * Pull the shared catalogue, customers and sales onto this device. Read-only:
+     * nothing is written to the cloud here, so a mapping bug cannot corrupt prod data.
+     *
+     * ★ Only tables that EXIST on the shared schema are pulled. The previous version
+     * asked for `products`, `credit_transactions`, `cash_txns`, `audit_log`,
+     * `notifications` and `staff_requests` — six tables the web database does not have.
+     * Every pass therefore spent six round-trips collecting 404s and reporting them to
+     * the owner as sync errors, which made the real errors impossible to pick out.
+     *
+     * Parents before children throughout: customers before the sales and credit rows
+     * that reference them, and sale headers before their lines and tenders.
+     */
     private suspend fun pull(api: SupabaseRest): Int {
         val bid = businessDao.getOnce()?.id ?: return 0
         var n = 0
-        n += pullProducts(api, bid)
-        n += pullCustomers(api, bid)
-        n += pullSales(api, bid)
+        n += pullItems(api, bid)
+        n += pullCustomersWire(api, bid)
+        n += pullSalesWire(api, bid)
+        n += pullSaleItems(api, bid)
+        n += pullSalePayments(api, bid)
         // Runs every pass, not just when sales came down: devices that already
         // double-counted need the repair even once their cursor is past those rows.
         healDuplicateSales(bid)
-        n += pullCredit(api, bid)
+        n += pullCreditWire(api, bid)
         n += pullMobileMoney(api, bid)
-        // Accounting spine + supplier orders. Same last-write-wins-by-updated_at rule,
-        // same per-table cursor; parents (suppliers, POs) before children (PO lines).
-        n += pullExpenses(api, bid)
-        n += pullCashTxns(api, bid)
-        n += pullSuppliers(api, bid)
-        n += pullPurchaseOrders(api, bid)
-        n += pullPurchaseOrderLines(api)
-        n += pullNotifications(api, bid)
-        n += pullAudit(api, bid)
-        n += pullStaffRequests(api, bid)
+        n += pullRefunds(api, bid)
+        n += pullRefundItems(api, bid)
+        n += pullRefundPayments(api, bid)
+        n += pullStockMovements(api, bid)
+        // AFTER the ledger lands: items.stock_qty is a CACHE of these rows, so the
+        // pulled cache is only as good as the movements behind it. Recomputing here is
+        // what makes another till's sale show up as stock leaving this one.
+        recomputeStockFromLedger(bid)
+        n += pullCashSessions(api, bid)
+        // AFTER the session pull, because that pull is the moment two tills that were
+        // offline from each other finally see each other's shift. Resolving before it
+        // would just re-decide a conflict this device cannot yet know exists.
+        mergeOpenSessions(bid)
         return n
+    }
+
+    /**
+     * Learn the shop's business id from the cloud and remember it.
+     *
+     * ★ ADOPT, NEVER INSERT. A device makes up its own business uuid on first run, before
+     * it has ever seen a database. Pushing rows under that id uploads them successfully
+     * and renders them invisible to every other client, because the web filters by ITS
+     * business — a 2xx, no error, and takings that belong to nobody.
+     *
+     * Creating a `businesses` row instead would be worse still: a second business row
+     * permanently disables the web's automatic adoption, by design, so the mistake could
+     * not be undone from here afterwards.
+     *
+     * `id` is the column to take, NOT `business_id` — the table has both, and `id` is the
+     * one every `items.business_id` actually references. Only adopted when the database
+     * holds EXACTLY ONE business: two rows means this is not a single-shop database and
+     * guessing which one the till belongs to is not a decision code should make silently.
+     */
+    private suspend fun adoptBusinessId(api: SupabaseRest) {
+        if (config.cloudBusinessId() != null) return
+        val rows = runCatching {
+            syncJson.decodeFromString<List<BusinessIdRow>>(api.selectAll("businesses", "id"))
+        }.getOrNull() ?: return
+        val only = rows.singleOrNull() ?: return
+        if (only.id.isNotBlank()) config.setCloudBusinessId(only.id)
+    }
+
+    /**
+     * `refunds` → local refund headers.
+     *
+     * A refund whose wire row names no `sale_id`, on a device that has no local copy to
+     * take one from, is SKIPPED rather than imported. `Refund.saleId` is NOT NULL on this
+     * side, so importing it would mean inventing a sale id — attaching real money to a
+     * receipt it never came off, which is worse than not having the row at all. It stays
+     * skipped rather than being counted as applied, so the cursor is the only thing that
+     * moves and a later pass can pick it up if the sale arrives.
+     */
+    private suspend fun pullRefunds(api: SupabaseRest, bid: String): Int {
+        val rows = syncJson.decodeFromString<List<RefundDto>>(
+            api.selectSince("refunds", config.cursor("refunds"), PAGE)
+        )
+        if (rows.isEmpty()) return 0
+        var applied = 0
+        for (dto in rows) {
+            val local = refundDao.getById(dto.id)
+            if (local != null && IsoTime.toMillis(dto.cursorStamp()) <= local.updatedAt) continue
+            val merged = dto.toRefund(bid, local) ?: continue
+            refundDao.upsert(merged)
+            applied++
+        }
+        config.setCursor("refunds", rows.maxOf { it.cursorStamp() })
+        return applied
+    }
+
+    private suspend fun pullRefundItems(api: SupabaseRest, bid: String): Int {
+        val rows = syncJson.decodeFromString<List<RefundItemDto>>(
+            api.selectSince("refund_items", config.cursor("refund_items"), PAGE)
+        )
+        if (rows.isEmpty()) return 0
+        val live = rows.filter { !it.deleted }
+        if (live.isNotEmpty()) refundDao.upsertLines(live.map { it.toRefundLine(bid) })
+        config.setCursor("refund_items", rows.maxOf { it.cursorStamp() })
+        return live.size
+    }
+
+    private suspend fun pullRefundPayments(api: SupabaseRest, bid: String): Int {
+        val rows = syncJson.decodeFromString<List<RefundPaymentDto>>(
+            api.selectSince("refund_payments", config.cursor("refund_payments"), PAGE)
+        )
+        if (rows.isEmpty()) return 0
+        val live = rows.filter { !it.deleted }
+        if (live.isNotEmpty()) refundDao.upsertPayments(live.map { it.toRefundPayment(bid) })
+        config.setCursor("refund_payments", rows.maxOf { it.cursorStamp() })
+        return live.size
+    }
+
+    /** `stock_movements` → the local ledger. Append-only in spirit, upserted by id so a
+     *  re-pull after a cursor reset lands on the row it already wrote. */
+    private suspend fun pullStockMovements(api: SupabaseRest, bid: String): Int {
+        val rows = syncJson.decodeFromString<List<StockMovementDto>>(
+            api.selectSince("stock_movements", config.cursor("stock_movements"), PAGE)
+        )
+        if (rows.isEmpty()) return 0
+        val applied = rows.mapNotNull { it.toStockMovement(bid) }
+        if (applied.isNotEmpty()) stockMovementDao.upsertAll(applied)
+        config.setCursor("stock_movements", rows.maxOf { it.cursorStamp() })
+        return applied.size
+    }
+
+    /**
+     * Rebuild every item's on-hand from its movement ledger.
+     *
+     * `items.stock_qty` is a CACHE. The authority is the sum of that item's movements,
+     * and this is the step that makes a sale rung up on another till show as stock leaving
+     * this one — without it, a device would keep whatever figure the catalogue pull
+     * happened to carry and never notice the other till's draw-down.
+     *
+     * ★ Items with NO movements are left ALONE rather than zeroed. A shop that has been
+     * trading before the ledger existed has plenty of stock and no history for it, and
+     * "no movements recorded" means unknown, not none. Zeroing them would empty the
+     * shelves of a working shop on its first sync.
+     *
+     * ★ A `measure` product's on-hand lives in [Item.stockMeasured], not [Item.stockQty] —
+     * the fractional quantity and the whole-unit count are different fields on this side,
+     * even though the cloud keeps both in `stock_qty`.
+     */
+    private suspend fun recomputeStockFromLedger(bid: String) {
+        val onHand = stockMovementDao.onHandByItem(bid).associate { it.itemId to it.onHand }
+        if (onHand.isEmpty()) return
+        val updated = itemDao.allForBusinessOnce(bid).mapNotNull { item ->
+            val computed = onHand[item.id] ?: return@mapNotNull null
+            val measured = item.productType == "measured"
+            val current = if (measured) item.stockMeasured else item.stockQty
+            if (abs(current - computed) < 0.0005) return@mapNotNull null
+            if (measured) item.copy(stockMeasured = computed) else item.copy(stockQty = computed)
+        }
+        if (updated.isNotEmpty()) itemDao.upsertAll(updated)
+    }
+
+    /** `cash_sessions` → local shifts, keyed by id. */
+    private suspend fun pullCashSessions(api: SupabaseRest, bid: String): Int {
+        val rows = syncJson.decodeFromString<List<CashSessionDto>>(
+            api.selectSince("cash_sessions", config.cursor("cash_sessions"), PAGE)
+        )
+        if (rows.isEmpty()) return 0
+        var applied = 0
+        for (dto in rows) {
+            val local = cashSessionDao.getById(dto.id)
+            if (local == null || IsoTime.toMillis(dto.cursorStamp()) > local.updatedAt) {
+                cashSessionDao.upsert(dto.toCashSession(bid, local))
+                applied++
+            }
+        }
+        config.setCursor("cash_sessions", rows.maxOf { it.cursorStamp() })
+        return applied
+    }
+
+    /**
+     * Collapse a shop that has ended up with more than one open shift down to one.
+     *
+     * The unique index on the cloud REJECTS the second open session, and rejecting it is
+     * not the same as resolving it: the losing till's sales still reference a session id
+     * the cloud has never heard of, and a cash-up that cannot resolve a session leaves
+     * those takings out of the count silently. So the resolution happens here, on every
+     * device, using a rule that reaches the same answer everywhere without any device
+     * asking another — see [planSessionMerge].
+     *
+     * Everything happens in ONE transaction: repoint the losers' sales and refunds onto
+     * the survivor, then close the losers with a note saying what became of them. Split
+     * across two transactions there would be a window where a sale points at a shift that
+     * has already been closed, which is the very state this is fixing.
+     *
+     * Every touched row is marked dirty, so the correction goes UP on the same pass
+     * rather than living only on the device that happened to notice.
+     */
+    private suspend fun mergeOpenSessions(bid: String) {
+        val plan = planSessionMerge(cashSessionDao.openSessions(bid)) ?: return
+        cashSessionDao.applyMerge(
+            winnerId = plan.winner.id,
+            losers = plan.losers.map { it.id to plan.closingNote(it) },
+            at = System.currentTimeMillis(),
+        )
+    }
+
+    /**
+     * `items` → the local catalogue, keyed by id.
+     *
+     * Keyed by ID, not bridged by sku or name. The old pull had to guess which local row
+     * a cloud product meant — matching on folded sku, then on folded NAME — because the
+     * shared table carried no id the device could recognise, and every near-miss inserted
+     * a second copy of a product the shop already had. Both sides now agree on the uuid,
+     * so there is nothing left to guess and no duplicate to heal afterwards.
+     */
+    private suspend fun pullItems(api: SupabaseRest, bid: String): Int {
+        val rows = syncJson.decodeFromString<List<ItemDto>>(
+            api.selectSince("items", config.cursor("items"), PAGE)
+        )
+        if (rows.isEmpty()) return 0
+        var applied = 0
+        for (dto in rows) {
+            val local = itemDao.getById(dto.id)
+            if (local == null || IsoTime.toMillis(dto.updatedAt) > local.updatedAt) {
+                itemDao.upsert(dto.toItem(bid, local))
+                applied++
+            }
+        }
+        config.setCursor("items", rows.maxOf { it.updatedAt ?: IsoTime.EPOCH })
+        return applied
+    }
+
+    private suspend fun pullCustomersWire(api: SupabaseRest, bid: String): Int {
+        val rows = syncJson.decodeFromString<List<WireCustomerDto>>(
+            api.selectSince("customers", config.cursor("customers"), PAGE)
+        )
+        if (rows.isEmpty()) return 0
+        var applied = 0
+        for (dto in rows) {
+            val local = customerDao.getById(dto.id)
+            if (local == null || IsoTime.toMillis(dto.updatedAt) > local.updatedAt) {
+                customerDao.upsert(dto.toCustomer(bid, local))
+                applied++
+            }
+        }
+        config.setCursor("customers", rows.maxOf { it.updatedAt ?: IsoTime.EPOCH })
+        return applied
+    }
+
+    /** `sales` → local sale HEADERS. Lines and tenders arrive on their own cursors. */
+    private suspend fun pullSalesWire(api: SupabaseRest, bid: String): Int {
+        val rows = syncJson.decodeFromString<List<WireSaleDto>>(
+            api.selectSince("sales", config.cursor("sales"), PAGE)
+        )
+        if (rows.isEmpty()) return 0
+        var applied = 0
+        for (dto in rows) {
+            val local = saleDao.getSaleById(dto.id)
+            if (local == null) {
+                saleDao.upsertSale(dto.toSaleEntity(bid))
+                applied++
+            } else if (IsoTime.toMillis(dto.cursorStamp()) > local.updatedAt) {
+                // Fold onto the row that already exists — its id is referenced by lines,
+                // tenders, refunds, credit rows and the audit trail.
+                saleDao.upsertSale(dto.mergeIntoSale(local))
+                applied++
+            }
+        }
+        config.setCursor("sales", rows.maxOf { it.cursorStamp() })
+        return applied
+    }
+
+    private suspend fun pullSaleItems(api: SupabaseRest, bid: String): Int {
+        val rows = syncJson.decodeFromString<List<SaleItemDto>>(
+            api.selectSince("sale_items", config.cursor("sale_items"), PAGE)
+        )
+        if (rows.isEmpty()) return 0
+        // The cloud row carries every field a SaleLine has, so it is applied whole rather
+        // than merged onto a local copy — there is nothing local worth preserving on a
+        // line, unlike a sale header (which owns edit markers and payment state).
+        val toApply = rows.map { it.toSaleLine(bid, null) }
+        saleDao.upsertLines(toApply)
+        config.setCursor("sale_items", rows.maxOf { it.cursorStamp() })
+        return toApply.size
+    }
+
+    private suspend fun pullSalePayments(api: SupabaseRest, bid: String): Int {
+        val rows = syncJson.decodeFromString<List<SalePaymentDto>>(
+            api.selectSince("sale_payments", config.cursor("sale_payments"), PAGE)
+        )
+        if (rows.isEmpty()) return 0
+        // A tender is append-only in practice; a deleted one is dropped rather than
+        // applied, so a voided payment cannot reappear on the device that pulled it.
+        val live = rows.filter { !it.deleted }
+        salePaymentDao.upsertAll(live.map { it.toSalePayment(bid) })
+        config.setCursor("sale_payments", rows.maxOf { it.cursorStamp() })
+        return live.size
+    }
+
+    /** `credit_txns` → the local credit ledger. Note the table name: the old engine
+     *  asked for `credit_transactions`, which has never existed on the web schema. */
+    private suspend fun pullCreditWire(api: SupabaseRest, bid: String): Int {
+        val rows = syncJson.decodeFromString<List<WireCreditDto>>(
+            api.selectSince("credit_txns", config.cursor("credit_txns"), PAGE)
+        )
+        if (rows.isEmpty()) return 0
+        var applied = 0
+        for (dto in rows) {
+            val local = creditDao.getById(dto.id)
+            if (local == null || IsoTime.toMillis(dto.cursorStamp()) > local.updatedAt) {
+                creditDao.upsert(dto.toCreditTxn(bid, local))
+                applied++
+            }
+        }
+        config.setCursor("credit_txns", rows.maxOf { it.cursorStamp() })
+        return applied
     }
 
     /**

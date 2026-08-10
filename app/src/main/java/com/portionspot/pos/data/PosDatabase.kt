@@ -815,6 +815,90 @@ val MIGRATION_33_34 = object : Migration(33, 34) {
     }
 }
 
+/**
+ * Shop-wide capability locks on [Business] — the coarse half of the permission model,
+ * mirroring the web's `businesses.lock_*` columns.
+ *
+ * All seven default to 0 (unlocked), which is the only safe backfill: a shop that has
+ * never had these switches has never used them, and defaulting any of them to LOCKED
+ * would silently take a capability away from every cashier on upgrade — for a shop that
+ * never asked for it. The owner turns a lock on deliberately or it stays off.
+ */
+val MIGRATION_34_35 = object : Migration(34, 35) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        listOf(
+            "lockRefunds", "lockDiscounts", "lockCredit", "lockPriceOverride",
+            "lockParking", "lockQuotes", "lockStockAdjust"
+        ).forEach { col ->
+            db.execSQL("ALTER TABLE businesses ADD COLUMN $col INTEGER NOT NULL DEFAULT 0")
+        }
+    }
+}
+
+/**
+ * The trading SHIFT — [CashSession] — plus the `sessionId` that ties a sale or a refund
+ * to the shift it happened in.
+ *
+ * Nothing is backfilled. Every existing sale keeps `sessionId = null`, which reads as
+ * "rung up before the shop tracked shifts" and is the truth. Inventing a session to hang
+ * history off would put real money into a shift that never existed and that nobody ever
+ * counted — a cash-up is a claim about what was in a drawer at a moment, and it cannot be
+ * reconstructed after the fact.
+ */
+val MIGRATION_35_36 = object : Migration(35, 36) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS cash_sessions (" +
+                "id TEXT NOT NULL PRIMARY KEY, " +
+                "businessId TEXT NOT NULL, " +
+                "status TEXT NOT NULL DEFAULT 'open', " +
+                "openedAt INTEGER NOT NULL, " +
+                "openedBy TEXT, " +
+                "openedByName TEXT, " +
+                "openingFloat REAL NOT NULL DEFAULT 0, " +
+                "closedAt INTEGER, " +
+                "closedBy TEXT, " +
+                "closedByName TEXT, " +
+                "countedCash REAL, " +
+                "expectedCash REAL, " +
+                "note TEXT, " +
+                "tillCode TEXT, " +
+                "updatedAt INTEGER NOT NULL, " +
+                "deleted INTEGER NOT NULL DEFAULT 0, " +
+                "pendingSync INTEGER NOT NULL DEFAULT 1)"
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_cash_sessions_businessId ON cash_sessions (businessId)")
+        db.execSQL(
+            "CREATE INDEX IF NOT EXISTS index_cash_sessions_businessId_status " +
+                "ON cash_sessions (businessId, status)"
+        )
+        db.execSQL("ALTER TABLE sales ADD COLUMN sessionId TEXT")
+        db.execSQL("ALTER TABLE refunds ADD COLUMN sessionId TEXT")
+    }
+}
+
+/**
+ * Make the stock ledger syncable.
+ *
+ * `stock_movements` was device-local, so a sale drew down the till that rang it up and no
+ * other till ever heard. Since `items.stock_qty` is only a CACHE of these rows, that left
+ * a shop with as many different stock figures as it had tills, none of them wrong from
+ * where it was standing.
+ *
+ * Existing rows are backfilled `pendingSync = 0` — NOT 1. They are this device's own
+ * history of draw-downs it already applied locally; pushing them now would replay every
+ * sale the till has ever made into the shared ledger and take the shop's stock down twice.
+ * History stays where it is; only movements made from here travel.
+ */
+val MIGRATION_36_37 = object : Migration(36, 37) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE stock_movements ADD COLUMN updatedAt INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE stock_movements ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE stock_movements ADD COLUMN pendingSync INTEGER NOT NULL DEFAULT 1")
+        db.execSQL("UPDATE stock_movements SET pendingSync = 0, updatedAt = createdAt WHERE deleted = 0")
+    }
+}
+
 @Database(
     entities = [
         Business::class,
@@ -839,9 +923,10 @@ val MIGRATION_33_34 = object : Migration(33, 34) {
         AuditEntry::class,
         StaffRequest::class,
         DayClose::class,
-        OutsideFund::class
+        OutsideFund::class,
+        CashSession::class
     ],
-    version = 34,
+    version = 37,
     exportSchema = false
 )
 abstract class PosDatabase : RoomDatabase() {
@@ -864,6 +949,7 @@ abstract class PosDatabase : RoomDatabase() {
     abstract fun staffRequestDao(): StaffRequestDao
     abstract fun dayCloseDao(): DayCloseDao
     abstract fun outsideFundDao(): OutsideFundDao
+    abstract fun cashSessionDao(): CashSessionDao
 
     companion object {
         @Volatile
@@ -892,7 +978,8 @@ abstract class PosDatabase : RoomDatabase() {
                         MIGRATION_23_24, MIGRATION_24_25, MIGRATION_25_26,
                         MIGRATION_26_27, MIGRATION_27_28, MIGRATION_28_29,
                         MIGRATION_29_30, MIGRATION_30_31, MIGRATION_31_32,
-                        MIGRATION_32_33, MIGRATION_33_34
+                        MIGRATION_32_33, MIGRATION_33_34, MIGRATION_34_35,
+                        MIGRATION_35_36, MIGRATION_36_37
                     )
                     .fallbackToDestructiveMigration()
                     .build()

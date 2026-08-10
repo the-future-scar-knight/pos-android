@@ -1,490 +1,530 @@
 -- ============================================================================
 -- ON-SPOT POS — Supabase setup (bring-your-own-database)
 -- ----------------------------------------------------------------------------
--- Run this ONCE in your own Supabase project: Dashboard -> SQL Editor -> New
--- query -> paste -> Run. It creates every table the app syncs to.
+-- Run ONCE: Dashboard -> SQL Editor -> New query -> paste -> Run.
+-- Safe to run again: every statement is "if not exists" / "add column if not
+-- exists", so it never drops or overwrites data.
 --
--- Safe to run more than once and safe on an existing project: every statement
--- uses "if not exists" / "add column if not exists", so it never drops or
--- overwrites your data. Re-running an OLDER setup upgrades it in place.
---
--- The app connects with your project's anon (public) key. Kept in lockstep with
--- the in-app copy at app/.../sync/SupabaseSetupSql.kt.
+-- This creates the SHARED PortionSpot POS schema — the same shape the web POS
+-- uses. Do NOT hand-edit table or column names: both clients read them.
 -- ============================================================================
 
--- ---------------------------------------------------------------------------
--- 1) Till core — products, customers, sales, credit/change, mobile money
--- ---------------------------------------------------------------------------
+create extension if not exists "pgcrypto";
 
-create table if not exists public.products (
-    id                  bigint generated always as identity primary key,
-    sku                 text not null unique,
-    name                text not null,
-    category            text,
-    box_price           numeric not null default 0,
-    box_size            integer not null default 1,
-    wholesale_price     numeric not null default 0,
-    retail_price        numeric not null default 0,
-    cost_price          numeric not null default 0,
-    stock_boxes         integer not null default 0,
-    stock_units         integer not null default 0,
-    low_stock_threshold integer not null default 5,
-    active              boolean not null default true,
-    product_type        text    not null default 'box',   -- box | set | piece | measured
-    box_only            boolean not null default false,
-    image_url           text,
-    show_image          boolean not null default true,
-    -- Measured goods, sold by weight/volume/length (e.g. 2.5 kg)
-    unit                text,
-    price_per_unit      numeric default 0,
-    stock_measured      numeric default 0,
-    updated_at          timestamptz not null default now()
+-- Tenant scoping. Returns NULL when the JWT carries no org claim, which is how
+-- an anon-key client is allowed through on a single-shop database.
+create or replace function public.auth_org_id()
+returns uuid language sql stable set search_path to '' as $$
+  select nullif(auth.jwt() ->> 'org_id', '')::uuid
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 1) Shop profile + staff
+-- ---------------------------------------------------------------------------
+create table if not exists public.businesses (
+    id                  uuid primary key,
+    business_id         uuid not null,
+    name                text default '',
+    currency            text default 'USD',
+    tagline             text,
+    address             text,
+    phone               text,
+    email               text,
+    website             text,
+    receipt_header      text,
+    receipt_footer      text,
+    paper_width         text default '80mm',
+    receipt_large_text  boolean default false,
+    vat_enabled         boolean default false,
+    vat_number          text,
+    vat_percent         numeric default 15,
+    total_rounding      numeric default 0,
+    discount_threshold  numeric default 5,
+    quote_validity_days integer default 7,
+    -- Shop-wide capability locks. A lock switches a capability off for every
+    -- cashier at once; a per-staff permission can only ever subtract further.
+    lock_refunds        boolean default false,
+    lock_discounts      boolean default false,
+    lock_credit         boolean default false,
+    lock_price_override boolean default false,
+    lock_parking        boolean default false,
+    lock_quotes         boolean default false,
+    lock_stock_adjust   boolean default false,
+    updated_at          timestamptz not null default now(),
+    deleted             boolean not null default false,
+    client_updated_at   timestamptz
 );
 
+create table if not exists public.staff (
+    id                uuid primary key,
+    business_id       uuid not null,
+    name              text not null,
+    username          text not null,
+    role              text not null default 'cashier',
+    active            boolean not null default true,
+    pin_hash          text,
+    -- Positive keys; an explicit false revokes. Android writes every key
+    -- explicitly (both spellings) so neither client has to infer from absence.
+    permissions       jsonb,
+    updated_at        timestamptz not null default now(),
+    deleted           boolean not null default false,
+    client_updated_at timestamptz
+);
+
+do $$ begin
+    alter table public.staff add constraint staff_role_check
+        check (role = any (array['admin','manager','cashier']));
+exception when duplicate_object then null; end $$;
+
+-- ---------------------------------------------------------------------------
+-- 2) Catalogue. `items` — NOT `products`.
+-- ---------------------------------------------------------------------------
+create table if not exists public.items (
+    id                uuid primary key,
+    business_id       uuid not null,
+    category_id       uuid,
+    name              text default '',
+    barcode           text,
+    sku               text,
+    category          text,
+    -- The price of ONE STOCK UNIT. For a 'measure' product that unit is the
+    -- kg / L / m — there is no second per-unit price column.
+    price             numeric default 0,
+    wholesale_price   numeric default 0,
+    box_price         numeric default 0,
+    box_size          numeric(14,3) default 1,
+    cost              numeric,
+    tax_rate          numeric default 0,
+    track_stock       boolean default true,
+    -- On-hand in stock units. A 'measure' product carries FRACTIONAL quantities
+    -- here; measured stock deliberately has no column of its own.
+    stock_qty         numeric(14,3) default 0,
+    reorder_level     numeric default 0,
+    unit              text default 'pc',
+    color_hex         text,
+    is_active         boolean default true,
+    product_type      text not null default 'piece',
+    updated_at        timestamptz not null default now(),
+    deleted           boolean not null default false,
+    client_updated_at timestamptz
+);
+
+do $$ begin
+    alter table public.items add constraint items_product_type_check
+        check (product_type = any (array['box','set','piece','measure']));
+exception when duplicate_object then null; end $$;
+
+create index if not exists items_cursor_idx on public.items (business_id, updated_at);
+create index if not exists items_sku_idx on public.items (business_id, sku);
+create index if not exists items_barcode_idx on public.items (business_id, barcode);
+
+-- Stock ledger. THIS is the authority; items.stock_qty is a derived cache that
+-- every device recomputes from these rows after a pull.
+create table if not exists public.stock_movements (
+    id                uuid primary key,
+    business_id       uuid not null,
+    item_id           uuid,
+    type              text default 'adjust',
+    delta             numeric default 0,
+    balance_after     numeric default 0,
+    note              text,
+    created_by        text,
+    created_by_name   text,
+    created_at        timestamptz,
+    updated_at        timestamptz not null default now(),
+    deleted           boolean not null default false,
+    client_updated_at timestamptz
+);
+
+-- ---------------------------------------------------------------------------
+-- 3) Customers + credit ledger
+-- ---------------------------------------------------------------------------
 create table if not exists public.customers (
-    id               bigint generated always as identity primary key,
-    local_id         text unique,
-    name             text not null,
-    phone            text,
-    email            text,
-    address          text,
-    notes            text,
-    balance          numeric not null default 0,
-    credit_limit     numeric,
-    is_trade_account boolean not null default false,
-    source           text not null default 'pos',
-    created_at       timestamptz not null default now(),
-    updated_at       timestamptz not null default now()
+    id                uuid primary key,
+    business_id       uuid not null,
+    name              text default '',
+    phone             text,
+    email             text,
+    address           text,
+    note              text,
+    wholesale         boolean default false,
+    updated_at        timestamptz not null default now(),
+    deleted           boolean not null default false,
+    client_updated_at timestamptz
+);
+create index if not exists customers_cursor_idx on public.customers (business_id, updated_at);
+
+-- Balance is DERIVED from these rows, never stored.
+create table if not exists public.credit_txns (
+    id                uuid primary key,
+    business_id       uuid not null,
+    customer_id       uuid,
+    sale_id           uuid,
+    type              text not null,
+    amount            numeric default 0,
+    note              text,
+    method            text,
+    created_by        text,
+    created_by_name   text,
+    created_at        timestamptz,
+    server_created_at timestamptz,
+    updated_at        timestamptz not null default now(),
+    deleted           boolean not null default false,
+    client_updated_at timestamptz
 );
 
+-- ---------------------------------------------------------------------------
+-- 4) Cash: one drawer, one shift
+-- ---------------------------------------------------------------------------
+create table if not exists public.cash_sessions (
+    id                uuid primary key,
+    business_id       uuid not null,
+    status            text not null default 'open',
+    opened_at         timestamptz not null default now(),
+    opened_by         text,
+    opened_by_name    text,
+    opening_float     numeric not null default 0,
+    closed_at         timestamptz,
+    closed_by         text,
+    closed_by_name    text,
+    counted_cash      numeric,
+    expected_cash     numeric,
+    -- GENERATED: never send this column, an insert naming it fails the batch.
+    -- COALESCE, verbatim from the live schema. Without it a shift counted before its
+    -- expected figure is known yields NULL variance instead of the counted amount.
+    variance          numeric generated always as
+                          (coalesce(counted_cash, 0::numeric) - coalesce(expected_cash, 0::numeric)) stored,
+    note              text,
+    -- Which DEVICE opened the shift. Recorded, but NOT part of its identity —
+    -- any device may close it, and closing it closes it for the shop.
+    till_code         text,
+    updated_at        timestamptz not null default now(),
+    deleted           boolean not null default false,
+    client_updated_at timestamptz
+);
+
+-- ONE open shift per SHOP, not per till: the shop has one physical drawer, so
+-- it has exactly one thing to count. Two offline tills can still each open one
+-- (both correctly see none open); the clients settle that afterwards with a
+-- shared rule — oldest opened_at wins, ties broken by id.
+-- CHECK-constrained on the live schema. Only four columns in the whole database are,
+-- and this is one: the merge writes 'closed' on a loser, and anything else fails the
+-- WHOLE batch rather than the row.
+do $$ begin
+    alter table public.cash_sessions add constraint cash_sessions_status_check
+        check (status = any (array['open','closed']));
+exception when duplicate_object then null; end $$;
+
+create unique index if not exists uq_cash_sessions_one_open
+    on public.cash_sessions (business_id)
+    where status = 'open' and deleted = false;
+
+create index if not exists idx_cash_sessions_cursor on public.cash_sessions (business_id, updated_at);
+
+-- No `location` column: TILL / SAFE / OUTSIDE is DERIVED from `type`.
+create table if not exists public.cash_movements (
+    id                uuid primary key,
+    business_id       uuid not null,
+    session_id        uuid,
+    type              text not null,
+    amount            numeric not null,
+    reason            text,
+    created_by        text,
+    created_by_name   text,
+    created_at        timestamptz not null default now(),
+    updated_at        timestamptz not null default now(),
+    deleted           boolean not null default false,
+    client_updated_at timestamptz
+);
+
+do $$ begin
+    alter table public.cash_movements add constraint cash_movements_type_check
+        check (type = any (array['pay_in','pay_out','drop','petty','float_topup','safe_in','bank_deposit']));
+exception when duplicate_object then null; end $$;
+
+-- ---------------------------------------------------------------------------
+-- 5) Sales. A sale is THREE rows: header + lines + tenders.
+-- ---------------------------------------------------------------------------
 create table if not exists public.sales (
-    id                  text primary key,          -- the receipt ref string
-    ref                 text,
-    type                text not null default 'sale',      -- sale | return | quote
-    status              text not null default 'completed',
-    customer_id         text,
-    customer_name       text,
-    items               jsonb not null default '[]'::jsonb,
-    payments            jsonb not null default '[]'::jsonb,
-    subtotal            numeric not null default 0,
+    id                  uuid primary key,
+    business_id         uuid not null,
+    receipt_no          text,
+    status              text default 'completed',
+    -- subtotal            = Sum(unit_price * qty)                    GROSS
+    -- discount_total      = whole-sale discount + Sum(line_discount) COMBINED
+    -- line_discount_total = Sum(line_discount)                       so a reader
+    --   can recover the whole-sale half by SUBTRACTION rather than reconstructing
+    --   it. Note it is clamped to discount_total: discount_total itself is capped
+    --   at the goods value, so an over-large whole-sale discount would otherwise
+    --   make (discount_total - line_discount_total) go negative.
+    subtotal            numeric default 0,
+    discount_total      numeric default 0,
     line_discount_total numeric not null default 0,
-    sale_discount       numeric not null default 0,
-    sale_discount_pct   numeric not null default 0,
-    total_discount      numeric not null default 0,
-    discount_pct        numeric not null default 0,
     markup_total        numeric not null default 0,
-    vat_enabled         boolean not null default false,
-    vat_amount          numeric not null default 0,
-    grand_total         numeric not null default 0,
-    amount_paid         numeric not null default 0,
-    change_given        numeric not null default 0,
-    change_owed         numeric not null default 0,
-    amount_owing        numeric not null default 0,
-    pay_method          text,
-    cashier             text,
-    cashier_id          text,
-    notes               text,
-    hold_name           text,
-    created_at          timestamptz not null default now(),
-    updated_at          timestamptz not null default now()
+    cost_total          numeric not null default 0,
+    -- Gross profit: costed revenue - discount share - cost, COSTED LINES ONLY.
+    -- A line with no cost is unknown-cost, not zero-cost.
+    profit_total        numeric not null default 0,
+    tax_total           numeric default 0,
+    total               numeric default 0,
+    payment_method      text,
+    tendered            numeric,
+    amount_paid         numeric default 0,
+    change_due          numeric,
+    payment_ref         text,
+    payment_status      text default 'unpaid',
+    note                text,
+    customer_id         uuid,
+    customer_name       text,
+    sold_at             timestamptz,
+    session_id          uuid,
+    created_by          text,
+    created_by_name     text,
+    server_created_at   timestamptz,
+    updated_at          timestamptz not null default now(),
+    deleted             boolean not null default false,
+    client_updated_at   timestamptz
+);
+create index if not exists sales_cursor_idx on public.sales (business_id, updated_at);
+create index if not exists sales_sold_at_idx on public.sales (business_id, sold_at desc);
+create index if not exists idx_sales_session on public.sales (session_id);
+
+create table if not exists public.sale_items (
+    id                uuid primary key,
+    business_id       uuid not null,
+    sale_id           uuid not null,
+    item_id           uuid,
+    name              text default '',
+    qty               numeric default 0,
+    unit_price        numeric default 0,
+    unit_cost         numeric,
+    line_discount     numeric default 0,
+    line_markup       numeric not null default 0,
+    line_tax          numeric default 0,
+    line_total        numeric default 0,
+    mode              text default 'retail',
+    units_per_line    numeric default 1,
+    -- GENERATED. Naming either in an INSERT fails the WHOLE batch, not the row.
+    -- Verbatim from the live schema. Null unit_cost yields NULL for both, which is the
+    -- "cost not recorded" case and must stay distinct from a zero cost.
+    line_cost         numeric generated always as ((unit_cost * qty) * units_per_line) stored,
+    line_profit       numeric generated always as (line_total - ((unit_cost * qty) * units_per_line)) stored,
+    updated_at        timestamptz not null default now(),
+    deleted           boolean not null default false,
+    client_updated_at timestamptz
+);
+create index if not exists sale_items_sale_idx on public.sale_items (sale_id);
+
+create table if not exists public.sale_payments (
+    id                uuid primary key,
+    business_id       uuid not null,
+    sale_id           uuid not null,
+    method            text default 'cash',
+    amount            numeric default 0,
+    reference         text,
+    tender_currency   text,
+    tender_amount     numeric,
+    rate              numeric,
+    created_at        timestamptz,
+    updated_at        timestamptz not null default now(),
+    deleted           boolean not null default false,
+    client_updated_at timestamptz
+);
+create index if not exists sale_payments_sale_idx on public.sale_payments (sale_id);
+
+-- ---------------------------------------------------------------------------
+-- 6) Refunds — first-class rows, NOT negative-total sales.
+--    sale_id / sale_line_id are what let a returned line be traced back to the
+--    receipt it came off.
+-- ---------------------------------------------------------------------------
+create table if not exists public.refunds (
+    id                uuid primary key,
+    business_id       uuid not null,
+    sale_id           uuid,
+    sale_receipt_no   text,
+    customer_id       uuid,
+    customer_name     text,
+    reason            text,
+    refund_total      numeric default 0,
+    status            text default 'owed',
+    created_by        text,
+    created_by_name   text,
+    created_at        timestamptz,
+    server_created_at timestamptz,
+    session_id        uuid,
+    updated_at        timestamptz not null default now(),
+    deleted           boolean not null default false,
+    client_updated_at timestamptz
 );
 
-create table if not exists public.credit_transactions (
-    id            bigint generated always as identity primary key,
-    local_id      text unique,
-    sale_id       text,
-    customer_id   text,                        -- customers.id (bigint) as text
-    customer_name text,
-    type          text not null,               -- credit_owed | credit_paid | change_owed | change_paid
-    amount        numeric not null default 0,
-    note          text,
-    cashier       text,
-    settled       boolean not null default false,
-    settled_at    timestamptz,
-    created_at    timestamptz not null default now(),
-    updated_at    timestamptz not null default now()
+create table if not exists public.refund_items (
+    id                uuid primary key,
+    business_id       uuid not null,
+    refund_id         uuid not null,
+    sale_line_id      uuid,
+    item_id           uuid,
+    name              text default '',
+    qty               numeric default 0,
+    unit_price        numeric default 0,
+    line_total        numeric default 0,
+    mode              text default 'retail',
+    units_per_line    numeric default 1,
+    restock           boolean default true,
+    created_at        timestamptz,
+    updated_at        timestamptz not null default now(),
+    deleted           boolean not null default false,
+    client_updated_at timestamptz
 );
 
+create table if not exists public.refund_payments (
+    id                uuid primary key,
+    business_id       uuid not null,
+    refund_id         uuid not null,
+    method            text default 'cash',
+    amount            numeric default 0,
+    reference         text,
+    tender_currency   text,
+    tender_amount     numeric,
+    rate              numeric,
+    created_by        text,
+    created_by_name   text,
+    created_at        timestamptz,
+    updated_at        timestamptz not null default now(),
+    deleted           boolean not null default false,
+    client_updated_at timestamptz
+);
+
+-- ---------------------------------------------------------------------------
+-- 7) Mobile money, audit, accounting spine
+-- ---------------------------------------------------------------------------
 create table if not exists public.mobile_money_receipts (
-    id                    bigint generated always as identity primary key,
-    local_id              text unique,
-    provider              text not null default 'unknown',
-    txn_code              text not null unique,
-    amount                numeric not null default 0,
-    currency              text not null default 'USD',
+    id                    uuid primary key,
+    business_id           uuid not null,
+    provider              text default 'unknown',
+    raw_body              text,
     sender                text,
     sender_name           text,
     sender_phone          text,
-    raw_body              text,
+    amount                numeric default 0,
+    currency              text default 'USD',
+    txn_code              text not null,
     received_at           timestamptz,
-    status                text not null default 'unmatched',
-    matched_customer_id   text,
+    status                text default 'unmatched',
+    matched_customer_id   uuid,
     matched_customer_name text,
     purpose               text,
+    applied_credit_txn_id uuid,
+    applied_sale_id       uuid,
     note                  text,
-    cashier               text,
-    cashier_id            text,
-    created_at            timestamptz not null default now(),
-    updated_at            timestamptz not null default now()
+    created_by            text,
+    created_by_name       text,
+    server_created_at     timestamptz,
+    updated_at            timestamptz not null default now(),
+    deleted               boolean not null default false,
+    client_updated_at     timestamptz
 );
 
--- ---------------------------------------------------------------------------
--- 2) Accounting spine — expenses and the cash-on-hand ledger
--- ---------------------------------------------------------------------------
+-- The ONE genuine idempotency key in this schema: the same provider SMS read
+-- twice is the same receipt, so a duplicate here may safely be ignored. Nowhere
+-- else may a push silently skip a row.
+create unique index if not exists mobile_money_receipts_txn_key
+    on public.mobile_money_receipts (business_id, txn_code);
+
+create table if not exists public.audit_entries (
+    id                uuid primary key,
+    business_id       uuid not null,
+    action            text not null,
+    entity_type       text,
+    entity_id         text,
+    summary           text,
+    meta              jsonb,
+    created_by        text,
+    created_by_name   text,
+    created_at        timestamptz not null default now(),
+    updated_at        timestamptz not null default now(),
+    deleted           boolean not null default false,
+    client_updated_at timestamptz
+);
 
 create table if not exists public.expenses (
-    id                bigint generated always as identity primary key,
-    local_id          text unique,
-    business_id       text,
-    category          text default 'Other',
-    amount            numeric default 0,
+    id                uuid primary key,
+    business_id       uuid not null,
+    category          text,
+    amount            numeric not null default 0,
     date              date,
     description       text,
-    -- approval lifecycle
-    status            text default 'pending',   -- pending | approved | rejected
-    submitted_by      text,
-    submitted_by_name text,
-    approved_by       text,
-    approved_by_name  text,
-    approved_at       bigint,                   -- epoch millis
-    posted_at         bigint,                   -- epoch millis
-    -- how it was funded (these three sum to amount)
-    cash_portion      numeric default 0,        -- paid from the drawer
-    payable_portion   numeric default 0,        -- still owed to the payee
-    capital_portion   numeric default 0,        -- the owner covered it
-    -- recurring schedule
-    recurring         boolean default false,
-    recurrence_period text,                     -- daily | weekly | monthly
-    recurrence_active boolean default true,
-    is_template       boolean default false,
-    template_id       text,
-    next_run_at       bigint,
-    last_run_at       bigint,
-    period_start      date,
-    period_end        date,
-    created_at        timestamptz default now(),
-    updated_at        timestamptz default now(),
-    deleted           boolean default false
+    updated_at        timestamptz not null default now(),
+    deleted           boolean not null default false,
+    client_updated_at timestamptz
 );
-
-create table if not exists public.cash_txns (
-    id              bigint generated always as identity primary key,
-    local_id        text unique,
-    business_id     text,
-    type            text,                       -- sale | expense | purchase | payout | capital | adjust
-    amount          numeric default 0,          -- signed: + into the drawer, - out of it
-    source          text,
-    note            text,
-    ref_type        text,
-    ref_id          text,
-    created_by      text,
-    created_by_name text,
-    created_at      timestamptz default now(),
-    updated_at      timestamptz default now(),
-    deleted         boolean default false
-);
-
--- ---------------------------------------------------------------------------
--- 3) Supply — suppliers and purchase orders
--- ---------------------------------------------------------------------------
 
 create table if not exists public.suppliers (
-    id          bigint generated always as identity primary key,
-    local_id    text unique,
-    business_id text,
-    name        text,
-    phone       text,
-    email       text,
-    address     text,
-    notes       text,
-    created_at  timestamptz default now(),
-    updated_at  timestamptz default now(),
-    deleted     boolean default false
+    id                uuid primary key,
+    business_id       uuid not null,
+    name              text not null,
+    phone             text,
+    email             text,
+    address           text,
+    notes             text,
+    updated_at        timestamptz not null default now(),
+    deleted           boolean not null default false,
+    client_updated_at timestamptz
 );
 
 create table if not exists public.purchase_orders (
-    id                  bigint generated always as identity primary key,
-    local_id            text unique,
-    business_id         text,
-    ref                 text,
-    supplier_id         text,
-    supplier_name       text default '',
-    status              text default 'draft',   -- draft | placed | partial | received | cancelled
-    notes               text,
-    eta                 bigint,                 -- epoch millis
-    cash_paid           numeric default 0,
-    capital_paid        numeric default 0,
-    payable_remainder   numeric default 0,
-    arrival_prompted_at bigint,
-    sent_at             bigint,
-    received_at         bigint,
-    created_at          timestamptz default now(),
-    updated_at          timestamptz default now(),
-    deleted             boolean default false
+    id                uuid primary key,
+    business_id       uuid not null,
+    ref               text,
+    supplier_id       uuid,
+    supplier_name     text,
+    status            text not null default 'draft',
+    notes             text,
+    created_at        timestamptz not null default now(),
+    sent_at           timestamptz,
+    received_at       timestamptz,
+    updated_at        timestamptz not null default now(),
+    deleted           boolean not null default false,
+    client_updated_at timestamptz
 );
 
--- Lines link to their order by po_local_id (the device's own stable key) rather
--- than a hard foreign key, so an offline-first push can never wedge on
--- parent/child ordering.
 create table if not exists public.purchase_order_items (
-    id               bigint generated always as identity primary key,
-    local_id         text unique,
-    po_local_id      text,
-    item_id          text,
-    name             text default '',
-    sku              text,
-    qty              numeric default 1,
-    unit_cost        numeric default 0,
-    sell_price       numeric,
-    stock_on_arrival boolean default true,
-    product_type     text default 'piece',
-    received_qty     numeric,
-    created_at       timestamptz default now(),
-    updated_at       timestamptz default now()
+    id                uuid primary key,
+    business_id       uuid not null,
+    po_id             uuid not null,
+    item_id           uuid,
+    name              text,
+    sku               text,
+    qty               numeric not null default 0,
+    unit_cost         numeric not null default 0,
+    received_qty      numeric,
+    updated_at        timestamptz not null default now(),
+    deleted           boolean not null default false,
+    client_updated_at timestamptz
 );
 
 -- ---------------------------------------------------------------------------
--- 4) Team — alerts, audit trail, approval requests, staff roster
+-- 8) Row-level security — one tenant policy per table, matching the live shop.
 -- ---------------------------------------------------------------------------
-
--- Alerts converge on ONE row per condition per shop, so two phones noticing the
--- same thing update the same row instead of duplicating it.
-create table if not exists public.notifications (
-    id          bigint generated always as identity primary key,
-    local_id    text,
-    business_id text,
-    category    text,
-    severity    text default 'info',            -- info | warn | danger
-    audience    text not null default 'admin',  -- admin | cashier | all
-    title       text,
-    body        text,
-    dedupe_key  text,
-    ref_type    text,
-    ref_id      text,
-    event_at    bigint,                         -- epoch millis
-    read_at     bigint,                         -- epoch millis, null = unread
-    created_at  timestamptz default now(),
-    updated_at  timestamptz default now(),
-    deleted     boolean default false,
-    constraint notifications_business_dedupe_key unique (business_id, dedupe_key)
-);
-
--- Append-only. Receipt edits, till shortages/overages and voids recorded on a
--- cashier phone become visible on the admin phone.
-create table if not exists public.audit_log (
-    id          bigint generated always as identity primary key,
-    local_id    text unique,
-    business_id text,
-    action      text not null,
-    entity_type text,
-    entity_id   text,
-    summary     text,
-    meta        text,
-    user_id     text,
-    user_name   text,
-    details     jsonb,
-    created_at  timestamptz default now(),
-    updated_at  timestamptz default now()
-);
-
--- The admin-approval channel: a cashier files a request (a credit limit), the
--- admin decides, and the admin's device applies the change.
-create table if not exists public.staff_requests (
-    id                bigint generated always as identity primary key,
-    local_id          text unique,
-    business_id       text,
-    type              text,                     -- credit_limit
-    target_type       text,                     -- customer
-    target_id         text,
-    target_name       text,
-    amount            numeric,
-    note              text,
-    requested_by      text,
-    requested_by_name text,
-    status            text default 'pending',   -- pending | approved | rejected
-    decided_by        text,
-    decided_by_name   text,
-    decided_at        bigint,                   -- epoch millis
-    applied           boolean default false,    -- guards against double-application
-    created_at        timestamptz default now(),
-    updated_at        timestamptz default now(),
-    deleted           boolean default false
-);
-
--- Staff roster: powers the lock-screen "Other staff" list and the per-person
--- permission switches. Creating cashier LOGINS additionally needs Supabase Auth
--- and the create-cashier Edge Function; the till works fully without that.
-create table if not exists public.pos_staff (
-    id           uuid primary key,                  -- matches the auth user id
-    role         text not null default 'cashier',   -- admin | cashier
-    display_name text not null default '',
-    email        text,
-    permissions  jsonb not null default '{}'::jsonb,
-    active       boolean not null default true,
-    created_by   uuid,
-    created_at   timestamptz not null default now(),
-    updated_at   timestamptz not null default now()
-);
-
--- ---------------------------------------------------------------------------
--- 5) Upgrade an older setup in place (no-ops on a fresh database)
--- ---------------------------------------------------------------------------
-
-alter table public.products add column if not exists box_only       boolean not null default false;
-alter table public.products add column if not exists image_url      text;
-alter table public.products add column if not exists show_image     boolean not null default true;
-alter table public.products add column if not exists unit           text;
-alter table public.products add column if not exists price_per_unit numeric default 0;
-alter table public.products add column if not exists stock_measured numeric default 0;
-
-alter table public.customers add column if not exists source     text not null default 'pos';
-alter table public.customers add column if not exists created_at timestamptz not null default now();
-
-alter table public.sales add column if not exists line_discount_total numeric not null default 0;
-alter table public.sales add column if not exists sale_discount       numeric not null default 0;
-alter table public.sales add column if not exists sale_discount_pct   numeric not null default 0;
-alter table public.sales add column if not exists discount_pct        numeric not null default 0;
-alter table public.sales add column if not exists markup_total        numeric not null default 0;
-alter table public.sales add column if not exists vat_enabled         boolean not null default false;
-alter table public.sales add column if not exists hold_name           text;
-
-alter table public.credit_transactions add column if not exists sale_id    text;
-alter table public.credit_transactions add column if not exists settled    boolean not null default false;
-alter table public.credit_transactions add column if not exists settled_at timestamptz;
-
-alter table public.mobile_money_receipts add column if not exists created_at timestamptz not null default now();
-
-alter table public.notifications add column if not exists audience text not null default 'admin';
-
-alter table public.pos_staff add column if not exists email       text;
-alter table public.pos_staff add column if not exists permissions jsonb not null default '{}'::jsonb;
-
--- ---------------------------------------------------------------------------
--- 6) Indexes for the "pull rows changed since <cursor>" query
--- ---------------------------------------------------------------------------
-
-create index if not exists idx_products_updated_at    on public.products (updated_at);
-create index if not exists idx_customers_updated_at   on public.customers (updated_at);
-create index if not exists idx_sales_updated_at       on public.sales (updated_at);
-create index if not exists idx_credit_updated_at      on public.credit_transactions (updated_at);
-create index if not exists idx_mmr_updated_at         on public.mobile_money_receipts (updated_at);
-create index if not exists idx_expenses_updated_at    on public.expenses (updated_at);
-create index if not exists idx_cash_txns_updated_at   on public.cash_txns (updated_at);
-create index if not exists idx_suppliers_updated_at   on public.suppliers (updated_at);
-create index if not exists idx_po_updated_at          on public.purchase_orders (updated_at);
-create index if not exists idx_po_items_updated_at    on public.purchase_order_items (updated_at);
-create index if not exists idx_notifications_updated  on public.notifications (updated_at);
-create index if not exists idx_audit_log_updated_at   on public.audit_log (updated_at);
-create index if not exists idx_staff_requests_updated on public.staff_requests (updated_at);
-
-create index if not exists idx_expenses_business      on public.expenses (business_id);
-create index if not exists idx_cash_txns_business     on public.cash_txns (business_id);
-create index if not exists idx_suppliers_business     on public.suppliers (business_id);
-create index if not exists idx_po_business            on public.purchase_orders (business_id);
-create index if not exists idx_po_items_po            on public.purchase_order_items (po_local_id);
-create index if not exists idx_notifications_business on public.notifications (business_id);
-create index if not exists idx_audit_log_business     on public.audit_log (business_id);
-create index if not exists idx_staff_requests_status  on public.staff_requests (status);
-
--- ---------------------------------------------------------------------------
--- 7) Access for the anon (public) key
--- ---------------------------------------------------------------------------
--- The app talks to these tables as the anon/authenticated role. RLS is enabled
--- with permissive policies so the access is explicit. Anyone holding BOTH your
--- URL and anon key can read/write this data — keep them private, use a project
--- dedicated to this shop, and tighten these policies later if you wish.
-
-alter table public.products              enable row level security;
-alter table public.customers             enable row level security;
-alter table public.sales                 enable row level security;
-alter table public.credit_transactions   enable row level security;
-alter table public.mobile_money_receipts enable row level security;
-alter table public.expenses              enable row level security;
-alter table public.cash_txns             enable row level security;
-alter table public.suppliers             enable row level security;
-alter table public.purchase_orders       enable row level security;
-alter table public.purchase_order_items  enable row level security;
-alter table public.notifications         enable row level security;
-alter table public.audit_log             enable row level security;
-alter table public.staff_requests        enable row level security;
-alter table public.pos_staff             enable row level security;
-
-drop policy if exists pos_all on public.products;
-create policy pos_all on public.products
-    for all to anon, authenticated using (true) with check (true);
-
-drop policy if exists pos_all on public.customers;
-create policy pos_all on public.customers
-    for all to anon, authenticated using (true) with check (true);
-
-drop policy if exists pos_all on public.sales;
-create policy pos_all on public.sales
-    for all to anon, authenticated using (true) with check (true);
-
-drop policy if exists pos_all on public.credit_transactions;
-create policy pos_all on public.credit_transactions
-    for all to anon, authenticated using (true) with check (true);
-
-drop policy if exists pos_all on public.mobile_money_receipts;
-create policy pos_all on public.mobile_money_receipts
-    for all to anon, authenticated using (true) with check (true);
-
-drop policy if exists pos_all on public.expenses;
-create policy pos_all on public.expenses
-    for all to anon, authenticated using (true) with check (true);
-
-drop policy if exists pos_all on public.cash_txns;
-create policy pos_all on public.cash_txns
-    for all to anon, authenticated using (true) with check (true);
-
-drop policy if exists pos_all on public.suppliers;
-create policy pos_all on public.suppliers
-    for all to anon, authenticated using (true) with check (true);
-
-drop policy if exists pos_all on public.purchase_orders;
-create policy pos_all on public.purchase_orders
-    for all to anon, authenticated using (true) with check (true);
-
-drop policy if exists pos_all on public.purchase_order_items;
-create policy pos_all on public.purchase_order_items
-    for all to anon, authenticated using (true) with check (true);
-
-drop policy if exists pos_all on public.notifications;
-create policy pos_all on public.notifications
-    for all to anon, authenticated using (true) with check (true);
-
-drop policy if exists pos_all on public.audit_log;
-create policy pos_all on public.audit_log
-    for all to anon, authenticated using (true) with check (true);
-
-drop policy if exists pos_all on public.staff_requests;
-create policy pos_all on public.staff_requests
-    for all to anon, authenticated using (true) with check (true);
-
-drop policy if exists pos_all on public.pos_staff;
-create policy pos_all on public.pos_staff
-    for all to anon, authenticated using (true) with check (true);
-
-grant usage on schema public to anon, authenticated;
-grant all on
-    public.products,
-    public.customers,
-    public.sales,
-    public.credit_transactions,
-    public.mobile_money_receipts,
-    public.expenses,
-    public.cash_txns,
-    public.suppliers,
-    public.purchase_orders,
-    public.purchase_order_items,
-    public.notifications,
-    public.audit_log,
-    public.staff_requests,
-    public.pos_staff
-to anon, authenticated;
-
-grant usage, select on all sequences in schema public to anon, authenticated;
-
--- Done. Copy your Project URL and anon (public) key from
--- Dashboard -> Project Settings -> API, then paste them into the app under
--- Settings -> Cloud sync, and tap "Connect & sync".
+do $$
+declare t text;
+begin
+  foreach t in array array[
+    'businesses','staff','items','stock_movements','customers','credit_txns',
+    'cash_sessions','cash_movements','sales','sale_items','sale_payments',
+    'refunds','refund_items','refund_payments','mobile_money_receipts',
+    'audit_entries','expenses','suppliers','purchase_orders','purchase_order_items'
+  ] loop
+    execute format('alter table public.%I enable row level security', t);
+    execute format('drop policy if exists %I on public.%I', t || '_tenant_rw', t);
+    execute format(
+      'create policy %I on public.%I for all to anon, authenticated ' ||
+      'using (auth_org_id() is null or business_id = auth_org_id()) ' ||
+      'with check (auth_org_id() is null or business_id = auth_org_id())',
+      t || '_tenant_rw', t
+    );
+    execute format(
+      'create index if not exists %I on public.%I (business_id, client_updated_at)',
+      'idx_' || t || '_client_updated', t
+    );
+  end loop;
+end $$;

@@ -79,6 +79,22 @@ data class Business(
     // — never in the APK and never in a synced cloud table.
     val paynowIntegrationId: String? = null,
     val paynowIntegrationKey: String? = null,  // LOCAL-ONLY — not synced
+    // ──── Shop-wide capability locks (synced: businesses.lock_*) ────
+    // A lock switches a capability off for EVERY cashier at once, whatever their own
+    // per-staff permissions say. The two gates compose one way only:
+    //
+    //     allowed = isAdmin OR (NOT shopLocked AND staffPermitted)
+    //
+    // so a per-staff grant can never open what the shop has closed — it can only ever
+    // subtract. The admin bypasses both. See Capability.shopLockColumn for the mapping
+    // and PosUser.can for the check.
+    @ColumnInfo(defaultValue = "0") val lockRefunds: Boolean = false,
+    @ColumnInfo(defaultValue = "0") val lockDiscounts: Boolean = false,
+    @ColumnInfo(defaultValue = "0") val lockCredit: Boolean = false,
+    @ColumnInfo(defaultValue = "0") val lockPriceOverride: Boolean = false,
+    @ColumnInfo(defaultValue = "0") val lockParking: Boolean = false,
+    @ColumnInfo(defaultValue = "0") val lockQuotes: Boolean = false,
+    @ColumnInfo(defaultValue = "0") val lockStockAdjust: Boolean = false,
     val updatedAt: Long = now(),
     val deleted: Boolean = false,
     /** Local-only: true => has unsynced local edits to push. Never sent to cloud. */
@@ -200,6 +216,11 @@ data class SaleEntity(
     val customerId: String? = null,        // null => walk-in
     val customerName: String? = null,      // snapshot so receipts print without a lookup
     val soldAt: Long = now(),
+    /** The shift this sale belongs to ([CashSession]); null for a sale rung up with no
+     *  shift open. This is what a cash-up counts by — a sale that points at a session the
+     *  shop cannot resolve is silently left out of the drawer count, which is the whole
+     *  reason the merge rule repoints these rather than letting a loser session linger. */
+    val sessionId: String? = null,
     // ──── Attribution & audit (Phase 2) ────
     // Stamped from the signed-in cashier's cached session AT creation time (offline
     // included) so ownership survives device sharing and network drops. Nullable
@@ -319,8 +340,20 @@ data class StockMovement(
     // is created by a refund; a "sale" by checkout; "adjust"/"restock" by inventory).
     val createdBy: String? = null,
     val createdByName: String? = null,
-    val createdAt: Long = now()
+    val createdAt: Long = now(),
+    // ──── Sync. The ledger is the AUTHORITY for stock, so it has to travel ────
+    // This was device-local, which meant a sale drew down the till that rang it up and
+    // no other till ever heard about it. Because `items.stock_qty` is only a CACHE of
+    // these rows, that left a shop with as many stock figures as it had tills — none of
+    // them wrong from where it was standing.
+    @ColumnInfo(defaultValue = "0") val updatedAt: Long = 0L,
+    @ColumnInfo(defaultValue = "0") val deleted: Boolean = false,
+    /** Local-only: true => has unsynced local edits to push. Never sent to cloud. */
+    @ColumnInfo(defaultValue = "1") val pendingSync: Boolean = true
 )
+
+/** On-hand for one item, summed from its movement ledger (read model). */
+data class ItemOnHand(val itemId: String, val onHand: Double)
 
 /** A completed sale together with its lines (read model for receipts/history). */
 data class SaleWithLines(
@@ -364,6 +397,9 @@ data class Refund(
     val createdByName: String? = null,
     val createdAt: Long = now(),           // device time at creation (offline-safe)
     val serverCreatedAt: Long? = null,     // server time, set on sync
+    /** The shift this payout belongs to ([CashSession]) — money leaving the drawer has to
+     *  be counted against the same shift the sales were. */
+    val sessionId: String? = null,
     val updatedAt: Long = now(),
     val deleted: Boolean = false,
     /** Local-only: true => has unsynced local edits to push. Never sent to cloud. */
@@ -728,6 +764,65 @@ data class CashTxn(
  * LOCAL-ONLY but sync-ready (carries [localId] / [updatedAt] / [pendingSync] like every
  * other syncable entity). No push/pull is wired: the cloud schema has no `day_closes`.
  */
+/**
+ * One trading SHIFT — the drawer being open from the moment someone counts a float in to
+ * the moment someone counts it out.
+ *
+ * ★ ONE OPEN SESSION PER SHOP, NOT PER TILL. Gridline has one physical drawer, so it has
+ * exactly one thing to count; the shared database enforces it with a partial unique index
+ * on `(business_id) where status = 'open'`. [tillCode] records which DEVICE opened the
+ * shift, but it is NOT part of the shift's identity — any device may close it, and closing
+ * it closes it for the whole shop.
+ *
+ * That constraint cannot prevent two offline tills both opening one (each correctly sees
+ * no open shift), so the survivor is settled after the fact by [planSessionMerge], whose
+ * rule this app and the web POS must implement identically or they will each pick a
+ * different winner forever.
+ *
+ * Distinct from [DayClose], which is the RECORD of a completed count — a session is the
+ * period, a day-close is the event that ends one.
+ */
+@Entity(
+    tableName = "cash_sessions",
+    indices = [Index("businessId"), Index(value = ["businessId", "status"])]
+)
+data class CashSession(
+    @PrimaryKey override val id: String = newId(),
+    val businessId: String,
+    val status: String = SessionStatus.OPEN,
+    override val openedAt: Long = now(),
+    val openedBy: String? = null,
+    val openedByName: String? = null,
+    val openingFloat: Double = 0.0,
+    val closedAt: Long? = null,
+    val closedBy: String? = null,
+    val closedByName: String? = null,
+    val countedCash: Double? = null,
+    val expectedCash: Double? = null,
+    /** Free note. Also where a merged-away shift records what became of it. */
+    val note: String? = null,
+    /** Which device opened the shift. Recorded, never part of its identity. */
+    val tillCode: String? = null,
+    val updatedAt: Long = now(),
+    val deleted: Boolean = false,
+    /** Local-only: true => has unsynced local edits to push. Never sent to cloud. */
+    val pendingSync: Boolean = true
+) : MergeableSession {
+    val isOpen: Boolean get() = status == SessionStatus.OPEN && !deleted
+
+    /**
+     * The over/short on this shift. DERIVED, never stored — the cloud's `variance` column
+     * is GENERATED, so sending one would be rejected, and keeping a second copy on the
+     * device is how the two drift apart.
+     */
+    val variance: Double? get() = countedCash?.let { it - (expectedCash ?: 0.0) }
+}
+
+object SessionStatus {
+    const val OPEN = "open"
+    const val CLOSED = "closed"
+}
+
 @Entity(tableName = "day_closes", indices = [Index("businessId"), Index("closedAt")])
 data class DayClose(
     @PrimaryKey val id: String = newId(),

@@ -61,9 +61,25 @@ class SupabaseRest(
          */
         const val SESSION_UNAVAILABLE = "\u0000pos-session-unavailable"
 
-        /** The most recently added synced table — bump this whenever the setup script
-         *  gains a new one, so an out-of-date database is detected as needing setup. */
-        private const val PROBE_NEWEST = "staff_requests"
+        /**
+         * The catalogue table — proves the project is reachable and the key is accepted.
+         *
+         * ★ It is `items`, NOT `products`. The web POS owns this schema and its catalogue
+         * has always been `items`; `products` never existed there. Probing for a table the
+         * shared database does not have is how a till ends up believing the database "needs
+         * setting up" and standing up a second, parallel catalogue nobody else can see.
+         */
+        private const val PROBE_TABLE = "items"
+
+        /**
+         * A COLUMN probe, not a table one — the schema moves by columns now, not by whole
+         * tables. `sales.profit_total` is the newest thing Android depends on (the settled
+         * money model); a database that predates it answers "column does not exist", which
+         * is precisely the out-of-date case the owner needs told about. Bump this whenever
+         * Android starts depending on a newer column.
+         */
+        private const val PROBE_TABLE_NEWEST = "sales"
+        private const val PROBE_COLUMN_NEWEST = "profit_total"
     }
 
     private val client = OkHttpClient.Builder()
@@ -77,17 +93,22 @@ class SupabaseRest(
     private fun rest(table: String) = "$baseUrl/rest/v1/$table"
 
     /**
-     * Is the database ready? Probes TWO tables, not one: `products` proves the project
-     * is reachable and the key is accepted, and [PROBE_NEWEST] proves the CURRENT setup
-     * script has been run. Without the second probe a project still carrying only the
-     * original five tables reports Ok, the setup sheet never appears, and every newer
-     * table then fails to sync on every pass. The script is idempotent, so re-running it
-     * to add what is missing is safe.
+     * Is the database ready? Two probes, because they answer different questions:
+     * [PROBE_TABLE] proves the project is reachable and the key is accepted, and
+     * [PROBE_COLUMN_NEWEST] proves the schema is CURRENT. Without the second, a database
+     * that predates the shared money model reports Ok and then fails on every push with
+     * a raw Postgres error instead of an answer the owner can act on.
+     *
+     * ★ Android never repairs what it finds. The web POS owns this schema; if a probe
+     * comes back missing, the fix is to migrate the WEB, not to have a till create the
+     * table itself. A till that stands up its own copy produces two catalogues that
+     * both work and never see each other, which is worse than a refusal because a
+     * refusal tells you.
      */
     fun test(): ConnectionTest {
-        val core = probeTable("products", "sku")
+        val core = probeTable(PROBE_TABLE, "id")
         if (core !is ConnectionTest.Ok) return core
-        return probeTable(PROBE_NEWEST, "local_id")
+        return probeTable(PROBE_TABLE_NEWEST, PROBE_COLUMN_NEWEST)
     }
 
     private fun probeTable(table: String, column: String): ConnectionTest {
@@ -105,8 +126,15 @@ class SupabaseRest(
                     resp.code == 404 -> ConnectionTest.TablesMissing
                     else -> {
                         val body = resp.body?.string().orEmpty()
-                        if (body.contains("does not exist", true) || body.contains("PGRST205"))
-                            ConnectionTest.TablesMissing
+                        // A missing TABLE is 404/PGRST205; a missing COLUMN comes back 400
+                        // with Postgres 42703 (or PGRST204 from the schema cache). Both mean
+                        // the same thing to the owner — this database is not the one this
+                        // build expects — so both land on TablesMissing.
+                        val outOfDate = body.contains("does not exist", true) ||
+                            body.contains("PGRST205") ||
+                            body.contains("PGRST204") ||
+                            body.contains("42703")
+                        if (outOfDate) ConnectionTest.TablesMissing
                         else ConnectionTest.Failed("HTTP ${resp.code}")
                     }
                 }

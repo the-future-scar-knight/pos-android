@@ -127,3 +127,73 @@ fun computeSaleMargin(
         profit = costedRevenue - costedLinesCost
     )
 }
+
+// ───────────────────────────── the wire figures ─────────────────────────────
+// Two columns the shared cloud schema asks each client to state outright rather
+// than leave to be reconstructed: `sales.line_discount_total` and `sales.profit_total`.
+//
+// Both are derived HERE, from the sale's own lines, and neither is stored on
+// [SaleEntity]. That is deliberate and it is the same rule that governs refunds
+// (see RefundMath's header): the lines are the record, and a stored total is a
+// second copy that can drift from them. A column that only exists at the moment
+// of push cannot go stale in the database.
+
+/**
+ * Σ `lineDiscount` over the sale's live lines — the cloud's `sales.line_discount_total`.
+ *
+ * This is the figure the sale's own [SaleEntity.discountTotal] already contains: that
+ * column is the COMBINED total (whole-sale discount + every per-item discount, see
+ * [PosRepository.checkout]). Stating the per-item half separately is what lets a reader
+ * recover the other half by subtraction —
+ *
+ *     wholeSaleDiscount = discountTotal − lineDiscountTotal
+ *
+ * — instead of reconstructing it as `allLinesNet − (total − taxTotal)`, which is what
+ * [computeSaleMargin] does above. That reconstruction is correct, but it is an IMPLICIT
+ * invariant: it holds only while every one of those four figures agrees, and it fails
+ * silently rather than loudly when one of them doesn't (a checkout rounding adjustment
+ * lands in it, which is exactly why line 119 needs its floor).
+ *
+ * ★ CLAMPED to [SaleEntity.discountTotal]. `computeSaleTotals` clamps the combined
+ * discount to the goods value, so a whole-sale discount larger than the cart makes the
+ * stored `discountTotal` SMALLER than the discounts the lines actually carry. Left
+ * unclamped, the subtraction above would then hand a reader a negative whole-sale
+ * discount for a sale that never had one.
+ *
+ * [lines] must already be filtered to the live ones — a tombstoned line removed by an
+ * in-place receipt edit is not part of what the receipt says now.
+ */
+fun saleLineDiscountTotal(sale: SaleEntity, lines: List<SaleLine>): Double =
+    lines.sumOf { it.lineDiscount }
+        .coerceIn(0.0, sale.discountTotal.coerceAtLeast(0.0))
+
+/**
+ * This sale's margin, computed from its own lines — the cloud's `sales.profit_total`,
+ * and byte-for-byte the figure the dashboard shows, because it goes through the same
+ * [computeSaleMargin]. Pushing a profit the shop's own reports disagree with would give
+ * the owner two answers and no way to choose.
+ *
+ * Matches the shared definition: costed revenue − discount share − cost, over the
+ * COSTED lines only. A line with no [SaleLine.unitCost] is unknown-cost, not zero-cost,
+ * and a sale with nothing costed reports zero rather than a loss.
+ *
+ * `unitsPerLine` is floored at 1 so a malformed line can never zero out its own cost —
+ * the same guard the margin read model uses.
+ */
+fun saleMarginFromLines(sale: SaleEntity, lines: List<SaleLine>): SaleMargin {
+    val costed = lines.filter { it.unitCost != null }
+    return computeSaleMargin(
+        allLinesNet = saleGoodsValue(lines),
+        costedLinesNet = saleGoodsValue(costed),
+        costedLinesCost = costed.sumOf { it.unitCost!! * maxOf(it.unitsPerLine, 1) * it.qty },
+        saleNetTake = sale.total - sale.taxTotal
+    )
+}
+
+/** [saleMarginFromLines]'s bottom line — what goes in `sales.profit_total`. */
+fun saleProfitTotal(sale: SaleEntity, lines: List<SaleLine>): Double =
+    saleMarginFromLines(sale, lines).profit
+
+/** Σ `unitCost × unitsPerLine × qty` over the costed lines — the cloud's `sales.cost_total`. */
+fun saleCostTotal(sale: SaleEntity, lines: List<SaleLine>): Double =
+    saleMarginFromLines(sale, lines).costTotal

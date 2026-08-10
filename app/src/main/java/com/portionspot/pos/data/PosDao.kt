@@ -442,6 +442,12 @@ interface SalePaymentDao {
     @Insert
     suspend fun insertAll(payments: List<SalePayment>)
 
+    /** Apply pulled tenders. REPLACE, not a plain insert: a tender that comes back down
+     *  a second time — a cursor reset, a re-pull after a wipe — must land on the row it
+     *  already wrote rather than abort the whole batch on a primary-key clash. */
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertAll(payments: List<SalePayment>)
+
     @Query("SELECT * FROM sale_payments WHERE saleId = :saleId ORDER BY createdAt ASC")
     suspend fun forSale(saleId: String): List<SalePayment>
 
@@ -466,6 +472,31 @@ interface SalePaymentDao {
 interface StockMovementDao {
     @Insert
     suspend fun insert(movement: StockMovement)
+
+    // ── sync (the ledger is the authority for stock, so it travels) ──
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertAll(movements: List<StockMovement>)
+
+    @Query("SELECT * FROM stock_movements WHERE pendingSync = 1 AND deleted = 0")
+    suspend fun pending(): List<StockMovement>
+
+    @Query("UPDATE stock_movements SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun markSynced(ids: List<String>)
+
+    /**
+     * On-hand per item, summed from the whole ledger.
+     *
+     * SUM(delta), not the newest row's `balanceAfter`: two tills selling the same product
+     * while offline each write a snapshot computed from the stock THEY could see, so the
+     * later-arriving snapshot silently discards the other till's sale. The deltas are
+     * independent facts and add up correctly whatever order they arrive in.
+     */
+    @Query(
+        "SELECT itemId AS itemId, SUM(delta) AS onHand FROM stock_movements " +
+            "WHERE businessId = :businessId AND deleted = 0 GROUP BY itemId"
+    )
+    suspend fun onHandByItem(businessId: String): List<ItemOnHand>
 
     @Insert
     suspend fun insertAll(movements: List<StockMovement>)
@@ -626,6 +657,15 @@ interface RefundDao {
 
     @Insert
     suspend fun insertPayment(payment: RefundPayment)
+
+    // ── pull (REPLACE, so a re-pull lands on the row it already wrote instead of
+    //    aborting the batch on a primary-key clash) ──
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertLines(lines: List<RefundLine>)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertPayments(payments: List<RefundPayment>)
 
     @Upsert
     suspend fun upsert(refund: Refund)

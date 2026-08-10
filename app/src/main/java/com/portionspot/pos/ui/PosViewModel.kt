@@ -44,6 +44,8 @@ import com.portionspot.pos.data.Tender
 import com.portionspot.pos.data.TopProduct
 import com.portionspot.pos.auth.Capability
 import com.portionspot.pos.auth.Permissions
+import com.portionspot.pos.auth.isCapabilityAllowed
+import com.portionspot.pos.auth.lockedCapabilities
 import com.portionspot.pos.payments.PaynowClient
 import com.portionspot.pos.payments.PaynowInit
 import com.portionspot.pos.payments.PaynowPoll
@@ -172,16 +174,28 @@ class PosViewModel(
      *  (Phase 3) re-subscribes when the active session changes on a shared device. */
     private val _cashierId = MutableStateFlow<String?>(null)
 
+    /**
+     * Capabilities the SHOP has locked for everyone but the admin, read off the business
+     * profile's `lock_*` switches. Empty until the business loads, which is the right
+     * default: an unknown lock state must not invent restrictions the owner never set.
+     */
+    private val _shopLocks: StateFlow<Set<Capability>> =
+        repo.businessFlow
+            .map { b -> b?.lockedCapabilities() ?: emptySet() }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptySet())
+
     /** The set of capabilities the current user is allowed to exercise right now (admin =
      *  all). Collect this in Compose to gate visible controls. */
     val allowedCaps: StateFlow<Set<Capability>> =
-        combine(_currentIsAdmin, _currentPermissions) { admin, perms ->
-            if (admin) Capability.entries.toSet()
-            else Capability.entries.filter { perms.allows(it) }.toSet()
+        combine(_currentIsAdmin, _currentPermissions, _shopLocks) { admin, perms, locks ->
+            Capability.entries.filter { isCapabilityAllowed(admin, perms, it, locks) }.toSet()
         }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptySet())
 
-    /** Synchronous capability check for action handlers (the second, non-UI gate). */
-    fun can(cap: Capability): Boolean = _currentIsAdmin.value || _currentPermissions.value.allows(cap)
+    /** Synchronous capability check for action handlers (the second, non-UI gate).
+     *  Goes through the SAME [isCapabilityAllowed] the UI gate uses — two gates, one rule,
+     *  so a control that is visible can never be one the handler then refuses (or worse). */
+    fun can(cap: Capability): Boolean =
+        isCapabilityAllowed(_currentIsAdmin.value, _currentPermissions.value, cap, _shopLocks.value)
 
     /** Is the signed-in session an ADMIN? Drives the §4 safe gate in the UI: an admin
      *  opens the safe inline, anyone else has to ask the owner. The real enforcement is
@@ -2281,7 +2295,16 @@ class PosViewModel(
         }
     }
 
-    /** Save a staff member's capability grants (admin-only, direct PATCH to pos_staff). */
+    /**
+     * Save a staff member's capability grants (admin-only, direct PATCH to the staff row).
+     *
+     * The editor's map is normalised through [Permissions.toWireMap] before it goes up, so
+     * the column is written with EVERY capability stated explicitly and under both this
+     * app's and the web's spelling. The two clients read absence differently — this app
+     * treats a missing key as denied, the web as allowed — so a partial map is the one
+     * thing that could have them disagree about the same cashier. Stating everything
+     * removes the question rather than answering it.
+     */
     fun setStaffPermissions(
         staffId: String,
         permissions: Map<String, Boolean>,
@@ -2291,10 +2314,11 @@ class PosViewModel(
             onResult(com.portionspot.pos.auth.StaffResult.Err("You don't have permission to manage staff"))
             return
         }
+        val wire = Permissions.fromKeyMap(permissions).toWireMap()
         viewModelScope.launch {
             val client = staffClient()
                 ?: return@launch onResult(com.portionspot.pos.auth.StaffResult.Err("Connect cloud sync first"))
-            val r = withContext(Dispatchers.IO) { client.setPermissions(staffId, permissions) }
+            val r = withContext(Dispatchers.IO) { client.setPermissions(staffId, wire) }
             if (r is com.portionspot.pos.auth.StaffResult.Ok) refreshStaff()
             onResult(r)
         }
