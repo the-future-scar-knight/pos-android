@@ -15,6 +15,54 @@ import org.junit.Test
 class DtoMappingTest {
     private val eps = 1e-9
 
+    // ── product_type: one type, two spellings across the two clients ──────────────
+    //
+    // The web POS calls it `measure` and enforces it with a CHECK constraint on the
+    // shared schema; this app calls it `measured` internally. A CHECK violation is not
+    // a coerced value — it fails the entire upsert batch, so one bad product would take
+    // every other product in the push down with it.
+
+    @Test
+    fun productType_emitsTheWebsSpellingOnTheWire() {
+        assertEquals("measure", productTypeToWire("measured"))
+    }
+
+    @Test
+    fun productType_leavesTheSharedSpellingsAlone() {
+        // These three are spelled identically on both sides and must pass through
+        // untouched — a translation that "helpfully" rewrote them would be a new bug.
+        assertEquals("box", productTypeToWire("box"))
+        assertEquals("set", productTypeToWire("set"))
+        assertEquals("piece", productTypeToWire("piece"))
+    }
+
+    @Test
+    fun productType_readsBothSpellingsBackAsMeasured() {
+        // Rows already written by THIS app say "measured"; rows written by the web say
+        // "measure". Both must land on the app's internal value, or a product silently
+        // loses its unit pricing and starts being treated as a boxed item.
+        assertEquals("measured", normalizeProductType("measure", 1))
+        assertEquals("measured", normalizeProductType("measured", 1))
+        assertEquals("measured", normalizeProductType("  MEASURE  ", 1))
+    }
+
+    @Test
+    fun productType_survivesARoundTripThroughTheWire() {
+        // The property that actually matters: push then pull must not change the type.
+        for (t in listOf("box", "set", "piece", "measured")) {
+            assertEquals(t, normalizeProductType(productTypeToWire(t), 1))
+        }
+    }
+
+    @Test
+    fun productType_unknownValueStillFallsBackByBoxSize() {
+        // Unchanged legacy behaviour: "unit" and anything unrecognised resolve by pack
+        // size rather than throwing, so an older row can never block a pull.
+        assertEquals("box", normalizeProductType("unit", 12))
+        assertEquals("piece", normalizeProductType("unit", 1))
+        assertEquals("piece", normalizeProductType(null, 1))
+    }
+
     @Test
     fun product_mapsToItem_bridgingSkuAndSplittingStock() {
         val dto = ProductDto(

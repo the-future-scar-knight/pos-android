@@ -54,7 +54,7 @@ create table if not exists public.products (
     stock_units         integer not null default 0,
     low_stock_threshold integer not null default 5,
     active              boolean not null default true,
-    product_type        text    not null default 'box',   -- box | set | piece | measured
+    product_type        text    not null default 'box',   -- box | set | piece | measure
     box_only            boolean not null default false,
     image_url           text,
     show_image          boolean not null default true,

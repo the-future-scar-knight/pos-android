@@ -127,16 +127,38 @@ data class ProductDto(
     @SerialName("updated_at") val updatedAt: String? = null,
 )
 
-/** Coerce a cloud/legacy product_type to the three values the app understands. Older
+/** Coerce a cloud/legacy product_type to the four values the app understands. Older
  *  rows (and the app's own earlier push) used "unit" for a single-unit item; map that —
- *  and anything unrecognised — to box vs piece by box size. */
+ *  and anything unrecognised — to box vs piece by box size.
+ *
+ *  ★ "measure" and "measured" are THE SAME TYPE, spelled differently by the two clients.
+ *  The web POS calls it `measure` and enforces it with a CHECK constraint
+ *  (`product_type = ANY (ARRAY['box','set','piece','measure'])`); this app has always
+ *  called it `measured` internally. Both are accepted here so a row written by either
+ *  client reads correctly, whichever table it came from. See [productTypeToWire] for the
+ *  outbound half — a CHECK violation is not a coerced value, it fails the whole upsert
+ *  batch and takes every other product in it down too. */
 fun normalizeProductType(raw: String?, boxSize: Int): String = when (raw?.trim()?.lowercase()) {
     "box" -> "box"
     "set" -> "set"
     "piece" -> "piece"
-    "measured" -> "measured"
+    "measure", "measured" -> "measured"
     else -> if (boxSize > 1) "box" else "piece"
 }
+
+/**
+ * The wire spelling of a product type. Internally this app says `measured`; the shared
+ * Postgres schema says `measure` and enforces it with a CHECK, so the translation has to
+ * happen at the boundary rather than in the domain — renaming ~14 internal usages would
+ * be a bigger change for no gain, and the app's own `products` table (which has no CHECK)
+ * accepts either.
+ *
+ * Emitting the web's spelling now, before anything is repointed at the shared `items`
+ * table, means the value is already right when that happens and no historical row has to
+ * be rewritten — [normalizeProductType] reads both spellings back.
+ */
+fun productTypeToWire(productType: String): String =
+    if (productType == "measured") "measure" else productType
 
 /** Merge a pulled product onto the local [Item] (bridged by sku), preserving the
  *  Android-only fields the cloud doesn't carry (barcode, colour, unit, tax rate). */
@@ -585,7 +607,7 @@ fun Item.toProductPush(): ProductPushDto {
         sku = sku.orEmpty(),
         name = name,
         category = category,
-        productType = normalizeProductType(productType, bs),
+        productType = productTypeToWire(normalizeProductType(productType, bs)),
         boxPrice = boxPrice,
         boxSize = bs,
         wholesalePrice = wholesalePrice,
