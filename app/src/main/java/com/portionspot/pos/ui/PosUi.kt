@@ -4317,9 +4317,25 @@ private fun SyncScreen(vm: PosViewModel) {
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)
     ) {
-        if (appMode == AppMode.Cloud) {
-            CloudSyncSection(vm)
-        } else {
+        // ★ The database panel shows in BOTH modes.
+        //
+        // It used to render only in Cloud mode, which put a staff login in front of the
+        // one screen you need to connect a database — so an owner with a database and no
+        // account yet could not reach it, and the app gave no hint that the two were
+        // even related. That is the same trap as the cashier lock-screen: a credential
+        // gate in front of the thing you need in order to create the credential.
+        //
+        // The gate was never a database requirement. Signing in buys per-cashier
+        // ATTRIBUTION (createdBy on each sale), not access: with no account on the
+        // device the anon key is the intended identity, and this schema's row-level
+        // security passes it on the `auth_org_id() IS NULL` branch for every table.
+        //
+        // So a local-mode device can sync fully. What it cannot do is say WHICH cashier
+        // rang up a sale — which is exactly what the Connect-cloud card below is for,
+        // and why that card stays offered rather than being replaced.
+        CloudSyncSection(vm)
+        if (appMode != AppMode.Cloud) {
+            Spacer(Modifier.height(24.dp))
             SettingsSectionHeader("Cloud & staff accounts")
             ConnectCloudCard(vm)
         }

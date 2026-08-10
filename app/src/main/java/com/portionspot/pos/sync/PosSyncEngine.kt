@@ -59,6 +59,7 @@ import com.portionspot.pos.sync.wire.SalePaymentPushDto
 import com.portionspot.pos.sync.wire.SalePushDto
 import com.portionspot.pos.sync.wire.buildSalePush
 import com.portionspot.pos.sync.wire.toPush
+import com.portionspot.pos.sync.wire.toMovementPush
 import com.portionspot.pos.sync.wire.toReceiptPush
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -179,7 +180,10 @@ class PosSyncEngine(
             saleDao.pendingSales().count { it.status == "completed" } +
             refundDao.pending().size +
             creditDao.pending().size +
-            mobileMoneyDao.pending().size
+            mobileMoneyDao.pending().size +
+            stockMovementDao.pending().size +
+            cashTxnDao.pending().size +
+            cashSessionDao.pending().size
     }
 
     // ── push ────────────────────────────────────────────────────────────────
@@ -362,6 +366,38 @@ class PosSyncEngine(
                 "id",
             )
             stockMovementDao.markSynced(rows.map { it.id })
+            rows.size
+        }
+
+        // cash_movements — the till/safe ledger. Pushed so a float top-up or a drop made
+        // on a PHONE reaches the shop's drawer count; without it the cash-up saw the
+        // phone's sales but none of its cash handling.
+        //
+        // Stamped with the shift that is open on THIS device, or null when none is. Null
+        // is safe by agreement: the web counts an unstamped movement whose timestamp
+        // falls inside the shift window, the same way it counts an unstamped sale.
+        //
+        // ★ `type` is CHECK-constrained to seven values and a violation fails the WHOLE
+        // batch, so it goes through [cashMovementTypeToWire], which is guaranteed to emit
+        // a legal one. This app's vocabulary is much wider than those seven (sale,
+        // expense, drawing, loan, transfer_in/out, safe_withdrawal, variance …), so
+        // anything without an exact counterpart collapses to pay_in/pay_out by sign. The
+        // DIRECTION of the money is always preserved; the finer category is not, and that
+        // is a deliberate trade rather than a mapping still to be finished — inventing a
+        // category for a movement whose meaning we are guessing at would put real money
+        // under the wrong heading in the shop's own cash report.
+        pushTable("cash_movements") {
+            val rows = cashTxnDao.pending()
+            if (rows.isEmpty()) return@pushTable 0
+            val openShift = cashSessionDao.openSessions(bid).firstOrNull()?.id
+            api.upsert(
+                "cash_movements",
+                syncJson.encodeToString(
+                    rows.map { it.toMovementPush(openShift).copy(businessId = cloudBid) }
+                ),
+                "id",
+            )
+            cashTxnDao.markSynced(rows.map { it.id })
             rows.size
         }
 

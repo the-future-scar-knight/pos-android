@@ -285,9 +285,29 @@ class SupabaseRest(
     private fun Request.Builder.authed(): Request.Builder {
         val token = accessToken()
         if (token == SESSION_UNAVAILABLE) throw SessionExpiredException()
-        return this
+        val builder = this
             .header("apikey", anonKey)
-            .header("Authorization", "Bearer ${token ?: anonKey}")
             .header("Accept", "application/json")
+        // ★ `Authorization: Bearer` must carry a JWT. Supabase now issues TWO key formats
+        // per project — the legacy `anon` key, which IS a JWT, and a newer
+        // `sb_publishable_…` key, which is not. Sending the publishable one as a Bearer
+        // token makes PostgREST answer:
+        //
+        //     401 PGRST301  "No suitable key was found to decode the JWT"
+        //
+        // which reads like a permissions or key-validity problem and sends you looking at
+        // RLS and at the wrong project, when the key is perfectly valid and merely in the
+        // wrong header. The `apikey` header above is where a publishable key belongs, and
+        // it is already set, so the request authenticates correctly once Authorization is
+        // simply left off.
+        //
+        // A signed-in staff JWT always goes in Authorization, whatever the key format is.
+        val bearer = token ?: anonKey.takeIf { it.looksLikeJwt() }
+        return if (bearer != null) builder.header("Authorization", "Bearer $bearer") else builder
     }
+
+    /** A JWT is three dot-separated base64url segments; Supabase's start `eyJ` (`{"` encoded).
+     *  Deliberately a shape check, not a parse — we only need to know which header it belongs in. */
+    private fun String.looksLikeJwt(): Boolean =
+        startsWith("eyJ") && count { it == '.' } == 2
 }
