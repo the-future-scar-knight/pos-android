@@ -301,8 +301,22 @@ class SupabaseRest(
         // it is already set, so the request authenticates correctly once Authorization is
         // simply left off.
         //
-        // A signed-in staff JWT always goes in Authorization, whatever the key format is.
-        val bearer = token ?: anonKey.takeIf { it.looksLikeJwt() }
+        // ★ A JWT is only usable against the project that ISSUED it.
+        //
+        // This device can hold a session from a database it used to sync with — the app
+        // has pointed at more than one Supabase project over its life, and the vault
+        // survives a change of connection. Handing that older token to this project makes
+        // PostgREST answer 401 PGRST301 "No suitable key was found to decode the JWT",
+        // which names the JWT and so reads like a broken key. It is not: the key is fine
+        // and the token belongs to somewhere else.
+        //
+        // A mismatched token is DROPPED rather than sent, and the request falls back to
+        // the anon key — which is the correct identity for a device with no valid session
+        // here, and which this schema's RLS accepts. Signing in against THIS project
+        // replaces it and attribution resumes.
+        val projectRef = baseUrl.projectRef()
+        val usableToken = token?.takeIf { projectRef == null || it.issuedFor(projectRef) }
+        val bearer = usableToken ?: anonKey.takeIf { it.looksLikeJwt() }
         return if (bearer != null) builder.header("Authorization", "Bearer $bearer") else builder
     }
 
@@ -310,4 +324,32 @@ class SupabaseRest(
      *  Deliberately a shape check, not a parse — we only need to know which header it belongs in. */
     private fun String.looksLikeJwt(): Boolean =
         startsWith("eyJ") && count { it == '.' } == 2
+
+    /** The project ref out of a Supabase URL — `https://<ref>.supabase.co`. Null for a
+     *  self-hosted or otherwise unrecognised host, where the check cannot apply and the
+     *  token is given the benefit of the doubt rather than dropped. */
+    private fun String.projectRef(): String? {
+        val host = toHttpUrlOrNull()?.host ?: return null
+        if (!host.endsWith(".supabase.co")) return null
+        return host.substringBefore('.').takeIf { it.isNotBlank() }
+    }
+
+    /**
+     * Was this JWT issued by [projectRef]? Reads the `ref` claim from the payload.
+     *
+     * The payload is decoded, NOT verified — we are not authenticating anything here, only
+     * deciding which of two projects a token belongs to. The server still verifies it.
+     * An unreadable payload returns true: a token we cannot parse is sent as before and
+     * left for PostgREST to judge, because silently dropping a valid token would break
+     * sync for a shape we simply did not anticipate.
+     */
+    private fun String.issuedFor(projectRef: String): Boolean {
+        val payload = split(".").getOrNull(1) ?: return true
+        val json = runCatching {
+            String(android.util.Base64.decode(payload, android.util.Base64.URL_SAFE))
+        }.getOrNull() ?: return true
+        val ref = Regex("\"ref\"\\s*:\\s*\"([^\"]+)\"").find(json)?.groupValues?.get(1)
+            ?: return true
+        return ref == projectRef
+    }
 }
