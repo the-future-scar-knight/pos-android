@@ -122,6 +122,11 @@ class MainActivity : ComponentActivity() {
             PosTheme(theme = theme) {
                 val bootLoaded by vm.bootLoaded.collectAsState()
                 val appMode by vm.appMode.collectAsState()
+                // Once a cloud account has ever signed in here, the back-out-to-local route
+                // stops existing — see [PosViewModel.cloudProvisioned]. Local mode is a
+                // hard-coded admin against the same database, so leaving that arrow on the
+                // login screen let a signed-out cashier promote themselves in three taps.
+                val cloudProvisioned by vm.cloudProvisioned.collectAsState()
 
                 when {
                     // Wait for the persisted mode/onboarding flags so a returning user
@@ -169,7 +174,13 @@ class MainActivity : ComponentActivity() {
                     // ── Cloud (team) mode: the original behaviour, now opt-in. Login,
                     // per-cashier PIN, staff management, attribution, sync. Backing out
                     // of login (no account yet) returns to local mode.
-                    else -> AuthGate(container.authManager, onExitToLocal = { vm.useLocalMode() }) { user ->
+                    else -> AuthGate(
+                        container.authManager,
+                        // Null = no back arrow at all. Offered only on a device that has
+                        // never had a cloud sign-in, so an owner who opens the login screen
+                        // and changes their mind can still get back to their till.
+                        onExitToLocal = if (cloudProvisioned) null else ({ vm.useLocalMode() }),
+                    ) { user ->
                         // ★ user.role is a key, not just a passenger. A role-only demotion
                         // (admin -> cashier with an identical permissions map) re-emits
                         // AuthState and recomposes this branch into the cashier shell, but
@@ -179,6 +190,10 @@ class MainActivity : ComponentActivity() {
                         LaunchedEffect(user.id, user.role, user.permissions) {
                             vm.setCurrentCashier(user.id, user.displayName, user.isAdmin, user.permissions)
                         }
+                        // A session reaching Active IS the cloud sign-in. Stamp it here and
+                        // the escalation route is shut from this moment on, including after
+                        // the last account is signed out and the account list is empty.
+                        LaunchedEffect(Unit) { vm.markCloudProvisioned() }
                         val open by openTarget
                         val record by openRecord
                         val wantMobileMoney =

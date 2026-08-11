@@ -218,6 +218,7 @@ import com.portionspot.pos.data.tagCaption
 import com.portionspot.pos.data.isMeasured
 import com.portionspot.pos.data.onHand
 import com.portionspot.pos.data.sellableBlocked
+import com.portionspot.pos.data.stockIsShort
 import com.portionspot.pos.data.MethodBreakdown
 import com.portionspot.pos.data.PurchaseOrderLine
 import com.portionspot.pos.data.PurchaseOrderWithLines
@@ -557,6 +558,7 @@ fun AppRoot(
     // Per-person permissions: hide whole screens a cashier can't view (reports), and
     // steer off one if the admin revokes access while it's open.
     val caps by vm.allowedCaps.collectAsState()
+    val isAdmin by vm.isAdmin.collectAsState()
     val screenVisible: (Screen) -> Boolean = { s -> s.viewCap()?.let { it in caps } ?: true }
     LaunchedEffect(caps) { if (!screenVisible(screen)) screen = Screen.Sell }
 
@@ -678,6 +680,12 @@ fun AppRoot(
                 onDismiss = { drawerOpen = false },
                 onSwitchUser = { drawerOpen = false; vm.switchUser() },
                 onSignOut = { drawerOpen = false; vm.signOut() },
+                // ★ Sign-out is an ADMIN action here. "Switch user" locks the device and
+                // returns to the account picker, which still needs a credential; signing
+                // out REMOVES the account, and a cashier removing the last one used to
+                // drop the device to a login screen it could back out of into local admin.
+                // A cashier ending their shift wants the lock screen, not an empty device.
+                canSignOut = isAdmin,
                 logoUri = business?.logoUri,
                 visible = screenVisible
             )
@@ -2903,6 +2911,8 @@ private fun SideDrawer(
     onDismiss: () -> Unit,
     onSwitchUser: () -> Unit,
     onSignOut: () -> Unit,
+    /** Sign-out is offered to ADMINS only; a cashier gets "Switch user" instead. */
+    canSignOut: Boolean = true,
     logoUri: String? = null,
     visible: (Screen) -> Boolean = { true },
 ) {
@@ -2969,7 +2979,9 @@ private fun SideDrawer(
                 verticalArrangement = Arrangement.spacedBy(2.dp)
             ) {
                 DrawerAction(Icons.Filled.SwitchAccount, "Switch user", onSwitchUser)
-                DrawerAction(Icons.AutoMirrored.Filled.Logout, "Sign out", onSignOut)
+                if (canSignOut) {
+                    DrawerAction(Icons.AutoMirrored.Filled.Logout, "Sign out", onSignOut)
+                }
             }
         }
     }
@@ -3010,7 +3022,17 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
     val parkedSales by vm.parkedSales.collectAsState()
     val parkedCount by vm.parkedCount.collectAsState()
     val caps by vm.allowedCaps.collectAsState()
+    // A cart change parked because it would sell past the on-hand. Lives on the ViewModel,
+    // not here, so it survives the cashier switching screens mid-decision and so the cart
+    // and the question about it can never be applied out of order.
+    val oversell by vm.oversellPrompt.collectAsState()
     val canGiveDiscounts = com.portionspot.pos.auth.Capability.GIVE_DISCOUNTS in caps
+    // The four the app declared and never consulted. Each has a matching handler-side
+    // return in the ViewModel — hiding the control alone is not a gate.
+    val canPriceOverride = com.portionspot.pos.auth.Capability.PRICE_OVERRIDE in caps
+    val canSellOnCredit = com.portionspot.pos.auth.Capability.SELL_ON_CREDIT in caps
+    val canParkSales = com.portionspot.pos.auth.Capability.PARK_SALES in caps
+    val canMakeQuotes = com.portionspot.pos.auth.Capability.MAKE_QUOTES in caps
     var showParked by remember { mutableStateOf(false) }
 
     var search by remember { mutableStateOf("") }
@@ -3150,11 +3172,16 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
             }
         }
 
+        // Quote mode can't survive the grant being revoked mid-session, or the charge
+        // button would still say "Generate quote" over a handler that now refuses.
+        LaunchedEffect(canMakeQuotes) { if (!canMakeQuotes) quoteMode = false }
         CartBar(
             count = count,
             total = total,
             currency = currency,
             quoteMode = quoteMode,
+            canQuote = canMakeQuotes,
+            canPark = canParkSales,
             onToggleMode = { quoteMode = it },
             onOpenCart = { if (count > 0) showCart = true },
             onHold = {
@@ -3208,8 +3235,20 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
             onDismiss = { measuredItem = null }
         )
     }
+    oversell?.let { prompt ->
+        OversellDialog(
+            prompt = prompt,
+            onProceed = { vm.confirmOversell() },
+            onDismiss = { vm.dismissOversell() }
+        )
+    }
     if (showCart) {
-        CartDialog(cart, currency, vm, canGiveDiscounts = canGiveDiscounts, onDismiss = { showCart = false })
+        CartDialog(
+            cart, currency, vm,
+            canGiveDiscounts = canGiveDiscounts,
+            canPriceOverride = canPriceOverride,
+            onDismiss = { showCart = false }
+        )
     }
     if (showPayment) {
         PaymentDialog(
@@ -3223,7 +3262,8 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
             customers = customers,
             paynowAvailable = paynowReady,
             canGiveDiscounts = canGiveDiscounts,
-            onCreateCustomer = { name, onCreated -> vm.createCustomer(name, onCreated = onCreated) },
+            canSellOnCredit = canSellOnCredit,
+            onCreateCustomer ={ name, onCreated -> vm.createCustomer(name, onCreated = onCreated) },
             onPaynowInitiate = { amount, onResult -> vm.paynowInitiate(amount, onResult) },
             onPaynowPoll = { reference, onResult -> vm.paynowPoll(reference, onResult) },
             onDismiss = { showPayment = false }
@@ -3304,7 +3344,11 @@ private fun ProductCard(
     val d = LocalPosDimens.current
     val tracked = item.trackStock
     val measured = item.isMeasured
-    // A not-yet-arrived pending product is blocked from sale just like an out-of-stock item.
+    // Dimmed when there is nothing recorded on the shelf — but NOT unclickable for it.
+    // A card that refuses the tap is a hard block, and the shop really does sell stock the
+    // system has not caught up with; the tap now raises the oversell warning instead, which
+    // states the figures and is itself gated on SELL_BELOW_STOCK. What stays a hard block is
+    // [sellableBlocked]: a product ordered but never arrived isn't miscounted, it isn't here.
     val isOut = (tracked && item.onHand <= 0.0) || item.sellableBlocked
     // Measured items show their per-unit price (never a box/WS price).
     val hasBox = !measured && item.boxSize > 1 && item.boxPrice > 0.0
@@ -3319,7 +3363,7 @@ private fun ProductCard(
             .background(t.surface1)
             .border(1.dp, t.surfaceBorder, RoundedCornerShape(d.cardCorner))
             .alpha(if (isOut) 0.45f else 1f)
-            .clickable(enabled = !isOut, onClick = onClick)
+            .clickable(enabled = !item.sellableBlocked, onClick = onClick)
             .padding(d.cardPadding)
     ) {
         Box(Modifier.align(Alignment.TopEnd)) { StockBadge(item) }
@@ -3460,6 +3504,7 @@ private fun ProductListRow(
     val d = LocalPosDimens.current
     val tracked = item.trackStock
     val measured = item.isMeasured
+    // Dimmed, not disabled — see [ProductCard]. The oversell warning is the gate now.
     val isOut = (tracked && item.onHand <= 0.0) || item.sellableBlocked
     val hasBox = !measured && item.boxSize > 1 && item.boxPrice > 0.0
     val hasWs = !measured && item.wholesalePrice > 0.0
@@ -3473,7 +3518,7 @@ private fun ProductListRow(
             .background(t.surface1)
             .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
             .alpha(if (isOut) 0.45f else 1f)
-            .clickable(enabled = !isOut, onClick = onClick)
+            .clickable(enabled = !item.sellableBlocked, onClick = onClick)
             .padding(horizontal = d.listRowPadding, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -3551,7 +3596,8 @@ private fun ProductListRow(
     }
 }
 
-/** Stock pill: Out (danger), Low<5 (warning + count), else faint count. Untracked → nothing. */
+/** Stock pill: Recount (negative), Out (danger), Low<5 (warning + count), else faint count.
+ *  Untracked → nothing. */
 @Composable
 private fun StockBadge(item: Item) {
     val t = LocalPosTokens.current
@@ -3568,6 +3614,20 @@ private fun StockBadge(item: Item) {
                     .padding(horizontal = 6.dp, vertical = 2.dp)
             ) { Text("Pending", color = t.accentBlue, fontSize = 9.sp, fontWeight = FontWeight.Bold) }
             !item.trackStock -> { /* untracked item with a pending addition: badge below only */ }
+            // ★ BELOW ZERO is not "out". An empty shelf is an ordinary Tuesday; a shelf the
+            // record says holds -2 is the record being wrong, and the only thing that fixes
+            // it is somebody counting. Rendered SOLID rather than as the faint "Out" tint so
+            // it can't be read past — the whole reason the owner's -2 went unnoticed is that
+            // it wore the same badge as every product that had simply sold out.
+            item.stockIsShort() -> Box(
+                Modifier.clip(RoundedCornerShape(6.dp)).background(t.danger)
+                    .padding(horizontal = 6.dp, vertical = 2.dp)
+            ) {
+                Text(
+                    "Recount ${trimQty(units)}$suffix", color = Color.White,
+                    fontSize = 9.sp, fontWeight = FontWeight.Bold
+                )
+            }
             units <= 0.0 -> Box(
                 Modifier.clip(RoundedCornerShape(6.dp)).background(t.danger.copy(alpha = 0.12f))
                     .padding(horizontal = 6.dp, vertical = 2.dp)
@@ -3668,6 +3728,10 @@ private fun CartBar(
     total: Double,
     currency: String,
     quoteMode: Boolean,
+    /** make_quotes — hides the Sale/Quote toggle entirely when not held. */
+    canQuote: Boolean = true,
+    /** park_sales — hides "Hold" when not held. */
+    canPark: Boolean = true,
     onToggleMode: (Boolean) -> Unit,
     onOpenCart: () -> Unit,
     onHold: () -> Unit,
@@ -3678,15 +3742,19 @@ private fun CartBar(
     Column(Modifier.fillMaxWidth().background(t.surface1).padding(horizontal = 12.dp, vertical = 10.dp)) {
         // Sale ⇄ Quote mode toggle (§1.2 parity). Quote mode swaps the action for
         // "Generate quote": a priced document with no payment taken.
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            FilterChip(selected = !quoteMode, onClick = { onToggleMode(false) }, label = { Text("Sale") })
-            FilterChip(
-                selected = quoteMode, onClick = { onToggleMode(true) },
-                leadingIcon = { Icon(Icons.AutoMirrored.Filled.ReceiptLong, contentDescription = null, modifier = Modifier.size(16.dp)) },
-                label = { Text("Quote") }
-            )
+        // Without make_quotes there is only one mode, so the toggle is dropped rather
+        // than shown with a chip that leads to a handler which refuses.
+        if (canQuote) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(selected = !quoteMode, onClick = { onToggleMode(false) }, label = { Text("Sale") })
+                FilterChip(
+                    selected = quoteMode, onClick = { onToggleMode(true) },
+                    leadingIcon = { Icon(Icons.AutoMirrored.Filled.ReceiptLong, contentDescription = null, modifier = Modifier.size(16.dp)) },
+                    label = { Text("Quote") }
+                )
+            }
+            Spacer(Modifier.height(8.dp))
         }
-        Spacer(Modifier.height(8.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f).clickable(enabled = count > 0, onClick = onOpenCart)) {
                 Text(
@@ -3695,7 +3763,7 @@ private fun CartBar(
                 )
                 Text(money(total, currency), color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 20.sp)
             }
-            if (!quoteMode) {
+            if (!quoteMode && canPark) {
                 OutlinedButton(onClick = onHold, enabled = count > 0, shape = RoundedCornerShape(12.dp)) {
                     Text("Hold")
                 }
@@ -4030,6 +4098,82 @@ private fun MeasuredQtyDialog(
     }
 }
 
+/**
+ * The oversell warning: this cart takes more off the shelf than the shop's figure says is
+ * there. Raised at the moment the quantity crosses, not held back to the payment screen,
+ * because the point of it is to be answerable while the customer is still standing there.
+ *
+ * Two readings, and the difference matters at the counter:
+ *  - the ordinary case is a shelf that has run down or a delivery not yet booked in, and
+ *    the cashier is told the two numbers and sells anyway if that is what is true;
+ *  - [Oversell.alreadyShort] means the record is ALREADY below zero, i.e. this has happened
+ *    before and nobody has counted since. That is a data problem, so it says so and asks
+ *    for a stock take rather than implying the shelf is merely empty.
+ *
+ * Without [Capability.SELL_BELOW_STOCK] the same figures show with the confirm disabled —
+ * the cashier still learns what is wrong and can go and ask, which is the difference
+ * between a gate and a dead button.
+ */
+@Composable
+private fun OversellDialog(
+    prompt: PosViewModel.OversellPrompt,
+    onProceed: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val t = LocalPosTokens.current
+    val d = prompt.detail
+    // Measured products read in their own unit ("1.5 kg"); everything else is a bare count.
+    val suffix = if (d.measured) " ${d.unitLabel}" else ""
+    PosContainedForm(
+        title = if (d.alreadyShort) "Stock is already short" else "More than you have",
+        onDismiss = onDismiss,
+        confirmLabel = if (prompt.allowed) "Sell anyway" else "Needs the owner",
+        confirmEnabled = prompt.allowed,
+        dismissLabel = if (prompt.allowed) "Cancel" else "OK",
+        onConfirm = onProceed,
+    ) {
+        Text(d.itemName, color = t.inkPrimary, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+        PosFormCard {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("On hand", color = t.inkTertiary, fontSize = 12.sp)
+                    Text(
+                        "${trimQty(d.onHand)}$suffix",
+                        color = if (d.onHand < 0) t.danger else t.inkPrimary,
+                        fontWeight = FontWeight.Black, fontSize = 20.sp
+                    )
+                }
+                Column(Modifier.weight(1f)) {
+                    Text("Selling", color = t.inkTertiary, fontSize = 12.sp)
+                    Text(
+                        "${trimQty(d.requested)}$suffix",
+                        color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 20.sp
+                    )
+                }
+            }
+            Text(
+                "Short by ${trimQty(d.shortfall)}$suffix",
+                color = t.danger, fontSize = 13.sp, fontWeight = FontWeight.Bold
+            )
+        }
+        Text(
+            if (d.alreadyShort)
+                "This product is already recorded below zero, so the count is wrong — " +
+                    "count the shelf and correct it in Inventory."
+            else
+                "Selling this will put the product below zero until someone counts the shelf.",
+            color = t.inkSecondary, fontSize = 12.sp
+        )
+        if (!prompt.allowed) {
+            Text(
+                "You can't sell past the recorded stock. Ask the owner to count it in, " +
+                    "or to allow it for you.",
+                color = t.danger, fontSize = 12.sp, fontWeight = FontWeight.SemiBold
+            )
+        }
+    }
+}
+
 @Composable
 private fun PriceOption(title: String, subtitle: String, price: String, accent: Color, onClick: () -> Unit) {
     val t = LocalPosTokens.current
@@ -4054,6 +4198,7 @@ private fun CartDialog(
     currency: String,
     vm: PosViewModel,
     canGiveDiscounts: Boolean = true,
+    canPriceOverride: Boolean = true,
     onDismiss: () -> Unit,
 ) {
     val t = LocalPosTokens.current
@@ -4095,20 +4240,24 @@ private fun CartDialog(
                             )
                         }
                         // Per-item markup affordance (tap to set/edit) — mirror of the
-                        // discount above, but ADDS to the line.
-                        Text(
-                            if (line.lineMarkupApplied > 0)
-                                "Plus ${money(line.lineMarkupApplied, currency)} — edit"
-                            else "Add markup",
-                            color = if (line.lineMarkupApplied > 0) t.accentBlue else t.inkTertiary,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier
-                                .padding(top = 2.dp)
-                                .clip(RoundedCornerShape(6.dp))
-                                .clickable { editingMarkupLine = line }
-                                .padding(vertical = 2.dp, horizontal = 2.dp)
-                        )
+                        // discount above, but ADDS to the line. Hidden the same way, on
+                        // price_override: marking a line up is the same discretion as
+                        // marking it down, and it rendered unconditionally before.
+                        if (canPriceOverride) {
+                            Text(
+                                if (line.lineMarkupApplied > 0)
+                                    "Plus ${money(line.lineMarkupApplied, currency)} — edit"
+                                else "Add markup",
+                                color = if (line.lineMarkupApplied > 0) t.accentBlue else t.inkTertiary,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier
+                                    .padding(top = 2.dp)
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .clickable { editingMarkupLine = line }
+                                    .padding(vertical = 2.dp, horizontal = 2.dp)
+                            )
+                        }
                     }
                     QtyStepper(
                         qty = line.qty.toInt(),
@@ -4392,6 +4541,9 @@ private fun PaymentDialog(
     customers: List<CustomerWithBalance>,
     paynowAvailable: Boolean = false,
     canGiveDiscounts: Boolean = true,
+    /** sell_on_credit — without it the "put it on account" switch is not offered and the
+     *  sale must be covered by tender. [PosViewModel.checkout] refuses a credit sale too. */
+    canSellOnCredit: Boolean = true,
     onCreateCustomer: (name: String, onCreated: (Customer) -> Unit) -> Unit = { _, _ -> },
     onPaynowInitiate: (amount: Double, onResult: (PaynowInit) -> Unit) -> Unit = { _, _ -> },
     onPaynowPoll: (reference: String, onResult: (PaynowPoll) -> Unit) -> Unit = { _, _ -> },
@@ -4455,7 +4607,7 @@ private fun PaymentDialog(
 
     // Fully covered by tenders, or the shortfall goes on the customer's account.
     val fullyPaid = paid + 0.0001 >= total
-    val creditValid = onCredit && selected != null
+    val creditValid = onCredit && selected != null && canSellOnCredit
     val valid = fullyPaid || creditValid
 
     fun addTender() {
@@ -4693,7 +4845,7 @@ private fun PaymentDialog(
         }
 
         // ── Settling the gap (credit) or the overpayment (change owed) ──
-        if (selected != null && remaining > 0) {
+        if (selected != null && remaining > 0 && canSellOnCredit) {
             Row(
                 Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -4718,9 +4870,11 @@ private fun PaymentDialog(
                 }
             }
         }
-        if (remaining > 0 && selected == null) {
+        if (remaining > 0 && (selected == null || !canSellOnCredit)) {
             Text(
-                "Add payment to cover the total, or pick a customer to sell on credit.",
+                if (canSellOnCredit)
+                    "Add payment to cover the total, or pick a customer to sell on credit."
+                else "Add payment to cover the total. You can't sell on credit.",
                 color = t.danger, fontSize = 12.sp
             )
         }
@@ -5698,11 +5852,18 @@ private fun ItemsScreen(
                                         // Measured items count in their decimal unit; box/piece in whole units.
                                         val onHand = item.onHand
                                         val out = onHand <= 0.0
+                                        // Below zero is a COUNTING problem, not an empty shelf,
+                                        // and this is the screen where it gets fixed — so it
+                                        // says what is wrong and what to do, rather than
+                                        // sharing "Out of stock" with every sold-out product.
+                                        val short = item.stockIsShort()
                                         // Per-item reorder level wins; fall back to the global
                                         // default, except on a measured item — see lowStockLevel.
                                         val threshold = lowStockLevel(item)
                                         val low = !out && onHand <= threshold
                                         val (label, tint) = when {
+                                            short -> "Stock take needed: ${trimQty(onHand)} ${item.unit}".trimEnd() to
+                                                MaterialTheme.colorScheme.error
                                             out -> "Out of stock" to MaterialTheme.colorScheme.error
                                             low -> "Low: ${trimQty(onHand)} ${item.unit} left" to MaterialTheme.colorScheme.error
                                             else -> "In stock: ${trimQty(onHand)} ${item.unit}" to
@@ -8898,7 +9059,11 @@ private fun DashboardScreen(vm: PosViewModel, business: Business) {
     var showZ by remember { mutableStateOf(false) }
 
     // Health figures, computed from the live catalog/ledger (like the web).
-    val outStock = items.count { it.trackStock && it.onHand <= 0.0 }
+    // Below zero is counted SEPARATELY from out-of-stock, and deliberately not in both:
+    // rolled together, the one figure that means "the record is wrong" disappears into the
+    // one that means "we sold out", which is the count an owner scrolls past.
+    val shortStock = items.count { it.trackStock && it.stockIsShort() }
+    val outStock = items.count { it.trackStock && it.onHand <= 0.0 && !it.stockIsShort() }
     val lowStock = items.count {
         it.trackStock && it.onHand > 0.0 && it.onHand <= lowStockLevel(it)
     }
@@ -9107,6 +9272,9 @@ private fun DashboardScreen(vm: PosViewModel, business: Business) {
                 Column(Modifier.fillMaxWidth().padding(14.dp)) {
                     Text("INVENTORY", color = t.inkTertiary, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp)
                     Spacer(Modifier.height(6.dp))
+                    // Only when there IS one — an owner who has never oversold should not
+                    // be taught to ignore a row that always reads zero.
+                    if (shortStock > 0) DashAlertRow("Stock take needed", shortStock, t.danger)
                     DashAlertRow("Out of stock", outStock, t.danger)
                     DashAlertRow("Low stock", lowStock, t.warning)
                     DashAlertRow("Need cost", noCost, t.inkTertiary)
@@ -10357,6 +10525,10 @@ private fun RefundsScreen(vm: PosViewModel, business: Business, printer: Printer
     val t = LocalPosTokens.current
     val currency = business.currency
     val refunds by vm.refunds.collectAsState()
+    // Recording a payout hands cash back across the counter, so it needs the same grant
+    // as raising the refund did. It was ungated in BOTH places before this.
+    val caps by vm.allowedCaps.collectAsState()
+    val canPayOut = com.portionspot.pos.auth.Capability.PROCESS_REFUNDS in caps
     var payoutFor by remember { mutableStateOf<Refund?>(null) }
 
     Column(Modifier.fillMaxSize()) {
@@ -10419,7 +10591,7 @@ private fun RefundsScreen(vm: PosViewModel, business: Business, printer: Printer
                                 style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
                             )
                         }
-                        if (owed) {
+                        if (owed && canPayOut) {
                             Spacer(Modifier.height(6.dp))
                             OutlinedButton(onClick = { payoutFor = r }) { Text("Record payout") }
                         }
@@ -10512,7 +10684,24 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
     // Settings are grouped into categories so it isn't one endless scroll; the picker
     // below swaps which group is shown. All the editable state lives in this one
     // composable, so switching categories never loses an unsaved edit.
+    //
+    // ★ MOST OF THIS SCREEN IS THE OWNER'S, NOT THE SHIFT'S. Settings has no view
+    // capability (see Screen.viewCap) so a cashier can open it, and from here could raise
+    // their OWN per-item discount ceiling, switch VAT off, zero every shelf, wipe the sales
+    // history, or repoint the Supabase connection at a database of their choosing. Only the
+    // two genuinely per-device groups stay open to everyone: the theme and the receipt
+    // printer, which belong to the phone in your hand rather than to the business.
+    val isAdmin by vm.isAdmin.collectAsState()
+    val visibleCats = remember(isAdmin) {
+        if (isAdmin) SettingsCat.entries.toList()
+        else listOf(SettingsCat.Appearance, SettingsCat.Receipt)
+    }
     var settingsCat by remember { mutableStateOf(SettingsCat.Business) }
+    // Also covers a demotion landing while the screen is open: the group goes away rather
+    // than staying put because it happened to be selected first.
+    LaunchedEffect(visibleCats) {
+        if (settingsCat !in visibleCats) settingsCat = visibleCats.first()
+    }
 
     var name by remember(business.id) { mutableStateOf(business.name) }
     var tagline by remember(business.id) { mutableStateOf(business.tagline ?: "") }
@@ -10637,7 +10826,11 @@ private fun SettingsScreen(vm: PosViewModel, business: Business, printer: Printe
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 96.dp)
     ) {
         item {
-            SettingsCategoryBar(selected = settingsCat, onSelect = { settingsCat = it })
+            SettingsCategoryBar(
+                selected = settingsCat,
+                categories = visibleCats,
+                onSelect = { settingsCat = it }
+            )
             Spacer(Modifier.height(16.dp))
 
           if (settingsCat == SettingsCat.Business) {
@@ -11540,12 +11733,17 @@ private fun SettingsSectionHeader(title: String) {
 
 /** Horizontal, scrollable category picker at the top of Settings (mobile-first). */
 @Composable
-private fun SettingsCategoryBar(selected: SettingsCat, onSelect: (SettingsCat) -> Unit) {
+private fun SettingsCategoryBar(
+    selected: SettingsCat,
+    /** Only the groups this session may open — cashiers get the per-device ones. */
+    categories: List<SettingsCat> = SettingsCat.entries.toList(),
+    onSelect: (SettingsCat) -> Unit
+) {
     Row(
         Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
         horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        SettingsCat.values().forEach { cat ->
+        categories.forEach { cat ->
             FilterChip(
                 selected = selected == cat,
                 onClick = { onSelect(cat) },

@@ -13,6 +13,8 @@ import com.portionspot.pos.data.CreditTxn
 import com.portionspot.pos.data.DayClose
 import com.portionspot.pos.data.OutsideFund
 import com.portionspot.pos.data.OutsideFundTotals
+import com.portionspot.pos.data.Oversell
+import com.portionspot.pos.data.oversellFor
 import com.portionspot.pos.data.Customer
 import com.portionspot.pos.data.CustomerWithBalance
 import com.portionspot.pos.data.Expense
@@ -123,6 +125,29 @@ class PosViewModel(
     // Default Local so a fresh install is usable immediately (no login wall).
     private val _appMode = MutableStateFlow(AppMode.Local)
     val appMode: StateFlow<AppMode> = _appMode.asStateFlow()
+
+    /**
+     * ★ TRUE ONCE A CLOUD ACCOUNT HAS EVER SIGNED IN ON THIS DEVICE, and never false again.
+     *
+     * This closes a three-tap privilege escalation. Local mode runs as a hard-coded ADMIN
+     * ([MainActivity]'s `LOCAL_OWNER_ID`) against the SAME Room database the cloud session
+     * uses. A cashier who signed out of the only account on the phone landed on
+     * [com.portionspot.pos.auth.AuthState.LoggedOut] → LoginScreen, whose back arrow called
+     * [useLocalMode] — so a just-revoked cashier could back out of the login screen into
+     * unrestricted admin on live shop data, and the persisted mode made it survive a
+     * restart. Worst of all on the one-phone-per-cashier deployment this shop chose.
+     *
+     * It is PERSISTED rather than derived from the account list, because the whole problem
+     * is that the account list becomes empty: `hasCloudAccount()` says "no" at exactly the
+     * moment we most need it to say "yes". Once set, [useLocalMode] refuses and the login
+     * screen loses its back arrow, so the only way past the lock screen is a credential.
+     *
+     * It is stamped on a SUCCESSFUL sign-in, not on tapping "Connect cloud" — otherwise an
+     * owner who opened the login screen and changed their mind would be trapped there, and
+     * locking the owner out is worse than the bug.
+     */
+    private val _cloudProvisioned = MutableStateFlow(false)
+    val cloudProvisioned: StateFlow<Boolean> = _cloudProvisioned.asStateFlow()
 
     /** False until the first-run "Set a PIN / Keep it open" choice has been made. */
     private val _onboarded = MutableStateFlow(false)
@@ -696,7 +721,22 @@ class PosViewModel(
             _varianceNoteThreshold.value = repo.varianceNoteThreshold()
         }
         viewModelScope.launch {
-            _appMode.value = if (repo.getSetting(KEY_APP_MODE) == "cloud") AppMode.Cloud else AppMode.Local
+            val storedMode = repo.getSetting(KEY_APP_MODE)
+            // Back-fill the flag for installs that predate it: a device that already holds a
+            // cloud account has plainly been in cloud mode, and must not keep the back-out
+            // route just because it upgraded rather than signed in afresh.
+            val stored = repo.getSetting(KEY_CLOUD_PROVISIONED) == "1"
+            // Off the main thread: the fallback decrypts the session vault, and this block
+            // resumes on Main.immediate.
+            val provisioned = stored || withContext(Dispatchers.IO) { authManager.hasCloudAccount() }
+            _cloudProvisioned.value = provisioned
+            if (provisioned && !stored) repo.putSetting(KEY_CLOUD_PROVISIONED, "1")
+            // A provisioned device boots into CLOUD mode whatever the stored mode says. An
+            // older build could have persisted "local" from the back-arrow route; honouring
+            // that would keep serving local admin on a phone that has cloud staff on it.
+            _appMode.value =
+                if (storedMode == "cloud" || provisioned) AppMode.Cloud else AppMode.Local
+            if (provisioned && storedMode != "cloud") repo.putSetting(KEY_APP_MODE, "cloud")
             _onboarded.value = repo.getSetting(KEY_ONBOARDED) == "1"
             _hasLocalPin.value = authManager.hasLocalPin()
             _bootLoaded.value = true
@@ -744,10 +784,30 @@ class PosViewModel(
         viewModelScope.launch { repo.putSetting(KEY_APP_MODE, "cloud") }
     }
 
-    /** Return to local (phone-only) mode, e.g. backing out of cloud login. */
+    /**
+     * Return to local (phone-only) mode, e.g. backing out of cloud login before any
+     * account exists.
+     *
+     * ★ REFUSED once [cloudProvisioned] is set. Local mode is a hard-coded admin session
+     * against the live shop database, so on a device that has had a cloud sign-in this
+     * would be a privilege escalation, not a convenience: sign out the last account, press
+     * back, and a revoked cashier is the owner. The UI hides the route as well (see
+     * [MainActivity]) — this is the handler-side half of the same gate.
+     */
     fun useLocalMode() {
+        if (_cloudProvisioned.value) return
         _appMode.value = AppMode.Local
         viewModelScope.launch { repo.putSetting(KEY_APP_MODE, "local") }
+    }
+
+    /**
+     * Record that a cloud account has signed in on this device — called from the auth gate
+     * the moment a session goes Active. One-way and persisted; see [cloudProvisioned].
+     */
+    fun markCloudProvisioned() {
+        if (_cloudProvisioned.value) return
+        _cloudProvisioned.value = true
+        viewModelScope.launch { repo.putSetting(KEY_CLOUD_PROVISIONED, "1") }
     }
 
     /** True once at least one cloud account has been provisioned on this device. */
@@ -847,6 +907,68 @@ class PosViewModel(
     // ---- Cart operations (live, in-memory) -------------------------------
 
     /**
+     * A cart change parked at the counter because it would sell an item past its on-hand.
+     *
+     * [allowed] is whether this cashier holds [Capability.SELL_BELOW_STOCK]. It is carried
+     * on the prompt rather than checked by the dialog because the answer must be the one
+     * taken at the moment of the decision — the same value the handler will act on when the
+     * cashier taps through — and because the UI then has one thing to render, not two states
+     * to keep in step.
+     */
+    data class OversellPrompt(val detail: Oversell, val allowed: Boolean)
+
+    private val _oversellPrompt = MutableStateFlow<OversellPrompt?>(null)
+    val oversellPrompt: StateFlow<OversellPrompt?> = _oversellPrompt.asStateFlow()
+
+    /** The cart the cashier is being asked about. Held back, not applied, until they say so;
+     *  null when they are not allowed to proceed, so a confirm that somehow arrives anyway
+     *  has nothing to commit. */
+    private var pendingOversellCart: List<CartLine>? = null
+
+    /** The cashier read the figures and wants the sale anyway. */
+    fun confirmOversell() {
+        val next = pendingOversellCart
+        pendingOversellCart = null
+        _oversellPrompt.value = null
+        if (next != null) _cart.value = next
+    }
+
+    /** Backed out — the cart is left exactly as it was. */
+    fun dismissOversell() {
+        pendingOversellCart = null
+        _oversellPrompt.value = null
+    }
+
+    /**
+     * The single door every cart mutation goes through: commit [next], or stop and ask.
+     *
+     * A WARNING, not a block, by default (§ oversell). The shop genuinely sells stock the
+     * system has not caught up with, so a refusal here would cost real sales to defend a
+     * figure that is already wrong; what the cashier gets instead is the on-hand and the
+     * quantity side by side, and a deliberate tap. An owner who wants the counter held to
+     * the recorded stock revokes [Capability.SELL_BELOW_STOCK] and the same prompt becomes
+     * a refusal. Admins — including every local/phone-only session, which runs as one —
+     * are never gated, so this can only ever appear as a warning for the owner.
+     *
+     * [items] is read synchronously for the item row. It is a `WhileSubscribed` flow, so an
+     * unsubscribed moment would resolve to no item and silently skip the check; every path
+     * that can reach here is on the POS screen, which is collecting [items] to draw the very
+     * product being tapped. A missing row is treated as "nothing to compare against" rather
+     * than as a denial: inventing a restriction out of not knowing is the wrong direction.
+     */
+    private fun applyCart(itemId: String, next: List<CartLine>) {
+        val item = items.value.firstOrNull { it.id == itemId }
+        val over = item?.let { oversellFor(it, _cart.value, next) }
+        if (over == null) {
+            _cart.value = next
+            return
+        }
+        val allowed = can(Capability.SELL_BELOW_STOCK)
+        pendingOversellCart = if (allowed) next else null
+        _oversellPrompt.value = OversellPrompt(over, allowed)
+    }
+
+    /**
      * Add one of [item] to the cart at the chosen price [mode]:
      *  - "box"       → one whole box (unitPrice = boxPrice, draws boxSize units)
      *  - "wholesale" → trade price each (falls back to retail if none set)
@@ -864,7 +986,7 @@ class PosViewModel(
             applyRounding(rawPrice, _shopPrefs.value.wholesaleRounding)
         else rawPrice
         val key = "${item.id}#$mode"
-        _cart.value = _cart.value.toMutableList().also { list ->
+        val next = _cart.value.toMutableList().also { list ->
             val idx = list.indexOfFirst { it.lineKey == key }
             if (idx >= 0) {
                 val existing = list[idx]
@@ -883,6 +1005,7 @@ class PosViewModel(
                 )
             }
         }
+        applyCart(item.id, next)
     }
 
     /**
@@ -893,7 +1016,7 @@ class PosViewModel(
     fun addMeasuredToCart(item: Item, qty: Double) {
         if (qty <= 0.0) return
         val key = "${item.id}#measured"
-        _cart.value = _cart.value.toMutableList().also { list ->
+        val next = _cart.value.toMutableList().also { list ->
             val idx = list.indexOfFirst { it.lineKey == key }
             if (idx >= 0) {
                 val existing = list[idx]
@@ -914,6 +1037,7 @@ class PosViewModel(
                 )
             }
         }
+        applyCart(item.id, next)
     }
 
     /**
@@ -932,22 +1056,26 @@ class PosViewModel(
         }
     }
 
+    /** Nudge a line's quantity. Goes through [applyCart], because "+" on a line is the
+     *  commonest way a cart walks past the on-hand — the shelf had two and the third tap
+     *  is the oversell. Dropping to zero removes the line, as before. */
     fun changeQty(lineKey: String, delta: Double) {
-        _cart.value = _cart.value.mapNotNull { line ->
-            if (line.lineKey != lineKey) line
-            else {
-                val q = line.qty + delta
-                if (q <= 0) null else line.copy(qty = q)
-            }
-        }
+        val line = _cart.value.firstOrNull { it.lineKey == lineKey } ?: return
+        val q = line.qty + delta
+        val next =
+            if (q <= 0) _cart.value.filterNot { it.lineKey == lineKey }
+            else _cart.value.map { if (it.lineKey == lineKey) it.copy(qty = q) else it }
+        applyCart(line.itemId, next)
     }
 
     /** Set an explicit quantity on a line (fast qty entry from the cart). */
     fun setQty(lineKey: String, qty: Double) {
         if (qty <= 0) { removeLine(lineKey); return }
-        _cart.value = _cart.value.map { line ->
-            if (line.lineKey == lineKey) line.copy(qty = qty) else line
-        }
+        val line = _cart.value.firstOrNull { it.lineKey == lineKey } ?: return
+        applyCart(
+            line.itemId,
+            _cart.value.map { if (it.lineKey == lineKey) it.copy(qty = qty) else it }
+        )
     }
 
     /**
@@ -978,6 +1106,10 @@ class PosViewModel(
      * as far as it likes), so the [amount] is only floored at 0.
      */
     fun setLineMarkup(lineKey: String, amount: Double) {
+        // Marking a line up IS a price override — the same discretion [Capability.PRICE_OVERRIDE]
+        // exists to hold back, just pointing the other way. The affordance is hidden too
+        // (see CartDialog); this is the handler half, so a stale screen can't slip one past.
+        if (!can(Capability.PRICE_OVERRIDE)) return
         _cart.value = _cart.value.map { line ->
             if (line.lineKey != lineKey) line
             else line.copy(lineMarkup = amount.coerceAtLeast(0.0))
@@ -1023,6 +1155,10 @@ class PosViewModel(
         val bid = businessId.value ?: return
         val lines = _cart.value
         if (lines.isEmpty()) return
+        // ★ Only a CREDIT sale is gated. A cashier without sell_on_credit still rings up
+        // ordinary cash/card sales all day — blocking every checkout on this grant would
+        // shut the shop, which is the opposite of what the permission is for.
+        if (onCredit && !can(Capability.SELL_ON_CREDIT)) return
         if (checkoutInFlight) return
         checkoutInFlight = true
         // Handler-side discount gate: a cashier without give_discounts can never apply a
@@ -1070,6 +1206,7 @@ class PosViewModel(
         val bid = businessId.value ?: return
         val lines = _cart.value
         if (lines.isEmpty()) return
+        if (!can(Capability.MAKE_QUOTES)) return
         val effDiscount = if (can(Capability.GIVE_DISCOUNTS)) discount else 0.0
         val biz = business.value
         viewModelScope.launch {
@@ -1130,6 +1267,7 @@ class PosViewModel(
         val bid = businessId.value ?: return
         val lines = _cart.value
         if (lines.isEmpty()) return
+        if (!can(Capability.PARK_SALES)) return
         viewModelScope.launch {
             repo.parkSale(
                 bid, lines, note = note, customer = customer,
@@ -1290,12 +1428,18 @@ class PosViewModel(
 
     // ---- Danger zone ------------------------------------------------------
 
+    // ★ ADMIN ONLY, and deliberately not grantable. These two zero every shelf and delete
+    // the sales history outright — there is no cashier task that needs either, and no
+    // capability an owner could hand out by mistake. The Settings group that hosts them is
+    // hidden from cashiers as well; this is the handler half of that gate.
     fun resetAllStock() {
+        if (!currentIsAdmin) return
         val bid = businessId.value ?: return
         viewModelScope.launch { repo.resetAllStock(bid, currentCashierId, currentCashierName) }
     }
 
     fun wipeSalesData() {
+        if (!currentIsAdmin) return
         val bid = businessId.value ?: return
         viewModelScope.launch { repo.wipeSalesData(bid) }
     }
@@ -1487,6 +1631,11 @@ class PosViewModel(
     /** Pay off part/all of a refund the shop still owes (writes a payout + refund_paid). */
     fun recordRefundPayout(refundId: String, tender: Tender, onDone: () -> Unit = {}) {
         if (tender.amount <= 0) return
+        // Paying a refund out hands cash across the counter, so it sits behind the same
+        // grant as raising the refund did. Nothing gated it before — not the button, not
+        // the handler — so a cashier with refunds revoked could still empty the drawer
+        // against any refund the shop already owed.
+        if (!can(Capability.PROCESS_REFUNDS)) return
         viewModelScope.launch {
             repo.recordRefundPayout(refundId, tender, currentCashierId, currentCashierName)
             nudgeSync("refundPayout")
@@ -1687,6 +1836,10 @@ class PosViewModel(
      * of a `credit_limit` request the repository executes the change on this device.
      */
     fun decideStaffRequest(id: String, approve: Boolean, approvedAmount: Double? = null) {
+        // ★ The whole point of the request channel is that someone ELSE decides. Ungated,
+        // a cashier could approve their own safe withdrawal or credit limit and the
+        // approval would ride back out as if the owner had granted it.
+        if (!currentIsAdmin) return
         viewModelScope.launch {
             repo.decideStaffRequest(id, approve, currentCashierId, currentCashierName, approvedAmount)
             sync.requestPullNow("request-decided")
@@ -1751,8 +1904,9 @@ class PosViewModel(
         }
     }
 
-    /** Admin-only debt write-off (§8). */
+    /** Admin-only debt write-off (§8) — now actually enforced, not just documented. */
     fun writeOffDebt(customerId: String, amount: Double, onDone: () -> Unit = {}) {
+        if (!currentIsAdmin) return
         val bid = businessId.value ?: return
         if (amount <= 0.0) return
         viewModelScope.launch {
@@ -1949,6 +2103,7 @@ class PosViewModel(
         note: String?,
         onDone: (DayClose?) -> Unit = {}
     ) {
+        if (!can(Capability.CLOSE_DAY)) return
         val bid = businessId.value ?: return
         viewModelScope.launch {
             val close = repo.closeDay(
@@ -1964,6 +2119,7 @@ class PosViewModel(
 
     /** TOP UP THE FLOAT (§3) — move [amount] from the safe into the till, on command. */
     fun topUpFloat(amount: Double, onDone: (Double) -> Unit = {}) {
+        if (!can(Capability.TOP_UP_FLOAT)) return
         val bid = businessId.value ?: return
         viewModelScope.launch {
             val moved = repo.topUpFloat(bid, amount, currentCashierId, currentCashierName)
@@ -2018,6 +2174,7 @@ class PosViewModel(
         amount: Double, kind: String, source: String?, note: String?,
         location: String = CashLocation.SAFE
     ) {
+        if (!can(Capability.RECORD_MONEY_IN)) return
         val bid = businessId.value ?: return
         if (amount <= 0.0) return
         viewModelScope.launch {
@@ -2506,6 +2663,8 @@ class PosViewModel(
         private const val KEY_THEME_BG = "theme_background"
         private const val KEY_THEME_SIDEBAR = "theme_sidebar"
         private const val KEY_APP_MODE = "app_mode"        // "local" | "cloud"
+        // "1" once a cloud account has EVER signed in here. One-way; see [cloudProvisioned].
+        private const val KEY_CLOUD_PROVISIONED = "cloud_provisioned"
         private const val KEY_ONBOARDED = "onboarded"      // "1" once first-run choice made
         private const val KEY_RC_FONT = "rc_font_scale"
         private const val KEY_RC_FEED = "rc_feed_lines"

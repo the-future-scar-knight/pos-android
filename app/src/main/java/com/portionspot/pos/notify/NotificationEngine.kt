@@ -9,6 +9,7 @@ import com.portionspot.pos.data.Refund
 import com.portionspot.pos.data.SaleEntity
 import com.portionspot.pos.data.isMeasured
 import com.portionspot.pos.data.onHand
+import com.portionspot.pos.data.stockIsShort
 import java.util.Locale
 
 /**
@@ -90,9 +91,25 @@ object NotificationEngine {
         // Wording is product-type aware (§ Box/Set/Piece): a set reads "2 sets left", a
         // piece "4 pieces left", a measured item its own unit "1.5 kg left", and a box
         // item just "5 left" (the count carries it).
+        // ★ BELOW ZERO IS ITS OWN ALERT, not the bottom end of "Out of stock". It used to
+        // fall into the `qty <= 0.0` branch and reach the owner as an ordinary sold-out
+        // notice, which is how a -2 sat on a real phone unnoticed: the two conditions look
+        // identical in a feed but need opposite responses. Out of stock means reorder;
+        // below zero means the record is wrong and only a count will fix it — no delivery
+        // corrects it, and it will keep mis-costing every sale until someone does. Its own
+        // dedupeKey (`negstock:`) so the two can coexist on the same item's history rather
+        // than one overwriting the other.
         for (it in s.trackedItems) {
             val qty = it.onHand
-            if (qty <= 0.0) {
+            if (it.stockIsShort()) {
+                val noun = qtyNoun(it, qty)
+                out += NotifCandidate(
+                    "inventory", "danger", "Stock take needed",
+                    "${it.name}: recorded at ${trimQty(qty)}${noun?.let { n -> " $n" } ?: ""} — " +
+                        "more was sold than the system had. Count the shelf and correct it.",
+                    "negstock:${it.id}", "item", it.id, s.nowMs, pushWorthy = true
+                )
+            } else if (qty <= 0.0) {
                 val noun = stockNoun(it, 0.0)
                 out += NotifCandidate(
                     "inventory", "danger", "Out of stock",

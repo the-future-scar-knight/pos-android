@@ -263,7 +263,25 @@ class PosRepository(private val db: PosDatabase) {
                         note = edit.note,
                         createdBy = cashierId,
                         createdByName = cashierName,
-                        createdAt = stamp
+                        // ★ STRICTLY AFTER the row, and the millisecond matters.
+                        //
+                        // On-hand is the shop's figure plus movements stamped strictly
+                        // after the instant that figure was true, and the item row's
+                        // `client_updated_at` IS that instant. Stamping both at `stamp`
+                        // put the movement exactly ON the baseline, where it is treated
+                        // as the change that PRODUCED the figure and is not replayed.
+                        //
+                        // On the device that made the edit nothing went wrong — the pull
+                        // sees an unchanged cloud figure and keeps its existing baseline,
+                        // so the movement still counts. But any OTHER device adopts the
+                        // pushed row as a fresh baseline and drops the movement sitting on
+                        // it. Measured on the shop's own data: `Hamburger` was created on
+                        // the till with 3, went up with stock_qty 0 (the catalogue push
+                        // never sends stock), and its `restock +3` was stamped to the
+                        // exact millisecond of the row — so every other phone would have
+                        // read it as 0 in stock. The opening count of a till-created
+                        // product was invisible to the whole shop.
+                        createdAt = stamp + 1
                     )
                 )
             }
@@ -1993,18 +2011,25 @@ class PosRepository(private val db: PosDatabase) {
             }
             // Draw down stock for any tracked items in the cart and log the movement.
             // Untracked items and ad-hoc lines (no matching item row) are left alone.
-            // Clamped at zero so a mis-counted shelf never shows negative on hand.
             // Box lines consume qty * boxSize units.
+            //
+            // ★ NOT clamped at zero, and the clamp that used to be here is the whole bug:
+            // it floored the CACHED figure at 0 while writing the full movement to the
+            // ledger, so the till showed a tidy 0 and the next sync recomputed
+            // `baseline + Σ deltas` — no clamp there — and handed every till a -2. The
+            // shortfall was real from the moment it was rung up; the clamp only decided
+            // which screen found out about it, and made it look like a sync fault instead
+            // of an oversell. The cache now says exactly what the recompute will say, and
+            // a negative on-hand reads as "count this shelf" in the UI (see StockBadge).
             for (c in cart) {
                 val item = itemDao.getById(c.itemId) ?: continue
                 if (!item.trackStock) continue
                 // Measured items draw down the DECIMAL stockMeasured by the sold quantity
                 // and never touch the integer box/piece stockQty; everything else draws
-                // whole units (qty * boxSize) off stockQty. Both clamp at zero.
+                // whole units (qty * boxSize) off stockQty.
                 val measured = item.productType == "measured" || c.measured
                 val drawn = if (measured) c.qty else c.stockUnits
-                val remaining = ((if (measured) item.stockMeasured else item.stockQty) - drawn)
-                    .coerceAtLeast(0.0)
+                val remaining = (if (measured) item.stockMeasured else item.stockQty) - drawn
                 val updated = if (measured) item.copy(stockMeasured = remaining, updatedAt = stamp, pendingSync = true)
                 else item.copy(stockQty = remaining, updatedAt = stamp, pendingSync = true)
                 itemDao.upsert(updated)
@@ -2281,7 +2306,11 @@ class PosRepository(private val db: PosDatabase) {
                 if (!item.trackStock) continue
                 val measured = item.isMeasured
                 val onHand = if (measured) item.stockMeasured else item.stockQty
-                val remaining = (onHand - change).coerceAtLeast(0.0)
+                // Unclamped, for the same reason as the checkout draw-down above: editing a
+                // sale UP past the on-hand is an oversell arriving by a different door, and
+                // a floored cache next to a full movement is the disagreement that produced
+                // the -2 on the owner's phone.
+                val remaining = onHand - change
                 val next = if (measured) item.copy(stockMeasured = remaining, updatedAt = stamp, pendingSync = true)
                 else item.copy(stockQty = remaining, updatedAt = stamp, pendingSync = true)
                 itemDao.upsert(next)
@@ -3922,4 +3951,108 @@ data class CartLine(
     val stockUnits: Double get() = qty * unitsPerLine
     /** Identity for cart merge/update: the same item at a different price mode is a separate line. */
     val lineKey: String get() = "$itemId#$mode"
+}
+
+// ── Overselling: is this cart asking for more than the shelf holds? ─────────────
+//
+// Pure, so the decision can be tested on its own and cannot drift from the draw-down it
+// describes. It answers ONLY "would this be an oversell"; whether the cashier may then go
+// ahead is [com.portionspot.pos.auth.Capability.SELL_BELOW_STOCK], decided in the ViewModel.
+//
+// ★ Nothing here clamps anything. A shortfall is a fact about the shop, and the sale's
+// movement is written in full (-3 when 3 were sold) precisely so the fact survives into the
+// ledger where a stock take can find it. Clamping the movement would balance the number and
+// lose the shortfall, which is how a shelf silently disagrees with its record.
+
+/** A hundredth of a unit — the same tolerance the money and quantity comparisons use. */
+private const val UNIT_EPS = 0.005
+
+/**
+ * Units of [item] one cart line takes off the shelf.
+ *
+ * Mirrors the checkout draw-down exactly, INCLUDING which column it comes out of: a
+ * measured product's quantity is its own decimal (2.35 kg is 2.35 off `stockMeasured`),
+ * everything else is whole units, so a box line of 2 with a pack size of 4 is 8. Reading
+ * the wrong basis here would warn about the wrong number, which is worse than not warning.
+ *
+ * The line's own [CartLine.measured] flag counts too, matching checkout: the item row is
+ * the authority on which column holds stock, but a line the cashier rang up by measure
+ * draws a measure.
+ */
+fun stockUnitsDrawn(item: Item, line: CartLine): Double =
+    if (item.isMeasured || line.measured) line.qty else line.stockUnits
+
+/** Everything [cart] asks for of [item], across however many lines/price modes it sits on. */
+fun cartStockUnits(item: Item, cart: List<CartLine>): Double =
+    cart.filter { it.itemId == item.id }.sumOf { stockUnitsDrawn(item, it) }
+
+/**
+ * Is this item's recorded on-hand actually BELOW zero — the state that needs a stock take?
+ *
+ * The single definition, shared by the product badge, the inventory list, the dashboard
+ * count and the admin notification, so those four can never disagree about the same shelf
+ * (they have before, over the low-stock rule, and the owner got the false alarms).
+ *
+ * ★ Not a bare `< 0`. A measured item's on-hand is a running sum of decimals — 5 kg less
+ * 2.35 less 2.65 does not land on 0.0 in binary — and a residue of -4e-16 is an empty
+ * shelf, not a deficit. Testing it strictly would have every measured product in the shop
+ * eventually announce a stock take it does not need, which is how an alert stops being
+ * read. Counted items are whole numbers and are unaffected either way.
+ */
+fun Item.stockIsShort(): Boolean = onHand < -UNIT_EPS
+
+/**
+ * A cart that asks for more of an item than the shop's figure says is there.
+ *
+ * [onHand] is the figure as the till holds it — which can itself be NEGATIVE, when an
+ * earlier oversell has already been rung up. That is a different situation from a busy
+ * shelf and reads differently ([alreadyShort]): the shop is not merely out, its record is
+ * wrong and only a count can fix it.
+ */
+data class Oversell(
+    val itemName: String,
+    /** What the till says is on the shelf right now. May be negative. */
+    val onHand: Double,
+    /** What the cart would take, in the same basis as [onHand]. */
+    val requested: Double,
+    /** True for a measured product, whose figures read in [unitLabel] rather than as a count. */
+    val measured: Boolean,
+    /** kg / L / m … for a measured product; blank for anything counted. */
+    val unitLabel: String,
+) {
+    /** How far past the recorded stock this cart goes. Always > 0 for a real [Oversell]. */
+    val shortfall: Double get() = requested - onHand
+    /** The record was ALREADY below zero before this sale — a data problem, not a busy day.
+     *  Same rule and same tolerance as [Item.stockIsShort], applied to the figure already
+     *  captured here. */
+    val alreadyShort: Boolean get() = onHand < -UNIT_EPS
+}
+
+/**
+ * Would moving the cart from [current] to [next] sell [item] past its on-hand?
+ *
+ * Null means "just do it", and three things earn that answer:
+ *
+ *  - the item does not track stock at all, so it has no on-hand to exceed and there is
+ *    nothing to warn about, ever;
+ *  - the cart lands exactly ON the on-hand — selling the last two of two is the ordinary
+ *    end of a shelf, not an incident, so the comparison is strictly-greater by [UNIT_EPS]
+ *    and not >=;
+ *  - the cart is not asking for MORE than it already was. A cashier reducing a line that is
+ *    over (or removing it) is moving toward the truth; interrupting them to warn about a
+ *    state they are in the middle of fixing would train them to dismiss the warning.
+ */
+fun oversellFor(item: Item, current: List<CartLine>, next: List<CartLine>): Oversell? {
+    if (!item.trackStock) return null
+    val requested = cartStockUnits(item, next)
+    val onHand = item.onHand
+    if (requested <= onHand + UNIT_EPS) return null
+    if (requested <= cartStockUnits(item, current) + UNIT_EPS) return null
+    return Oversell(
+        itemName = item.name,
+        onHand = onHand,
+        requested = requested,
+        measured = item.isMeasured,
+        unitLabel = if (item.isMeasured) item.unit.trim().ifBlank { "unit" } else "",
+    )
 }

@@ -16,9 +16,9 @@ import kotlinx.serialization.json.jsonPrimitive
  * ── TWO VOCABULARIES, ONE COLUMN ──────────────────────────────────────────────
  *
  * The web POS gates SEVEN capabilities, named in camelCase: `refunds`, `discounts`,
- * `credit`, `priceOverride`, `parking`, `quotes`, `stockAdjust`. This app gates fifteen,
+ * `credit`, `priceOverride`, `parking`, `quotes`, `stockAdjust`. This app gates sixteen,
  * named in snake_case, and the seven overlap. [wireKey] carries the web's spelling for
- * the ones that are the same capability wearing a different name; the eight this app
+ * the ones that are the same capability wearing a different name; the nine this app
  * gates alone have no [wireKey] and the web simply never asks about them.
  *
  * ★ ABSENCE MEANS DIFFERENT THINGS ON THE TWO SIDES, and that is settled, not pending.
@@ -38,6 +38,29 @@ enum class Capability(val key: String, val wireKey: String? = null) {
     EDIT_RECEIPTS("edit_receipts"),
     GIVE_DISCOUNTS("give_discounts", wireKey = "discounts"),
     MANAGE_INVENTORY("manage_inventory", wireKey = "stockAdjust"),
+
+    /**
+     * Ring a sale up for MORE of a tracked item than the shop's figure says is on the shelf.
+     *
+     * Deliberately NOT folded into [MANAGE_INVENTORY]: that grant is about correcting the
+     * catalogue's numbers, this one is about selling past them, and an owner can reasonably
+     * want either without the other — the cashier who may count a shelf is not automatically
+     * the cashier who may sell a shelf into deficit, and the cashier who must be able to
+     * serve a customer from an un-booked-in delivery does not thereby need the stock editor.
+     * One switch for both would make those four positions two.
+     *
+     * A grant rather than a block because the shop really does sell stock the system has not
+     * caught up with — a delivery not yet booked in, a count that drifted. Refusing the sale
+     * protects a number at the cost of a customer standing at the counter, so the default is
+     * to WARN with the figures and let the cashier proceed on purpose. The movement is
+     * written in full either way; what the owner gets back is a visible negative and a stock
+     * take, not a quietly-lost sale.
+     *
+     * No [wireKey]: the web gates seven capabilities and this is not one of them, so there is
+     * nothing on that side to round-trip with. If the web ever names it, its spelling goes
+     * here and the shared vocabulary joins up — same as the four adopted below.
+     */
+    SELL_BELOW_STOCK("sell_below_stock"),
     MANAGE_EXPENSES_ORDERS("manage_expenses_orders"),
     VIEW_REPORTS("view_reports"),
     MANAGE_STAFF("manage_staff"),
@@ -78,6 +101,7 @@ enum class Capability(val key: String, val wireKey: String? = null) {
             EDIT_RECEIPTS -> "Edit receipts"
             GIVE_DISCOUNTS -> "Give discounts"
             MANAGE_INVENTORY -> "Manage inventory"
+            SELL_BELOW_STOCK -> "Sell past on-hand stock"
             MANAGE_EXPENSES_ORDERS -> "Expenses & purchase orders"
             VIEW_REPORTS -> "View reports & dashboard"
             MANAGE_STAFF -> "Manage staff"
@@ -175,6 +199,14 @@ data class Permissions(val granted: Map<Capability, Boolean> = emptyMap()) {
             Capability.EDIT_RECEIPTS to false,
             Capability.GIVE_DISCOUNTS to false,
             Capability.MANAGE_INVENTORY to true,
+            // ★ ON by default. This is a WARNING, not a permission the shop has to hand out
+            // before it can trade: the cashier is shown the on-hand and what they are about
+            // to sell and has to confirm. Off by default would mean every shop that never
+            // opens the staff console cannot serve a customer from a delivery it hasn't
+            // booked in yet — stopping real trade to protect a number that is already wrong.
+            // The owner who wants the counter held to the recorded figure turns it off, per
+            // cashier, and then it is a hard refusal.
+            Capability.SELL_BELOW_STOCK to true,
             Capability.MANAGE_EXPENSES_ORDERS to false,
             Capability.VIEW_REPORTS to false,
             Capability.MANAGE_STAFF to false,

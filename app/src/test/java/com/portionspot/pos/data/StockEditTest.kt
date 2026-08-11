@@ -142,6 +142,38 @@ class StockEditTest {
     }
 
     @Test
+    fun aStockEditsMovementMustOutrankTheRowItCameWith() {
+        // The bug this pins, found on the shop's own data. `saveItem` stamps the item row
+        // and its movement from the same `stamp`, and the row's client_updated_at IS the
+        // baseline instant — so a movement stamped ON it is read as the change that
+        // PRODUCED the figure and is never replayed. The originating device never
+        // noticed (it keeps its existing baseline, because the catalogue push does not
+        // send stock_qty so the cloud figure never changes), but every OTHER device
+        // adopted the row as a fresh baseline and dropped the movement.
+        //
+        // `Hamburger` was created on the till with 3, arrived in the cloud with
+        // stock_qty 0, and its `restock +3` was stamped to the identical millisecond.
+        // Every other phone would have read it as out of stock.
+        val rowStamp = 1_754_745_588_000L
+        val newProduct = Item(
+            id = "i1", businessId = "biz", name = "Hamburger",
+            stockQty = 3.0, trackStock = true,
+            // What a second device adopts from the cloud: the figure is 0, because the
+            // catalogue push never carries stock, as of the row's own instant.
+            stockBaseQty = 0.0, stockBaseAt = rowStamp,
+        )
+        val opening = StockMovement(
+            businessId = "biz", itemId = "i1", type = "restock",
+            delta = 3.0, balanceAfter = 3.0, createdAt = rowStamp + 1,
+        )
+        assertEquals(3.0, stockOnHandFromLedger(newProduct, listOf(opening))!!, 1e-9)
+
+        // Stamped ON the row instead, it is silently discarded — the old behaviour.
+        val onTheBaseline = opening.copy(createdAt = rowStamp)
+        assertEquals(0.0, stockOnHandFromLedger(newProduct, listOf(onTheBaseline))!!, 1e-9)
+    }
+
+    @Test
     fun anEditThenTheRecomputeAgree() {
         // End to end on the arithmetic that matters: an item with a cloud baseline of 24,
         // one sale of -3, then a delivery of 9 typed in. The recompute must land on 30.
