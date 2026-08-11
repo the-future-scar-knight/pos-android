@@ -290,6 +290,25 @@ class PosSyncEngine(
             }
         }
 
+        // items — the catalogue. Pushed FIRST, before anything that references a product:
+        // a sale line or a stock movement naming an item the cloud has never heard of is
+        // an orphan nothing will ever resolve, since there are no foreign keys to refuse
+        // it. Parents before children, the same rule the rest of this pass follows.
+        //
+        // ★ `stock_qty` is deliberately NOT in [ItemPushDto]. Stock travels as movements
+        // and only as movements — see that DTO for what writing a till's computed on-hand
+        // into the shop's baseline would do to a second till.
+        //
+        // Last-write-wins on `client_updated_at`, which is what the pull already applies
+        // in the other direction: a row older than the local edit does not overwrite it.
+        pushTable("items") {
+            val rows = itemDao.pending()
+            if (rows.isEmpty()) return@pushTable 0
+            api.upsert("items", syncJson.encodeToString(rows.map { it.toPush().copy(businessId = cloudBid) }), "id")
+            itemDao.markSynced(rows.map { it.id })
+            rows.size
+        }
+
         // customers — upsert on the Android uuid, which IS the cloud primary key now.
         // No `local_id` bridge and nothing to resolve: the row goes up under the id it
         // already has, so a sale referencing it can never arrive before its customer.
@@ -743,9 +762,17 @@ class PosSyncEngine(
             // Stamped on the CLIENT clock, the one the movements share — see
             // [ItemDto.baselineStamp]. `stamp` above is the server's and is only good for
             // ordering the pull.
-            val baseAt = dto.baselineStamp()
-            if (local.stockBaseAt != baseAt) {
-                itemDao.upsert(local.copy(stockBaseQty = dto.stockQty.toMoney(), stockBaseAt = baseAt))
+            // ★ Only when the FIGURE moved. `client_updated_at` bumps for any edit at
+            // all, so re-stamping the baseline on a rename or a reprice pushed it past
+            // every movement made before that edit and dropped them — a product with 24
+            // on the shelf and a sale of 3 against it reported 24 again the moment
+            // someone fixed its spelling.
+            val incoming = dto.stockQty.toMoney()
+            val figureMoved = abs(local.stockBaseQty - incoming) >= 0.0005
+            if (local.stockBaseAt <= 0L || figureMoved) {
+                itemDao.upsert(
+                    local.copy(stockBaseQty = incoming, stockBaseAt = dto.baselineStamp())
+                )
             }
         }
         config.setCursor("items", rows.maxOf { it.updatedAt ?: IsoTime.EPOCH })

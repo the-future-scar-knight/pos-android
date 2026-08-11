@@ -129,6 +129,25 @@ fun ItemDto.baselineStamp(): Long =
     IsoTime.toMillis(clientUpdatedAt ?: updatedAt)
 
 /**
+ * Does [local] keep the stock baseline it already has, rather than adopting this row's?
+ *
+ * True when the incoming figure is the SAME one the device is already measuring from.
+ * `client_updated_at` bumps for any edit at all — a rename, a price change — and moving
+ * the baseline on those was silently destructive: every movement made before the edit
+ * then fell before the baseline and stopped counting. A product with 24 on the shelf and
+ * a sale of 3 against it went back to reporting 24 the moment someone corrected its name.
+ *
+ * An item with no baseline yet (`stockBaseAt == 0`) always adopts — that is the first
+ * reconciliation against the shop, and there is nothing to preserve.
+ */
+private fun ItemDto.keepsBaseline(local: Item?): Boolean {
+    if (local == null || local.stockBaseAt <= 0L) return false
+    val incoming = stockQty.toMoney()
+    val held = local.stockBaseQty
+    return incoming > held - 0.0005 && incoming < held + 0.0005
+}
+
+/**
  * Merge a pulled item onto the local row, keyed by id.
  *
  * The cloud has no column for images (`imageUrl`, `showImage`), incoming purchase-order
@@ -169,8 +188,16 @@ fun ItemDto.toItem(businessId: String, local: Item?): Item {
         // The shop's own figure, and the instant it was true. `stock_movements` is a log
         // of CHANGES with no opening entry, so this is the only thing that makes the
         // ledger add up to an on-hand rather than to "how much this has moved".
-        stockBaseQty = onHand,
-        stockBaseAt = baselineStamp(),
+        //
+        // ★ ONLY MOVED WHEN THE FIGURE ITSELF MOVED. `client_updated_at` is the row's
+        // edit clock, not a stock clock: it bumps for a rename or a reprice just the
+        // same. Re-baselining on those meant every movement made before the edit fell
+        // BEFORE the new baseline and was discarded — rename a product with 24 on the
+        // shelf and a sale of 3 against it, and the till went back to reporting 24. The
+        // sale silently un-happened. Holding the old stamp while the figure is unchanged
+        // keeps the ledger measured from when the count was actually taken.
+        stockBaseQty = if (keepsBaseline(local)) local!!.stockBaseQty else onHand,
+        stockBaseAt = if (keepsBaseline(local)) local!!.stockBaseAt else baselineStamp(),
         reorderLevel = reorderLevel.toMoney(),
         unit = unit?.ifBlank { null } ?: base.unit,
         colorHex = colorHex ?: base.colorHex,
@@ -180,6 +207,78 @@ fun ItemDto.toItem(businessId: String, local: Item?): Item {
         pendingSync = false,
     )
 }
+
+/**
+ * A product as it goes UP — the catalogue push.
+ *
+ * ★ `stock_qty` IS ABSENT, and that is the whole design. The ledger is the authority for
+ * what is on the shelf and `items.stock_qty` is the shop's baseline figure; a till that
+ * wrote its own computed on-hand into it would re-baseline every device to a number
+ * derived from whatever movements THAT phone happened to have seen. Two tills doing it
+ * while offline from each other would each discard the other's sales, and neither would
+ * report an error. Stock travels as `stock_movements`, only ever as movements.
+ *
+ * Consequences worth stating rather than discovering:
+ *  - A product CREATED on a till arrives in the cloud with `stock_qty` at its default of
+ *    0. Its opening count is carried by the `restock` movement [PosRepository.saveItem]
+ *    writes, which is stamped after the row and so counts against the 0 baseline.
+ *  - `price_per_unit`, the image columns and the purchase-order `pending` fields have no
+ *    cloud column at all, so a measured product's per-unit price does not round-trip.
+ *    Nothing here can fix that; it needs a column on the shared schema.
+ *  - `category_id` is left to the web. This app models categories as the free-text
+ *    `category` the same table already carries.
+ *
+ * `updated_at` is never sent either — it is the server's cursor column, and a device with
+ * a skewed clock stamping it makes every other device skip everything behind it.
+ */
+@Serializable
+data class ItemPushDto(
+    val id: String,
+    @SerialName("business_id") val businessId: String,
+    val name: String,
+    val sku: String? = null,
+    val barcode: String? = null,
+    val category: String? = null,
+    val price: Double,
+    @SerialName("wholesale_price") val wholesalePrice: Double,
+    @SerialName("box_price") val boxPrice: Double,
+    @SerialName("box_size") val boxSize: Int,
+    val cost: Double? = null,
+    @SerialName("tax_rate") val taxRate: Double,
+    @SerialName("track_stock") val trackStock: Boolean,
+    @SerialName("reorder_level") val reorderLevel: Double,
+    val unit: String? = null,
+    @SerialName("color_hex") val colorHex: String? = null,
+    @SerialName("is_active") val isActive: Boolean,
+    @SerialName("product_type") val productType: String,
+    val deleted: Boolean = false,
+    @SerialName("client_updated_at") val clientUpdatedAt: String,
+)
+
+fun Item.toPush(): ItemPushDto = ItemPushDto(
+    id = id,
+    businessId = businessId,
+    name = name,
+    sku = sku?.ifBlank { null },
+    barcode = barcode?.ifBlank { null },
+    category = category?.ifBlank { null },
+    price = price,
+    wholesalePrice = wholesalePrice,
+    boxPrice = boxPrice,
+    boxSize = boxSize.coerceAtLeast(1),
+    // NULL means UNKNOWN on this column, and the cloud defaults it that way. Sending 0.0
+    // for "no cost recorded" would report the whole line as profit on the other client.
+    cost = cost?.takeIf { it > 0.0 },
+    taxRate = taxRate,
+    trackStock = trackStock,
+    reorderLevel = reorderLevel,
+    unit = unit.ifBlank { null },
+    colorHex = colorHex,
+    isActive = isActive,
+    productType = productType,
+    deleted = deleted,
+    clientUpdatedAt = IsoTime.toIso(updatedAt),
+)
 
 /** `box_size` is `numeric(14,3)` on the wire but a whole number of units in the app. */
 private fun ItemDto.boxSizeInt(): Int =

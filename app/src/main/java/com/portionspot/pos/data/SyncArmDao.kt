@@ -63,9 +63,16 @@ interface SyncArmDao {
     /**
      * Arm every table the engine actually pushes, and return how many rows were touched.
      *
-     * ★ NOT `items`. The catalogue is PULL-ONLY — the web owns it and this app never
-     * pushes a product — so arming it would mark the whole catalogue dirty to no effect
-     * and leave a queue indicator that can never drain.
+     * ★ NOT `items`, even though the catalogue now HAS a push.
+     *
+     * A pulled product carries the SERVER's stamp in [Item.updatedAt], and the push sends
+     * that value as `client_updated_at`. Re-offering the whole catalogue would therefore
+     * restate every product under a clock it was never written on, to a database that in
+     * all likelihood already holds it. The rows a till genuinely owns — the ones it
+     * created or edited — are already dirty and go up on their own.
+     *
+     * This is the conservative direction: a product that fails to reach a new database
+     * can be re-saved, whereas a catalogue overwritten from a till cannot be un-written.
      *
      * ★ NOT `sale_items`, `sale_payments`, `refund_items`, `refund_payments`. These have
      * no dirty flag of their own by design: they travel with their header, in the same
