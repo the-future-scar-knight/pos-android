@@ -33,6 +33,7 @@ import com.portionspot.pos.sync.wire.SaleDto as WireSaleDto
 import com.portionspot.pos.sync.wire.CreditDto as WireCreditDto
 import com.portionspot.pos.data.CashSessionDao
 import com.portionspot.pos.data.StockMovementDao
+import com.portionspot.pos.data.stockOnHandFromDelta
 import com.portionspot.pos.data.planSessionMerge
 import com.portionspot.pos.sync.wire.RefundDto
 import com.portionspot.pos.sync.wire.RefundItemDto
@@ -46,6 +47,7 @@ import com.portionspot.pos.sync.wire.CashSessionDto
 import com.portionspot.pos.sync.wire.toCashSession
 import com.portionspot.pos.sync.wire.ItemAttributeDto
 import com.portionspot.pos.sync.wire.toItemAttribute
+import com.portionspot.pos.sync.wire.toMoney
 import com.portionspot.pos.sync.wire.ItemDto
 import com.portionspot.pos.sync.wire.SaleItemDto
 import com.portionspot.pos.sync.wire.SalePaymentDto
@@ -616,10 +618,14 @@ class PosSyncEngine(
      * even though the cloud keeps both in `stock_qty`.
      */
     private suspend fun recomputeStockFromLedger(bid: String) {
-        val onHand = stockMovementDao.onHandByItem(bid).associate { it.itemId to it.onHand }
-        if (onHand.isEmpty()) return
+        val moved = stockMovementDao.deltaSinceBaselineByItem(bid).associate { it.itemId to it.onHand }
         val updated = itemDao.allForBusinessOnce(bid).mapNotNull { item ->
-            val computed = onHand[item.id] ?: return@mapNotNull null
+            // The shop's figure plus everything that has moved since — INCLUDING nothing
+            // at all, which is why the delta cannot be `moved[item.id] ?: return`: an item
+            // whose only movements predate its baseline must settle back to that figure
+            // rather than keep a stale local number. Null = no baseline = leave it alone.
+            val computed = stockOnHandFromDelta(item, moved[item.id] ?: 0.0)
+                ?: return@mapNotNull null
             val measured = item.productType == "measured"
             val current = if (measured) item.stockMeasured else item.stockQty
             if (abs(current - computed) < 0.0005) return@mapNotNull null
@@ -690,9 +696,21 @@ class PosSyncEngine(
         var applied = 0
         for (dto in rows) {
             val local = itemDao.getById(dto.id)
-            if (local == null || IsoTime.toMillis(dto.updatedAt) > local.updatedAt) {
+            val stamp = IsoTime.toMillis(dto.updatedAt)
+            if (local == null || stamp > local.updatedAt) {
                 itemDao.upsert(dto.toItem(bid, local))
                 applied++
+                continue
+            }
+            // The row is older than the local edit and must NOT overwrite it — but its
+            // STOCK BASELINE still applies. Android never pushes `items.stock_qty`, so
+            // the shop's figure is the only authority for what is on the shelf, and a
+            // device that has rung up a sale (bumping its own updatedAt past the cloud's)
+            // would otherwise never learn a baseline at all. Without one the ledger has
+            // nothing to be measured from, which is precisely how a shelf of 2 read as
+            // empty after selling 1.
+            if (local.stockBaseAt != stamp) {
+                itemDao.upsert(local.copy(stockBaseQty = dto.stockQty.toMoney(), stockBaseAt = stamp))
             }
         }
         config.setCursor("items", rows.maxOf { it.updatedAt ?: IsoTime.EPOCH })

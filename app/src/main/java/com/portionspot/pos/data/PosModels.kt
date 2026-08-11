@@ -157,6 +157,23 @@ data class Item(
     // cloud `products` table has no matching columns, so both stay on-device.
     @ColumnInfo(defaultValue = "0") val pendingQty: Double = 0.0,
     @ColumnInfo(defaultValue = "0") val pendingNew: Boolean = false,
+    // ──── Stock baseline — the anchor the ledger is measured FROM (LOCAL-ONLY) ────
+    // `stock_movements` is a log of CHANGES, and nothing ever writes an opening entry:
+    // an item pulled with 20 on hand, or typed in with 20, has no movement saying so.
+    // Summing the deltas therefore yields "how much this item has moved", not what is
+    // on the shelf — and reading that sum as an on-hand emptied a shelf of 2 after a
+    // single sale of 1, because the only movement the device held was the -1.
+    //
+    // [stockBaseQty] is the shop's own figure (cloud `items.stock_qty`) and
+    // [stockBaseAt] is the cloud row's `updated_at` at the moment it was taken. On-hand
+    // is then baseline + every movement created AFTER it, which is well-defined however
+    // many tills contributed and in whatever order their rows arrive.
+    //
+    // stockBaseAt == 0 means NO baseline is known — this item has never been reconciled
+    // against the shop, so the ledger says nothing absolute about it and its stockQty is
+    // left exactly as the till's own bookkeeping has it.
+    @ColumnInfo(defaultValue = "0") val stockBaseQty: Double = 0.0,
+    @ColumnInfo(defaultValue = "0") val stockBaseAt: Long = 0L,
     val colorHex: String? = null,        // tile colour when no image
     // ──── Product image (mirrors the cloud `products.image_url` + `show_image`) ────
     // [imageUrl] is the REMOTE Supabase Storage public URL — this is what syncs to the

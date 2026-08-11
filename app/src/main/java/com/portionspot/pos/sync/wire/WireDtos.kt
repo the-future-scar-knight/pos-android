@@ -145,6 +145,11 @@ fun ItemDto.toItem(businessId: String, local: Item?): Item {
         // for that product type and leave the other alone.
         stockQty = if (type == "measured") base.stockQty else onHand,
         stockMeasured = if (type == "measured") onHand else base.stockMeasured,
+        // The shop's own figure, and the instant it was true. `stock_movements` is a log
+        // of CHANGES with no opening entry, so this is the only thing that makes the
+        // ledger add up to an on-hand rather than to "how much this has moved".
+        stockBaseQty = onHand,
+        stockBaseAt = IsoTime.toMillis(updatedAt),
         reorderLevel = reorderLevel.toMoney(),
         unit = unit?.ifBlank { null } ?: base.unit,
         colorHex = colorHex ?: base.colorHex,

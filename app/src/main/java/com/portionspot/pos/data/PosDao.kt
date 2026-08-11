@@ -528,6 +528,24 @@ interface StockMovementDao {
     )
     suspend fun onHandByItem(businessId: String): List<ItemOnHand>
 
+    /**
+     * Net movement PER ITEM since that item's own stock baseline.
+     *
+     * The join is what makes this correct: each item is measured from its OWN
+     * `stockBaseAt`, because the tills learn the shop's figure for different products at
+     * different times. `onHand` here is a DELTA to add to [Item.stockBaseQty], not an
+     * on-hand — summing the whole ledger instead is what emptied a shelf of 2 after one
+     * sale of 1, since nothing ever writes the opening entry the sum assumes.
+     */
+    @Query(
+        "SELECT sm.itemId AS itemId, SUM(sm.delta) AS onHand FROM stock_movements sm " +
+            "JOIN items i ON i.id = sm.itemId " +
+            "WHERE sm.businessId = :businessId AND sm.deleted = 0 " +
+            "AND i.stockBaseAt > 0 AND sm.createdAt > i.stockBaseAt " +
+            "GROUP BY sm.itemId"
+    )
+    suspend fun deltaSinceBaselineByItem(businessId: String): List<ItemOnHand>
+
     @Insert
     suspend fun insertAll(movements: List<StockMovement>)
 

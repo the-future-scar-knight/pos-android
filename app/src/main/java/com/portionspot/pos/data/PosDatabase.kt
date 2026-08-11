@@ -934,6 +934,31 @@ val MIGRATION_37_38 = object : Migration(37, 38) {
     }
 }
 
+/**
+ * Give every item a stock BASELINE, and repair the shelves the ledger emptied.
+ *
+ * `stock_movements` records CHANGES and nothing has ever written an opening entry, so
+ * `SUM(delta)` is how much an item has moved, not what is on the shelf. The sync pass read
+ * it as an on-hand: an item pulled with 2, sold once, held exactly one movement of -1, and
+ * came back from the recompute as -1 — out of stock, with two of them on the shelf.
+ *
+ * The columns start at 0, which reads as "no baseline known" and makes the recompute skip
+ * the item entirely — so the damage stops on upgrade, before any sync runs. The repair
+ * needs the shop's own figure, which is not on the device, so the items cursor is dropped
+ * as well: the next pull re-reads the whole catalogue, stamps each item with the cloud's
+ * `stock_qty` and `updated_at`, and the recompute replays only the movements made after
+ * that instant. A sale rung up offline before this upgrade is therefore still subtracted,
+ * exactly once.
+ */
+val MIGRATION_38_39 = object : Migration(38, 39) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE items ADD COLUMN stockBaseQty REAL NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE items ADD COLUMN stockBaseAt INTEGER NOT NULL DEFAULT 0")
+        // Force a full catalogue re-read so every item gets a baseline from the shop.
+        db.execSQL("DELETE FROM settings WHERE `key` = 'cursor_items'")
+    }
+}
+
 @Database(
     entities = [
         Business::class,
@@ -962,7 +987,7 @@ val MIGRATION_37_38 = object : Migration(37, 38) {
         OutsideFund::class,
         CashSession::class
     ],
-    version = 38,
+    version = 39,
     exportSchema = false
 )
 abstract class PosDatabase : RoomDatabase() {
@@ -1016,7 +1041,8 @@ abstract class PosDatabase : RoomDatabase() {
                         MIGRATION_26_27, MIGRATION_27_28, MIGRATION_28_29,
                         MIGRATION_29_30, MIGRATION_30_31, MIGRATION_31_32,
                         MIGRATION_32_33, MIGRATION_33_34, MIGRATION_34_35,
-                        MIGRATION_35_36, MIGRATION_36_37, MIGRATION_37_38
+                        MIGRATION_35_36, MIGRATION_36_37, MIGRATION_37_38,
+                        MIGRATION_38_39
                     )
                     .fallbackToDestructiveMigration()
                     .build()

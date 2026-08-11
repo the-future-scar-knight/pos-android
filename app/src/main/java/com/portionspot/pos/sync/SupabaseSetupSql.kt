@@ -561,6 +561,39 @@ create table if not exists public.purchase_order_items (
 );
 
 -- ---------------------------------------------------------------------------
+-- 7b) Columns the WEB back-office reads that the till does not.
+--
+-- Added here rather than in the create-table above so a database stood up by an
+-- older copy of this script gains them on a re-run. The pos2_* views in section
+-- 9 select them BY NAME and cannot be created without them.
+-- ---------------------------------------------------------------------------
+alter table public.businesses add column if not exists logo_uri text;
+alter table public.businesses add column if not exists cash_enabled boolean default true;
+alter table public.businesses add column if not exists card_enabled boolean default false;
+alter table public.businesses add column if not exists bank_enabled boolean default false;
+alter table public.businesses add column if not exists paynow_enabled boolean default false;
+alter table public.businesses add column if not exists ecocash_enabled boolean default false;
+alter table public.businesses add column if not exists innbucks_enabled boolean default false;
+alter table public.businesses add column if not exists onemoney_enabled boolean default false;
+alter table public.businesses add column if not exists omari_enabled boolean default false;
+alter table public.businesses add column if not exists bank_name text;
+alter table public.businesses add column if not exists bank_branch text;
+alter table public.businesses add column if not exists bank_account_name text;
+alter table public.businesses add column if not exists bank_account_number text;
+alter table public.businesses add column if not exists ecocash_account_name text;
+alter table public.businesses add column if not exists ecocash_phone text;
+alter table public.businesses add column if not exists ecocash_merchant_code text;
+alter table public.businesses add column if not exists innbucks_account_name text;
+alter table public.businesses add column if not exists innbucks_phone text;
+alter table public.businesses add column if not exists onemoney_account_name text;
+alter table public.businesses add column if not exists onemoney_phone text;
+alter table public.businesses add column if not exists omari_account_name text;
+alter table public.businesses add column if not exists omari_phone text;
+alter table public.businesses add column if not exists paynow_integration_id text;
+alter table public.businesses add column if not exists second_currency text;
+alter table public.businesses add column if not exists second_currency_rate numeric default 0;
+
+-- ---------------------------------------------------------------------------
 -- 8) Row-level security — one tenant policy per table, matching the live shop.
 -- ---------------------------------------------------------------------------
 do ${'$'}${'$'}
@@ -584,6 +617,43 @@ begin
       'create index if not exists %I on public.%I (business_id, client_updated_at)',
       'idx_' || t || '_client_updated', t
     );
+  end loop;
+end ${'$'}${'$'};
+
+-- ---------------------------------------------------------------------------
+-- 9) pos2_* views — how the WEB back-office addresses this same data.
+--
+-- The two clients are not on two schemas. The web reads and writes `pos2_items`,
+-- `pos2_sales` and the rest, which are plain views over the very tables above;
+-- the Android till reads and writes the tables directly. Skip this section and
+-- you get a working till and a back-office that reports "the POS tables are
+-- missing", against a database that has every one of them.
+--
+-- `security_invoker = true` is NOT optional. A view runs as its OWNER by
+-- default, the owner here is `postgres`, and postgres BYPASSES row-level
+-- security — so without it every view below is an unrestricted door around the
+-- tenant policy just installed on the table beneath it. (Requires PG15+; both
+-- Supabase projects this targets are PG17.)
+--
+-- `select *` is expanded at creation, so these freeze the column list as it
+-- stands. They are dropped and recreated rather than `create or replace`d,
+-- because replace cannot change a view's column list and re-running this script
+-- after a schema change would otherwise fail.
+-- ---------------------------------------------------------------------------
+do ${'$'}${'$'}
+declare t text;
+declare v text;
+begin
+  foreach t in array array[
+    'businesses','staff','items','item_attributes','stock_movements','customers','credit_txns',
+    'cash_sessions','cash_movements','sales','sale_items','sale_payments',
+    'refunds','refund_items','refund_payments','mobile_money_receipts',
+    'audit_entries','expenses','suppliers','purchase_orders','purchase_order_items'
+  ] loop
+    v := 'pos2_' || t;
+    execute format('drop view if exists public.%I', v);
+    execute format('create view public.%I with (security_invoker = true) as select * from public.%I', v, t);
+    execute format('grant select, insert, update, delete on public.%I to anon, authenticated', v);
   end loop;
 end ${'$'}${'$'};
 """
