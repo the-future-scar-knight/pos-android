@@ -95,8 +95,16 @@ interface ItemDao {
     )
     suspend fun trackedOnce(businessId: String): List<Item>
 
-    /** Danger zone: zero out every item's on-hand for a business. */
-    @Query("UPDATE items SET stockQty = 0, updatedAt = :at, pendingSync = 1 WHERE businessId = :businessId")
+    /** Danger zone: zero out every item's on-hand for a business.
+     *  BOTH columns — a `measure` product keeps its quantity in `stockMeasured`, and
+     *  leaving that behind meant "reset all stock" emptied everything except the very
+     *  products sold by weight. [PosRepository.resetAllStock] logs the ledger entries
+     *  that make this survive a sync; on its own this statement is undone by the next
+     *  recompute. */
+    @Query(
+        "UPDATE items SET stockQty = 0, stockMeasured = 0, updatedAt = :at, pendingSync = 1 " +
+            "WHERE businessId = :businessId"
+    )
     suspend fun resetAllStock(businessId: String, at: Long)
 
     /** Hard-delete one item (used to merge a duplicate catalogue row; never synced). */

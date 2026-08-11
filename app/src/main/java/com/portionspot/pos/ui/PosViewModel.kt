@@ -1242,17 +1242,23 @@ class PosViewModel(
                     imageLocalPath = imageLocalPath,
                     imagePending = imageLocalPath != null,
                     showImage = showImage
-                )
+                ),
+                // Attributes the opening-stock movement this write logs, the same way a
+                // sale or a refund names the cashier behind it.
+                currentCashierId, currentCashierName
             )
             nudgeSync("addItem")
         }
     }
 
-    /** Persist edits to an existing item (rename, reprice, restock, toggle tracking). */
+    /** Persist edits to an existing item (rename, reprice, restock, toggle tracking).
+     *  A changed stock figure is logged as a movement by [PosRepository.saveItem] — the
+     *  ledger is the authority, and the cached figure alone would be computed away on the
+     *  next sync. */
     fun updateItem(item: Item) {
         if (!can(Capability.MANAGE_INVENTORY)) return
         viewModelScope.launch {
-            repo.saveItem(item)
+            repo.saveItem(item, currentCashierId, currentCashierName)
             nudgeSync("updateItem")
         }
     }
@@ -1286,7 +1292,7 @@ class PosViewModel(
 
     fun resetAllStock() {
         val bid = businessId.value ?: return
-        viewModelScope.launch { repo.resetAllStock(bid) }
+        viewModelScope.launch { repo.resetAllStock(bid, currentCashierId, currentCashierName) }
     }
 
     fun wipeSalesData() {

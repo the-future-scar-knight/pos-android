@@ -216,15 +216,58 @@ class PosRepository(private val db: PosDatabase) {
      * SKU (case/space-folded), we write onto THAT row's id instead of inserting a second
      * copy — whether this is a brand-new add or an edit that collides with an existing
      * code. SKU-less items are unaffected (they can legitimately repeat).
+     *
+     * ══ Changing the stock figure here LOGS A MOVEMENT, and has to ══
+     * `items.stockQty` is a CACHE of the movement ledger — [PosSyncEngine] rebuilds it
+     * after every pull as `stockBaseQty + Σ deltas since the baseline`. So writing a new
+     * figure onto the row and stopping there does not restock anything: the number shows
+     * until the next sync and is then computed away, because no movement ever said the
+     * stock arrived. Restocking on the till simply did not work, and it failed by
+     * reverting quietly rather than by refusing.
+     *
+     * It also never left the device. The catalogue is PULL-ONLY — the web owns products
+     * and this app has no `items` push — so the ledger is the ONLY channel a till has for
+     * telling the shop that stock moved. A movement both survives the recompute and
+     * reaches the other tills; the cached figure does neither.
+     *
+     * The delta is measured against what this device currently holds, which is what the
+     * recompute last settled on, so applying it lands exactly on the figure that was
+     * typed. A brand-new product logs its opening count instead: that item has no
+     * baseline yet ([Item.stockBaseAt] is 0), so the recompute leaves it alone and the
+     * entry is there to answer where the stock came from — and to be correctly ignored
+     * later, as pre-baseline, if the web ever gives the product a figure of its own.
      */
-    suspend fun saveItem(item: Item) {
+    suspend fun saveItem(item: Item, cashierId: String? = null, cashierName: String? = null) {
         val sku = item.sku?.trim()?.ifBlank { null }
         val canonicalId = sku
             ?.let { itemDao.getBySku(item.businessId, it) }
             ?.takeIf { it.id != item.id }
             ?.id
         val target = if (canonicalId != null) item.copy(id = canonicalId) else item
-        itemDao.upsert(target.copy(sku = sku, updatedAt = now(), pendingSync = true))
+        val stamp = now()
+        db.withTransaction {
+            // Read BEFORE the upsert — afterwards the old figure is gone and the delta
+            // would always compute as zero.
+            val prior = itemDao.getById(target.id)
+            itemDao.upsert(target.copy(sku = sku, updatedAt = stamp, pendingSync = true))
+
+            // Which entry this edit owes, if any — see [stockEditFor] for the rules.
+            stockEditFor(prior, target)?.let { edit ->
+                movementDao.insert(
+                    StockMovement(
+                        businessId = target.businessId,
+                        itemId = target.id,
+                        type = edit.type,
+                        delta = edit.delta,
+                        balanceAfter = edit.balanceAfter,
+                        note = edit.note,
+                        createdBy = cashierId,
+                        createdByName = cashierName,
+                        createdAt = stamp
+                    )
+                )
+            }
+        }
     }
 
     suspend fun itemByBarcode(businessId: String, barcode: String): Item? =
@@ -2572,9 +2615,54 @@ class PosRepository(private val db: PosDatabase) {
 
     // ---- danger zone ------------------------------------------------------
 
-    /** Zero every item's on-hand for a business (keeps the catalog rows). */
-    suspend fun resetAllStock(businessId: String) =
-        itemDao.resetAllStock(businessId, now())
+    /**
+     * Zero every item's on-hand for a business (keeps the catalog rows).
+     *
+     * ══ Why this writes a movement per item ══
+     * The single blanket UPDATE this used to be looked like it worked and did not.
+     * `items.stockQty` is a CACHE the sync pass rebuilds as `stockBaseQty + Σ deltas`, so
+     * a zeroed row with nothing in the ledger behind it came back at the next pull with
+     * every figure restored. The owner reaches for this button exactly when the till is
+     * holding stock numbers they want gone; a reset that silently undoes itself one sync
+     * later is the worst available answer, because by then the shop has moved on
+     * believing the shelves are clear.
+     *
+     * It also never left the device. The catalogue is pull-only, so the ledger is a
+     * till's only way of telling the rest of the shop that stock moved — without these
+     * rows the other tills kept their own figures and never heard about the reset.
+     *
+     * The row UPDATE stays: it is one statement for the whole catalogue, and it clears
+     * BOTH on-hand columns, so a `measure` product is emptied rather than left holding a
+     * fractional quantity the recompute would then treat as authoritative.
+     */
+    suspend fun resetAllStock(
+        businessId: String,
+        cashierId: String? = null,
+        cashierName: String? = null
+    ) {
+        val stamp = now()
+        db.withTransaction {
+            // Read the on-hands BEFORE the UPDATE — afterwards every delta is zero and
+            // the ledger would record a reset of nothing.
+            val moves = itemDao.allForBusinessOnce(businessId).mapNotNull { item ->
+                stockResetFor(item)?.let { reset ->
+                    StockMovement(
+                        businessId = businessId,
+                        itemId = item.id,
+                        type = reset.type,
+                        delta = reset.delta,
+                        balanceAfter = reset.balanceAfter,
+                        note = reset.note,
+                        createdBy = cashierId,
+                        createdByName = cashierName,
+                        createdAt = stamp
+                    )
+                }
+            }
+            if (moves.isNotEmpty()) movementDao.insertAll(moves)
+            itemDao.resetAllStock(businessId, stamp)
+        }
+    }
 
     /** Wipe all sales history: receipts, their lines, their tenders and refunds. */
     suspend fun wipeSalesData(businessId: String) {
