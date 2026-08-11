@@ -2389,6 +2389,11 @@ class PosViewModel(
         viewModelScope.launch {
             repo.resetLocalData()
             sync.config.resetCursors()
+            // Re-decide which shop this database belongs to as well. A reset is what
+            // someone reaches for when the till is holding the wrong data, and "the wrong
+            // data" now includes having adopted the wrong business — which nothing else
+            // can undo, because adoption only runs while the id is unset.
+            sync.config.forgetCloudBusinessId()
             sync.runNow()
             refreshSyncState()
             onDone()

@@ -33,6 +33,14 @@ class SyncConfig(private val dao: SettingDao) {
     suspend fun clearConnection() {
         dao.delete(KEY_URL)
         dao.delete(KEY_KEY)
+        // ★ And forget WHICH SHOP we decided we were.
+        //
+        // The adopted id belongs to the database being disconnected from, and adoption
+        // only ever runs while it is unset. Keeping it means a device pointed at a
+        // different project afterwards filters every pull on a business that project has
+        // never heard of: the sync succeeds, reports no error, and pulls nothing at all,
+        // forever, with no way back short of clearing app data.
+        dao.delete(KEY_CLOUD_BID)
         // Forget where we were so a future reconnect re-pulls from scratch.
         resetCursors()
         dao.delete(KEY_LAST_SYNC)
@@ -65,6 +73,11 @@ class SyncConfig(private val dao: SettingDao) {
     suspend fun cloudBusinessId(): String? = dao.get(KEY_CLOUD_BID)?.trim()?.ifBlank { null }
 
     suspend fun setCloudBusinessId(id: String) = dao.put(Setting(KEY_CLOUD_BID, id.trim()))
+
+    /** Un-decide which shop this till belongs to, so the next pass adopts afresh.
+     *  Adoption is one-shot by design (it returns early once the id is known), so this is
+     *  the only way a device that latched onto the wrong business can be recovered. */
+    suspend fun forgetCloudBusinessId() = dao.delete(KEY_CLOUD_BID)
 
     suspend fun cursor(table: String): String = dao.get(cursorKey(table)) ?: IsoTime.EPOCH
 
