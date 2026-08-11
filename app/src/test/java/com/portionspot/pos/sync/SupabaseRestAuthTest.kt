@@ -39,7 +39,7 @@ class SupabaseRestAuthTest {
     @Test
     fun reads_alsoRefuse() {
         try {
-            refusing().selectSince("sales", "1970-01-01T00:00:00.000Z", 10)
+            refusing().selectSince("sales", "biz-1", "1970-01-01T00:00:00.000Z", 10)
             fail("expected SessionExpiredException")
         } catch (_: SessionExpiredException) {
             // expected

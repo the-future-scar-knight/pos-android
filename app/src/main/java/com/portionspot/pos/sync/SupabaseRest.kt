@@ -144,11 +144,26 @@ class SupabaseRest(
         }
     }
 
-    /** GET rows where `updated_at > cursor`, oldest-first, capped at [limit]. */
-    fun selectSince(table: String, cursor: String, limit: Int): String {
+    /**
+     * GET this shop's rows where `updated_at > cursor`, oldest-first, capped at [limit].
+     *
+     * ★ [businessId] is REQUIRED, and it is not a convenience. Every one of these tables
+     * is multi-tenant and the filter is the only thing that keeps one shop's data out of
+     * another's till. Without it a pull returns every business in the project, and the
+     * mappers then stamp all of it with THIS device's business id — the till silently
+     * adopts a catalogue that is not its own and reports stock for products it does not
+     * sell. That is exactly what happened: a phone pointed at a database it shared with
+     * a seeded test shop came back holding eight products belonging to someone else.
+     *
+     * Required rather than defaulted for the same reason: a nullable parameter would let
+     * a new call site be added unscoped without anything failing, and an unscoped pull
+     * looks completely normal until you notice whose stock you are counting.
+     */
+    fun selectSince(table: String, businessId: String, cursor: String, limit: Int): String {
         val url = (rest(table).toHttpUrlOrNull() ?: throw IOException("Bad URL"))
             .newBuilder()
             .addQueryParameter("select", "*")
+            .addQueryParameter("business_id", "eq.$businessId")
             .addQueryParameter("updated_at", "gt.$cursor")
             .addQueryParameter("order", "updated_at.asc")
             .addQueryParameter("limit", limit.toString())

@@ -103,9 +103,30 @@ data class ItemDto(
     @SerialName("color_hex") val colorHex: String? = null,
     @SerialName("is_active") val isActive: Boolean = true,
     @SerialName("product_type") val productType: String = "piece",
+    /** SERVER arrival order. Monotonic, immune to a device with a wrong clock, and so
+     *  the only safe thing to page the pull cursor on. It is NOT when the edit happened. */
     @SerialName("updated_at") val updatedAt: String? = null,
+    /** When the DEVICE that wrote the row made the edit — a client clock, the same one
+     *  `stock_movements.created_at` is stamped with. See [baselineStamp]. */
+    @SerialName("client_updated_at") val clientUpdatedAt: String? = null,
     val deleted: Boolean = false,
 )
+
+/**
+ * The instant the shop's stock figure was true, on the CLIENT clock.
+ *
+ * This has to be the same clock as `stock_movements.created_at`, because the ledger is
+ * measured from it — a movement counts only if it is stamped strictly after. `updated_at`
+ * is the SERVER's, rewritten by a trigger when the row arrives, so it runs seconds ahead
+ * of the very movement that produced the figure: measure from it and that movement is
+ * silently discarded, and the sale it recorded is lost from every till that pulls the row.
+ *
+ * Falls back to the server stamp for a row written before the column existed, or by a bulk
+ * SQL import. Those compare as "true when the server received them", which is the old
+ * behaviour and the best that can be said about them.
+ */
+fun ItemDto.baselineStamp(): Long =
+    IsoTime.toMillis(clientUpdatedAt ?: updatedAt)
 
 /**
  * Merge a pulled item onto the local row, keyed by id.
@@ -149,7 +170,7 @@ fun ItemDto.toItem(businessId: String, local: Item?): Item {
         // of CHANGES with no opening entry, so this is the only thing that makes the
         // ledger add up to an on-hand rather than to "how much this has moved".
         stockBaseQty = onHand,
-        stockBaseAt = IsoTime.toMillis(updatedAt),
+        stockBaseAt = baselineStamp(),
         reorderLevel = reorderLevel.toMoney(),
         unit = unit?.ifBlank { null } ?: base.unit,
         colorHex = colorHex ?: base.colorHex,
@@ -1035,7 +1056,11 @@ fun CashTxn.toMovementPush(sessionId: String?): CashMovementPushDto = CashMoveme
     businessId = businessId,
     sessionId = sessionId,
     type = cashMovementTypeToWire(type, location, amount),
-    amount = amount,
+    // ★ ALWAYS POSITIVE. The shared schema puts the direction in the `type` and reads the
+    // amount as a magnitude — its `effectOn` multiplies a `pay_out` by −1. Sending this
+    // app's signed figure means a $5 payout arrives as −5, is negated again, and ADDS $5
+    // to the expected drawer: a refund that makes the till look fuller than before it.
+    amount = kotlin.math.abs(amount),
     // The cloud calls it `reason`; locally the same text is a free `note`.
     reason = note ?: source,
     createdBy = createdBy,

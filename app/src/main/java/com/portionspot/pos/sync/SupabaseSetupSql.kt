@@ -153,18 +153,46 @@ create index if not exists items_barcode_idx on public.items (business_id, barco
 --
 -- The unique index is PARTIAL (live rows only) so re-tagging a part that was
 -- previously untagged and tombstoned does not collide with the tombstone.
+--
+-- key_norm / value_norm are GENERATED. The DATABASE owns the canonical form so
+-- the two clients can never disagree about what counts as "the same tag" — the
+-- unique index below is built on them, and as plain columns nothing fills them:
+-- every live row indexes (null, null), the constraint stops meaning anything and
+-- a search for "hiace" matches nothing.
 create table if not exists public.item_attributes (
     id                uuid primary key,
     business_id       uuid not null,
     item_id           uuid not null,
     key               text not null,
     value             text not null,
-    key_norm          text,
-    value_norm        text,
+    key_norm          text generated always as (lower(btrim(regexp_replace(key, '\s+', ' ', 'g')))) stored,
+    value_norm        text generated always as (lower(btrim(regexp_replace(value, '\s+', ' ', 'g')))) stored,
     updated_at        timestamptz not null default now(),
     deleted           boolean not null default false,
     client_updated_at timestamptz
 );
+
+-- Upgrade a database created by an earlier run of this script, where the two
+-- columns were plain text. Dropping them loses nothing: every value is derived.
+do ${'$'}${'$'}
+begin
+  if exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'item_attributes'
+      and column_name = 'key_norm' and is_generated <> 'ALWAYS'
+  ) then
+    -- The view and the indexes depend on the columns, so they go first; both are
+    -- recreated further down by this same script.
+    drop view if exists public.pos2_item_attributes;
+    drop index if exists public.uq_item_attributes_live;
+    drop index if exists public.idx_item_attributes_lookup;
+    drop index if exists public.idx_item_attributes_value_trgm;
+    alter table public.item_attributes drop column key_norm, drop column value_norm;
+    alter table public.item_attributes
+      add column key_norm text generated always as (lower(btrim(regexp_replace(key, '\s+', ' ', 'g')))) stored,
+      add column value_norm text generated always as (lower(btrim(regexp_replace(value, '\s+', ' ', 'g')))) stored;
+  end if;
+end ${'$'}${'$'};
 
 create unique index if not exists uq_item_attributes_live
     on public.item_attributes (business_id, item_id, key_norm, value_norm)
@@ -592,6 +620,87 @@ alter table public.businesses add column if not exists omari_phone text;
 alter table public.businesses add column if not exists paynow_integration_id text;
 alter table public.businesses add column if not exists second_currency text;
 alter table public.businesses add column if not exists second_currency_rate numeric default 0;
+
+-- ---------------------------------------------------------------------------
+-- 7.5) TWO CLOCKS, TWO JOBS — the trigger every table needs.
+--
+-- Leaving this out does not break anything loudly. It breaks sync quietly, which
+-- is worse, and it is exactly what happened to the project this section was
+-- written for.
+--
+--   `updated_at` is the SERVER's, and it is what every pull cursor pages on. It
+--   has to be monotonic and immune to a device with a wrong clock. With only a
+--   DEFAULT, that holds for a client which OMITS the column — but a client that
+--   SENDS it writes its own browser clock straight into the cursor column. Two
+--   clients then order the same log by two different clocks: one stamps a row
+--   slightly ahead, the other's cursor jumps past it, and every row behind it is
+--   never pulled again. No error, no retry; a day's takings simply never arrive.
+--
+--   `client_updated_at` is the DEVICE's, and it decides conflicts. Without it
+--   "last write wins" is really "last PUSH wins": a till offline since morning
+--   overwrites an afternoon edit made elsewhere the moment it reconnects,
+--   because its rows get a fresh server timestamp on arrival.
+--
+-- The stale-write guard lives here rather than in either client so that it also
+-- covers direct SQL and any future client.
+-- ---------------------------------------------------------------------------
+create or replace function public.auth_org_role()
+returns text language sql stable set search_path to '' as ${'$'}${'$'}
+  select nullif(auth.jwt() ->> 'org_role', '')
+${'$'}${'$'};
+
+create or replace function public.set_updated_at()
+returns trigger language plpgsql set search_path to '' as ${'$'}${'$'}
+begin
+  -- An update carrying an OLDER client timestamp than the row already has is a
+  -- stale write from a device that has been out of touch. Returning OLD leaves
+  -- the row exactly as it is: the write is IGNORED rather than rejected, so a
+  -- catching-up device is not stuck retrying a batch it can never land.
+  if tg_op = 'UPDATE'
+     and new.client_updated_at is not null
+     and old.client_updated_at is not null
+     and new.client_updated_at < old.client_updated_at then
+    return old;
+  end if;
+
+  new.updated_at := now();
+  -- Defaulted when absent (a client that knows nothing about the column) and
+  -- capped a day ahead, so a clock set to 2049 cannot win every conflict on this
+  -- shop forever.
+  new.client_updated_at := least(coalesce(new.client_updated_at, now()), now() + interval '1 day');
+  return new;
+end;
+${'$'}${'$'};
+
+do ${'$'}${'$'}
+declare t text;
+begin
+  foreach t in array array[
+    'businesses','staff','items','item_attributes','stock_movements','customers','credit_txns',
+    'cash_sessions','cash_movements','sales','sale_items','sale_payments',
+    'refunds','refund_items','refund_payments','mobile_money_receipts',
+    'audit_entries','expenses','suppliers','purchase_orders','purchase_order_items'
+  ] loop
+    execute format('drop trigger if exists %I on public.%I', t || '_set_updated_at', t);
+    execute format(
+      'create trigger %I before insert or update on public.%I ' ||
+      'for each row execute function public.set_updated_at()',
+      t || '_set_updated_at', t
+    );
+  end loop;
+end ${'$'}${'$'};
+
+-- Fuzzy matching for the fitment search ("hiace" finding "Toyota HiAce"). Kept
+-- optional: a project where the extension cannot be installed should still end
+-- up with a working till rather than a failed script.
+do ${'$'}${'$'}
+begin
+  create extension if not exists pg_trgm with schema extensions;
+  create index if not exists idx_item_attributes_value_trgm
+    on public.item_attributes using gin (value_norm extensions.gin_trgm_ops);
+exception when others then
+  raise notice 'pg_trgm not available, skipping the fuzzy tag index: %', sqlerrm;
+end ${'$'}${'$'};
 
 -- ---------------------------------------------------------------------------
 -- 8) Row-level security — one tenant policy per table, matching the live shop.

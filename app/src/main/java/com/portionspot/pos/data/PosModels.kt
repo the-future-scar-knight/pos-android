@@ -165,7 +165,8 @@ data class Item(
     // single sale of 1, because the only movement the device held was the -1.
     //
     // [stockBaseQty] is the shop's own figure (cloud `items.stock_qty`) and
-    // [stockBaseAt] is the cloud row's `updated_at` at the moment it was taken. On-hand
+    // [stockBaseAt] is the cloud row's `client_updated_at` — the DEVICE clock, the same
+    // one `stock_movements.created_at` uses, because the ledger is measured from it. On-hand
     // is then baseline + every movement created AFTER it, which is well-defined however
     // many tills contributed and in whatever order their rows arrive.
     //

@@ -34,6 +34,7 @@ import com.portionspot.pos.sync.wire.CreditDto as WireCreditDto
 import com.portionspot.pos.data.CashSessionDao
 import com.portionspot.pos.data.StockMovementDao
 import com.portionspot.pos.data.stockOnHandFromDelta
+import com.portionspot.pos.data.cashMovementCountedElsewhere
 import com.portionspot.pos.data.planSessionMerge
 import com.portionspot.pos.sync.wire.RefundDto
 import com.portionspot.pos.sync.wire.RefundItemDto
@@ -49,6 +50,7 @@ import com.portionspot.pos.sync.wire.ItemAttributeDto
 import com.portionspot.pos.sync.wire.toItemAttribute
 import com.portionspot.pos.sync.wire.toMoney
 import com.portionspot.pos.sync.wire.ItemDto
+import com.portionspot.pos.sync.wire.baselineStamp
 import com.portionspot.pos.sync.wire.SaleItemDto
 import com.portionspot.pos.sync.wire.SalePaymentDto
 import com.portionspot.pos.sync.wire.toItem
@@ -169,14 +171,31 @@ class PosSyncEngine(
             // whole pass), then pull. Per-table push failures ride back on Success so
             // the UI can name the table and error instead of a blanket "Sync failed".
             val pushResult = push(api)
-            val pulled = pull(api)
+            // ★ NOTHING is pulled until this device knows which shop it belongs to.
+            //
+            // Every pull is filtered on it, and a pull that cannot be filtered returns
+            // every business in the project — which the mappers then stamp as ours. The
+            // till ends up holding another shop's catalogue and counting stock for
+            // products it has never sold, with no error anywhere to say so. Refusing is
+            // recoverable and visible; adopting a stranger's inventory is neither.
+            val cloudBid = config.cloudBusinessId()
+            val pulled = if (cloudBid == null) 0 else pull(api, cloudBid)
+            // Said out loud rather than left as a quiet no-op. With push disabled — the
+            // default on a freshly repointed device — an unidentified shop would
+            // otherwise report a clean pass that moved nothing, every time, forever.
+            val errors = if (cloudBid == null) {
+                pushResult.errors + (
+                    "Waiting to identify this shop in the database. It must hold exactly " +
+                        "one business before this till can sync; check the Sync screen."
+                    )
+            } else pushResult.errors
             val at = System.currentTimeMillis()
             config.setLastSyncAt(at)
             // Split timestamps so the owner can SEE the two directions independently:
             // only stamp a direction that actually moved rows this pass.
             if (pushResult.pushed > 0) config.setLastUploadAt(at)
             if (pulled > 0) config.setLastDownloadAt(at)
-            SyncOutcome.Success(pushResult.pushed, pulled, pushResult.errors)
+            SyncOutcome.Success(pushResult.pushed, pulled, errors)
         } catch (e: Exception) {
             SyncOutcome.Failed(e.message ?: "Sync failed")
         }
@@ -202,7 +221,9 @@ class PosSyncEngine(
             creditDao.pending().size +
             mobileMoneyDao.pending().size +
             stockMovementDao.pending().size +
-            cashTxnDao.pending().size +
+            // Sale and refund drawer movements are never sent (the other side derives
+            // them), so counting them here would promise an upload that cannot happen.
+            cashTxnDao.pending().count { !cashMovementCountedElsewhere(it.refType) } +
             cashSessionDao.pending().size
     }
 
@@ -407,18 +428,28 @@ class PosSyncEngine(
         // category for a movement whose meaning we are guessing at would put real money
         // under the wrong heading in the shop's own cash report.
         pushTable("cash_movements") {
-            val rows = cashTxnDao.pending()
-            if (rows.isEmpty()) return@pushTable 0
+            val pending = cashTxnDao.pending()
+            if (pending.isEmpty()) return@pushTable 0
+            // ★ A sale's and a refund's cash never go up — the other side already counts
+            // them from the tenders and the change, and a second copy doubles the drawer.
+            // See [cashMovementCountedElsewhere].
+            val (counted, ours) = pending.partition { cashMovementCountedElsewhere(it.refType) }
+            // Marked clean without being sent. They are deliberately local-only, and
+            // leaving them pending would park them in the "N to upload" badge forever —
+            // a queue indicator that never empties is worse than none, because the owner
+            // learns to ignore it and then it cannot tell them when something IS stuck.
+            if (counted.isNotEmpty()) cashTxnDao.markSynced(counted.map { it.id })
+            if (ours.isEmpty()) return@pushTable 0
             val openShift = cashSessionDao.openSessions(bid).firstOrNull()?.id
             api.upsert(
                 "cash_movements",
                 syncJson.encodeToString(
-                    rows.map { it.toMovementPush(openShift).copy(businessId = cloudBid) }
+                    ours.map { it.toMovementPush(openShift).copy(businessId = cloudBid) }
                 ),
                 "id",
             )
-            cashTxnDao.markSynced(rows.map { it.id })
-            rows.size
+            cashTxnDao.markSynced(ours.map { it.id })
+            ours.size
         }
 
         // cash_sessions — the shift itself. Pushed AFTER the sales and refunds that
@@ -482,29 +513,29 @@ class PosSyncEngine(
      * Parents before children throughout: customers before the sales and credit rows
      * that reference them, and sale headers before their lines and tenders.
      */
-    private suspend fun pull(api: SupabaseRest): Int {
+    private suspend fun pull(api: SupabaseRest, cloudBid: String): Int {
         val bid = businessDao.getOnce()?.id ?: return 0
         var n = 0
-        n += pullItems(api, bid)
-        n += pullItemAttributes(api, bid)
-        n += pullCustomersWire(api, bid)
-        n += pullSalesWire(api, bid)
-        n += pullSaleItems(api, bid)
-        n += pullSalePayments(api, bid)
+        n += pullItems(api, bid, cloudBid)
+        n += pullItemAttributes(api, bid, cloudBid)
+        n += pullCustomersWire(api, bid, cloudBid)
+        n += pullSalesWire(api, bid, cloudBid)
+        n += pullSaleItems(api, bid, cloudBid)
+        n += pullSalePayments(api, bid, cloudBid)
         // Runs every pass, not just when sales came down: devices that already
         // double-counted need the repair even once their cursor is past those rows.
         healDuplicateSales(bid)
-        n += pullCreditWire(api, bid)
-        n += pullMobileMoney(api, bid)
-        n += pullRefunds(api, bid)
-        n += pullRefundItems(api, bid)
-        n += pullRefundPayments(api, bid)
-        n += pullStockMovements(api, bid)
+        n += pullCreditWire(api, bid, cloudBid)
+        n += pullMobileMoney(api, bid, cloudBid)
+        n += pullRefunds(api, bid, cloudBid)
+        n += pullRefundItems(api, bid, cloudBid)
+        n += pullRefundPayments(api, bid, cloudBid)
+        n += pullStockMovements(api, bid, cloudBid)
         // AFTER the ledger lands: items.stock_qty is a CACHE of these rows, so the
         // pulled cache is only as good as the movements behind it. Recomputing here is
         // what makes another till's sale show up as stock leaving this one.
         recomputeStockFromLedger(bid)
-        n += pullCashSessions(api, bid)
+        n += pullCashSessions(api, bid, cloudBid)
         // AFTER the session pull, because that pull is the moment two tills that were
         // offline from each other finally see each other's shift. Resolving before it
         // would just re-decide a conflict this device cannot yet know exists.
@@ -548,9 +579,9 @@ class PosSyncEngine(
      * skipped rather than being counted as applied, so the cursor is the only thing that
      * moves and a later pass can pick it up if the sale arrives.
      */
-    private suspend fun pullRefunds(api: SupabaseRest, bid: String): Int {
+    private suspend fun pullRefunds(api: SupabaseRest, bid: String, cloudBid: String): Int {
         val rows = syncJson.decodeFromString<List<RefundDto>>(
-            api.selectSince("refunds", config.cursor("refunds"), PAGE)
+            api.selectSince("refunds", cloudBid, config.cursor("refunds"), PAGE)
         )
         if (rows.isEmpty()) return 0
         var applied = 0
@@ -565,9 +596,9 @@ class PosSyncEngine(
         return applied
     }
 
-    private suspend fun pullRefundItems(api: SupabaseRest, bid: String): Int {
+    private suspend fun pullRefundItems(api: SupabaseRest, bid: String, cloudBid: String): Int {
         val rows = syncJson.decodeFromString<List<RefundItemDto>>(
-            api.selectSince("refund_items", config.cursor("refund_items"), PAGE)
+            api.selectSince("refund_items", cloudBid, config.cursor("refund_items"), PAGE)
         )
         if (rows.isEmpty()) return 0
         val live = rows.filter { !it.deleted }
@@ -576,9 +607,9 @@ class PosSyncEngine(
         return live.size
     }
 
-    private suspend fun pullRefundPayments(api: SupabaseRest, bid: String): Int {
+    private suspend fun pullRefundPayments(api: SupabaseRest, bid: String, cloudBid: String): Int {
         val rows = syncJson.decodeFromString<List<RefundPaymentDto>>(
-            api.selectSince("refund_payments", config.cursor("refund_payments"), PAGE)
+            api.selectSince("refund_payments", cloudBid, config.cursor("refund_payments"), PAGE)
         )
         if (rows.isEmpty()) return 0
         val live = rows.filter { !it.deleted }
@@ -589,9 +620,9 @@ class PosSyncEngine(
 
     /** `stock_movements` → the local ledger. Append-only in spirit, upserted by id so a
      *  re-pull after a cursor reset lands on the row it already wrote. */
-    private suspend fun pullStockMovements(api: SupabaseRest, bid: String): Int {
+    private suspend fun pullStockMovements(api: SupabaseRest, bid: String, cloudBid: String): Int {
         val rows = syncJson.decodeFromString<List<StockMovementDto>>(
-            api.selectSince("stock_movements", config.cursor("stock_movements"), PAGE)
+            api.selectSince("stock_movements", cloudBid, config.cursor("stock_movements"), PAGE)
         )
         if (rows.isEmpty()) return 0
         val applied = rows.mapNotNull { it.toStockMovement(bid) }
@@ -635,9 +666,9 @@ class PosSyncEngine(
     }
 
     /** `cash_sessions` → local shifts, keyed by id. */
-    private suspend fun pullCashSessions(api: SupabaseRest, bid: String): Int {
+    private suspend fun pullCashSessions(api: SupabaseRest, bid: String, cloudBid: String): Int {
         val rows = syncJson.decodeFromString<List<CashSessionDto>>(
-            api.selectSince("cash_sessions", config.cursor("cash_sessions"), PAGE)
+            api.selectSince("cash_sessions", cloudBid, config.cursor("cash_sessions"), PAGE)
         )
         if (rows.isEmpty()) return 0
         var applied = 0
@@ -688,9 +719,9 @@ class PosSyncEngine(
      * a second copy of a product the shop already had. Both sides now agree on the uuid,
      * so there is nothing left to guess and no duplicate to heal afterwards.
      */
-    private suspend fun pullItems(api: SupabaseRest, bid: String): Int {
+    private suspend fun pullItems(api: SupabaseRest, bid: String, cloudBid: String): Int {
         val rows = syncJson.decodeFromString<List<ItemDto>>(
-            api.selectSince("items", config.cursor("items"), PAGE)
+            api.selectSince("items", cloudBid, config.cursor("items"), PAGE)
         )
         if (rows.isEmpty()) return 0
         var applied = 0
@@ -709,8 +740,12 @@ class PosSyncEngine(
             // would otherwise never learn a baseline at all. Without one the ledger has
             // nothing to be measured from, which is precisely how a shelf of 2 read as
             // empty after selling 1.
-            if (local.stockBaseAt != stamp) {
-                itemDao.upsert(local.copy(stockBaseQty = dto.stockQty.toMoney(), stockBaseAt = stamp))
+            // Stamped on the CLIENT clock, the one the movements share — see
+            // [ItemDto.baselineStamp]. `stamp` above is the server's and is only good for
+            // ordering the pull.
+            val baseAt = dto.baselineStamp()
+            if (local.stockBaseAt != baseAt) {
+                itemDao.upsert(local.copy(stockBaseQty = dto.stockQty.toMoney(), stockBaseAt = baseAt))
             }
         }
         config.setCursor("items", rows.maxOf { it.updatedAt ?: IsoTime.EPOCH })
@@ -728,9 +763,9 @@ class PosSyncEngine(
      * Tombstones apply like any other row: a fitment deleted on the web must stop matching
      * here, or the till keeps offering a part for a car the shop has decided it does not fit.
      */
-    private suspend fun pullItemAttributes(api: SupabaseRest, bid: String): Int {
+    private suspend fun pullItemAttributes(api: SupabaseRest, bid: String, cloudBid: String): Int {
         val body = try {
-            api.selectSince("item_attributes", config.cursor("item_attributes"), PAGE)
+            api.selectSince("item_attributes", cloudBid, config.cursor("item_attributes"), PAGE)
         } catch (e: IOException) {
             // A database that predates this table must not lose its SALES over its tags.
             // Tags are enrichment — every other pull in this pass is money — so a missing
@@ -751,9 +786,9 @@ class PosSyncEngine(
         return apply.size
     }
 
-    private suspend fun pullCustomersWire(api: SupabaseRest, bid: String): Int {
+    private suspend fun pullCustomersWire(api: SupabaseRest, bid: String, cloudBid: String): Int {
         val rows = syncJson.decodeFromString<List<WireCustomerDto>>(
-            api.selectSince("customers", config.cursor("customers"), PAGE)
+            api.selectSince("customers", cloudBid, config.cursor("customers"), PAGE)
         )
         if (rows.isEmpty()) return 0
         var applied = 0
@@ -769,9 +804,9 @@ class PosSyncEngine(
     }
 
     /** `sales` → local sale HEADERS. Lines and tenders arrive on their own cursors. */
-    private suspend fun pullSalesWire(api: SupabaseRest, bid: String): Int {
+    private suspend fun pullSalesWire(api: SupabaseRest, bid: String, cloudBid: String): Int {
         val rows = syncJson.decodeFromString<List<WireSaleDto>>(
-            api.selectSince("sales", config.cursor("sales"), PAGE)
+            api.selectSince("sales", cloudBid, config.cursor("sales"), PAGE)
         )
         if (rows.isEmpty()) return 0
         var applied = 0
@@ -791,9 +826,9 @@ class PosSyncEngine(
         return applied
     }
 
-    private suspend fun pullSaleItems(api: SupabaseRest, bid: String): Int {
+    private suspend fun pullSaleItems(api: SupabaseRest, bid: String, cloudBid: String): Int {
         val rows = syncJson.decodeFromString<List<SaleItemDto>>(
-            api.selectSince("sale_items", config.cursor("sale_items"), PAGE)
+            api.selectSince("sale_items", cloudBid, config.cursor("sale_items"), PAGE)
         )
         if (rows.isEmpty()) return 0
         // The cloud row carries every field a SaleLine has, so it is applied whole rather
@@ -805,9 +840,9 @@ class PosSyncEngine(
         return toApply.size
     }
 
-    private suspend fun pullSalePayments(api: SupabaseRest, bid: String): Int {
+    private suspend fun pullSalePayments(api: SupabaseRest, bid: String, cloudBid: String): Int {
         val rows = syncJson.decodeFromString<List<SalePaymentDto>>(
-            api.selectSince("sale_payments", config.cursor("sale_payments"), PAGE)
+            api.selectSince("sale_payments", cloudBid, config.cursor("sale_payments"), PAGE)
         )
         if (rows.isEmpty()) return 0
         // A tender is append-only in practice; a deleted one is dropped rather than
@@ -820,9 +855,9 @@ class PosSyncEngine(
 
     /** `credit_txns` → the local credit ledger. Note the table name: the old engine
      *  asked for `credit_transactions`, which has never existed on the web schema. */
-    private suspend fun pullCreditWire(api: SupabaseRest, bid: String): Int {
+    private suspend fun pullCreditWire(api: SupabaseRest, bid: String, cloudBid: String): Int {
         val rows = syncJson.decodeFromString<List<WireCreditDto>>(
-            api.selectSince("credit_txns", config.cursor("credit_txns"), PAGE)
+            api.selectSince("credit_txns", cloudBid, config.cursor("credit_txns"), PAGE)
         )
         if (rows.isEmpty()) return 0
         var applied = 0
@@ -843,9 +878,9 @@ class PosSyncEngine(
      * DTO->entity merge PRESERVES the device-local `applied` flag on the cashier side (a
      * cashier can't UPDATE the cloud row, so a cloud `false` must not clobber a local apply).
      */
-    private suspend fun pullStaffRequests(api: SupabaseRest, bid: String): Int {
+    private suspend fun pullStaffRequests(api: SupabaseRest, bid: String, cloudBid: String): Int {
         val rows = syncJson.decodeFromString<List<StaffRequestDto>>(
-            api.selectSince("staff_requests", config.cursor("staff_requests"), PAGE)
+            api.selectSince("staff_requests", cloudBid, config.cursor("staff_requests"), PAGE)
         )
         if (rows.isEmpty()) return 0
         var applied = 0
@@ -867,9 +902,9 @@ class PosSyncEngine(
      * re-pull after a cursor reset is a no-op instead of a rewrite. Inserted rows land
      * with `pendingSync = false` so they are not bounced straight back up.
      */
-    private suspend fun pullAudit(api: SupabaseRest, bid: String): Int {
+    private suspend fun pullAudit(api: SupabaseRest, bid: String, cloudBid: String): Int {
         val rows = syncJson.decodeFromString<List<AuditDto>>(
-            api.selectSince("audit_log", config.cursor("audit_log"), PAGE)
+            api.selectSince("audit_log", cloudBid, config.cursor("audit_log"), PAGE)
         )
         if (rows.isEmpty()) return 0
         // One row per local_id (defensive: the column is unique, but a legacy/foreign
@@ -897,9 +932,9 @@ class PosSyncEngine(
      * is updated in place (the local `id` and the device-local `pushedAt` survive); a
      * miss is inserted. Last-write-wins on `updated_at`, same as every other table.
      */
-    private suspend fun pullNotifications(api: SupabaseRest, bid: String): Int {
+    private suspend fun pullNotifications(api: SupabaseRest, bid: String, cloudBid: String): Int {
         val rows = syncJson.decodeFromString<List<NotificationDto>>(
-            api.selectSince("notifications", config.cursor("notifications"), PAGE)
+            api.selectSince("notifications", cloudBid, config.cursor("notifications"), PAGE)
         )
         if (rows.isEmpty()) return 0
         var applied = 0
@@ -916,9 +951,9 @@ class PosSyncEngine(
     }
 
     /** expenses → local expenses, bridged by local_id. */
-    private suspend fun pullExpenses(api: SupabaseRest, bid: String): Int {
+    private suspend fun pullExpenses(api: SupabaseRest, bid: String, cloudBid: String): Int {
         val rows = syncJson.decodeFromString<List<ExpenseDto>>(
-            api.selectSince("expenses", config.cursor("expenses"), PAGE)
+            api.selectSince("expenses", cloudBid, config.cursor("expenses"), PAGE)
         )
         if (rows.isEmpty()) return 0
         var applied = 0
@@ -934,9 +969,9 @@ class PosSyncEngine(
     }
 
     /** cash_txns → local cash ledger, bridged by local_id. */
-    private suspend fun pullCashTxns(api: SupabaseRest, bid: String): Int {
+    private suspend fun pullCashTxns(api: SupabaseRest, bid: String, cloudBid: String): Int {
         val rows = syncJson.decodeFromString<List<CashTxnDto>>(
-            api.selectSince("cash_txns", config.cursor("cash_txns"), PAGE)
+            api.selectSince("cash_txns", cloudBid, config.cursor("cash_txns"), PAGE)
         )
         if (rows.isEmpty()) return 0
         var applied = 0
@@ -952,9 +987,9 @@ class PosSyncEngine(
     }
 
     /** suppliers → local suppliers, bridged by local_id. */
-    private suspend fun pullSuppliers(api: SupabaseRest, bid: String): Int {
+    private suspend fun pullSuppliers(api: SupabaseRest, bid: String, cloudBid: String): Int {
         val rows = syncJson.decodeFromString<List<SupplierDto>>(
-            api.selectSince("suppliers", config.cursor("suppliers"), PAGE)
+            api.selectSince("suppliers", cloudBid, config.cursor("suppliers"), PAGE)
         )
         if (rows.isEmpty()) return 0
         var applied = 0
@@ -970,9 +1005,9 @@ class PosSyncEngine(
     }
 
     /** purchase_orders → local POs, bridged by local_id. */
-    private suspend fun pullPurchaseOrders(api: SupabaseRest, bid: String): Int {
+    private suspend fun pullPurchaseOrders(api: SupabaseRest, bid: String, cloudBid: String): Int {
         val rows = syncJson.decodeFromString<List<PurchaseOrderDto>>(
-            api.selectSince("purchase_orders", config.cursor("purchase_orders"), PAGE)
+            api.selectSince("purchase_orders", cloudBid, config.cursor("purchase_orders"), PAGE)
         )
         if (rows.isEmpty()) return 0
         var applied = 0
@@ -992,9 +1027,9 @@ class PosSyncEngine(
      * header by `po_local_id`. A line whose header hasn't arrived yet is still applied
      * (the link is a plain value, no FK), so it can never be silently dropped.
      */
-    private suspend fun pullPurchaseOrderLines(api: SupabaseRest): Int {
+    private suspend fun pullPurchaseOrderLines(api: SupabaseRest, cloudBid: String): Int {
         val rows = syncJson.decodeFromString<List<PurchaseOrderLineDto>>(
-            api.selectSince("purchase_order_items", config.cursor("purchase_order_items"), PAGE)
+            api.selectSince("purchase_order_items", cloudBid, config.cursor("purchase_order_items"), PAGE)
         )
         if (rows.isEmpty()) return 0
         var applied = 0
@@ -1019,9 +1054,9 @@ class PosSyncEngine(
 
     /** credit_transactions → credit, bridging customer_id(bigint)→customers.local_id.
      *  Rows whose customer can't be resolved are skipped (kept for a later pass). */
-    private suspend fun pullCredit(api: SupabaseRest, bid: String): Int {
+    private suspend fun pullCredit(api: SupabaseRest, bid: String, cloudBid: String): Int {
         val rows = syncJson.decodeFromString<List<CreditDto>>(
-            api.selectSince("credit_transactions", config.cursor("credit_transactions"), PAGE)
+            api.selectSince("credit_transactions", cloudBid, config.cursor("credit_transactions"), PAGE)
         )
         if (rows.isEmpty()) return 0
         val cloudIdToLocal = customerIdMap(api)
@@ -1041,9 +1076,9 @@ class PosSyncEngine(
     }
 
     /** mobile_money_receipts → local, deduped by txn_code (the idempotency key). */
-    private suspend fun pullMobileMoney(api: SupabaseRest, bid: String): Int {
+    private suspend fun pullMobileMoney(api: SupabaseRest, bid: String, cloudBid: String): Int {
         val rows = syncJson.decodeFromString<List<MobileMoneyDto>>(
-            api.selectSince("mobile_money_receipts", config.cursor("mobile_money_receipts"), PAGE)
+            api.selectSince("mobile_money_receipts", cloudBid, config.cursor("mobile_money_receipts"), PAGE)
         )
         if (rows.isEmpty()) return 0
         var applied = 0
@@ -1073,9 +1108,9 @@ class PosSyncEngine(
      * duplicated (from earlier connects, before this broader bridge) so the shop doesn't
      * keep seeing two of everything.
      */
-    private suspend fun pullProducts(api: SupabaseRest, bid: String): Int {
+    private suspend fun pullProducts(api: SupabaseRest, bid: String, cloudBid: String): Int {
         val rows = syncJson.decodeFromString<List<ProductDto>>(
-            api.selectSince("products", config.cursor("products"), PAGE)
+            api.selectSince("products", cloudBid, config.cursor("products"), PAGE)
         )
         if (rows.isEmpty()) return 0
         val localAll = itemDao.allForBusinessOnce(bid)
@@ -1120,9 +1155,9 @@ class PosSyncEngine(
     }
 
     /** customers → customers, bridged by local_id (= the Android UUID). */
-    private suspend fun pullCustomers(api: SupabaseRest, bid: String): Int {
+    private suspend fun pullCustomers(api: SupabaseRest, bid: String, cloudBid: String): Int {
         val rows = syncJson.decodeFromString<List<CustomerDto>>(
-            api.selectSince("customers", config.cursor("customers"), PAGE)
+            api.selectSince("customers", cloudBid, config.cursor("customers"), PAGE)
         )
         if (rows.isEmpty()) return 0
         var applied = 0
@@ -1161,9 +1196,9 @@ class PosSyncEngine(
      * case of a device pulling back the row it just pushed, where the two stamps are
      * equal and nothing is touched.
      */
-    private suspend fun pullSales(api: SupabaseRest, bid: String): Int {
+    private suspend fun pullSales(api: SupabaseRest, bid: String, cloudBid: String): Int {
         val rows = syncJson.decodeFromString<List<SaleDto>>(
-            api.selectSince("sales", config.cursor("sales"), PAGE)
+            api.selectSince("sales", cloudBid, config.cursor("sales"), PAGE)
         )
         if (rows.isEmpty()) return 0
         // sku → local item id, so pulled sale lines join to the catalog for reports.

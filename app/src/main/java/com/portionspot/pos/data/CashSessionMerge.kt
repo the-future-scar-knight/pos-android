@@ -106,6 +106,24 @@ data class SessionMerge<T : MergeableSession>(
  * `pay_in`/`pay_out` by sign, which is the honest fallback: the money definitely moved
  * in that direction, and the shop can see it, even if the finer category is lost.
  */
+/**
+ * Is this movement's cash ALREADY counted by the other client, from the sale or refund
+ * it belongs to?
+ *
+ * The shared cash-up derives takings from the tenders (`sale_payments`), the change from
+ * `sales.change_due` and payouts from `refund_payments`, and its own screen says so:
+ * "Only cash that moves for a reason other than a sale. Sales, refunds and change are
+ * already counted." This app ALSO writes a drawer movement for each of those, because it
+ * models cash-on-hand as one ledger — so pushing them adds a second copy of money the
+ * shop already counted once, and the expected drawer comes out double.
+ *
+ * Everything else — a pay-in, a petty spend, a bank drop, a float top-up — has no other
+ * representation on that side and must go up, or a shop doing its cash-up on the web
+ * cannot see cash a phone moved.
+ */
+fun cashMovementCountedElsewhere(refType: String?): Boolean =
+    refType == "sale" || refType == "refund"
+
 fun cashMovementTypeToWire(localType: String, location: String, amount: Double): String =
     when (localType.trim().lowercase()) {
         "drop" -> "drop"
