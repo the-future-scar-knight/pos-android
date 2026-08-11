@@ -1138,6 +1138,72 @@ data class PurchaseOrderWithLines(
 )
 
 /**
+ * The shared schema's word for a purchase order's state.
+ *
+ * `purchase_orders.status` is CHECK-constrained on the cloud to exactly
+ *
+ *     draft · sent · received · cancelled
+ *
+ * and this app writes two words that are not on that list: `placed` (the order has gone
+ * to the supplier) and `partial` (some of it has arrived). A CHECK violation fails the
+ * WHOLE upsert batch rather than the offending row, so one PO in a state the cloud has
+ * never heard of would take every other PO in the push down with it.
+ *
+ * Both collapse to `sent`, which is what the shared schema calls "ordered, not yet fully
+ * received". Anything unrecognised falls back to `draft` instead of travelling as-is: an
+ * unknown value is precisely the one that would be illegal, and a PO that arrives on the
+ * other client as a draft is visibly wrong, where a rejected batch is silently missing.
+ */
+fun purchaseOrderStatusToWire(localStatus: String): String =
+    when (localStatus.trim().lowercase()) {
+        "draft" -> "draft"
+        "sent", "placed", "partial" -> "sent"
+        "received" -> "received"
+        "cancelled", "canceled" -> "cancelled"
+        else -> "draft"
+    }
+
+/**
+ * The local word for a purchase order's state, given what the wire says and what this
+ * device already believed.
+ *
+ * The translation is LOSSY in one direction — `placed` and `partial` both go up as
+ * `sent` — so coming back it has to be told what it is landing on. A half-received order
+ * whose local status is `partial` KEEPS it when the wire says `sent`; without that, every
+ * pull would quietly reset it to `placed` and the shop could receive the same goods a
+ * second time, restocking stock that is already on the shelf.
+ *
+ * An unrecognised wire value keeps whatever the device had rather than inventing a state:
+ * a PO whose status we cannot read is not evidence that it went back to draft.
+ */
+fun purchaseOrderStatusFromWire(wireStatus: String, localStatus: String?): String =
+    when (wireStatus.trim().lowercase()) {
+        "sent" -> if (localStatus?.trim()?.lowercase() == "partial") "partial" else "placed"
+        "draft" -> "draft"
+        "received" -> "received"
+        "cancelled", "canceled" -> "cancelled"
+        else -> localStatus?.ifBlank { null } ?: "draft"
+    }
+
+/** Exactly the 8-4-4-4-12 hex shape Postgres will accept for a `uuid` column. */
+private val UUID_SHAPE =
+    Regex("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+/**
+ * [raw] if it really is a uuid, else null.
+ *
+ * Several cloud columns this app fills are `uuid` while the local field beside them is a
+ * free String — `purchase_orders.supplier_id` most of all, which can hold anything a
+ * caller put there. Postgres rejects a value that is not a uuid outright and takes the
+ * whole batch with it, so one that cannot be one is sent as NULL instead: losing a link
+ * is recoverable and visible, losing every row in the push is neither.
+ *
+ * `java.util.UUID.fromString` is deliberately NOT used — it accepts short forms like
+ * "1-1-1-1-1" that Postgres also accepts but that no row on either side ever means.
+ */
+fun uuidOrNull(raw: String?): String? = raw?.trim()?.takeIf { UUID_SHAPE.matches(it) }
+
+/**
  * A parsed mobile-money confirmation SMS (prompt §6 — the flagship reconciliation
  * feature). One row per incoming payment message (EcoCash primarily; OneMoney,
  * InnBucks, Omari and bank alerts add by a parser RULE, not new columns).

@@ -2,15 +2,24 @@ package com.portionspot.pos.sync.wire
 
 import com.portionspot.pos.sync.IsoTime
 import com.portionspot.pos.sync.normalizeProductType
+import com.portionspot.pos.sync.syncJson
+import com.portionspot.pos.data.AuditEntry
 import com.portionspot.pos.data.CashSession
 import com.portionspot.pos.data.CashTxn
 import com.portionspot.pos.data.CreditTxn
 import com.portionspot.pos.data.cashMovementTypeToWire
 import com.portionspot.pos.data.Customer
+import com.portionspot.pos.data.Expense
 import com.portionspot.pos.data.Item
 import com.portionspot.pos.data.ItemAttribute
 import com.portionspot.pos.data.MobileMoneyReceipt
+import com.portionspot.pos.data.PurchaseOrder
+import com.portionspot.pos.data.PurchaseOrderLine
 import com.portionspot.pos.data.attrNorm
+import com.portionspot.pos.data.now
+import com.portionspot.pos.data.purchaseOrderStatusFromWire
+import com.portionspot.pos.data.purchaseOrderStatusToWire
+import com.portionspot.pos.data.uuidOrNull
 import com.portionspot.pos.data.Refund
 import com.portionspot.pos.data.RefundLine
 import com.portionspot.pos.data.RefundPayment
@@ -18,10 +27,14 @@ import com.portionspot.pos.data.SaleEntity
 import com.portionspot.pos.data.SaleLine
 import com.portionspot.pos.data.SalePayment
 import com.portionspot.pos.data.StockMovement
+import com.portionspot.pos.data.Supplier
 import com.portionspot.pos.data.saleLineDiscountTotal
 import com.portionspot.pos.data.saleMarginFromLines
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonPrimitive
 
 /**
  * Sync DTOs for the REAL shared schema — the one the web POS actually runs on, verified
@@ -1307,4 +1320,451 @@ fun CreditTxn.toPush(): CreditPushDto = CreditPushDto(
     createdAt = IsoTime.toIso(createdAt),
     deleted = deleted,
     clientUpdatedAt = IsoTime.toIso(updatedAt),
+)
+
+// ────────────────────────────────── suppliers ──────────────────────────────────
+// The simplest of the five and the pattern the rest follow: uuid key, ten columns, no
+// generated column, no vocabulary to translate.
+
+@Serializable
+data class SupplierDto(
+    val id: String,
+    val name: String? = null,
+    val phone: String? = null,
+    val email: String? = null,
+    val address: String? = null,
+    val notes: String? = null,
+    @SerialName("updated_at") val updatedAt: String? = null,
+    val deleted: Boolean = false,
+)
+
+/**
+ * Merge a pulled supplier onto the local row.
+ *
+ * `createdAt` and `localId` have NO cloud column, so they come from [local] untouched —
+ * a pull must never blank what the device knows and the shared schema has no opinion
+ * about. On a first pull `createdAt` takes the entity's own default (now), which is the
+ * honest answer to "when did this device first hear of this supplier".
+ */
+fun SupplierDto.toSupplier(businessId: String, local: Supplier?): Supplier {
+    val base = local ?: Supplier(id = id, businessId = businessId, name = name.orEmpty())
+    return base.copy(
+        id = id,
+        businessId = businessId,
+        name = name?.ifBlank { null } ?: base.name,
+        phone = phone,
+        email = email,
+        address = address,
+        notes = notes,
+        updatedAt = IsoTime.toMillis(updatedAt),
+        deleted = deleted,
+        pendingSync = false,
+    )
+}
+
+@Serializable
+data class SupplierPushDto(
+    val id: String,
+    @SerialName("business_id") val businessId: String,
+    val name: String,
+    val phone: String? = null,
+    val email: String? = null,
+    val address: String? = null,
+    val notes: String? = null,
+    val deleted: Boolean = false,
+    @SerialName("client_updated_at") val clientUpdatedAt: String,
+)
+
+fun Supplier.toPush(): SupplierPushDto = SupplierPushDto(
+    id = id,
+    businessId = businessId,
+    // NOT NULL on the cloud. A supplier with no name is a data-entry accident, not a
+    // reason to fail the batch every other supplier is riding in.
+    name = name.ifBlank { "Supplier" },
+    phone = phone?.ifBlank { null },
+    email = email?.ifBlank { null },
+    address = address?.ifBlank { null },
+    notes = notes?.ifBlank { null },
+    deleted = deleted,
+    clientUpdatedAt = IsoTime.toIso(updatedAt),
+)
+
+// ─────────────────────────────────── expenses ───────────────────────────────────
+// NINE columns on the cloud against THIRTY-ONE fields locally. The approval lifecycle,
+// the cash/payable/capital funding split and the whole recurrence engine have no home on
+// the shared schema, which is why the pull below is a MERGE onto the local row and not a
+// replacement: applying a wire row wholesale would wipe every one of them.
+
+@Serializable
+data class ExpenseDto(
+    val id: String,
+    val category: String? = null,
+    val amount: String? = null,
+    /** A real Postgres DATE, so it arrives as "yyyy-MM-dd" — which is exactly how this
+     *  app already stores it. It is NOT a timestamp and must never go through [IsoTime];
+     *  parsing it as one yields 0 and buckets the cost on 1 January 1970. */
+    val date: String? = null,
+    val description: String? = null,
+    @SerialName("updated_at") val updatedAt: String? = null,
+    val deleted: Boolean = false,
+)
+
+/**
+ * Merge a pulled expense onto the local row — only the five fields the shared table
+ * actually has. Everything else on [Expense] is preserved from [local].
+ *
+ * ★ A row authored on the WEB arrives with no lifecycle at all, because the shared table
+ * has no column for one. Left at the entity's defaults it would land as `status =
+ * "pending"`, and a pending expense is invisible to the dashboard's net-profit line and
+ * sits in the admin's approval queue forever waiting for a decision about a cost that was
+ * already incurred somewhere else. So a FIRST pull synthesises the only reading that
+ * makes sense: approved and posted, stamped with the row's own clock.
+ *
+ * The funding split is deliberately left at zero rather than booked to cash. There is no
+ * `cash_txns` row on this device for money another client spent, so claiming it came out
+ * of this drawer would make the shop's cash-on-hand disagree with the money in it.
+ */
+fun ExpenseDto.toExpense(businessId: String, local: Expense?): Expense {
+    val stamp = IsoTime.toMillis(updatedAt)
+    val base = local ?: Expense(
+        id = id,
+        businessId = businessId,
+        date = date?.ifBlank { null }.orEmpty(),
+        status = "approved",
+        approvedAt = stamp.takeIf { it > 0 },
+        postedAt = stamp.takeIf { it > 0 },
+        createdAt = stamp.takeIf { it > 0 } ?: now(),
+    )
+    return base.copy(
+        id = id,
+        businessId = businessId,
+        category = category?.ifBlank { null } ?: base.category,
+        amount = amount.toMoney(),
+        date = date?.ifBlank { null } ?: base.date,
+        description = description,
+        updatedAt = stamp,
+        deleted = deleted,
+        pendingSync = false,
+    )
+}
+
+@Serializable
+data class ExpensePushDto(
+    val id: String,
+    @SerialName("business_id") val businessId: String,
+    val category: String? = null,
+    val amount: Double,
+    /** Straight through: both sides speak "yyyy-MM-dd". */
+    val date: String? = null,
+    val description: String? = null,
+    val deleted: Boolean = false,
+    @SerialName("client_updated_at") val clientUpdatedAt: String,
+)
+
+fun Expense.toPush(): ExpensePushDto = ExpensePushDto(
+    id = id,
+    businessId = businessId,
+    category = category.ifBlank { null },
+    amount = amount,
+    date = date.ifBlank { null },
+    description = description?.ifBlank { null },
+    deleted = deleted,
+    clientUpdatedAt = IsoTime.toIso(updatedAt),
+)
+
+// ───────────────────────────────── audit_entries ─────────────────────────────────
+// The cloud table is `audit_entries`; the LOCAL Room table is `audit_log`. Append-only in
+// spirit on both sides.
+//
+// ★ `meta` is JSONB on the cloud and a JSON *string* on this side. Declaring the DTO
+// field `String?` compiles perfectly and then fails at RUNTIME the first time a real row
+// comes down, because kotlinx cannot decode a JSON object into a String — and going up it
+// would double-encode, storing the text of the JSON rather than the JSON. It travels as a
+// [JsonElement] and is rendered back to the local string form with `toString()`.
+
+/**
+ * Local meta text → a jsonb value.
+ *
+ * ★ On THIS side the column is free text, not JSON: everything the app writes into it is
+ * a human note ("$12.50", "qty 2 → 3; price 8.00 → 7.50", "No line changes"). Only text
+ * SHAPED like a JSON object or array is sent as structured jsonb; the rest travels as a
+ * JSON string, so it comes home byte for byte.
+ *
+ * Handing every value to a lenient parser instead would quietly rewrite a note of "12.50"
+ * as the NUMBER 12.5 and hand it back as "12.5" — a shop's audit trail editing itself.
+ */
+private fun String?.toWireMeta(): JsonElement? {
+    val raw = this?.trim()?.ifBlank { null } ?: return null
+    val structured = (raw.startsWith("{") && raw.endsWith("}")) ||
+        (raw.startsWith("[") && raw.endsWith("]"))
+    if (!structured) return JsonPrimitive(raw)
+    // Shaped like JSON but not parseable — a note that merely begins with a brace. It
+    // still travels, as text: losing an audit entry over its punctuation is the worse bug.
+    return runCatching { syncJson.parseToJsonElement(raw) }.getOrNull() ?: JsonPrimitive(raw)
+}
+
+/**
+ * A jsonb value → the local meta text. SQL NULL and JSON `null` both read as absent.
+ *
+ * ★ A jsonb STRING unwraps to its CONTENT. `toString()` would hand back the quoted form,
+ * so a plain note would come home as `"No line changes"`, quotes and all, and grow another
+ * pair on every round trip after that.
+ */
+private fun JsonElement?.toLocalMeta(): String? {
+    val el = this?.takeIf { it !is JsonNull } ?: return null
+    if (el is JsonPrimitive && el.isString) return el.content
+    return el.toString()
+}
+
+@Serializable
+data class AuditEntryDto(
+    val id: String,
+    val action: String? = null,
+    @SerialName("entity_type") val entityType: String? = null,
+    /** `text` on the cloud, NOT `uuid` — an audit entry can point at anything, including
+     *  a row that no longer exists, so it is never validated as a key. */
+    @SerialName("entity_id") val entityId: String? = null,
+    val summary: String? = null,
+    val meta: JsonElement? = null,
+    @SerialName("created_by") val createdBy: String? = null,
+    @SerialName("created_by_name") val createdByName: String? = null,
+    @SerialName("created_at") val createdAt: String? = null,
+    @SerialName("updated_at") val updatedAt: String? = null,
+    val deleted: Boolean = false,
+) {
+    fun cursorStamp(): String = updatedAt ?: createdAt ?: IsoTime.EPOCH
+}
+
+/**
+ * Wire row → local trail entry. No merge parameter: an entry this device already holds is
+ * never rewritten (see PosSyncEngine.pullAudit), so there is nothing to fold onto.
+ */
+fun AuditEntryDto.toAuditEntry(businessId: String): AuditEntry {
+    val created = IsoTime.toMillis(createdAt).takeIf { it > 0 }
+        ?: IsoTime.toMillis(cursorStamp())
+    return AuditEntry(
+        id = id,
+        businessId = businessId,
+        // NOT NULL on the cloud, but a row written by another client could still be blank.
+        action = action?.ifBlank { null } ?: "unknown",
+        entityType = entityType,
+        entityId = entityId,
+        summary = summary.orEmpty(),
+        meta = meta.toLocalMeta(),
+        createdBy = createdBy,
+        createdByName = createdByName,
+        createdAt = created,
+        updatedAt = IsoTime.toMillis(cursorStamp()).takeIf { it > 0 } ?: created,
+        pendingSync = false,
+    )
+}
+
+/**
+ * ★ `deleted` IS ABSENT, and that is deliberate. [AuditEntry] has no such field, so this
+ * side has no opinion about it — and PostgREST only writes the columns a payload names,
+ * so leaving it out preserves whatever the cloud row already says instead of resurrecting
+ * an entry somebody tombstoned there.
+ */
+@Serializable
+data class AuditEntryPushDto(
+    val id: String,
+    @SerialName("business_id") val businessId: String,
+    val action: String,
+    @SerialName("entity_type") val entityType: String? = null,
+    @SerialName("entity_id") val entityId: String? = null,
+    val summary: String? = null,
+    val meta: JsonElement? = null,
+    @SerialName("created_by") val createdBy: String? = null,
+    @SerialName("created_by_name") val createdByName: String? = null,
+    @SerialName("created_at") val createdAt: String,
+    @SerialName("client_updated_at") val clientUpdatedAt: String,
+)
+
+fun AuditEntry.toPush(): AuditEntryPushDto = AuditEntryPushDto(
+    id = id,
+    businessId = businessId,
+    action = action.ifBlank { "unknown" },
+    entityType = entityType,
+    entityId = entityId,
+    summary = summary.ifBlank { null },
+    meta = meta.toWireMeta(),
+    createdBy = createdBy,
+    createdByName = createdByName,
+    createdAt = IsoTime.toIso(createdAt),
+    clientUpdatedAt = IsoTime.toIso(if (updatedAt > 0) updatedAt else createdAt),
+)
+
+// ─────────────────────────────── purchase_orders ───────────────────────────────
+// The riskiest of the five. Two things here fail the WHOLE batch rather than one row:
+//
+//  1. `status` is CHECK-constrained to draft/sent/received/cancelled, and this app writes
+//     `placed` and `partial` — see [purchaseOrderStatusToWire].
+//  2. `supplier_id` is a `uuid` column and the local field is a free String — see
+//     [uuidOrNull].
+//
+// The local money fields (`cashPaid`, `capitalPaid`, `payableRemainder`), the arrival
+// prompt (`eta`, `arrivalPromptedAt`) and `localId` have no cloud column at all and are
+// preserved from the local row on every pull.
+
+@Serializable
+data class PurchaseOrderDto(
+    val id: String,
+    val ref: String? = null,
+    @SerialName("supplier_id") val supplierId: String? = null,
+    @SerialName("supplier_name") val supplierName: String? = null,
+    val status: String = "draft",
+    val notes: String? = null,
+    @SerialName("created_at") val createdAt: String? = null,
+    @SerialName("sent_at") val sentAt: String? = null,
+    @SerialName("received_at") val receivedAt: String? = null,
+    @SerialName("updated_at") val updatedAt: String? = null,
+    val deleted: Boolean = false,
+) {
+    fun cursorStamp(): String = updatedAt ?: createdAt ?: IsoTime.EPOCH
+}
+
+fun PurchaseOrderDto.toPurchaseOrder(businessId: String, local: PurchaseOrder?): PurchaseOrder {
+    val base = local ?: PurchaseOrder(
+        id = id,
+        businessId = businessId,
+        ref = ref?.ifBlank { null } ?: "PO-${id.take(8)}",
+    )
+    return base.copy(
+        id = id,
+        businessId = businessId,
+        ref = ref?.ifBlank { null } ?: base.ref,
+        supplierId = supplierId?.ifBlank { null } ?: base.supplierId,
+        supplierName = supplierName?.ifBlank { null } ?: base.supplierName,
+        // ★ Told what it is landing on, because the trip up was lossy: a `partial` order
+        // comes back as `sent` and must STAY partial, or a half-received PO reverts to
+        // "placed" and the same goods can be received twice.
+        status = purchaseOrderStatusFromWire(status, local?.status),
+        notes = notes ?: base.notes,
+        createdAt = IsoTime.toMillis(createdAt).takeIf { it > 0 } ?: base.createdAt,
+        sentAt = IsoTime.toMillis(sentAt).takeIf { it > 0 } ?: base.sentAt,
+        receivedAt = IsoTime.toMillis(receivedAt).takeIf { it > 0 } ?: base.receivedAt,
+        updatedAt = IsoTime.toMillis(cursorStamp()),
+        deleted = deleted,
+        pendingSync = false,
+    )
+}
+
+@Serializable
+data class PurchaseOrderPushDto(
+    val id: String,
+    @SerialName("business_id") val businessId: String,
+    val ref: String? = null,
+    @SerialName("supplier_id") val supplierId: String? = null,
+    @SerialName("supplier_name") val supplierName: String? = null,
+    val status: String,
+    val notes: String? = null,
+    @SerialName("created_at") val createdAt: String,
+    @SerialName("sent_at") val sentAt: String? = null,
+    @SerialName("received_at") val receivedAt: String? = null,
+    val deleted: Boolean = false,
+    @SerialName("client_updated_at") val clientUpdatedAt: String,
+)
+
+fun PurchaseOrder.toPush(): PurchaseOrderPushDto = PurchaseOrderPushDto(
+    id = id,
+    businessId = businessId,
+    ref = ref.ifBlank { null },
+    // Nulled rather than sent as-is when it is not a uuid: the column is `uuid`, and
+    // Postgres rejecting one value takes every other PO in the batch with it.
+    supplierId = uuidOrNull(supplierId),
+    supplierName = supplierName.ifBlank { null },
+    status = purchaseOrderStatusToWire(status),
+    notes = notes?.ifBlank { null },
+    createdAt = IsoTime.toIso(createdAt),
+    sentAt = sentAt?.let { IsoTime.toIso(it) },
+    receivedAt = receivedAt?.let { IsoTime.toIso(it) },
+    deleted = deleted,
+    clientUpdatedAt = IsoTime.toIso(updatedAt),
+)
+
+// ──────────────────────────── purchase_order_items ────────────────────────────
+// The PO's lines. Two shapes to keep in mind:
+//
+//  • the cloud REQUIRES `business_id` and [PurchaseOrderLine] has no such field, so it is
+//    injected on push exactly like [SaleItemPushDto]'s;
+//  • the line has no clock of its own on this side — it only ever changes as part of a PO
+//    write — so `client_updated_at` comes from the parent order.
+//
+// `sellPrice`, `stockOnArrival`, `productType` and `localId` have no cloud column and are
+// preserved from the local row.
+
+@Serializable
+data class PurchaseOrderItemDto(
+    val id: String,
+    @SerialName("po_id") val poId: String,
+    @SerialName("item_id") val itemId: String? = null,
+    val name: String? = null,
+    val sku: String? = null,
+    val qty: String? = null,
+    @SerialName("unit_cost") val unitCost: String? = null,
+    /** Nullable `numeric`: NULL means NOT YET RECEIVED, which is a different fact from
+     *  "received none of it". Parsed with `toDoubleOrNull`, never [toMoney], so the
+     *  difference survives the trip. */
+    @SerialName("received_qty") val receivedQty: String? = null,
+    @SerialName("updated_at") val updatedAt: String? = null,
+    val deleted: Boolean = false,
+) {
+    fun cursorStamp(): String = updatedAt ?: IsoTime.EPOCH
+}
+
+fun PurchaseOrderItemDto.toPurchaseOrderLine(local: PurchaseOrderLine?): PurchaseOrderLine {
+    val base = local ?: PurchaseOrderLine(id = id, poId = poId)
+    return base.copy(
+        id = id,
+        poId = poId,
+        itemId = itemId?.ifBlank { null } ?: base.itemId,
+        name = name?.ifBlank { null } ?: base.name,
+        sku = sku?.ifBlank { null } ?: base.sku,
+        qty = qty?.toDoubleOrNull() ?: base.qty,
+        unitCost = unitCost.toMoney(),
+        receivedQty = receivedQty?.toDoubleOrNull(),
+        pendingSync = false,
+    )
+}
+
+/**
+ * ★ `deleted` is ABSENT for the same reason as [AuditEntryPushDto]'s: [PurchaseOrderLine]
+ * has no such field, and a payload that named the column would overwrite a tombstone set
+ * on the other side with a hard-coded false.
+ */
+@Serializable
+data class PurchaseOrderItemPushDto(
+    val id: String,
+    @SerialName("business_id") val businessId: String,
+    @SerialName("po_id") val poId: String,
+    @SerialName("item_id") val itemId: String? = null,
+    val name: String? = null,
+    val sku: String? = null,
+    val qty: Double,
+    @SerialName("unit_cost") val unitCost: Double,
+    @SerialName("received_qty") val receivedQty: Double? = null,
+    @SerialName("client_updated_at") val clientUpdatedAt: String,
+)
+
+/**
+ * [stamp] is the PARENT order's `updatedAt` — the line has no clock of its own.
+ *
+ * `businessId` goes out EMPTY and is filled in by the engine with `.copy(businessId =
+ * cloudBid)`, the same as every other push row: what belongs on the wire is the SHOP's id
+ * learned from the cloud, never the one this device invented on first run.
+ */
+fun PurchaseOrderLine.toPush(stamp: Long): PurchaseOrderItemPushDto = PurchaseOrderItemPushDto(
+    id = id,
+    businessId = "",
+    poId = poId,
+    // `uuid` on the cloud, free String here. Nulled rather than risking the batch.
+    itemId = uuidOrNull(itemId),
+    name = name.ifBlank { null },
+    sku = sku?.ifBlank { null },
+    qty = qty,
+    unitCost = unitCost,
+    // Stays NULL while nothing has been received. Sending 0.0 would read as "delivered,
+    // nothing in the box" and close the arrival prompt on an order still in transit.
+    receivedQty = receivedQty,
+    clientUpdatedAt = IsoTime.toIso(stamp),
 )
