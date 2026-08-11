@@ -26,7 +26,7 @@ class SyncConfig(private val dao: SettingDao) {
     suspend fun isConfigured(): Boolean = connection() != null
 
     suspend fun saveConnection(url: String, anonKey: String) {
-        dao.put(Setting(KEY_URL, url.trim().trimEnd('/')))
+        dao.put(Setting(KEY_URL, normalizeUrl(url)))
         dao.put(Setting(KEY_KEY, anonKey.trim()))
     }
 
@@ -43,6 +43,12 @@ class SyncConfig(private val dao: SettingDao) {
         dao.delete(KEY_CLOUD_BID)
         // Forget where we were so a future reconnect re-pulls from scratch.
         resetCursors()
+        // ★ [KEY_ARMED_FOR] is deliberately KEPT. It records which database this till has
+        // already uploaded to, and disconnecting does not remove the rows from it.
+        // Clearing it here would re-arm and re-upload the entire history on every
+        // reconnect to the SAME project — churn with nothing to show for it. It is
+        // compared against the new URL on connect, so a genuinely different database
+        // still triggers the arm.
         dao.delete(KEY_LAST_SYNC)
         dao.delete(KEY_LAST_UPLOAD)
         dao.delete(KEY_LAST_DOWNLOAD)
@@ -79,6 +85,28 @@ class SyncConfig(private val dao: SettingDao) {
      *  the only way a device that latched onto the wrong business can be recovered. */
     suspend fun forgetCloudBusinessId() = dao.delete(KEY_CLOUD_BID)
 
+    /**
+     * The database this till has already offered its own rows to, or null for none.
+     *
+     * A dirty flag says "sent" without saying WHERE. Repoint a till and every row it
+     * pushed to the old project is still marked clean, so it is never offered to the new
+     * one — the pass reports success because, as far as the engine can see, there was
+     * nothing to send. That is how two sales and a $15 debt reached the cloud referencing
+     * a customer who had stayed behind on the previous database.
+     *
+     * Compared against the connection URL rather than the adopted business id: the id is
+     * learned from the cloud AFTER the first successful pull, which is already too late —
+     * the first push would have run by then.
+     */
+    suspend fun armedFor(): String? = dao.get(KEY_ARMED_FOR)?.trim()?.ifBlank { null }
+
+    suspend fun setArmedFor(url: String) = dao.put(Setting(KEY_ARMED_FOR, normalizeUrl(url)))
+
+    /** True when [url] is a database this till has never offered its own rows to, and so
+     *  must re-arm before pushing. Normalised the same way [saveConnection] stores it, so
+     *  a trailing slash cannot read as a different project. */
+    suspend fun needsArmingFor(url: String): Boolean = armedFor() != normalizeUrl(url)
+
     suspend fun cursor(table: String): String = dao.get(cursorKey(table)) ?: IsoTime.EPOCH
 
     suspend fun setCursor(table: String, value: String) =
@@ -113,6 +141,12 @@ class SyncConfig(private val dao: SettingDao) {
         const val KEY_LAST_DOWNLOAD = "last_download_at"
         const val KEY_PUSH = "sync_push_enabled"
         const val KEY_CLOUD_BID = "cloud_business_id"
+        const val KEY_ARMED_FOR = "sync_armed_for_url"
+
+        /** How a connection URL is stored, and therefore how two of them are compared.
+         *  [saveConnection] applies exactly this, so the armed-for check compares like
+         *  with like instead of tripping over a trailing slash. */
+        fun normalizeUrl(url: String): String = url.trim().trimEnd('/')
 
         /**
          * Cloud tables Android syncs — the REAL web-POS schema, verified against the live

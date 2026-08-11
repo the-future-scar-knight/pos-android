@@ -1012,6 +1012,7 @@ abstract class PosDatabase : RoomDatabase() {
     abstract fun dayCloseDao(): DayCloseDao
     abstract fun outsideFundDao(): OutsideFundDao
     abstract fun cashSessionDao(): CashSessionDao
+    abstract fun syncArmDao(): SyncArmDao
 
     companion object {
         @Volatile

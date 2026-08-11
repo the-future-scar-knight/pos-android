@@ -2,6 +2,7 @@ package com.portionspot.pos.sync
 
 import android.content.Context
 import com.portionspot.pos.PosApp
+import com.portionspot.pos.data.SyncArmDao
 import com.portionspot.pos.device.ConnectivityObserver
 import com.portionspot.pos.notify.AdminNotificationWorker
 import com.portionspot.pos.notify.Notifier
@@ -37,7 +38,10 @@ sealed class SyncStatus {
 class SyncManager(
     private val appContext: Context,
     val config: SyncConfig,
-    private val engine: PosSyncEngine
+    private val engine: PosSyncEngine,
+    /** Re-arms locally-owned rows when this till meets a database it has not uploaded
+     *  to before. See [armForNewDatabase]. */
+    private val syncArm: SyncArmDao
 ) {
     private val _status = MutableStateFlow<SyncStatus>(SyncStatus.Idle)
     val status: StateFlow<SyncStatus> = _status.asStateFlow()
@@ -291,8 +295,44 @@ class SyncManager(
     suspend fun connect(url: String, key: String): SyncOutcome {
         config.saveConnection(url, key)
         config.setPushEnabled(true)
+        armForNewDatabase(url)
         SyncWorker.schedulePeriodic(appContext)
         return runNow()
+    }
+
+    /**
+     * Offer this till's own history to a database it has never uploaded to.
+     *
+     * A dirty flag records that a row was SENT, not where. So every row already pushed to
+     * a previous project stays marked clean, is never offered to the new one, and the
+     * pass reports success having sent nothing — there genuinely was nothing pending. The
+     * shop sees a database missing everything the till knew before it was repointed.
+     *
+     * This ran on real data: `Ryan` was created before the repoint and stayed behind,
+     * `Tim` was created after and went up. Two sales and a $15 `credit_owed` then landed
+     * in the cloud pointing at a customer in neither database — a debt with no debtor,
+     * with nothing raised anywhere, because nothing enforces the reference.
+     *
+     * It also covers the first connection a local-first till ever makes. Everything rung
+     * up before there was a cloud is exactly the history the shop wants uploaded, and
+     * without this it is the one thing that never would be.
+     *
+     * Failure here is logged and swallowed rather than blocking the connection: a till
+     * that cannot arm should still connect and sync going forward, since the alternative
+     * is refusing to work at all over rows it might merely be re-sending.
+     */
+    private suspend fun armForNewDatabase(url: String) {
+        if (!config.needsArmingFor(url)) return
+        try {
+            val armed = withContext(Dispatchers.IO) { syncArm.armAll() }
+            // Recorded only after the arm succeeds. Marked first, a crash mid-arm would
+            // leave the till believing it had offered rows it never touched — and nothing
+            // would ever try again.
+            config.setArmedFor(url)
+            android.util.Log.i(TAG, "Armed $armed local rows for upload to a new database")
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "Could not arm local rows for upload: ${e.message}")
+        }
     }
 
     suspend fun disconnect() {
@@ -325,6 +365,8 @@ class SyncManager(
     }
 
     private companion object {
+        const val TAG = "SyncManager"
+
         /** Coalescing window: 5 rapid edits within this land as one sync. */
         const val DEBOUNCE_MS = 2_500L
 

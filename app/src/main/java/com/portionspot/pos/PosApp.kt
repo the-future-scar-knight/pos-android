@@ -46,7 +46,8 @@ class AppContainer(app: Application) {
         accessToken = authManager::accessTokenOrNull,
         ensureFreshToken = { authManager.refreshIfNeeded() }
     )
-    val syncManager: SyncManager = SyncManager(app.applicationContext, syncConfig, syncEngine)
+    val syncManager: SyncManager =
+        SyncManager(app.applicationContext, syncConfig, syncEngine, database.syncArmDao())
 
     init {
         // A new/updated admin alert (or a read-state change) nudges a debounced sync so
