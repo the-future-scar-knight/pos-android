@@ -959,6 +959,60 @@ val MIGRATION_38_39 = object : Migration(38, 39) {
     }
 }
 
+/**
+ * v39 → v40 — THE SHOP ROSTER LANDS ON THE DEVICE. Adds the `staff` table: the local
+ * mirror of the shared cloud `staff` row (id, business_id, name, username, role, active,
+ * pin_hash, permissions, updated_at, deleted).
+ *
+ * This is what makes staff sign-in work at all, and specifically what makes it work with
+ * no network. The credential is `username` + a PIN checked against `pin_hash`, and the
+ * hash is byte-compatible with the web's (see [com.portionspot.pos.auth.StaffPin]) — so
+ * once a device has pulled the roster ONCE, every cashier on it can open the till through
+ * a power cut, a dead cell, or a cloud outage. Nothing secret is added to the device by
+ * doing this: a hash is a hash, and the plain PIN was never stored anywhere.
+ *
+ * It replaces a sign-in that could not work at ALL: the old path authenticated against
+ * Supabase GoTrue at a hard-coded URL belonging to a different project, then read a table
+ * called `pos_staff` that does not exist in the shared schema, then created cashiers
+ * through an Edge Function that was never deployed. Three independent breaks, one
+ * replacement.
+ *
+ * Brand-new table, so no existing data is touched and nothing can be lost. Sync-ready
+ * from birth (`updatedAt` / `deleted` / `pendingSync`), and `staff` is already in
+ * [com.portionspot.pos.sync.SyncConfig.TABLES], so it gets a pull cursor for free.
+ *
+ * `(businessId, username)` is a PLAIN index, not unique — the cloud table has no unique
+ * constraint on it either, and inventing one here would turn a merely-untidy shop into a
+ * pull that throws.
+ */
+val MIGRATION_39_40 = object : Migration(39, 40) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS `staff` (" +
+                "`id` TEXT NOT NULL, " +
+                "`businessId` TEXT NOT NULL, " +
+                "`name` TEXT NOT NULL, " +
+                "`username` TEXT NOT NULL, " +
+                "`role` TEXT NOT NULL, " +
+                "`active` INTEGER NOT NULL, " +
+                "`pinHash` TEXT, " +
+                // The business id the hash was salted with — see StaffMember.pinShopId.
+                // Empty string means "the same as businessId".
+                "`pinShopId` TEXT NOT NULL DEFAULT '', " +
+                "`permissions` TEXT, " +
+                "`updatedAt` INTEGER NOT NULL, " +
+                "`deleted` INTEGER NOT NULL, " +
+                "`pendingSync` INTEGER NOT NULL, " +
+                "PRIMARY KEY(`id`))"
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_staff_businessId ON staff (businessId)")
+        db.execSQL(
+            "CREATE INDEX IF NOT EXISTS index_staff_businessId_username " +
+                "ON staff (businessId, username)"
+        )
+    }
+}
+
 @Database(
     entities = [
         Business::class,
@@ -985,9 +1039,10 @@ val MIGRATION_38_39 = object : Migration(38, 39) {
         StaffRequest::class,
         DayClose::class,
         OutsideFund::class,
-        CashSession::class
+        CashSession::class,
+        StaffMember::class
     ],
-    version = 39,
+    version = 40,
     exportSchema = false
 )
 abstract class PosDatabase : RoomDatabase() {
@@ -1012,6 +1067,7 @@ abstract class PosDatabase : RoomDatabase() {
     abstract fun dayCloseDao(): DayCloseDao
     abstract fun outsideFundDao(): OutsideFundDao
     abstract fun cashSessionDao(): CashSessionDao
+    abstract fun staffDao(): StaffDao
     abstract fun syncArmDao(): SyncArmDao
 
     companion object {
@@ -1043,7 +1099,7 @@ abstract class PosDatabase : RoomDatabase() {
                         MIGRATION_29_30, MIGRATION_30_31, MIGRATION_31_32,
                         MIGRATION_32_33, MIGRATION_33_34, MIGRATION_34_35,
                         MIGRATION_35_36, MIGRATION_36_37, MIGRATION_37_38,
-                        MIGRATION_38_39
+                        MIGRATION_38_39, MIGRATION_39_40
                     )
                     .fallbackToDestructiveMigration()
                     .build()
