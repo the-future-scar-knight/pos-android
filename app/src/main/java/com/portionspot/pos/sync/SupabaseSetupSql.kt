@@ -261,6 +261,10 @@ create table if not exists public.credit_txns (
 
 -- ---------------------------------------------------------------------------
 -- 4) Cash: one drawer, one shift
+--
+-- This is also where a DAY-CLOSE lands: a close is the event that ends a shift,
+-- not a separate record. Two more columns for it are added in section 7b, which
+-- is where the reasoning lives.
 -- ---------------------------------------------------------------------------
 create table if not exists public.cash_sessions (
     id                uuid primary key,
@@ -621,6 +625,203 @@ alter table public.businesses add column if not exists paynow_integration_id tex
 alter table public.businesses add column if not exists second_currency text;
 alter table public.businesses add column if not exists second_currency_rate numeric default 0;
 
+-- A DAY-CLOSE IS THE CLOSING HALF OF A SHIFT, NOT A SECOND KIND OF THING.
+--
+-- The till keeps a local `day_closes` table: expected / counted / variance /
+-- who / when, plus how much was moved to the safe and what float was left. Six
+-- of those eight are already columns on `cash_sessions` — and its `variance` is
+-- GENERATED as exactly `counted_cash - expected_cash`, which is the same
+-- arithmetic the device does. Giving day-closes their own cloud table would put
+-- two answers to "what was the till short on the 8th?" in one database, and
+-- nothing would say which one the web should believe.
+--
+-- So the close FOLDS INTO `cash_sessions` and only the two genuinely missing
+-- facts get columns. A close writes (or completes) a session with
+-- status='closed', `opened_at` = the start of the trading day being closed —
+-- which is what the device's `day_start` grouping key means — and `closed_at`
+-- the moment of the count.
+--
+--   moved_to_safe  the excess physically carried from the drawer to the safe as
+--                  part of the same confirmation. Recoverable in theory from the
+--                  transfer PAIR in `cash_movements`, but only by pairing rows
+--                  by amount and timestamp: `cash_movements` has no ref_type /
+--                  ref_id, so nothing there says "this drop belongs to that
+--                  close". Snapshotting it is one column against a join nobody
+--                  can write correctly.
+--   float_target   what was deliberately LEFT in the till. It is a shop setting
+--                  that changes over time, so reading today's value tells you
+--                  nothing about a close from March. Snapshot, not lookup.
+--
+-- Not added: a `day_start` column. `opened_at` carries it.
+alter table public.cash_sessions add column if not exists moved_to_safe numeric not null default 0;
+alter table public.cash_sessions add column if not exists float_target numeric;
+
+-- ---------------------------------------------------------------------------
+-- 7c) Tables the till needs that the web schema never grew.
+--
+-- These three are the multi-device half of the app. Every one of them is
+-- useless on a single device: an alert nobody else sees, an approval the admin
+-- is never asked for, an owner's cash injection visible only on the phone it
+-- was typed into. They are added here — not as a private Android schema, but in
+-- the same shape and with the same mechanisms as everything above — so the web
+-- back-office can adopt them by reading the matching pos2_* views in section 9.
+--
+-- Deliberately NOT check-constrained. A CHECK that a client trips fails the
+-- WHOLE push batch rather than the offending row (see cash_movements above), and
+-- these carry vocabularies that are still growing: the till already writes
+-- notification categories the original design never listed ('cash', 'expenses',
+-- 'requests'), and `staff_requests.type` is free-form by design. `outside_funds`
+-- is the exception and is constrained — see below.
+-- ---------------------------------------------------------------------------
+
+-- The shared alert feed. The engine recomputes the shop's alert state on a
+-- schedule and upserts on the NATURAL key (business_id, dedupe_key), so a
+-- standing condition — a low-stock item, an owed refund — is ONE row that gets
+-- updated, never a fresh duplicate every cycle.
+--
+-- ★ `id` DEFAULTS here, unlike every other table in this schema, and the client
+-- must NOT send it. Two devices computing the same condition mint different
+-- local ids but the same dedupe_key; if the push named `id`, each device's
+-- upsert would rewrite the row's primary key to its own, bumping `updated_at`
+-- and making every other device re-pull a row that did not change. The cloud
+-- owns the id; the clients match on dedupe_key.
+--
+-- `read_at` is SHARED (read on one phone is read everywhere). There is no
+-- `pushed_at` column and there must not be: that flag records whether THIS
+-- handset already fired its own heads-up notification and is meaningless on any
+-- other one.
+create table if not exists public.notifications (
+    id                uuid primary key default gen_random_uuid(),
+    business_id       uuid not null,
+    category          text not null default 'system',
+    severity          text not null default 'info',
+    title             text not null default '',
+    body              text not null default '',
+    -- The natural key. Stable across devices and across recomputes.
+    dedupe_key        text not null,
+    -- Who the alert is FOR: 'admin' | 'cashier' | 'all'. Decides which handset
+    -- buzzes, so a cashier phone does not fire for an admin-only alert.
+    audience          text not null default 'admin',
+    ref_type          text,
+    ref_id            text,
+    -- When the UNDERLYING event happened, which is what an ageing escalation is
+    -- measured from — not when the engine noticed it.
+    event_at          timestamptz not null default now(),
+    created_at        timestamptz not null default now(),
+    read_at           timestamptz,
+    updated_at        timestamptz not null default now(),
+    deleted           boolean not null default false,
+    client_updated_at timestamptz
+);
+
+-- NOT partial. A partial unique index cannot be inferred as a PostgREST
+-- `on_conflict` target, and this one exists to BE that target: without it the
+-- upsert has nothing to resolve against and every recompute inserts again.
+create unique index if not exists uq_notifications_dedupe
+    on public.notifications (business_id, dedupe_key);
+create index if not exists idx_notifications_unread
+    on public.notifications (business_id, read_at)
+    where deleted = false;
+
+-- The admin⇄cashier approval channel: a cashier who hits an admin-gated action
+-- raises a request instead of hunting for the owner's PIN, and it lands in the
+-- admin's feed on the OTHER phone.
+--
+-- This is the one table here with no local-only fallback worth having. An
+-- approval request that cannot leave the device is a dialog asking a person who
+-- is not in the room.
+--
+-- Keyed on the Android uuid like everything else. `target_id` / `ref` fields are
+-- text, not uuid: a request can point at a cart line that has no cloud row yet.
+create table if not exists public.staff_requests (
+    id                uuid primary key,
+    business_id       uuid not null,
+    -- Free-form in v1: 'discount' | 'void' | 'price_override' | 'credit_limit' | …
+    type              text not null,
+    target_type       text,
+    target_id         text,
+    -- Snapshot for display, so the admin sees WHAT they are approving without
+    -- the referenced row having reached the cloud yet.
+    target_name       text,
+    amount            numeric,
+    note              text,
+    requested_by      text,
+    requested_by_name text,
+    status            text not null default 'pending',
+    decided_by        text,
+    decided_by_name   text,
+    -- Non-null == decided. The push partitions on this alone (a pending row goes
+    -- up insert-once, a decided row merge-upserts), so a device never has to
+    -- know its own role to push correctly.
+    decided_at        timestamptz,
+    -- The approved action was actually consumed by the requester. Device-local
+    -- on the cashier side today; a convenience, never a correctness field.
+    applied           boolean not null default false,
+    created_at        timestamptz not null default now(),
+    updated_at        timestamptz not null default now(),
+    deleted           boolean not null default false,
+    client_updated_at timestamptz
+);
+
+create index if not exists idx_staff_requests_pending
+    on public.staff_requests (business_id, status, created_at desc);
+
+-- Money from OUTSIDE the shop, or out of it to the owner. Neither takings nor
+-- expense — this is the equity/liability side of the till-and-safe model, and it
+-- is its own ledger for a reason the cash tables cannot accommodate:
+--
+--   A row is written WHETHER OR NOT SHOP CASH MOVED. Paying a supplier straight
+--   from the owner's pocket never touches the drawer and writes no cash movement
+--   at all. Folding these into `cash_movements` would therefore post non-cash
+--   events into the ledger every till balance is derived from, and the drawer
+--   would read wrong on every device in the shop.
+--
+-- The split the schema had no way to say, said in two columns:
+--   kind='capital'  the OWNER's own money. 'in' raises what the shop owes the
+--                   owner; 'out' is a drawing that pays some of it back. NEVER
+--                   an expense — it must not touch profit.
+--   kind='loan'     money BORROWED from outside. A liability; 'out' is a
+--                   repayment.
+-- `amount` is always POSITIVE and `direction` carries the sign, so "put in" and
+-- "taken out" total separately without a SIGN() in every query.
+create table if not exists public.outside_funds (
+    id                uuid primary key,
+    business_id       uuid not null,
+    kind              text not null default 'capital',
+    direction         text not null default 'in',
+    amount            numeric not null default 0,
+    -- 'Owner', a lender's name, …
+    source            text,
+    note              text,
+    -- What it funded: 'expense' | 'purchase_order' | 'cash'.
+    ref_type          text,
+    ref_id            text,
+    created_by        text,
+    created_by_name   text,
+    created_at        timestamptz not null default now(),
+    updated_at        timestamptz not null default now(),
+    deleted           boolean not null default false,
+    client_updated_at timestamptz
+);
+
+-- The ONE place in section 7c that IS constrained, batch-kill risk accepted.
+-- These two columns are the entire semantic content of the table: a row whose
+-- `kind` is a typo is not a slightly-wrong row, it is money that has silently
+-- moved between what the shop owes its owner and what it owes a lender. A push
+-- that fails loudly is recoverable; that is not.
+do ${'$'}${'$'} begin
+    alter table public.outside_funds add constraint outside_funds_kind_check
+        check (kind = any (array['capital','loan']));
+exception when duplicate_object then null; end ${'$'}${'$'};
+
+do ${'$'}${'$'} begin
+    alter table public.outside_funds add constraint outside_funds_direction_check
+        check (direction = any (array['in','out']));
+exception when duplicate_object then null; end ${'$'}${'$'};
+
+create index if not exists idx_outside_funds_created
+    on public.outside_funds (business_id, created_at desc);
+
 -- ---------------------------------------------------------------------------
 -- 7.5) TWO CLOCKS, TWO JOBS — the trigger every table needs.
 --
@@ -679,7 +880,12 @@ begin
     'businesses','staff','items','item_attributes','stock_movements','customers','credit_txns',
     'cash_sessions','cash_movements','sales','sale_items','sale_payments',
     'refunds','refund_items','refund_payments','mobile_money_receipts',
-    'audit_entries','expenses','suppliers','purchase_orders','purchase_order_items'
+    'audit_entries','expenses','suppliers','purchase_orders','purchase_order_items',
+    -- Section 7c. New tables get the trigger, the tenant policy and the pos2_
+    -- view on exactly the same terms as the originals — a table added to this
+    -- schema and left out of these three loops is a table with no server clock,
+    -- no tenant isolation and no back-office door.
+    'notifications','staff_requests','outside_funds'
   ] loop
     execute format('drop trigger if exists %I on public.%I', t || '_set_updated_at', t);
     execute format(
@@ -704,6 +910,24 @@ end ${'$'}${'$'};
 
 -- ---------------------------------------------------------------------------
 -- 8) Row-level security — one tenant policy per table, matching the live shop.
+--
+-- ★ `staff_requests` is on the SAME uniform policy as every other table, and
+-- that is a decision, not an omission. The obvious tightening — staff may
+-- INSERT and SELECT, only an admin may UPDATE — is exactly what the till's push
+-- is already built for (a pending row goes up insert-once so it cannot trip an
+-- UPDATE policy; only a decided row merge-upserts). But `auth_org_role()`
+-- returns NULL for an anon-key client, which is how every till on a single-shop
+-- database connects, so the gate below would deny every approval in the shop
+-- rather than just the cashier's. It becomes correct the day the tills carry a
+-- JWT with an `org_role` claim, and not one day sooner:
+--
+--   create policy staff_requests_decide on public.staff_requests for update
+--     to authenticated
+--     using (business_id = auth_org_id() and auth_org_role() = 'admin')
+--     with check (business_id = auth_org_id() and auth_org_role() = 'admin');
+--
+-- Until then the split-mode push is a correctness measure the client keeps for
+-- itself. Do not read the till's comments as a description of this schema.
 -- ---------------------------------------------------------------------------
 do ${'$'}${'$'}
 declare t text;
@@ -712,7 +936,12 @@ begin
     'businesses','staff','items','item_attributes','stock_movements','customers','credit_txns',
     'cash_sessions','cash_movements','sales','sale_items','sale_payments',
     'refunds','refund_items','refund_payments','mobile_money_receipts',
-    'audit_entries','expenses','suppliers','purchase_orders','purchase_order_items'
+    'audit_entries','expenses','suppliers','purchase_orders','purchase_order_items',
+    -- Section 7c. New tables get the trigger, the tenant policy and the pos2_
+    -- view on exactly the same terms as the originals — a table added to this
+    -- schema and left out of these three loops is a table with no server clock,
+    -- no tenant isolation and no back-office door.
+    'notifications','staff_requests','outside_funds'
   ] loop
     execute format('alter table public.%I enable row level security', t);
     execute format('drop policy if exists %I on public.%I', t || '_tenant_rw', t);
@@ -757,7 +986,12 @@ begin
     'businesses','staff','items','item_attributes','stock_movements','customers','credit_txns',
     'cash_sessions','cash_movements','sales','sale_items','sale_payments',
     'refunds','refund_items','refund_payments','mobile_money_receipts',
-    'audit_entries','expenses','suppliers','purchase_orders','purchase_order_items'
+    'audit_entries','expenses','suppliers','purchase_orders','purchase_order_items',
+    -- Section 7c. New tables get the trigger, the tenant policy and the pos2_
+    -- view on exactly the same terms as the originals — a table added to this
+    -- schema and left out of these three loops is a table with no server clock,
+    -- no tenant isolation and no back-office door.
+    'notifications','staff_requests','outside_funds'
   ] loop
     v := 'pos2_' || t;
     execute format('drop view if exists public.%I', v);
