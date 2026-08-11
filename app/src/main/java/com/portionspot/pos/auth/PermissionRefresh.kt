@@ -1,7 +1,29 @@
 package com.portionspot.pos.auth
 
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonObject
+
 /**
- * The outcome of ONE attempt to re-read the signed-in staff member's own `pos_staff`
+ * The three columns of a `staff` row that can change under a signed-in cashier, plus the
+ * one that can end their shift.
+ *
+ * `display_name` rather than `name` because that is what this app has always called it;
+ * the shared table's column is `name` and the query aliases it (see
+ * [StaffAdminClient.fetchProfile]). Aliasing in the SELECT rather than adding a second DTO
+ * keeps one shape for one concept — two would drift the first time a column moved.
+ */
+@Serializable
+data class StaffProfileDto(
+    val role: String,
+    @SerialName("display_name") val displayName: String = "",
+    val active: Boolean = true,
+    /** jsonb capability grants; null/absent for a row never edited ⇒ cashier defaults. */
+    val permissions: JsonObject? = null,
+)
+
+/**
+ * The outcome of ONE attempt to re-read the signed-in staff member's own `staff`
  * row. Three-valued on purpose: the whole point of the remote-revocation path is that
  * "the server says this person is gone" and "I couldn't ask the server" must never be
  * the same value. Collapsing them into a nullable row is what let a deleted staff
@@ -67,12 +89,12 @@ sealed interface PermissionVerdict {
  *    ([PermissionVerdict.AwaitConfirmation] first). A 200 with no row IS evidence the
  *    server was reached and does not know this person — but unlike `active = false` it is
  *    evidence of an ABSENCE, and an absence has innocent causes that a present row does
- *    not: `pos_staff` recreated by a re-run of the setup SQL, a tightened RLS policy, the
+ *    not: `staff` recreated by a re-run of the setup SQL, a tightened RLS policy, the
  *    app pointed at a fresh project. Any of those answers 200-with-no-rows for EVERY
  *    cashier at once, and acting on the first sighting would wipe every account off every
- *    till in the shop simultaneously — with no way back until someone is online with a
- *    password. In Harare that is a dead shop, and it is a far worse failure than one
- *    sacked cashier keeping their grants for another sync cycle.
+ *    till in the shop simultaneously — with no way back until the roster pull succeeds
+ *    again. In Harare that is a dead shop, and it is a far worse failure than one sacked
+ *    cashier keeping their grants for another sync cycle.
  *
  *    A genuinely deleted row stays deleted, so the second strike lands on the next pass
  *    (~15 minutes on the periodic sync, sooner on a foreground or manual sync). A blip
@@ -82,12 +104,12 @@ sealed interface PermissionVerdict {
  *  - A blank role narrows to "cashier" rather than inheriting the cached one. Nonsense
  *    data must never WIDEN a person's powers; the worst it can do is make them ask.
  *
- * Revocation is deliberately account-removal rather than a quieter downgrade: the vault
- * holds an offline-unlock PIN, so anything short of removing the account would let the
- * revoked person keep unlocking the till offline forever. Re-adding the account needs a
- * fresh online password login, and that path already refuses an inactive profile
- * (see [AuthManager.login]), so a genuine mistake self-heals the moment the owner
- * reactivates them. Local Room data is never touched by any of this.
+ * Revocation is deliberately session-removal rather than a quieter downgrade: anything
+ * short of putting the person back on the sign-in screen would let a revoked cashier keep
+ * working the till offline for as long as the phone stayed on. Getting back in means
+ * presenting a PIN against a roster row, and [StaffSignIn] refuses a row whose `active`
+ * is false — so a genuine mistake self-heals the moment the owner reactivates them and the
+ * roster pull lands. Local Room data is never touched by any of this.
  */
 object PermissionRefresh {
 

@@ -42,6 +42,7 @@ class PosRepository(private val db: PosDatabase) {
     private val staffRequestDao = db.staffRequestDao()
     private val dayCloseDao = db.dayCloseDao()
     private val outsideFundDao = db.outsideFundDao()
+    private val staffDao = db.staffDao()
 
     /**
      * Fire-and-forget hook the DI container points at [com.portionspot.pos.sync.SyncManager.requestSync],
@@ -73,6 +74,25 @@ class PosRepository(private val db: PosDatabase) {
 
     suspend fun putSetting(key: String, value: String) =
         settingDao.put(Setting(key, value))
+
+    // ---- Staff roster mirror (cloud-owned; see StaffMember) -----------------
+
+    /**
+     * Mirror a `staff` row the admin console has just written to the cloud.
+     *
+     * ★ [member].businessId must be the CLOUD business id. The PIN hash is salted with it
+     * (see [StaffMember.pinShopId]), so a row filed under the device's own local uuid
+     * derives a digest that can never match — a correct PIN refused forever, with nothing
+     * anywhere to say why.
+     *
+     * `pendingSync = false`: the cloud already has this row, because the console wrote it
+     * there FIRST and only mirrors here on success. There is nothing to push back.
+     */
+    suspend fun mirrorStaff(member: StaffMember) =
+        staffDao.upsert(member.copy(pendingSync = false))
+
+    /** The local mirror of one staff row, or null if this device hasn't pulled it yet. */
+    suspend fun staffById(id: String): StaffMember? = staffDao.getById(id)
 
     val businessFlow: Flow<Business?> = businessDao.observe()
 

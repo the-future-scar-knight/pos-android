@@ -69,7 +69,7 @@ class SyncManager(
     @Volatile
     private var hotUntil: Long = 0L
 
-    /** When the signed-in user's own `pos_staff` grants were last re-read (see
+    /** When the signed-in user's own `staff` grants were last re-read (see
      *  [refreshPermissions]). Coalesces the several triggers that can land together. */
     @Volatile
     private var lastPermissionCheckAt: Long = 0L

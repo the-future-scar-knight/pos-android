@@ -24,11 +24,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.AccountCircle
-import androidx.compose.material.icons.rounded.Lock
-import androidx.compose.material.icons.rounded.PersonAdd
+import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Storefront
-import androidx.compose.material.icons.rounded.Visibility
-import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -51,18 +48,25 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.portionspot.pos.device.ConnectivityObserver
 import com.portionspot.pos.ui.LocalPosTokens
 import com.portionspot.pos.ui.PosField
 import kotlinx.coroutines.launch
 
 /**
- * Wraps the whole app: routes between the account picker / login / PIN setup /
- * PIN unlock and the real POS content depending on [AuthManager.state]. Also shows
- * the "session expired" banner when a refresh is rejected server-side.
+ * Wraps the whole app in cloud (team) mode: either the staff sign-in screen or the POS.
+ *
+ * There is no third branch and that is deliberate. The old gate had six states — logged
+ * out, add-account, account picker, PIN unlock, PIN setup, active — because a GoTrue login
+ * and an offline unlock PIN were two different credentials that had to be reconciled. A
+ * staff PIN is one credential checked against one table, so there is one screen in front
+ * of the till and one way through it.
+ *
+ * [onExitToLocal] is the back arrow, and it must be NULL on any device where a cloud
+ * account has ever signed in. Local mode runs as a hard-coded admin against the SAME
+ * database, so an arrow here is a route from "signed-out cashier" to "owner" in three
+ * taps. MainActivity decides; see `PosViewModel.cloudProvisioned`.
  */
 @Composable
 fun AuthGate(
@@ -71,40 +75,11 @@ fun AuthGate(
     content: @Composable (PosUser) -> Unit,
 ) {
     val state by auth.state.collectAsState()
-    val reloginRequired by auth.reloginRequired.collectAsState()
 
     when (val s = state) {
         is AuthState.Loading -> Box(Modifier.fillMaxSize()) {}
-        // With no account yet, [onExitToLocal] (when cloud mode was just opted into)
-        // becomes the back arrow so the user can return to using the till locally.
-        is AuthState.LoggedOut -> LoginScreen(auth, onBack = onExitToLocal)
-        is AuthState.AddAccount -> LoginScreen(auth, onBack = { auth.backToPicker() }, prefillEmail = s.prefillEmail)
-        is AuthState.Picker -> AccountPickerScreen(auth, s.accounts)
-        is AuthState.Locked -> PinUnlockScreen(auth, s.account)
-        is AuthState.PinSetup -> PinSetupScreen(auth)
-        is AuthState.Active -> Column(Modifier.fillMaxSize()) {
-            if (reloginRequired) {
-                val t = LocalPosTokens.current
-                Row(
-                    Modifier
-                        .fillMaxWidth()
-                        .background(t.danger.copy(alpha = 0.12f))
-                        .padding(horizontal = 16.dp, vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        "Session expired — sales keep saving on this device",
-                        fontSize = 12.sp,
-                        color = t.danger,
-                        modifier = Modifier.weight(1f),
-                    )
-                    TextButton(onClick = { auth.promptRelogin() }) {
-                        Text("Sign in", color = t.brand.s600, fontWeight = FontWeight.SemiBold)
-                    }
-                }
-            }
-            Box(Modifier.weight(1f)) { content(s.user) }
-        }
+        is AuthState.SignIn -> StaffSignInScreen(auth, onBack = onExitToLocal)
+        is AuthState.Active -> Box(Modifier.fillMaxSize()) { content(s.user) }
     }
 }
 
@@ -123,7 +98,7 @@ internal fun AuthScaffold(
                     IconButton(onClick = onBack) {
                         Icon(
                             Icons.AutoMirrored.Rounded.ArrowBack,
-                            contentDescription = "Back to accounts",
+                            contentDescription = "Back",
                             tint = t.inkSecondary,
                         )
                     }
@@ -142,10 +117,6 @@ internal fun AuthScaffold(
                     .then(if (onBack == null) Modifier.safeDrawingPadding() else Modifier)
                     .imePadding()
             ) {
-                // Center the form when it fits. When the keyboard shrinks the viewport
-                // and the form is taller than the remaining space, the inner Box grows
-                // PAST the viewport, so its content anchors at the TOP and the whole thing
-                // scrolls from the top — the title/logo can never be clipped or covered.
                 val viewportHeight = maxHeight
                 Box(
                     Modifier
@@ -161,9 +132,7 @@ internal fun AuthScaffold(
                         // Padding lives on the INNER column, never on the min-height Box.
                         // Applied outside, it added 48dp on top of the viewport height, so
                         // the form was permanently 48dp scrollable even when it all fitted —
-                        // and scrolling up slid the title under the top edge ("whatever
-                        // reaches that point gets hidden"). Inside, the box is exactly the
-                        // viewport when the content fits, so there is nothing to scroll.
+                        // and scrolling up slid the title under the top edge.
                         Column(
                             Modifier
                                 .wrapContentHeight()
@@ -211,227 +180,201 @@ private fun ErrorText(message: String?) {
     }
 }
 
-/** The lock screen when the device already has accounts: pick who's using it. When
- *  online (and a cloud connection is configured) a second "Other staff" section lists
- *  roster members who have never signed in here, so the owner can switch into any
- *  active account by name — that person then types their own password once. */
+/**
+ * The one screen in front of a cloud-mode till: tap your name, type your PIN.
+ *
+ * ── WHY THE ROSTER IS A LIST AND NOT A LOGIN FORM ────────────────────────────
+ *
+ * Everyone at the counter already knows who works there, so there is nothing to protect by
+ * making a cashier type their own name — only four digits to get wrong on a phone keyboard
+ * while a customer waits. The typed path stays available for a member whose row hasn't
+ * reached this device yet under a name they can see, and for a shop with a long roster.
+ *
+ * ── IT NEVER TOUCHES THE NETWORK ─────────────────────────────────────────────
+ *
+ * Both the list and the check read the roster mirrored on this device, so a till signs its
+ * cashier in through a power cut and a dead cell — which is when the shop most needs to
+ * open. The one thing a phone must do online is sync ONCE, which is exactly what the empty
+ * state says.
+ */
 @Composable
-private fun AccountPickerScreen(auth: AuthManager, accounts: List<AccountSummary>) {
-    val t = LocalPosTokens.current
-    val online by ConnectivityObserver.rememberOnlineState()
-    val roster by auth.roster.collectAsState()
-    val rosterLoading by auth.rosterLoading.collectAsState()
-
-    // Fetch the roster only while online; drop it the moment the device goes offline so
-    // the picker collapses back to local accounts exactly as before.
-    LaunchedEffect(online) {
-        if (online) auth.loadRoster() else auth.clearRoster()
-    }
-
-    AuthScaffold("Who's using this device?", "Tap your name, then enter your PIN") {
-        accounts.forEach { acc ->
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 4.dp)
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(t.surface1)
-                    .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
-                    .clickable { auth.chooseAccount(acc.userId) }
-                    .padding(14.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                Icon(
-                    Icons.Rounded.AccountCircle,
-                    contentDescription = null,
-                    tint = t.brand.s600,
-                    modifier = Modifier.width(36.dp).height(36.dp),
-                )
-                Column(Modifier.weight(1f)) {
-                    Text(
-                        acc.displayName.ifBlank { acc.email },
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = t.inkPrimary,
-                    )
-                    Text(
-                        if (acc.isAdmin) "Admin" else "Cashier",
-                        fontSize = 12.sp,
-                        color = t.inkTertiary,
-                    )
-                }
-                if (!acc.hasPin) {
-                    Text(
-                        "Set PIN",
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = t.brand.s600,
-                    )
-                }
-            }
-        }
-
-        // ── Other staff (online only): roster members not yet on this device. ──
-        if (online) {
-            Spacer(Modifier.height(20.dp))
-            Row(
-                Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                Text(
-                    "Other staff",
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = t.inkTertiary,
-                    modifier = Modifier.weight(1f),
-                )
-                if (rosterLoading) {
-                    CircularProgressIndicator(
-                        Modifier.width(16.dp).height(16.dp),
-                        color = t.brand.s600,
-                        strokeWidth = 2.dp,
-                    )
-                }
-            }
-            Spacer(Modifier.height(8.dp))
-            if (roster.isEmpty()) {
-                Text(
-                    if (rosterLoading) "Loading staff…" else "No other staff to switch to",
-                    fontSize = 12.sp,
-                    color = t.inkTertiary,
-                )
-            } else {
-                roster.forEach { member ->
-                    Row(
-                        Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 4.dp)
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(t.surface1)
-                            .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
-                            .clickable { auth.switchToStaff(member.email) }
-                            .padding(14.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    ) {
-                        Icon(
-                            Icons.Rounded.AccountCircle,
-                            contentDescription = null,
-                            tint = t.inkTertiary,
-                            modifier = Modifier.width(36.dp).height(36.dp),
-                        )
-                        Column(Modifier.weight(1f)) {
-                            Text(
-                                member.displayName.ifBlank { member.email },
-                                fontSize = 16.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = t.inkPrimary,
-                            )
-                            Text(
-                                if (member.isAdmin) "Admin" else "Cashier",
-                                fontSize = 12.sp,
-                                color = t.inkTertiary,
-                            )
-                        }
-                        Text(
-                            "Password",
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = t.brand.s600,
-                        )
-                    }
-                }
-            }
-        }
-
-        Spacer(Modifier.height(16.dp))
-        OutlinedButton(
-            onClick = { auth.addAccount() },
-            modifier = Modifier.fillMaxWidth().height(48.dp),
-        ) {
-            Icon(Icons.Rounded.PersonAdd, contentDescription = null, modifier = Modifier.width(18.dp).height(18.dp))
-            Spacer(Modifier.width(8.dp))
-            Text("Add another account")
-        }
-    }
-}
-
-@Composable
-private fun LoginScreen(auth: AuthManager, onBack: (() -> Unit)?, prefillEmail: String? = null) {
+private fun StaffSignInScreen(auth: AuthManager, onBack: (() -> Unit)?) {
     val t = LocalPosTokens.current
     val scope = rememberCoroutineScope()
-    var email by remember { mutableStateOf(prefillEmail ?: "") }
-    var password by remember { mutableStateOf("") }
-    var showPassword by remember { mutableStateOf(false) }
+    val roster by auth.roster.collectAsState()
+    val loading by auth.rosterLoading.collectAsState()
+
+    // Who is being signed in. Null = the name list; a member = their PIN pad.
+    var picked by remember { mutableStateOf<RosterMember?>(null) }
+    // The "I'll type my username" path, for a name that isn't on this device's list.
+    var typing by remember { mutableStateOf(false) }
+    var username by remember { mutableStateOf("") }
+    var pin by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
 
+    LaunchedEffect(Unit) { auth.loadRoster() }
+
     fun submit() {
-        if (busy || email.isBlank() || password.isBlank()) return
+        if (busy || pin.length < 4) return
         busy = true; error = null
         scope.launch {
-            when (val r = auth.login(email, password)) {
-                is LoginResult.Ok -> Unit // state flow moves us on
-                is LoginResult.Error -> error = r.message
+            val member = picked
+            val result =
+                if (member != null) auth.signInAs(member.id, pin)
+                else auth.signIn(username, pin)
+            when (result) {
+                is LoginResult.Ok -> Unit // the state flow moves us on
+                is LoginResult.Error -> { error = result.message; pin = "" }
             }
             busy = false
         }
     }
 
-    val switching = prefillEmail != null
+    // ── the PIN pad, for a name already chosen (or a username already typed) ──
+    if (picked != null || typing) {
+        val who = picked?.displayName
+        AuthScaffold(
+            title = who?.let { "Hello, $it" } ?: "Sign in",
+            subtitle = if (who != null) "Enter your PIN" else "Your username and PIN",
+            // Back always returns to the NAME LIST, never out of the gate. The only route
+            // out of cloud mode is [onBack] on the list itself, and that is null on a
+            // device that has ever had a sign-in.
+            onBack = {
+                picked = null; typing = false; pin = ""; username = ""; error = null
+            },
+        ) {
+            if (who == null) {
+                PosField(
+                    value = username,
+                    onValueChange = { username = it; error = null },
+                    label = "Username",
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(12.dp))
+            }
+            PinField(pin, { pin = it; error = null }, "PIN", enabled = !busy)
+            ErrorText(error)
+            Spacer(Modifier.height(20.dp))
+            Button(
+                onClick = { submit() },
+                enabled = !busy && pin.length >= 4 && (who != null || username.isNotBlank()),
+                modifier = Modifier.fillMaxWidth().height(48.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = t.brand.s600, contentColor = t.inkOnBrand,
+                ),
+            ) {
+                if (busy) CircularProgressIndicator(
+                    Modifier.width(22.dp).height(22.dp),
+                    color = t.inkOnBrand,
+                    strokeWidth = 2.dp,
+                ) else Text("Sign in")
+            }
+            if (picked?.hasPin == false) {
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    "No PIN has been set for this account yet — the owner sets one from the staff list.",
+                    fontSize = 12.sp,
+                    color = t.inkTertiary,
+                )
+            }
+        }
+        return
+    }
+
+    // ── the name list ────────────────────────────────────────────────────────
     AuthScaffold(
-        if (switching) "Switch account" else "PortionSpot POS",
-        if (switching) "Enter your password to switch in" else "Sign in to start selling",
+        title = "Who's using this till?",
+        subtitle = "Tap your name, then enter your PIN",
         onBack = onBack,
     ) {
-        PosField(
-            value = email,
-            onValueChange = { email = it },
-            label = "Email",
-            keyboardType = KeyboardType.Email,
-            modifier = Modifier.fillMaxWidth(),
-        )
-        Spacer(Modifier.height(12.dp))
-        PosField(
-            value = password,
-            onValueChange = { password = it },
-            label = "Password",
-            keyboardType = KeyboardType.Password,
-            visualTransformation =
-                if (showPassword) VisualTransformation.None else PasswordVisualTransformation(),
-            modifier = Modifier.fillMaxWidth(),
-            trailing = {
-                IconButton(onClick = { showPassword = !showPassword }, modifier = Modifier.width(24.dp).height(24.dp)) {
+        if (roster.isEmpty()) {
+            Text(
+                when {
+                    loading -> "Loading staff…"
+                    // The back arrow only exists on a till that has never had a sign-in —
+                    // which is exactly the till that still has to be pointed at a database.
+                    // Naming the route matters: the connection screen is behind this gate.
+                    onBack != null ->
+                        "This till hasn't loaded the staff list yet. Go back, open " +
+                            "Settings → Cloud sync, connect the shop's database and sync once. " +
+                            "After that everyone on the list signs in with no internet."
+                    else ->
+                        "This till hasn't loaded the staff list yet — it needs to sync once " +
+                            "while online. After that everyone on the list signs in offline."
+                },
+                fontSize = 13.sp,
+                color = t.inkTertiary,
+            )
+            Spacer(Modifier.height(16.dp))
+        } else {
+            roster.forEach { member ->
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(t.surface1)
+                        .border(1.dp, t.surfaceBorder, RoundedCornerShape(12.dp))
+                        .clickable { picked = member; pin = ""; error = null }
+                        .padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
                     Icon(
-                        if (showPassword) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility,
-                        contentDescription = if (showPassword) "Hide password" else "Show password",
-                        tint = t.inkTertiary,
-                        modifier = Modifier.width(20.dp).height(20.dp),
+                        Icons.Rounded.AccountCircle,
+                        contentDescription = null,
+                        tint = t.brand.s600,
+                        modifier = Modifier.width(36.dp).height(36.dp),
                     )
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            member.displayName,
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = t.inkPrimary,
+                        )
+                        Text(
+                            if (member.isAdmin) "Admin" else "Cashier",
+                            fontSize = 12.sp,
+                            color = t.inkTertiary,
+                        )
+                    }
+                    // Said on the LIST, not after four digits have been typed and refused:
+                    // "no PIN" is the owner's job to fix, and the cashier needs to know
+                    // that before they start doubting their own memory.
+                    if (!member.hasPin) {
+                        Text(
+                            "No PIN set",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = t.danger,
+                        )
+                    }
                 }
-            },
-        )
-        ErrorText(error)
-        Spacer(Modifier.height(20.dp))
-        Button(
-            onClick = { submit() },
-            enabled = !busy && email.isNotBlank() && password.isNotBlank(),
-            modifier = Modifier.fillMaxWidth().height(48.dp),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = t.brand.s600, contentColor = t.inkOnBrand,
-            ),
-        ) {
-            if (busy) CircularProgressIndicator(
-                Modifier.width(22.dp).height(22.dp),
-                color = t.inkOnBrand,
-                strokeWidth = 2.dp,
-            ) else Text("Sign in")
+            }
+            Spacer(Modifier.height(16.dp))
         }
-        Spacer(Modifier.height(12.dp))
+
+        OutlinedButton(
+            onClick = { typing = true; pin = ""; error = null },
+            modifier = Modifier.fillMaxWidth().height(48.dp),
+        ) { Text("Sign in with a username") }
+
+        Spacer(Modifier.height(8.dp))
+        TextButton(onClick = { auth.loadRoster() }, enabled = !loading) {
+            Icon(
+                Icons.Rounded.Refresh,
+                contentDescription = null,
+                modifier = Modifier.width(16.dp).height(16.dp),
+            )
+            Spacer(Modifier.width(6.dp))
+            Text("Refresh staff list", color = t.inkSecondary)
+        }
+        Spacer(Modifier.height(8.dp))
         Text(
-            "Signing in needs internet once. After that this person can unlock and sell offline with a PIN.",
+            "Your PIN is the same one you use on the web POS. This till works offline once " +
+                "it has synced the staff list.",
             fontSize = 12.sp,
             color = t.inkTertiary,
         )
@@ -453,98 +396,4 @@ internal fun PinField(
         visualTransformation = PasswordVisualTransformation(),
         modifier = Modifier.fillMaxWidth(),
     )
-}
-
-@Composable
-private fun PinSetupScreen(auth: AuthManager) {
-    val t = LocalPosTokens.current
-    val scope = rememberCoroutineScope()
-    var pin by remember { mutableStateOf("") }
-    var confirm by remember { mutableStateOf("") }
-    var busy by remember { mutableStateOf(false) }
-    var error by remember { mutableStateOf<String?>(null) }
-
-    AuthScaffold("Set a PIN", "Unlock quickly on this device, even offline") {
-        PinField(pin, { pin = it }, "PIN (4-6 digits)", enabled = !busy)
-        Spacer(Modifier.height(12.dp))
-        PinField(confirm, { confirm = it }, "Confirm PIN", enabled = !busy)
-        ErrorText(error)
-        Spacer(Modifier.height(20.dp))
-        Button(
-            onClick = {
-                when {
-                    pin.length < 4 -> error = "PIN must be at least 4 digits"
-                    pin != confirm -> error = "PINs don't match"
-                    else -> {
-                        busy = true; error = null
-                        // Hashing runs on Dispatchers.IO inside setPin, so the UI
-                        // stays responsive while the PIN is derived.
-                        scope.launch { auth.setPin(pin) }
-                    }
-                }
-            },
-            enabled = !busy && pin.isNotEmpty() && confirm.isNotEmpty(),
-            modifier = Modifier.fillMaxWidth().height(48.dp),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = t.brand.s600, contentColor = t.inkOnBrand,
-            ),
-        ) { Text(if (busy) "Saving…" else "Save PIN") }
-        TextButton(onClick = { auth.skipPin() }, enabled = !busy) {
-            Text("Skip for now", color = t.inkSecondary)
-        }
-    }
-}
-
-@Composable
-private fun PinUnlockScreen(auth: AuthManager, account: AccountSummary) {
-    val t = LocalPosTokens.current
-    val scope = rememberCoroutineScope()
-    var pin by remember { mutableStateOf("") }
-    var busy by remember { mutableStateOf(false) }
-    var error by remember { mutableStateOf<String?>(null) }
-
-    fun submit() {
-        if (busy || pin.length < 4) return
-        busy = true; error = null
-        scope.launch {
-            when (val r = auth.unlockWithPin(pin)) {
-                is LoginResult.Ok -> Unit
-                is LoginResult.Error -> { error = r.message; pin = "" }
-            }
-            busy = false
-        }
-    }
-
-    AuthScaffold(
-        "Welcome back, ${account.displayName.ifBlank { account.email }}",
-        "Enter your PIN to unlock",
-        onBack = { auth.backToPicker() },
-    ) {
-        Icon(
-            Icons.Rounded.Lock,
-            contentDescription = null,
-            tint = t.inkTertiary,
-        )
-        Spacer(Modifier.height(12.dp))
-        PinField(pin, { pin = it }, "PIN", enabled = !busy)
-        ErrorText(error)
-        Spacer(Modifier.height(20.dp))
-        Button(
-            onClick = { submit() },
-            enabled = !busy && pin.length >= 4,
-            modifier = Modifier.fillMaxWidth().height(48.dp),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = t.brand.s600, contentColor = t.inkOnBrand,
-            ),
-        ) {
-            if (busy) CircularProgressIndicator(
-                Modifier.width(22.dp).height(22.dp),
-                color = t.inkOnBrand,
-                strokeWidth = 2.dp,
-            ) else Text("Unlock")
-        }
-        TextButton(onClick = { auth.addAccount() }) {
-            Text("Sign in with password instead", color = t.brand.s600)
-        }
-    }
 }

@@ -48,7 +48,15 @@ data class StaffDto(
     val permissions: JsonObject? = null,
     @SerialName("updated_at") val updatedAt: String? = null,
     val deleted: Boolean = false,
-)
+) {
+    /**
+     * What the pull cursor advances to. `updated_at` is server-maintained on this table,
+     * so the fallback is only ever reached by a row written before the trigger existed —
+     * and [IsoTime.EPOCH] is the safe direction there: it cannot drag a cursor FORWARD
+     * past rows this device has not seen.
+     */
+    fun cursorStamp(): String = updatedAt ?: IsoTime.EPOCH
+}
 
 /**
  * Fold a pulled row into the local mirror.

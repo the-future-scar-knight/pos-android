@@ -28,7 +28,7 @@ data class CachedAuth(
     val refreshToken: String,
     val expiresAt: Long,       // epoch seconds
     /** Per-person capability grants, keyed by [Capability.key]. Cached so gating still
-     *  works offline; refreshed from pos_staff on login and on foreground/sync. */
+     *  works offline; refreshed from `staff` on sign-in and on foreground/sync. */
     val permissions: Map<String, Boolean> = emptyMap(),
 )
 

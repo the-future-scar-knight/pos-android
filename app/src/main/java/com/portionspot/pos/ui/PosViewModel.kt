@@ -113,6 +113,27 @@ private const val DAY_MS = 24L * 60 * 60 * 1000
  */
 enum class AppMode { Local, Cloud }
 
+/**
+ * Which shell a boot lands in, given the persisted choice and whether a cloud account has
+ * ever signed in here.
+ *
+ * Pure and separate from the ViewModel because it decides two things that must not be
+ * argued about again:
+ *
+ *  1. **Nothing persisted ⇒ [AppMode.Local].** A fresh install boots straight into a
+ *     usable till with no sign-in screen at all. That is the default the shop is running
+ *     on, and a login wall appearing on a phone with no cloud configured would be a worse
+ *     failure than any it prevents.
+ *
+ *  2. **Provisioned ⇒ [AppMode.Cloud], whatever [storedMode] says.** Local mode runs as a
+ *     hard-coded admin against the SAME database as the cloud session, so a device that
+ *     has had staff on it must never fall back to it. An older build could have persisted
+ *     "local" through the back-arrow route that is now closed; honouring that on upgrade
+ *     would keep serving unrestricted admin on a phone that has cashiers on it.
+ */
+fun bootAppMode(storedMode: String?, cloudProvisioned: Boolean): AppMode =
+    if (storedMode == "cloud" || cloudProvisioned) AppMode.Cloud else AppMode.Local
+
 class PosViewModel(
     private val repo: PosRepository,
     private val sync: SyncManager,
@@ -127,23 +148,29 @@ class PosViewModel(
     val appMode: StateFlow<AppMode> = _appMode.asStateFlow()
 
     /**
-     * ★ TRUE ONCE A CLOUD ACCOUNT HAS EVER SIGNED IN ON THIS DEVICE, and never false again.
+     * ★ TRUE ONCE A STAFF MEMBER HAS EVER SIGNED IN ON THIS DEVICE, and never false again.
      *
      * This closes a three-tap privilege escalation. Local mode runs as a hard-coded ADMIN
      * ([MainActivity]'s `LOCAL_OWNER_ID`) against the SAME Room database the cloud session
-     * uses. A cashier who signed out of the only account on the phone landed on
-     * [com.portionspot.pos.auth.AuthState.LoggedOut] → LoginScreen, whose back arrow called
-     * [useLocalMode] — so a just-revoked cashier could back out of the login screen into
-     * unrestricted admin on live shop data, and the persisted mode made it survive a
-     * restart. Worst of all on the one-phone-per-cashier deployment this shop chose.
+     * uses. A cashier who signed out of the only account on the phone landed on a
+     * `LoggedOut` login screen whose back arrow called [useLocalMode] — so a just-revoked
+     * cashier could back out into unrestricted admin on live shop data, and the persisted
+     * mode made it survive a restart. Worst of all on the one-phone-per-cashier deployment
+     * this shop chose.
+     *
+     * The staff-PIN rewrite removed that fall-through at its source: sign-out and revocation
+     * both land on [com.portionspot.pos.auth.AuthState.SignIn] whatever the account list
+     * says, and there is no other resting state. This flag is the second, independent gate
+     * and it stays — a UI route and a handler refusal, the same belt-and-braces rule the
+     * capability gates use.
      *
      * It is PERSISTED rather than derived from the account list, because the whole problem
-     * is that the account list becomes empty: `hasCloudAccount()` says "no" at exactly the
-     * moment we most need it to say "yes". Once set, [useLocalMode] refuses and the login
-     * screen loses its back arrow, so the only way past the lock screen is a credential.
+     * was that the account list becomes empty: `hasCloudAccount()` says "no" at exactly the
+     * moment we most need it to say "yes". Once set, [useLocalMode] refuses and the sign-in
+     * screen loses its back arrow, so the only way past it is a PIN.
      *
      * It is stamped on a SUCCESSFUL sign-in, not on tapping "Connect cloud" — otherwise an
-     * owner who opened the login screen and changed their mind would be trapped there, and
+     * owner who opened the sign-in screen and changed their mind would be trapped there, and
      * locking the owner out is worse than the bug.
      */
     private val _cloudProvisioned = MutableStateFlow(false)
@@ -243,8 +270,9 @@ class PosViewModel(
         _cashierId.value = id
     }
 
-    /** Pull the signed-in user's own grants from pos_staff (admin edits reach the device).
-     *  Wired to app foreground (PosApp) and the manual "Sync now". No-op offline/local. */
+    /** Re-read the signed-in user's own grants from the shared `staff` table, so an admin's
+     *  edit — or a revocation — reaches this device. Wired to app foreground (PosApp) and
+     *  the manual "Sync now". No-op offline/local. */
     fun refreshMyPermissions() {
         viewModelScope.launch { authManager.refreshCurrentPermissions() }
     }
@@ -731,11 +759,9 @@ class PosViewModel(
             val provisioned = stored || withContext(Dispatchers.IO) { authManager.hasCloudAccount() }
             _cloudProvisioned.value = provisioned
             if (provisioned && !stored) repo.putSetting(KEY_CLOUD_PROVISIONED, "1")
-            // A provisioned device boots into CLOUD mode whatever the stored mode says. An
-            // older build could have persisted "local" from the back-arrow route; honouring
-            // that would keep serving local admin on a phone that has cloud staff on it.
-            _appMode.value =
-                if (storedMode == "cloud" || provisioned) AppMode.Cloud else AppMode.Local
+            // A provisioned device boots into CLOUD mode whatever the stored mode says, and
+            // a device with nothing persisted boots straight into the till. See [bootAppMode].
+            _appMode.value = bootAppMode(storedMode, provisioned)
             if (provisioned && storedMode != "cloud") repo.putSetting(KEY_APP_MODE, "cloud")
             _onboarded.value = repo.getSetting(KEY_ONBOARDED) == "1"
             _hasLocalPin.value = authManager.hasLocalPin()
@@ -2427,37 +2453,66 @@ class PosViewModel(
 
     // ---- Account switching on this device (multi-account vault) ----
 
-    /** Lock this device and return to the account picker. Every cached account is
-     *  kept, so another cashier (or the admin) can unlock with their own PIN. */
+    /** Lock this device and return to the staff list, where the next person taps their own
+     *  name and enters their own PIN. */
     fun switchUser() = authManager.switchUser()
 
-    /** Remove the CURRENT account from this device (session + PIN), then drop to the
-     *  picker if other accounts remain, else to login. Local Room data is untouched. */
+    /** Same, and forget the cached session too. Local Room data is untouched — unsynced
+     *  sales stay queued and flush under whoever signs in next. */
     fun signOut() {
         viewModelScope.launch { authManager.signOut() }
     }
 
-    // ---- Staff / cashier accounts (admin, via the create-cashier Edge Function) ----
+    // ---- Staff / cashier accounts (admin, direct writes to the shared `staff` table) ----
+    //
+    // The Edge Function this used to call ("create-cashier") was never deployed, so every
+    // create, deactivate and password reset 404'd and the console silently did nothing. A
+    // cashier is not a GoTrue user any more: they are a `staff` row with a `pin_hash` this
+    // device derives itself, so the whole feature is an insert and a few PATCHes.
 
     private val _staff = MutableStateFlow<List<com.portionspot.pos.auth.StaffRow>>(emptyList())
     val staff: StateFlow<List<com.portionspot.pos.auth.StaffRow>> = _staff.asStateFlow()
 
     private suspend fun staffClient(): com.portionspot.pos.auth.StaffAdminClient? {
         val conn = sync.connection() ?: return null
-        return com.portionspot.pos.auth.StaffAdminClient(conn) { authManager.accessTokenOrNull() }
+        return com.portionspot.pos.auth.StaffAdminClient(conn)
     }
+
+    /**
+     * The CLOUD business id — the one the shared database keys `staff` by, and the one the
+     * PIN salt is derived from. Null until this till has identified its shop, which is also
+     * exactly when a staff write would be filed under an id no other client can see.
+     */
+    private suspend fun cloudShopId(): String? = sync.config.cloudBusinessId()
+
+    private fun noShopError() = com.portionspot.pos.auth.StaffResult.Err(
+        "This till hasn't identified the shop's database yet — sync once, then try again"
+    )
 
     /** Reload the staff list from the cloud (admin only; needs a connection). */
     fun refreshStaff() {
         viewModelScope.launch {
-            val client = staffClient() ?: run { _staff.value = emptyList(); return@launch }
-            _staff.value = withContext(Dispatchers.IO) { client.listStaff() }
+            val client = staffClient()
+            val shop = cloudShopId()
+            if (client == null || shop == null) { _staff.value = emptyList(); return@launch }
+            _staff.value = withContext(Dispatchers.IO) { client.list(shop) }
         }
     }
 
-    /** Create a cashier login via the Edge Function, then refresh the list. */
+    /**
+     * Create a cashier: one `staff` row, with a PIN hashed for THIS shop.
+     *
+     * ★ The hash is derived under the CLOUD business id, because that is what the web
+     * salts with ([com.portionspot.pos.auth.StaffPin]) and the two clients share the
+     * column. Under the local id the row would look perfectly fine and refuse the PIN
+     * forever.
+     *
+     * The row is mirrored into the local roster on success, so the new cashier can sign in
+     * on THIS phone immediately instead of waiting for the next pull to come round; other
+     * devices pick it up on theirs.
+     */
     fun createCashier(
-        email: String, password: String, displayName: String, role: String = "cashier",
+        name: String, username: String, pin: String, role: String = "cashier",
         onResult: (com.portionspot.pos.auth.StaffResult) -> Unit,
     ) {
         if (!can(Capability.MANAGE_STAFF)) {
@@ -2467,8 +2522,39 @@ class PosViewModel(
         viewModelScope.launch {
             val client = staffClient()
                 ?: return@launch onResult(com.portionspot.pos.auth.StaffResult.Err("Connect cloud sync first"))
-            val r = withContext(Dispatchers.IO) { client.createCashier(email, password, displayName, role) }
-            if (r is com.portionspot.pos.auth.StaffResult.Ok) refreshStaff()
+            val shop = cloudShopId() ?: return@launch onResult(noShopError())
+            val id = com.portionspot.pos.data.newId()
+            val clamped = com.portionspot.pos.sync.wire.clampStaffRole(role)
+            // Every capability stated explicitly, under both this app's and the web's
+            // spelling — the two sides read an ABSENT key oppositely, so a partial map is
+            // the one thing that could have them disagree about the same cashier.
+            val perms = Permissions.EMPTY.toWireMap()
+            val permsJson = Permissions.EMPTY.toWireJson()
+            val r = withContext(Dispatchers.IO) {
+                val hash = com.portionspot.pos.auth.StaffPin.hash(pin, shop)
+                client.create(shop, id, name.trim(), username.trim(), clamped, hash, perms)
+                    .also { result ->
+                        if (result is com.portionspot.pos.auth.StaffResult.Ok) {
+                            repo.mirrorStaff(
+                                com.portionspot.pos.data.StaffMember(
+                                    id = id,
+                                    businessId = shop,
+                                    name = name.trim(),
+                                    username = username.trim(),
+                                    role = clamped,
+                                    active = true,
+                                    pinHash = hash,
+                                    pinShopId = shop,
+                                    permissions = permsJson,
+                                )
+                            )
+                        }
+                    }
+            }
+            if (r is com.portionspot.pos.auth.StaffResult.Ok) {
+                refreshStaff()
+                authManager.loadRoster()
+            }
             onResult(r)
         }
     }
@@ -2493,18 +2579,36 @@ class PosViewModel(
             return
         }
         val wire = Permissions.fromKeyMap(permissions).toWireMap()
+        val json = Permissions.fromKeyMap(permissions).toWireJson()
         viewModelScope.launch {
             val client = staffClient()
                 ?: return@launch onResult(com.portionspot.pos.auth.StaffResult.Err("Connect cloud sync first"))
-            val r = withContext(Dispatchers.IO) { client.setPermissions(staffId, wire) }
+            val r = withContext(Dispatchers.IO) {
+                client.setPermissions(staffId, wire).also { result ->
+                    // Mirror locally too: a revocation the owner makes on this phone must
+                    // hold on this phone even if the next pull is hours away.
+                    if (result is com.portionspot.pos.auth.StaffResult.Ok) {
+                        repo.staffById(staffId)?.let {
+                            repo.mirrorStaff(it.copy(permissions = json, updatedAt = System.currentTimeMillis()))
+                        }
+                    }
+                }
+            }
             if (r is com.portionspot.pos.auth.StaffResult.Ok) refreshStaff()
             onResult(r)
         }
     }
 
-    /** Reset a staff member's password (admin-only, via the Edge Function). */
-    fun resetCashierPassword(
-        staffId: String, password: String,
+    /**
+     * Set (or replace) a staff member's till PIN — what used to be "reset password".
+     *
+     * There is no password any more: the credential IS the PIN, hashed for this shop and
+     * written to `staff.pin_hash`, which is the same column the web writes. So an owner can
+     * set a cashier's PIN here and that cashier can sign in on the web, or the other way
+     * round, with nothing to reconcile.
+     */
+    fun setCashierPin(
+        staffId: String, pin: String,
         onResult: (com.portionspot.pos.auth.StaffResult) -> Unit = {},
     ) {
         if (!can(Capability.MANAGE_STAFF)) {
@@ -2514,12 +2618,36 @@ class PosViewModel(
         viewModelScope.launch {
             val client = staffClient()
                 ?: return@launch onResult(com.portionspot.pos.auth.StaffResult.Err("Connect cloud sync first"))
-            val r = withContext(Dispatchers.IO) { client.resetPassword(staffId, password) }
+            val shop = cloudShopId() ?: return@launch onResult(noShopError())
+            val r = withContext(Dispatchers.IO) {
+                val hash = com.portionspot.pos.auth.StaffPin.hash(pin, shop)
+                    ?: return@withContext com.portionspot.pos.auth.StaffResult.Err("Enter a PIN")
+                client.setPinHash(staffId, hash).also { result ->
+                    if (result is com.portionspot.pos.auth.StaffResult.Ok) {
+                        repo.staffById(staffId)?.let {
+                            repo.mirrorStaff(
+                                it.copy(pinHash = hash, pinShopId = shop, updatedAt = System.currentTimeMillis())
+                            )
+                        }
+                    }
+                }
+            }
+            if (r is com.portionspot.pos.auth.StaffResult.Ok) {
+                refreshStaff()
+                authManager.loadRoster()
+            }
             onResult(r)
         }
     }
 
-    /** Activate/deactivate a staff member (admin-only delete = deactivate). */
+    /**
+     * Activate/deactivate a staff member. "Remove" in the console is a deactivation, never
+     * a delete: the row is what every sale that person rang up is attributed to.
+     *
+     * ★ The local mirror is updated on success, so the deactivation bites on THIS device
+     * before the next pull — [com.portionspot.pos.auth.StaffSignIn] refuses an inactive row
+     * offline, which is the half of revocation that works with no signal.
+     */
     fun setCashierActive(
         staffId: String, active: Boolean,
         onResult: (com.portionspot.pos.auth.StaffResult) -> Unit = {},
@@ -2531,8 +2659,19 @@ class PosViewModel(
         viewModelScope.launch {
             val client = staffClient()
                 ?: return@launch onResult(com.portionspot.pos.auth.StaffResult.Err("Connect cloud sync first"))
-            val r = withContext(Dispatchers.IO) { client.setActive(staffId, active) }
-            if (r is com.portionspot.pos.auth.StaffResult.Ok) refreshStaff()
+            val r = withContext(Dispatchers.IO) {
+                client.setActive(staffId, active).also { result ->
+                    if (result is com.portionspot.pos.auth.StaffResult.Ok) {
+                        repo.staffById(staffId)?.let {
+                            repo.mirrorStaff(it.copy(active = active, updatedAt = System.currentTimeMillis()))
+                        }
+                    }
+                }
+            }
+            if (r is com.portionspot.pos.auth.StaffResult.Ok) {
+                refreshStaff()
+                authManager.loadRoster()
+            }
             onResult(r)
         }
     }

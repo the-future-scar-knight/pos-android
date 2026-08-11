@@ -17,6 +17,7 @@ import com.portionspot.pos.data.RefundDao
 import com.portionspot.pos.data.SaleDao
 import com.portionspot.pos.data.SaleEntity
 import com.portionspot.pos.data.SalePaymentDao
+import com.portionspot.pos.data.StaffDao
 import com.portionspot.pos.data.StaffRequestDao
 import com.portionspot.pos.data.SupplierDao
 import com.portionspot.pos.media.ProductImages
@@ -70,6 +71,8 @@ import com.portionspot.pos.sync.wire.PurchaseOrderDto
 import com.portionspot.pos.sync.wire.toPurchaseOrder
 import com.portionspot.pos.sync.wire.PurchaseOrderItemDto
 import com.portionspot.pos.sync.wire.toPurchaseOrderLine
+import com.portionspot.pos.sync.wire.StaffDto
+import com.portionspot.pos.sync.wire.toStaffMember
 import com.portionspot.pos.data.uuidOrNull
 import com.portionspot.pos.sync.wire.RefundItemPushDto
 import com.portionspot.pos.sync.wire.RefundPaymentPushDto
@@ -160,6 +163,7 @@ class PosSyncEngine(
     private val staffRequestDao: StaffRequestDao,
     private val cashSessionDao: CashSessionDao,
     private val stockMovementDao: StockMovementDao,
+    private val staffDao: StaffDao,
     private val config: SyncConfig,
     /** Current signed-in user's JWT for RLS; null falls back to anon (denied). */
     private val accessToken: () -> String? = { null },
@@ -694,7 +698,54 @@ class PosSyncEngine(
         n += pullPurchaseOrderLines(api, cloudBid)
         n += pullExpenses(api, bid, cloudBid)
         n += pullAudit(api, bid, cloudBid)
+        // The roster + the credential behind it. Last because nothing else waits on it,
+        // and deliberately NOT stamped with `bid` — see [pullStaff].
+        n += pullStaff(api, cloudBid)
         return n
+    }
+
+    /**
+     * `staff` → the local roster the sign-in screen checks a PIN against.
+     *
+     * ★★ THE ONLY PULL IN THIS FILE THAT DOES NOT TAKE `bid` ★★
+     *
+     * Every other mapper here is handed the LOCAL business uuid — the id this device
+     * invented on first run — because local rows are keyed by it and nothing about their
+     * data depends on WHICH id it is. A staff row is the exception, and the difference is
+     * invisible until a cashier is standing at the counter.
+     *
+     * `staff.pin_hash` is PBKDF2 over a salt derived as
+     * `SHA-256("PortionSpot POS pin v1:" + business_id)`, copied from the web's `pin.js`
+     * so one hash works on both clients. The web salts with the CLOUD id. Stamp these rows
+     * with the local uuid instead and every hash this app derives disagrees with every hash
+     * the web wrote — no exception, no log line, just a correct PIN reported as wrong,
+     * forever, looking exactly like the cashier mistyping it.
+     *
+     * So the local `staff.businessId` IS the cloud business id, and the roster queries
+     * ([com.portionspot.pos.data.StaffDao.all]) are keyed by that. This is not a shortcut
+     * around the local/cloud split; it is the one table where the hash decides the key.
+     *
+     * Pull-only. Creating or editing a cashier is a direct PostgREST write from the admin
+     * device ([com.portionspot.pos.auth.StaffAdminClient]), which mirrors the row locally
+     * itself, so there is no pending-push set here to send back up.
+     */
+    private suspend fun pullStaff(api: SupabaseRest, cloudBid: String): Int {
+        val rows = syncJson.decodeFromString<List<StaffDto>>(
+            api.selectSince("staff", cloudBid, config.cursor("staff"), PAGE)
+        )
+        if (rows.isEmpty()) return 0
+        // ★ UNCONDITIONAL OVERWRITE — no last-write-wins comparison, unlike every other
+        // pull here. This table is the revocation channel: the cloud is the authority on
+        // who may open the till and what they may do, and a local row is only ever a bridge
+        // the admin console wrote so a change it just made is usable before the next pull.
+        // A last-write-wins check would hand that bridge a veto — and on a phone whose clock
+        // runs a few hours fast, a stale local row would shadow a real deactivation for
+        // exactly as long as the drift. There is nothing on this side worth defending.
+        for (dto in rows) {
+            staffDao.upsert(dto.toStaffMember(cloudBid, staffDao.getById(dto.id)))
+        }
+        config.setCursor("staff", rows.maxOf { it.cursorStamp() })
+        return rows.size
     }
 
     /**

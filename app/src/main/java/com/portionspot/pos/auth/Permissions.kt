@@ -147,7 +147,7 @@ enum class Capability(val key: String, val wireKey: String? = null) {
 }
 
 /**
- * A staff member's granted capabilities, parsed from `pos_staff.permissions`.
+ * A staff member's granted capabilities, parsed from `staff.permissions`.
  *
  * Stored/round-tripped as a plain `Map<String, Boolean>` keyed by [Capability.key], so
  * it serialises cleanly into the encrypted session vault ([CachedAuth]) and survives
@@ -186,9 +186,18 @@ data class Permissions(val granted: Map<Capability, Boolean> = emptyMap()) {
         }
     }
 
+    /**
+     * [toWireMap] as the jsonb TEXT the local `staff.permissions` column holds, so a row
+     * mirrored onto this device after an admin write reads back exactly as the row pulled
+     * from the cloud would. Kept next to [toWireMap] because the two must never disagree
+     * about what a written grant looks like.
+     */
+    fun toWireJson(): String =
+        toWireMap().entries.joinToString(",", "{", "}") { "\"${it.key}\":${it.value}" }
+
     companion object {
         /**
-         * Cashier defaults applied when `pos_staff.permissions` is empty/missing (a
+         * Cashier defaults applied when `staff.permissions` is empty/missing (a
          * freshly-created cashier). Money-sensitive capabilities are OFF by default;
          * only day-to-day inventory work is ON. The admin can flip any of these per
          * staff member from the staff console.

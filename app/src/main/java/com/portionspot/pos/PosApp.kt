@@ -5,6 +5,7 @@ import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import com.portionspot.pos.auth.AuthManager
+import com.portionspot.pos.auth.StaffDirectory
 import com.portionspot.pos.data.PosDatabase
 import com.portionspot.pos.data.PosRepository
 import com.portionspot.pos.notify.AdminNotificationWorker
@@ -28,11 +29,20 @@ class AppContainer(app: Application) {
     private val database: PosDatabase = PosDatabase.get(app)
     val repository: PosRepository = PosRepository(database)
 
-    // ---- Auth (Supabase Auth + RLS; offline PIN unlock) ----
-    val authManager: AuthManager = AuthManager(app)
-
     // ---- Cloud sync (bring-your-own Supabase) ----
+    // Declared BEFORE the auth manager on purpose: staff sign-in reads the shop's CLOUD
+    // business id from here (the PIN salt is derived from it), so the directory below
+    // cannot be built until this exists.
     val syncConfig: SyncConfig = SyncConfig(database.settingDao())
+
+    // ---- Auth (staff username + PIN against the shared `staff` table) ----
+    // No GoTrue, no tokens: the credential is `staff.pin_hash`, mirrored onto this device
+    // by the roster pull, so a cashier whose row has synced once signs in with no network.
+    val authManager: AuthManager = AuthManager(
+        app,
+        StaffDirectory(database.staffDao()) { syncConfig.cloudBusinessId() },
+    )
+
     val syncEngine: PosSyncEngine = PosSyncEngine(
         database.businessDao(), database.itemDao(), database.itemAttributeDao(),
         database.saleDao(),
@@ -42,7 +52,7 @@ class AppContainer(app: Application) {
         database.supplierDao(), database.purchaseOrderDao(),
         database.notificationDao(), database.auditDao(),
         database.staffRequestDao(), database.cashSessionDao(),
-        database.stockMovementDao(), syncConfig,
+        database.stockMovementDao(), database.staffDao(), syncConfig,
         accessToken = authManager::accessTokenOrNull,
         ensureFreshToken = { authManager.refreshIfNeeded() }
     )
@@ -53,8 +63,10 @@ class AppContainer(app: Application) {
         // A new/updated admin alert (or a read-state change) nudges a debounced sync so
         // it lands on the OTHER phones in seconds, not on the ~15-minute worker cycle.
         repository.onSyncWorthyChange = { reason -> syncManager.requestSync(reason) }
-        // Let the lock-screen picker fetch the shop roster (switch-by-name) using the
-        // saved cloud connection. Null until the owner has connected a database.
+        // The saved cloud connection, for the ONE thing auth still uses the network for:
+        // re-reading the signed-in member's own `staff` row so a revocation reaches their
+        // phone (see AuthManager.refreshCurrentPermissions). Sign-in itself never needs it.
+        // Null until the owner has connected a database.
         authManager.connectionProvider = { syncConfig.connection() }
     }
 }

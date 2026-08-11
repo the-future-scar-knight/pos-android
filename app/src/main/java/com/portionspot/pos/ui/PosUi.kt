@@ -680,11 +680,12 @@ fun AppRoot(
                 onDismiss = { drawerOpen = false },
                 onSwitchUser = { drawerOpen = false; vm.switchUser() },
                 onSignOut = { drawerOpen = false; vm.signOut() },
-                // ★ Sign-out is an ADMIN action here. "Switch user" locks the device and
-                // returns to the account picker, which still needs a credential; signing
-                // out REMOVES the account, and a cashier removing the last one used to
-                // drop the device to a login screen it could back out of into local admin.
-                // A cashier ending their shift wants the lock screen, not an empty device.
+                // ★ Sign-out stays an ADMIN action. Both routes now land on the SAME staff
+                // sign-in screen — the empty-account-list fall-through into a login screen
+                // with a back arrow into local admin is gone — so this is no longer the
+                // gate it once was. It is kept because a cashier ending their shift wants
+                // the lock screen, not a device that has forgotten the session the SMS
+                // receiver and the alert workers attribute by.
                 canSignOut = isAdmin,
                 logoUri = business?.logoUri,
                 visible = screenVisible
@@ -1666,7 +1667,7 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
         item { AdminSectionHeader("Account") }
         item {
             Text(
-                "Hand this device to a cashier: 'Switch user' returns to the account picker where they unlock with their own PIN (or 'Add another account' to sign them in the first time).",
+                "Hand this device to a cashier: 'Switch user' returns to the staff list, where they tap their own name and enter their own PIN. 'Sign out' does the same and forgets this session as well.",
                 color = t.inkTertiary, fontSize = 12.sp
             )
         }
@@ -2043,7 +2044,7 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
         if (syncConnection == null) {
             item {
                 Text(
-                    "Connect cloud sync to add cashier accounts. Each cashier logs in on their own device and is attributed on every sale.",
+                    "Connect cloud sync to add cashier accounts. Each cashier signs in with their own name and PIN — on this phone or their own — and is attributed on every sale.",
                     color = t.inkTertiary, fontSize = 12.sp
                 )
             }
@@ -2055,14 +2056,23 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
                     Column(Modifier.fillMaxWidth().padding(vertical = 5.dp)) {
                         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                             Column(Modifier.weight(1f)) {
-                                Text(s.displayName.ifBlank { "(no name)" }, color = t.inkPrimary, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                                Text(s.label, color = t.inkPrimary, fontSize = 14.sp, fontWeight = FontWeight.Medium)
                                 Text(
-                                    s.role.replaceFirstChar { it.uppercase() } + if (!s.active) " · inactive" else "",
-                                    color = if (s.active) t.inkTertiary else t.danger, fontSize = 11.sp
+                                    buildString {
+                                        append(s.role.replaceFirstChar { it.uppercase() })
+                                        if (s.username.isNotBlank()) append(" · ${s.username}")
+                                        // A member with no PIN cannot sign in anywhere. Said
+                                        // here because this is the only screen that can fix it.
+                                        if (!s.hasPin) append(" · no PIN")
+                                        if (!s.active) append(" · inactive")
+                                    },
+                                    color = if (s.active && s.hasPin) t.inkTertiary else t.danger, fontSize = 11.sp
                                 )
                             }
                             if (canManageStaff) {
-                                TextButton(onClick = { resetPwFor = s }) { Text("Reset PW") }
+                                TextButton(onClick = { resetPwFor = s }) {
+                                    Text(if (s.hasPin) "Set PIN" else "Give PIN")
+                                }
                                 // Admins aren't removed here; only cashiers are (de)activated.
                                 // Remove = soft-deactivate (history/attribution kept); a
                                 // deactivated account can't log in and drops off the roster.
@@ -2140,20 +2150,20 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
     if (showAddCashier) {
         AddCashierDialog(
             onDismiss = { showAddCashier = false },
-            onCreate = { email, pass, name, cb -> vm.createCashier(email, pass, name, "cashier", cb) }
+            onCreate = { name, username, pin, cb -> vm.createCashier(name, username, pin, "cashier", cb) }
         )
     }
     resetPwFor?.let { s ->
-        ResetPasswordDialog(
-            staffName = s.displayName.ifBlank { "this account" },
+        SetPinDialog(
+            staffName = s.label,
             onDismiss = { resetPwFor = null },
-            onReset = { pass, cb -> vm.resetCashierPassword(s.id, pass, cb) }
+            onSet = { pin, cb -> vm.setCashierPin(s.id, pin, cb) }
         )
     }
     permsFor?.let { s ->
         val ctx = LocalContext.current
         StaffPermissionsDialog(
-            staffName = s.displayName.ifBlank { "this cashier" },
+            staffName = s.label,
             initial = s.perms(),
             onDismiss = { permsFor = null },
             onSave = { map ->
@@ -2172,8 +2182,8 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
     removeStaffFor?.let { s ->
         val ctx = LocalContext.current
         ConfirmDialog(
-            title = "Remove ${s.displayName.ifBlank { "this cashier" }}?",
-            message = "They can no longer log in and won't appear in the lock-screen roster. " +
+            title = "Remove ${s.label}?",
+            message = "They can no longer sign in and won't appear on any till's staff list. " +
                 "Their past sales and attribution stay intact, and you can reactivate them later.",
             confirmLabel = "Remove",
             onConfirm = {
@@ -2363,18 +2373,26 @@ private fun WriteOffDialog(
     }
 }
 
-/** Admin dialog to create a cashier login via the create-cashier Edge Function. */
+/**
+ * Admin dialog to add a cashier — one `staff` row with a username and a PIN.
+ *
+ * No email and no password. The credential the shop shares between the web POS and every
+ * phone is `staff.pin_hash`, so what the owner sets here is the same four-to-six digits
+ * that cashier types on any till in the shop.
+ */
 @Composable
 private fun AddCashierDialog(
     onDismiss: () -> Unit,
     onCreate: (String, String, String, (com.portionspot.pos.auth.StaffResult) -> Unit) -> Unit,
 ) {
     var name by remember { mutableStateOf("") }
-    var email by remember { mutableStateOf("") }
-    var password by remember { mutableStateOf("") }
+    var username by remember { mutableStateOf("") }
+    var pin by remember { mutableStateOf("") }
+    var confirm by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
-    val valid = name.isNotBlank() && email.contains("@") && password.length >= 6
+    val valid = name.isNotBlank() && username.isNotBlank() &&
+        pin.length in 4..6 && pin == confirm
     PosContainedForm(
         title = "Add cashier",
         onDismiss = { if (!busy) onDismiss() },
@@ -2382,7 +2400,7 @@ private fun AddCashierDialog(
         confirmEnabled = valid && !busy,
         onConfirm = {
             busy = true; error = null
-            onCreate(email.trim(), password, name.trim()) { res ->
+            onCreate(name.trim(), username.trim(), pin) { res ->
                 busy = false
                 when (res) {
                     is com.portionspot.pos.auth.StaffResult.Ok -> onDismiss()
@@ -2393,43 +2411,58 @@ private fun AddCashierDialog(
     ) {
         val t = LocalPosTokens.current
         Text(
-            "Creates a login. The cashier signs in with it — on their own device, or on this one via 'Add another account' on the lock screen. They're attributed on every sale; only an admin can deactivate them.",
+            "Adds them to the shop's staff list. They tap their name and enter this PIN — on " +
+                "their own phone, on this one, or on the web POS. Once a phone has synced the " +
+                "staff list they can sign in with no internet. They're attributed on every sale.",
             fontSize = 12.sp, color = t.inkSecondary
         )
         PosFormCard {
             PosField(name, { name = it }, "Name", modifier = Modifier.fillMaxWidth())
-            PosField(email, { email = it }, "Email", keyboardType = KeyboardType.Email, modifier = Modifier.fillMaxWidth())
-            PosField(password, { password = it }, "Password (6+ characters)", visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
+            PosField(username, { username = it }, "Username", modifier = Modifier.fillMaxWidth())
+            PosField(
+                pin, { new -> if (new.length <= 6 && new.all { it.isDigit() }) pin = new },
+                "PIN (4-6 digits)",
+                keyboardType = KeyboardType.NumberPassword,
+                visualTransformation = PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth()
+            )
+            PosField(
+                confirm, { new -> if (new.length <= 6 && new.all { it.isDigit() }) confirm = new },
+                "Confirm PIN",
+                keyboardType = KeyboardType.NumberPassword,
+                visualTransformation = PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth()
+            )
         }
         error?.let { Text(it, color = t.danger, fontSize = 12.sp) }
     }
 }
 
-/** Admin dialog to reset a staff member's password via the create-cashier Edge Function. */
+/** Admin dialog to set (or replace) a staff member's till PIN. */
 @Composable
-private fun ResetPasswordDialog(
+private fun SetPinDialog(
     staffName: String,
     onDismiss: () -> Unit,
-    onReset: (String, (com.portionspot.pos.auth.StaffResult) -> Unit) -> Unit,
+    onSet: (String, (com.portionspot.pos.auth.StaffResult) -> Unit) -> Unit,
 ) {
     val context = LocalContext.current
-    var password by remember { mutableStateOf("") }
+    var pin by remember { mutableStateOf("") }
     var confirm by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
-    val valid = password.length >= 6 && password == confirm
+    val valid = pin.length in 4..6 && pin == confirm
     PosContainedForm(
-        title = "Reset password",
+        title = "Set PIN",
         onDismiss = { if (!busy) onDismiss() },
-        confirmLabel = if (busy) "Resetting…" else "Reset password",
+        confirmLabel = if (busy) "Saving…" else "Set PIN",
         confirmEnabled = valid && !busy,
         onConfirm = {
             busy = true; error = null
-            onReset(password) { res ->
+            onSet(pin) { res ->
                 busy = false
                 when (res) {
                     is com.portionspot.pos.auth.StaffResult.Ok -> {
-                        Toast.makeText(context, "Password reset for $staffName", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "PIN set for $staffName", Toast.LENGTH_SHORT).show()
                         onDismiss()
                     }
                     is com.portionspot.pos.auth.StaffResult.Err -> error = res.message
@@ -2439,12 +2472,25 @@ private fun ResetPasswordDialog(
     ) {
         val t = LocalPosTokens.current
         Text(
-            "Set a new password for $staffName. They'll sign in with it on their device (and re-add the account if their old session was cleared).",
+            "Sets the PIN $staffName types to sign in — on any till in the shop and on the web POS. " +
+                "The old one stops working everywhere as soon as each device syncs.",
             fontSize = 12.sp, color = t.inkSecondary
         )
         PosFormCard {
-            PosField(password, { password = it }, "New password (6+ characters)", visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
-            PosField(confirm, { confirm = it }, "Confirm password", visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
+            PosField(
+                pin, { new -> if (new.length <= 6 && new.all { it.isDigit() }) pin = new },
+                "New PIN (4-6 digits)",
+                keyboardType = KeyboardType.NumberPassword,
+                visualTransformation = PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth()
+            )
+            PosField(
+                confirm, { new -> if (new.length <= 6 && new.all { it.isDigit() }) confirm = new },
+                "Confirm PIN",
+                keyboardType = KeyboardType.NumberPassword,
+                visualTransformation = PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth()
+            )
         }
         error?.let { Text(it, color = t.danger, fontSize = 12.sp) }
     }
@@ -2453,7 +2499,7 @@ private fun ResetPasswordDialog(
 /**
  * Admin editor for one cashier's capability grants (auth/Permissions.kt). One switch per
  * capability, pre-filled from the cashier's current grants (empty ⇒ cashier defaults).
- * Saving PATCHes the full map to pos_staff.permissions via [PosViewModel.setStaffPermissions].
+ * Saving PATCHes the full map to `staff.permissions` via [PosViewModel.setStaffPermissions].
  */
 @Composable
 private fun StaffPermissionsDialog(
