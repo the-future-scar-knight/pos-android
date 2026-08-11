@@ -120,6 +120,36 @@ interface ItemDao {
     suspend fun wipe(businessId: String)
 }
 
+/**
+ * Item key/value tags — in this shop, the cars each part fits.
+ *
+ * No `pending`/`markSynced` pair here, unlike every other syncing DAO: [ItemAttribute] is
+ * pull-only, so there is nothing for a push to select.
+ */
+@Dao
+interface ItemAttributeDao {
+    /** Every live tag for the business. Small enough to hold in memory (the live shop has
+     *  671 rows across 105 items) and the search needs all of them at once. */
+    @Query("SELECT * FROM item_attributes WHERE businessId = :businessId AND deleted = 0")
+    fun observeForBusiness(businessId: String): Flow<List<ItemAttribute>>
+
+    @Query(
+        "SELECT * FROM item_attributes WHERE itemId = :itemId AND deleted = 0 " +
+            "ORDER BY key COLLATE NOCASE ASC, value COLLATE NOCASE ASC"
+    )
+    fun observeForItem(itemId: String): Flow<List<ItemAttribute>>
+
+    @Query("SELECT * FROM item_attributes WHERE id = :id LIMIT 1")
+    suspend fun getById(id: String): ItemAttribute?
+
+    @Upsert
+    suspend fun upsertAll(rows: List<ItemAttribute>)
+
+    /** Danger zone: drop every tag for a business (device reset before a fresh pull). */
+    @Query("DELETE FROM item_attributes WHERE businessId = :businessId")
+    suspend fun wipe(businessId: String)
+}
+
 @Dao
 interface SaleDao {
     @Insert

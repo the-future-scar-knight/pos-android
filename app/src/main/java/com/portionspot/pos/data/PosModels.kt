@@ -188,6 +188,54 @@ val Item.onHand: Double get() = if (isMeasured) stockMeasured else stockQty
  *  "+N pending" addition is NOT blocked — it keeps selling its current stock. */
 val Item.sellableBlocked: Boolean get() = pendingNew && onHand <= 0.0
 
+/**
+ * One key/value tag on a catalogue item — the web's `item_attributes`.
+ *
+ * In this shop every row is `key = "car"` and the value is a vehicle the part fits
+ * ("Vezel", "Ford Ranger T6", "Fit GK3"), which is why an item can carry a dozen of them.
+ * That is the point of the table: a part's name can only name one or two of the cars it
+ * fits, so without these a customer asking for "brake pads for a Hilux" only finds
+ * anything when the word happens to have been typed into the product name.
+ *
+ * **PULL-ONLY, and there is deliberately no `pendingSync` column.** The web owns the
+ * catalogue exactly as it owns [Item], so there is no field here for the push side to
+ * read even by accident. A tag entered on the till would have nowhere to go.
+ *
+ * [keyNorm] / [valueNorm] are computed on THIS side rather than taken from the wire: both
+ * cloud columns are nullable, and a null on a hand-inserted row would silently drop that
+ * fitment out of every search. Search reads the normalised pair, so it has to exist.
+ */
+@Entity(
+    tableName = "item_attributes",
+    indices = [
+        Index("businessId"),
+        Index("itemId"),
+        Index(value = ["businessId", "keyNorm", "valueNorm"])
+    ]
+)
+data class ItemAttribute(
+    @PrimaryKey val id: String = newId(),
+    val businessId: String,
+    val itemId: String,
+    val key: String,
+    val value: String,
+    val keyNorm: String = attrNorm(key),
+    val valueNorm: String = attrNorm(value),
+    val updatedAt: Long = now(),
+    val deleted: Boolean = false,
+)
+
+/**
+ * Fold an attribute key or value for matching: trimmed, inner runs of whitespace
+ * collapsed, lower-cased. Matches what the web stores in `key_norm` / `value_norm` for
+ * every row in the live table ("Ford Ranger T6" → "ford ranger t6"), and gives a stable
+ * answer for the rows where those columns are null.
+ */
+fun attrNorm(raw: String): String =
+    raw.trim().replace(WHITESPACE_RUN, " ").lowercase()
+
+private val WHITESPACE_RUN = Regex("\\s+")
+
 /** A COMPLETED receipt (frozen snapshot). The live cart stays in memory. */
 @Entity(
     tableName = "sales",

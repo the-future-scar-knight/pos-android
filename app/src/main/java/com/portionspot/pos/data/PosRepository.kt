@@ -24,6 +24,7 @@ class PosRepository(private val db: PosDatabase) {
 
     private val businessDao = db.businessDao()
     private val itemDao = db.itemDao()
+    private val itemAttributeDao = db.itemAttributeDao()
     private val saleDao = db.saleDao()
     private val paymentDao = db.salePaymentDao()
     private val movementDao = db.stockMovementDao()
@@ -77,6 +78,11 @@ class PosRepository(private val db: PosDatabase) {
 
     fun itemsFlow(businessId: String): Flow<List<Item>> =
         itemDao.observeForBusiness(businessId)
+
+    /** Every live item tag for the shop — the cars each part fits. Feeds catalogue search
+     *  (see [tagIndex]) and the fitment line on a product card. */
+    fun itemAttributesFlow(businessId: String): Flow<List<ItemAttribute>> =
+        itemAttributeDao.observeForBusiness(businessId)
 
     fun recentSalesFlow(businessId: String): Flow<List<SaleEntity>> =
         saleDao.observeRecent(businessId)
@@ -187,6 +193,10 @@ class PosRepository(private val db: PosDatabase) {
             notificationDao.wipe(bid)
             staffRequestDao.wipe(bid)
             itemDao.wipe(bid)
+            // With the items, not after them: a reset that dropped the catalogue and kept
+            // its tags would leave every fitment pointing at an item id that no longer
+            // exists — invisible, un-searchable, and re-inserted alongside the fresh pull.
+            itemAttributeDao.wipe(bid)
             customerDao.wipe(bid)
         }
     }

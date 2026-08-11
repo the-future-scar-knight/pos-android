@@ -118,6 +118,35 @@ create index if not exists items_cursor_idx on public.items (business_id, update
 create index if not exists items_sku_idx on public.items (business_id, sku);
 create index if not exists items_barcode_idx on public.items (business_id, barcode);
 
+-- Item tags: key/value pairs on a product. In the live shop every row is
+-- key = 'car' and the value is a vehicle the part fits, which is how a cashier
+-- finds a filter for a Hiace whose product name never says Hiace.
+--
+-- The unique index is PARTIAL (live rows only) so re-tagging a part that was
+-- previously untagged and tombstoned does not collide with the tombstone.
+create table if not exists public.item_attributes (
+    id                uuid primary key,
+    business_id       uuid not null,
+    item_id           uuid not null,
+    key               text not null,
+    value             text not null,
+    key_norm          text,
+    value_norm        text,
+    updated_at        timestamptz not null default now(),
+    deleted           boolean not null default false,
+    client_updated_at timestamptz
+);
+
+create unique index if not exists uq_item_attributes_live
+    on public.item_attributes (business_id, item_id, key_norm, value_norm)
+    where deleted = false;
+create index if not exists idx_item_attributes_cursor
+    on public.item_attributes (business_id, updated_at);
+create index if not exists idx_item_attributes_lookup
+    on public.item_attributes (business_id, key_norm, value_norm);
+create index if not exists idx_item_attributes_item
+    on public.item_attributes (item_id);
+
 -- Stock ledger. THIS is the authority; items.stock_qty is a derived cache that
 -- every device recomputes from these rows after a pull.
 create table if not exists public.stock_movements (
@@ -509,7 +538,7 @@ do $$
 declare t text;
 begin
   foreach t in array array[
-    'businesses','staff','items','stock_movements','customers','credit_txns',
+    'businesses','staff','items','item_attributes','stock_movements','customers','credit_txns',
     'cash_sessions','cash_movements','sales','sale_items','sale_payments',
     'refunds','refund_items','refund_payments','mobile_money_receipts',
     'audit_entries','expenses','suppliers','purchase_orders','purchase_order_items'

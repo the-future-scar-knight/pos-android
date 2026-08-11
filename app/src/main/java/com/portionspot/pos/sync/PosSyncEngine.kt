@@ -7,6 +7,8 @@ import com.portionspot.pos.data.CreditDao
 import com.portionspot.pos.data.CustomerDao
 import com.portionspot.pos.data.ExpenseDao
 import com.portionspot.pos.data.Item
+import com.portionspot.pos.data.ItemAttribute
+import com.portionspot.pos.data.ItemAttributeDao
 import com.portionspot.pos.data.ItemDao
 import com.portionspot.pos.data.MobileMoneyDao
 import com.portionspot.pos.data.NotificationDao
@@ -42,6 +44,8 @@ import com.portionspot.pos.sync.wire.StockMovementDto
 import com.portionspot.pos.sync.wire.toStockMovement
 import com.portionspot.pos.sync.wire.CashSessionDto
 import com.portionspot.pos.sync.wire.toCashSession
+import com.portionspot.pos.sync.wire.ItemAttributeDto
+import com.portionspot.pos.sync.wire.toItemAttribute
 import com.portionspot.pos.sync.wire.ItemDto
 import com.portionspot.pos.sync.wire.SaleItemDto
 import com.portionspot.pos.sync.wire.SalePaymentDto
@@ -65,6 +69,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
+import java.io.IOException
 import kotlin.math.abs
 
 /** Outcome of one sync pass, surfaced to the UI. */
@@ -94,6 +99,18 @@ private data class PushResult(val pushed: Int, val errors: List<String>)
  */
 private const val PG_RLS_VIOLATION = "42501"
 
+/**
+ * "This table does not exist here" — PostgREST answers 404/PGRST205 and Postgres 42P01.
+ *
+ * Only ever used to let an OPTIONAL table's pull degrade to nothing on a database that
+ * predates it. Never widen this to the tables that carry money: a sale that silently did
+ * not arrive is worse than a sync that says it failed.
+ */
+private fun IOException.isMissingTable(): Boolean {
+    val text = message.orEmpty()
+    return text.contains("HTTP 404") || text.contains("PGRST205") || text.contains("42P01")
+}
+
 /** Just the `id` of a cloud `businesses` row — see [PosSyncEngine.adoptBusinessId]. */
 @kotlinx.serialization.Serializable
 private data class BusinessIdRow(val id: String = "")
@@ -112,6 +129,7 @@ private data class BusinessIdRow(val id: String = "")
 class PosSyncEngine(
     private val businessDao: BusinessDao,
     private val itemDao: ItemDao,
+    private val itemAttributeDao: ItemAttributeDao,
     private val saleDao: SaleDao,
     private val salePaymentDao: SalePaymentDao,
     private val customerDao: CustomerDao,
@@ -466,6 +484,7 @@ class PosSyncEngine(
         val bid = businessDao.getOnce()?.id ?: return 0
         var n = 0
         n += pullItems(api, bid)
+        n += pullItemAttributes(api, bid)
         n += pullCustomersWire(api, bid)
         n += pullSalesWire(api, bid)
         n += pullSaleItems(api, bid)
@@ -678,6 +697,40 @@ class PosSyncEngine(
         }
         config.setCursor("items", rows.maxOf { it.updatedAt ?: IsoTime.EPOCH })
         return applied
+    }
+
+    /**
+     * `item_attributes` → the tags on each catalogue item (here: the cars a part fits).
+     *
+     * Runs straight after [pullItems] so a newly-arrived product and its fitments land in
+     * the same pass — a tag whose item is not on the device yet is still stored, because
+     * the search reads it by item id and simply finds nothing until the item shows up. That
+     * is self-correcting; dropping the row would not be, since the cursor has moved past it.
+     *
+     * Tombstones apply like any other row: a fitment deleted on the web must stop matching
+     * here, or the till keeps offering a part for a car the shop has decided it does not fit.
+     */
+    private suspend fun pullItemAttributes(api: SupabaseRest, bid: String): Int {
+        val body = try {
+            api.selectSince("item_attributes", config.cursor("item_attributes"), PAGE)
+        } catch (e: IOException) {
+            // A database that predates this table must not lose its SALES over its tags.
+            // Tags are enrichment — every other pull in this pass is money — so a missing
+            // table degrades to "no fitments" rather than aborting the whole pull. Only a
+            // missing table is swallowed; a network or permission failure still throws.
+            if (e.isMissingTable()) return 0 else throw e
+        }
+        val rows = syncJson.decodeFromString<List<ItemAttributeDto>>(body)
+        if (rows.isEmpty()) return 0
+        val apply = ArrayList<ItemAttribute>(rows.size)
+        for (dto in rows) {
+            val local = itemAttributeDao.getById(dto.id)
+            if (local != null && IsoTime.toMillis(dto.updatedAt) <= local.updatedAt) continue
+            apply += dto.toItemAttribute(bid) ?: continue
+        }
+        if (apply.isNotEmpty()) itemAttributeDao.upsertAll(apply)
+        config.setCursor("item_attributes", rows.maxOf { it.updatedAt ?: IsoTime.EPOCH })
+        return apply.size
     }
 
     private suspend fun pullCustomersWire(api: SupabaseRest, bid: String): Int {

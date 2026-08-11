@@ -899,10 +899,46 @@ val MIGRATION_36_37 = object : Migration(36, 37) {
     }
 }
 
+/**
+ * Item key/value tags — the web's `item_attributes`, in this shop the cars each part fits.
+ *
+ * Purely additive: a new table, nothing touched on `items`. Every row arrives from the
+ * pull, so an upgraded device starts empty and fills on its next sync rather than needing
+ * anything backfilled here. There is no `pendingSync` column by design — the web owns the
+ * catalogue, so these travel one way only.
+ *
+ * Index names are Room's own (`index_<table>_<cols>`); a hand-rolled name here passes the
+ * migration and then fails Room's schema identity check on the next open.
+ */
+val MIGRATION_37_38 = object : Migration(37, 38) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS `item_attributes` (" +
+                "`id` TEXT NOT NULL, " +
+                "`businessId` TEXT NOT NULL, " +
+                "`itemId` TEXT NOT NULL, " +
+                "`key` TEXT NOT NULL, " +
+                "`value` TEXT NOT NULL, " +
+                "`keyNorm` TEXT NOT NULL, " +
+                "`valueNorm` TEXT NOT NULL, " +
+                "`updatedAt` INTEGER NOT NULL, " +
+                "`deleted` INTEGER NOT NULL, " +
+                "PRIMARY KEY(`id`))"
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_item_attributes_businessId ON item_attributes (businessId)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_item_attributes_itemId ON item_attributes (itemId)")
+        db.execSQL(
+            "CREATE INDEX IF NOT EXISTS index_item_attributes_businessId_keyNorm_valueNorm " +
+                "ON item_attributes (businessId, keyNorm, valueNorm)"
+        )
+    }
+}
+
 @Database(
     entities = [
         Business::class,
         Item::class,
+        ItemAttribute::class,
         SaleEntity::class,
         SaleLine::class,
         SalePayment::class,
@@ -926,12 +962,13 @@ val MIGRATION_36_37 = object : Migration(36, 37) {
         OutsideFund::class,
         CashSession::class
     ],
-    version = 37,
+    version = 38,
     exportSchema = false
 )
 abstract class PosDatabase : RoomDatabase() {
     abstract fun businessDao(): BusinessDao
     abstract fun itemDao(): ItemDao
+    abstract fun itemAttributeDao(): ItemAttributeDao
     abstract fun saleDao(): SaleDao
     abstract fun salePaymentDao(): SalePaymentDao
     abstract fun stockMovementDao(): StockMovementDao
@@ -979,7 +1016,7 @@ abstract class PosDatabase : RoomDatabase() {
                         MIGRATION_26_27, MIGRATION_27_28, MIGRATION_28_29,
                         MIGRATION_29_30, MIGRATION_30_31, MIGRATION_31_32,
                         MIGRATION_32_33, MIGRATION_33_34, MIGRATION_34_35,
-                        MIGRATION_35_36, MIGRATION_36_37
+                        MIGRATION_35_36, MIGRATION_36_37, MIGRATION_37_38
                     )
                     .fallbackToDestructiveMigration()
                     .build()

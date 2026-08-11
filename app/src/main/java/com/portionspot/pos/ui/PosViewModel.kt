@@ -18,6 +18,8 @@ import com.portionspot.pos.data.CustomerWithBalance
 import com.portionspot.pos.data.Expense
 import com.portionspot.pos.data.Supplier
 import com.portionspot.pos.data.Item
+import com.portionspot.pos.data.TagValue
+import com.portionspot.pos.data.tagIndex
 import com.portionspot.pos.data.AppNotification
 import com.portionspot.pos.data.AuditEntry
 import com.portionspot.pos.data.CashierDay
@@ -233,6 +235,19 @@ class PosViewModel(
         businessId.filterNotNull()
             .flatMapLatest { repo.itemsFlow(it) }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /**
+     * Item tags, already grouped by item id and ready for [com.portionspot.pos.data.searchCatalog]
+     * — in this shop, the cars each part fits.
+     *
+     * Grouped here rather than in the screen so the ~700-row fold happens once per pull
+     * instead of on every keystroke: the search itself is then a map lookup per item.
+     */
+    val itemTags: StateFlow<Map<String, List<TagValue>>> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.itemAttributesFlow(it) }
+            .map { tagIndex(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyMap())
 
     val recentSales: StateFlow<List<SaleEntity>> =
         businessId.filterNotNull()

@@ -8,7 +8,9 @@ import com.portionspot.pos.data.CreditTxn
 import com.portionspot.pos.data.cashMovementTypeToWire
 import com.portionspot.pos.data.Customer
 import com.portionspot.pos.data.Item
+import com.portionspot.pos.data.ItemAttribute
 import com.portionspot.pos.data.MobileMoneyReceipt
+import com.portionspot.pos.data.attrNorm
 import com.portionspot.pos.data.Refund
 import com.portionspot.pos.data.RefundLine
 import com.portionspot.pos.data.RefundPayment
@@ -156,6 +158,54 @@ fun ItemDto.toItem(businessId: String, local: Item?): Item {
 /** `box_size` is `numeric(14,3)` on the wire but a whole number of units in the app. */
 private fun ItemDto.boxSizeInt(): Int =
     (boxSize?.toDoubleOrNull() ?: 1.0).toInt().coerceAtLeast(1)
+
+// ─────────────────────── item_attributes (PULL ONLY) ───────────────────────
+
+/**
+ * An item's key/value tag. **Pull only**, for the same reason as [ItemDto]: the catalogue
+ * belongs to the web, and these are part of the catalogue.
+ *
+ * In the live shop every row is `key = "car"` and the value is a vehicle the part fits —
+ * 671 rows over 80 items, which is 671 ways to find a product that its own name never
+ * mentions.
+ *
+ * `key_norm` and `value_norm` are read but not trusted: both are nullable on the wire, and
+ * a null one on a hand-inserted row would drop that fitment out of every search on this
+ * side. [toItemAttribute] falls back to computing them, and the fallback is the normal
+ * path rather than an edge case worth avoiding.
+ */
+@Serializable
+data class ItemAttributeDto(
+    val id: String,
+    @SerialName("item_id") val itemId: String,
+    val key: String? = null,
+    val value: String? = null,
+    @SerialName("key_norm") val keyNorm: String? = null,
+    @SerialName("value_norm") val valueNorm: String? = null,
+    @SerialName("updated_at") val updatedAt: String? = null,
+    val deleted: Boolean = false,
+)
+
+/**
+ * Wire row → local tag. Returns null for a row with no key or no value: an empty tag is
+ * not a fitment, it is a row that would match every search for the empty string.
+ */
+fun ItemAttributeDto.toItemAttribute(businessId: String): ItemAttribute? {
+    val k = key?.trim().orEmpty()
+    val v = value?.trim().orEmpty()
+    if (k.isEmpty() || v.isEmpty()) return null
+    return ItemAttribute(
+        id = id,
+        businessId = businessId,
+        itemId = itemId,
+        key = k,
+        value = v,
+        keyNorm = keyNorm?.trim()?.ifBlank { null } ?: attrNorm(k),
+        valueNorm = valueNorm?.trim()?.ifBlank { null } ?: attrNorm(v),
+        updatedAt = IsoTime.toMillis(updatedAt),
+        deleted = deleted,
+    )
+}
 
 // ────────────────────────────────── customers ──────────────────────────────────
 

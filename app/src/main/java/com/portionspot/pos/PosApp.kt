@@ -34,7 +34,8 @@ class AppContainer(app: Application) {
     // ---- Cloud sync (bring-your-own Supabase) ----
     val syncConfig: SyncConfig = SyncConfig(database.settingDao())
     val syncEngine: PosSyncEngine = PosSyncEngine(
-        database.businessDao(), database.itemDao(), database.saleDao(),
+        database.businessDao(), database.itemDao(), database.itemAttributeDao(),
+        database.saleDao(),
         database.salePaymentDao(), database.customerDao(), database.creditDao(),
         database.refundDao(), database.mobileMoneyDao(),
         database.expenseDao(), database.cashTxnDao(),

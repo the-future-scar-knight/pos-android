@@ -212,6 +212,9 @@ import com.portionspot.pos.data.Tender
 import com.portionspot.pos.data.Expense
 import com.portionspot.pos.data.Supplier
 import com.portionspot.pos.data.Item
+import com.portionspot.pos.data.TagValue
+import com.portionspot.pos.data.searchCatalog
+import com.portionspot.pos.data.tagCaption
 import com.portionspot.pos.data.isMeasured
 import com.portionspot.pos.data.onHand
 import com.portionspot.pos.data.sellableBlocked
@@ -2999,6 +3002,7 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
     val currency = business.currency
     val prefs by vm.shopPrefs.collectAsState()
     val items by vm.items.collectAsState()
+    val tags by vm.itemTags.collectAsState()
     val cart by vm.cart.collectAsState()
     val customers by vm.customers.collectAsState()
     val lastReceipt by vm.lastReceipt.collectAsState()
@@ -3030,18 +3034,19 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
     val categories = remember(items) {
         listOf("All") + items.mapNotNull { it.category?.trim()?.takeIf { c -> c.isNotEmpty() } }.distinct()
     }
-    val q = search.trim().lowercase()
-    val filtered = remember(items, q, selectedCat) {
-        items.filter { it.isActive && !it.deleted }.filter { item ->
-            val matchesSearch = q.isEmpty() ||
-                item.name.lowercase().contains(q) ||
-                (item.sku?.lowercase()?.contains(q) == true) ||
-                (item.barcode?.lowercase()?.contains(q) == true)
-            val matchesCat = q.isNotEmpty() || selectedCat == "All" ||
+    val q = search.trim()
+    // Search covers the item's TAGS as well as its name/sku/barcode — in this shop the
+    // tags are the cars a part fits, so "Hilux" finds the filter whose name never says
+    // Hilux. Each hit carries the tag values that matched, so the card can show WHY it is
+    // on screen instead of looking like a bad result.
+    val hits = remember(items, q, selectedCat, tags) {
+        val visible = items.filter { it.isActive && !it.deleted }.filter { item ->
+            q.isNotEmpty() || selectedCat == "All" ||
                 (item.category?.equals(selectedCat, ignoreCase = true) == true)
-            matchesSearch && matchesCat
         }
+        searchCatalog(visible, q, tags)
     }
+    val filtered = hits.map { it.item }
 
     Column(Modifier.fillMaxSize()) {
         // ── Search + category chips (white header, mirrors the web POS) ──
@@ -3122,9 +3127,10 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
                     contentPadding = PaddingValues(gridDimens.gridPadding),
                     verticalArrangement = Arrangement.spacedBy(gridDimens.gridSpacing)
                 ) {
-                    items(filtered, key = { it.id }) { item ->
+                    items(hits, key = { it.item.id }) { hit ->
+                        val item = hit.item
                         val inCart = cart.filter { it.itemId == item.id }.sumOf { it.qty }.toInt()
-                        ProductListRow(item, currency, inCart) { onPick(item) }
+                        ProductListRow(item, currency, inCart, hit.matchedTags) { onPick(item) }
                     }
                 }
             } else {
@@ -3135,9 +3141,10 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
                     horizontalArrangement = Arrangement.spacedBy(gridDimens.gridSpacing),
                     verticalArrangement = Arrangement.spacedBy(gridDimens.gridSpacing)
                 ) {
-                    items(filtered, key = { it.id }) { item ->
+                    items(hits, key = { it.item.id }) { hit ->
+                        val item = hit.item
                         val inCart = cart.filter { it.itemId == item.id }.sumOf { it.qty }.toInt()
-                        ProductCard(item, currency, inCart) { onPick(item) }
+                        ProductCard(item, currency, inCart, hit.matchedTags) { onPick(item) }
                     }
                 }
             }
@@ -3286,7 +3293,13 @@ private val Item.imageModel: String? get() = imageLocalPath ?: imageUrl
  * (top-left) and stock badge (top-right) float over a reserved top band.
  */
 @Composable
-private fun ProductCard(item: Item, currency: String, inCart: Int, onClick: () -> Unit) {
+private fun ProductCard(
+    item: Item,
+    currency: String,
+    inCart: Int,
+    matchedTags: List<TagValue> = emptyList(),
+    onClick: () -> Unit,
+) {
     val t = LocalPosTokens.current
     val d = LocalPosDimens.current
     val tracked = item.trackStock
@@ -3350,6 +3363,17 @@ private fun ProductCard(item: Item, currency: String, inCart: Int, onClick: () -
                 color = t.inkPrimary, fontWeight = FontWeight.SemiBold, fontSize = d.cardNameSize,
                 lineHeight = (d.cardNameSize.value * 1.25f).sp, maxLines = 2, overflow = TextOverflow.Ellipsis
             )
+            // Only when the search found this product THROUGH a tag: without it a filter
+            // for a Hilux appears in the results under a name that never says Hilux, and
+            // reads as a wrong result rather than the right one.
+            if (matchedTags.isNotEmpty()) {
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    tagCaption(matchedTags),
+                    color = t.accentBlue, fontSize = d.cardMetaSize, fontWeight = FontWeight.SemiBold,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis
+                )
+            }
             Spacer(Modifier.weight(1f))
             if (item.productType == "set" || item.productType == "piece" || measured) {
                 TypeBadge(item)
@@ -3425,7 +3449,13 @@ private fun ViewToggle(listView: Boolean, onToggle: (Boolean) -> Unit) {
  * Deliberately short so many products are visible at once on the small handheld.
  */
 @Composable
-private fun ProductListRow(item: Item, currency: String, inCart: Int, onClick: () -> Unit) {
+private fun ProductListRow(
+    item: Item,
+    currency: String,
+    inCart: Int,
+    matchedTags: List<TagValue> = emptyList(),
+    onClick: () -> Unit,
+) {
     val t = LocalPosTokens.current
     val d = LocalPosDimens.current
     val tracked = item.trackStock
@@ -3476,6 +3506,14 @@ private fun ProductListRow(item: Item, currency: String, inCart: Int, onClick: (
                     Spacer(Modifier.width(6.dp))
                     TypeBadge(item)
                 }
+            }
+            if (matchedTags.isNotEmpty()) {
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    tagCaption(matchedTags),
+                    color = t.accentBlue, fontSize = d.cardMetaSize, fontWeight = FontWeight.SemiBold,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis
+                )
             }
             if (hasBox || hasWs) {
                 Spacer(Modifier.height(2.dp))
@@ -5567,6 +5605,7 @@ private fun ItemsScreen(
 ) {
     val t = LocalPosTokens.current
     val items by vm.items.collectAsState()
+    val tags by vm.itemTags.collectAsState()
     val business by vm.business.collectAsState()
     val caps by vm.allowedCaps.collectAsState()
     val canManageInventory = com.portionspot.pos.auth.Capability.MANAGE_INVENTORY in caps
@@ -5594,15 +5633,11 @@ private fun ItemsScreen(
         onOpened()
     }
 
-    val q = search.trim().lowercase()
-    val shown = remember(items, q) {
-        if (q.isEmpty()) items
-        else items.filter { item ->
-            item.name.lowercase().contains(q) ||
-                (item.sku?.lowercase()?.contains(q) == true) ||
-                (item.barcode?.lowercase()?.contains(q) == true) ||
-                (item.category?.lowercase()?.contains(q) == true)
-        }
+    // Tags count here too: "what do I stock for a Vezel" is an inventory question before
+    // it is a till question.
+    val q = search.trim()
+    val shown = remember(items, q, tags) {
+        searchCatalog(items, q, tags, includeCategory = true).map { it.item }
     }
 
     Box(Modifier.fillMaxSize()) {
@@ -5674,6 +5709,18 @@ private fun ItemsScreen(
                                                 MaterialTheme.colorScheme.onSurfaceVariant
                                         }
                                         Text(label, color = tint, style = MaterialTheme.typography.bodySmall)
+                                    }
+                                    // The item's tags, always — not only when they matched.
+                                    // This is the manage view, and "which parts have no
+                                    // fitments recorded yet" is a question only the owner
+                                    // can answer, and only if the app shows the gap.
+                                    tags[item.id]?.takeIf { it.isNotEmpty() }?.let { itemTags ->
+                                        Text(
+                                            tagCaption(itemTags),
+                                            color = t.accentBlue,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            maxLines = 2, overflow = TextOverflow.Ellipsis
+                                        )
                                     }
                                 }
                                 Text(

@@ -121,6 +121,10 @@ class SyncConfig(private val dao: SettingDao) {
             // either — `stock_movements` is the authority and `items.stock_qty` is a
             // derived cache every device recomputes after a pull.
             "items",
+            // The tags on each item — here, the cars a part fits. Pull-only for the same
+            // reason as `items`, and on its own cursor so a catalogue that gains 600
+            // fitments doesn't re-read the whole product list to find them.
+            "item_attributes",
             "customers",
             // A sale is three rows, not one JSON blob: the header plus its line and tender
             // children. They carry their own cursors so a pull that dies part-way resumes
