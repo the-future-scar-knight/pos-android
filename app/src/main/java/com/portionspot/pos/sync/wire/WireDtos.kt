@@ -622,6 +622,26 @@ fun buildSalePush(sale: SaleEntity, lines: List<SaleLine>): SalePushDto {
     )
 }
 
+/**
+ * `line_total` means something DIFFERENT on the wire than it does in this app, and the
+ * difference is money.
+ *
+ * Locally the column is the GROSS goods value, `unitPrice × qty`, because the receipt
+ * prints the discount and the markup as their own lines underneath it. On the wire it is
+ * the NET — `unitPrice × qty − lineDiscount + lineMarkup` — which is the web POS's `ep()`,
+ * the meaning every row already in the cloud carries.
+ *
+ * It matters because `sale_items.line_profit` is GENERATED as
+ * `line_total − (unit_cost × qty × units_per_line)`. Push the gross figure and a cashier's
+ * $20 off a line reads in the cloud as $20 more profit — not a rounding difference, a
+ * wrong number in the owner's reports on every discounted sale.
+ *
+ * Reversible on the way back ([recoverLocalLineTotal]) because `line_discount` and
+ * `line_markup` travel in the same row, so the conversion is exact in both directions and
+ * the local convention survives a round trip untouched.
+ */
+private fun SaleLine.wireLineTotal(): Double = unitPrice * qty - lineDiscount + lineMarkup
+
 fun SaleLine.toPush(): SaleItemPushDto = SaleItemPushDto(
     id = id,
     businessId = businessId,
@@ -634,7 +654,7 @@ fun SaleLine.toPush(): SaleItemPushDto = SaleItemPushDto(
     lineDiscount = lineDiscount,
     lineMarkup = lineMarkup,
     lineTax = lineTax,
-    lineTotal = lineTotal,
+    lineTotal = wireLineTotal(),
     mode = mode,
     unitsPerLine = unitsPerLine.toDouble(),
     deleted = deleted,
@@ -663,6 +683,9 @@ fun SalePayment.toPush(): SalePaymentPushDto = SalePaymentPushDto(
  * `line_cost` and `line_profit` are readable here (they are generated, not secret) but
  * are deliberately not mapped — Android derives its own from `unit_cost`, and importing
  * the cloud's copy would give the device two costs for one line.
+ *
+ * `line_total` arrives NET and is converted back to this app's gross convention on the way
+ * in — see [wireLineTotal] for why the two sides spell it differently.
  */
 @Serializable
 data class SaleItemDto(
@@ -702,13 +725,20 @@ fun SaleItemDto.toSaleLine(businessId: String, local: SaleLine?): SaleLine {
         lineDiscount = lineDiscount.toMoney(),
         lineMarkup = lineMarkup.toMoney(),
         lineTax = lineTax.toMoney(),
-        lineTotal = lineTotal.toMoney(),
+        // Back to the gross figure this app's receipts are rendered from. Without it a
+        // sale rung on the web prints its discount twice — once folded into the line and
+        // again on the discount line below it.
+        lineTotal = recoverLocalLineTotal(),
         mode = mode,
         unitsPerLine = (unitsPerLine?.toDoubleOrNull() ?: 1.0).toInt().coerceAtLeast(1),
         updatedAt = IsoTime.toMillis(cursorStamp()),
         deleted = deleted,
     )
 }
+
+/** The wire's NET `line_total` read back as this app's GROSS one. Inverse of [wireLineTotal]. */
+private fun SaleItemDto.recoverLocalLineTotal(): Double =
+    lineTotal.toMoney() + lineDiscount.toMoney() - lineMarkup.toMoney()
 
 @Serializable
 data class SalePaymentDto(
