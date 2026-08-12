@@ -39,16 +39,54 @@ fun stockOnHandFromDelta(item: Item, deltaSinceBaseline: Double): Double? {
 
 /**
  * On-hand for [item] computed from [movements] directly. Only rows for this item, not
- * tombstoned, and stamped STRICTLY after the baseline count — a movement stamped at the
- * same instant as the shop's figure is what produced it, and counting it applies it twice.
+ * tombstoned, and only those [countsTowardBaseline] admits.
  */
 fun stockOnHandFromLedger(item: Item, movements: List<StockMovement>): Double? {
     if (item.stockBaseAt <= 0L) return null
     val delta = movements
-        .filter { it.itemId == item.id && !it.deleted && it.createdAt > item.stockBaseAt }
+        .filter { it.itemId == item.id && !it.deleted && countsTowardBaseline(item, it) }
         .sumOf { it.delta }
     return stockOnHandFromDelta(item, delta)
 }
+
+/**
+ * Movement types that assert an ABSOLUTE figure rather than a change. Only these can be
+ * the movement a stock count wrote alongside the shop's figure; a `sale` or a `return`
+ * never is, however close its stamp lands.
+ */
+private val ABSOLUTE_TYPES = setOf("adjust", "restock", "reset")
+
+/**
+ * True when [m] is the movement that PRODUCED [item]'s baseline, rather than one that
+ * merely shares its instant.
+ *
+ * A count writes two things at once — the shop's figure and the movement that records it —
+ * so that one movement is already inside the baseline and counting it applies it twice.
+ * Every OTHER movement at that instant belongs to a different till doing its own work.
+ *
+ * Identified by what the row IS, not by when it happened: an absolute type whose
+ * `balanceAfter` is the counted figure. That is the web POS's rule, and it is the reason
+ * both clients now read the same shelf.
+ */
+fun producedBaseline(item: Item, m: StockMovement): Boolean =
+    m.createdAt == item.stockBaseAt &&
+        m.type in ABSOLUTE_TYPES &&
+        kotlin.math.abs(m.balanceAfter - item.stockBaseQty) < QTY_EPSILON
+
+/**
+ * Whether [m] is movement the baseline has NOT already accounted for.
+ *
+ * Anything stamped before the count is inside the figure. Anything after it is new. At the
+ * exact instant of the count — which is a real collision, not a theoretical one, because
+ * two tills in a shop share a wall clock to the millisecond — only the count's own
+ * movement is excluded.
+ *
+ * ★ The SQL twin of this lives in `StockMovementDao.deltaSinceBaselineByItem`. The sync
+ * pass sums across the whole catalogue in one query and cannot call back into Kotlin, so
+ * the rule is written twice on purpose. Change both.
+ */
+fun countsTowardBaseline(item: Item, m: StockMovement): Boolean =
+    m.createdAt >= item.stockBaseAt && !producedBaseline(item, m)
 
 /** The ledger entry a catalogue edit owes, from [stockEditFor]. */
 data class StockEdit(

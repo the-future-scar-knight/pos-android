@@ -168,9 +168,13 @@ class StockEditTest {
         )
         assertEquals(3.0, stockOnHandFromLedger(newProduct, listOf(opening))!!, 1e-9)
 
-        // Stamped ON the row instead, it is silently discarded — the old behaviour.
+        // Stamped ON the row, this used to be silently discarded and the shelf read 0.
+        // It no longer is: the tie now excludes only the movement that PRODUCED the
+        // baseline, and an opening `restock` of 3 against a baseline of 0 plainly did not
+        // produce it. The +1ms stamp above stays as belt and braces — but a product added
+        // on a till no longer depends on it to arrive stocked on every other phone.
         val onTheBaseline = opening.copy(createdAt = rowStamp)
-        assertEquals(0.0, stockOnHandFromLedger(newProduct, listOf(onTheBaseline))!!, 1e-9)
+        assertEquals(3.0, stockOnHandFromLedger(newProduct, listOf(onTheBaseline))!!, 1e-9)
     }
 
     @Test

@@ -97,10 +97,56 @@ class StockBaselineTest {
     }
 
     @Test
-    fun aMovementExactlyOnTheBaselineIsAlreadyInTheFigure() {
-        // Strictly-after, matching the SQL. A movement stamped at the same millisecond as
-        // the shop's figure is what PRODUCED that figure; counting it applies it twice.
-        val onHand = stockOnHandFromLedger(item(0.0, 10.0, baseAt), listOf(move(-1.0, baseAt)))
+    fun theCountsOwnMovementIsAlreadyInTheFigure() {
+        // A count writes the figure and the movement recording it at the same instant.
+        // That one row is inside the baseline; counting it applies the count twice.
+        val counted = StockMovement(
+            businessId = "biz", itemId = "i1", type = "adjust", delta = 3.0,
+            balanceAfter = 10.0, createdAt = baseAt,
+        )
+        val onHand = stockOnHandFromLedger(item(0.0, 10.0, baseAt), listOf(counted))
         assertEquals(10.0, onHand!!, 1e-9)
+    }
+
+    @Test
+    fun anotherTillsSaleInTheSameMillisecondStillCounts() {
+        // The divergence that made two clients read the same rows differently: till A takes
+        // a count of 25, till B rings up two in the same millisecond. Excluding the whole
+        // tie drops B's sale and the shelf reads 25 with 23 on it. Only the movement that
+        // PRODUCED the figure is excluded — a sale never is, however close its stamp lands.
+        val count = StockMovement(
+            businessId = "biz", itemId = "i1", type = "adjust", delta = 5.0,
+            balanceAfter = 25.0, createdAt = baseAt,
+        )
+        val onHand = stockOnHandFromLedger(
+            item(0.0, 25.0, baseAt),
+            listOf(count, move(-2.0, baseAt)),
+        )
+        assertEquals(23.0, onHand!!, 1e-9)
+    }
+
+    @Test
+    fun anAbsoluteMovementThatDidNotProduceTheFigureStillCounts() {
+        // Same instant, same absolute type, but its `balanceAfter` is not the counted
+        // figure — so it is another till's stock-take, not the one this baseline came from.
+        val otherTill = StockMovement(
+            businessId = "biz", itemId = "i1", type = "restock", delta = 4.0,
+            balanceAfter = 99.0, createdAt = baseAt,
+        )
+        val onHand = stockOnHandFromLedger(item(0.0, 10.0, baseAt), listOf(otherTill))
+        assertEquals(14.0, onHand!!, 1e-9)
+    }
+
+    @Test
+    fun aResetCountsBecauseTheBaselineIsNotWhatItLeftBehind() {
+        // Reset is local: it writes `-on-hand` but never moves `stockBaseAt`, which only a
+        // pull can set. So its movement lands after the baseline and must be applied, or
+        // the Danger-zone reset undoes itself one sync later — the failure it exists to fix.
+        val reset = StockMovement(
+            businessId = "biz", itemId = "i1", type = "reset", delta = -10.0,
+            balanceAfter = 0.0, createdAt = afterBase,
+        )
+        val onHand = stockOnHandFromLedger(item(10.0, 10.0, baseAt), listOf(reset))
+        assertEquals(0.0, onHand!!, 1e-9)
     }
 }

@@ -544,12 +544,23 @@ interface StockMovementDao {
      * different times. `onHand` here is a DELTA to add to [Item.stockBaseQty], not an
      * on-hand — summing the whole ledger instead is what emptied a shelf of 2 after one
      * sale of 1, since nothing ever writes the opening entry the sum assumes.
+     *
+     * The tie clause is the web POS's rule, adopted so both clients read the same shelf:
+     * at the baseline instant, exclude only the movement that PRODUCED the figure —
+     * identified by WHAT IT IS (an absolute type carrying the counted figure as its
+     * `balanceAfter`), never by when it happened. A sale rung by another till in that same
+     * millisecond is independent work and counts. This is the SQL twin of
+     * [countsTowardBaseline]; the two are asserted against the same cases in
+     * `StockBaselineTest` and must be changed together.
      */
     @Query(
         "SELECT sm.itemId AS itemId, SUM(sm.delta) AS onHand FROM stock_movements sm " +
             "JOIN items i ON i.id = sm.itemId " +
             "WHERE sm.businessId = :businessId AND sm.deleted = 0 " +
-            "AND i.stockBaseAt > 0 AND sm.createdAt > i.stockBaseAt " +
+            "AND i.stockBaseAt > 0 AND sm.createdAt >= i.stockBaseAt " +
+            "AND NOT (sm.createdAt = i.stockBaseAt " +
+            "AND sm.type IN ('adjust', 'restock', 'reset') " +
+            "AND abs(sm.balanceAfter - i.stockBaseQty) < 0.005) " +
             "GROUP BY sm.itemId"
     )
     suspend fun deltaSinceBaselineByItem(businessId: String): List<ItemOnHand>
