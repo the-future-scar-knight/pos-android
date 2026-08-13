@@ -54,7 +54,12 @@ class AppContainer(app: Application) {
         database.staffRequestDao(), database.cashSessionDao(),
         database.stockMovementDao(), database.staffDao(), syncConfig,
         accessToken = authManager::accessTokenOrNull,
-        ensureFreshToken = { authManager.refreshIfNeeded() }
+        ensureFreshToken = { authManager.refreshIfNeeded() },
+        // A pulled sale is another till's cash sitting in the SAME physical drawer. The
+        // pull writes the sale and its tenders but no cash-ledger row, so without this each
+        // phone's cash-on-hand counts only its own takings and the day close books the
+        // difference as a variance against profit.
+        reconcileCash = { bid -> repository.reconcilePulledCash(bid) }
     )
     val syncManager: SyncManager =
         SyncManager(app.applicationContext, syncConfig, syncEngine, database.syncArmDao())

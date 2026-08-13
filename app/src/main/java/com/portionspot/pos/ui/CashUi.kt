@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccountBalanceWallet
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -105,6 +106,13 @@ fun TillAndSafeSection(vm: PosViewModel, currency: String) {
     val totals by vm.outsideFundTotals.collectAsState()
     val lastClose by vm.latestDayClose.collectAsState()
     val closes by vm.dayCloses.collectAsState()
+    // Whether TODAY has already been counted. Read here, at the top of the section, so the
+    // answer is on screen before anyone opens a drawer — not after they have counted it and
+    // pressed a button that cannot use the number.
+    val dayClosed by vm.todayClose.collectAsState()
+    // Re-derive which day "today" is whenever this section appears: a phone left open across
+    // midnight would otherwise still be reporting yesterday's close.
+    LaunchedEffect(Unit) { vm.refreshCashDay() }
 
     var showClose by remember { mutableStateOf(false) }
     var showTopUp by remember { mutableStateOf(false) }
@@ -148,11 +156,31 @@ fun TillAndSafeSection(vm: PosViewModel, currency: String) {
         if (canClose || canTopUp) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (canClose) {
-                    Button(
-                        onClick = { showClose = true },
-                        modifier = Modifier.weight(1f),
-                        colors = ButtonDefaults.buttonColors(containerColor = t.brand.s600, contentColor = t.inkOnBrand)
-                    ) { Text("Close the day") }
+                    // ★ THE BUTTON SAYS WHICH IT IS BEFORE THE DRAWER IS COUNTED. A day is
+                    // counted once (the owner's rule — see [PosRepository.closeDay]), so on
+                    // a day already closed this must not keep offering to close it: someone
+                    // would count the till, type the figure in, and get a dialog that
+                    // dismisses without recording anything.
+                    //
+                    // It stays tappable, but only to READ the record — and it drops the
+                    // brand fill for a plain outline, because the brand-accent control on
+                    // this screen is the one that moves money and this one no longer can.
+                    if (dayClosed != null) {
+                        OutlinedButton(onClick = { showClose = true }, modifier = Modifier.weight(1f)) {
+                            Icon(
+                                Icons.Filled.CheckCircle, contentDescription = null,
+                                tint = t.success, modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            Text("Day closed")
+                        }
+                    } else {
+                        Button(
+                            onClick = { showClose = true },
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.buttonColors(containerColor = t.brand.s600, contentColor = t.inkOnBrand)
+                        ) { Text("Close the day") }
+                    }
                 }
                 if (canTopUp) {
                     OutlinedButton(onClick = { showTopUp = true }, modifier = Modifier.weight(1f)) {
@@ -436,12 +464,33 @@ private fun DayCloseRow(c: DayClose, currency: String) {
 private fun CloseDayDialog(vm: PosViewModel, currency: String, onDismiss: () -> Unit) {
     val t = LocalPosTokens.current
     var proposal by remember { mutableStateOf<PosRepository.DayCloseProposal?>(null) }
-    LaunchedEffect(Unit) { proposal = vm.dayCloseProposal() }
-
+    // ★ ASK WHETHER THE DAY IS ALREADY COUNTED BEFORE OFFERING A FORM, and read it once,
+    // authoritatively, rather than trusting a flow that may not have emitted yet.
+    //
+    // A day is counted ONCE — the owner's rule (see [PosRepository.closeDay]). Without this
+    // check the cashier could open the dialog on an already-closed day, read an expected
+    // figure, physically count the drawer, type it in and press "Confirm — money moved";
+    // the repository would short-circuit, the dialog would dismiss, and it would look
+    // exactly like a successful close. Nothing recorded, nothing moved, and no way to tell.
+    // A silent no-op on a money button is worse than an error.
+    var closedRecord by remember { mutableStateOf<DayClose?>(null) }
+    var checked by remember { mutableStateOf(false) }
+    // ★ Every piece of state is declared HERE, above the branch below. Compose remembers
+    // positionally, so a `remember` that only runs on some passes through the function
+    // reads back a value that belongs to a different call. The three branches that follow
+    // are therefore pure rendering.
     var counted by remember { mutableStateOf("") }
     var targetText by remember { mutableStateOf("") }
     var note by remember { mutableStateOf("") }
     var loaded by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        vm.refreshCashDay()
+        closedRecord = vm.dayCloseForToday()
+        checked = true
+        // Only worth building a proposal for a day that can still be counted.
+        if (closedRecord == null) proposal = vm.dayCloseProposal()
+    }
 
     val p = proposal
     LaunchedEffect(p) {
@@ -449,6 +498,19 @@ private fun CloseDayDialog(vm: PosViewModel, currency: String, onDismiss: () -> 
             targetText = fmt2(p.floatTarget)
             loaded = true
         }
+    }
+
+    // Nothing is offered until the question has been answered — least of all a count field.
+    if (!checked) {
+        PosDialog(title = "Close the day", onDismiss = onDismiss) {
+            Text("Checking today…", color = t.inkTertiary, fontSize = 13.sp)
+        }
+        return
+    }
+    val already = closedRecord
+    if (already != null) {
+        DayAlreadyClosedDialog(already, currency, onDismiss)
+        return
     }
 
     val expected = p?.expectedTill ?: 0.0
@@ -573,6 +635,98 @@ private fun CloseDayDialog(vm: PosViewModel, currency: String, onDismiss: () -> 
                 color = t.warning, fontSize = 11.sp
             )
         }
+    }
+}
+
+/**
+ * The day, already counted — shown INSTEAD of the count form, never alongside it.
+ *
+ * ★ NOTHING HERE IS TAPPABLE EXCEPT "DONE". No count field, no "Confirm — money moved",
+ * no second-count path. A day is counted once (the owner's decision — see
+ * [PosRepository.closeDay]), and a control that implies otherwise is how someone ends up
+ * counting a drawer for a button that cannot do anything with the number.
+ *
+ * It is deliberately not written as an error. Coming back to a closed day is the normal
+ * state of a shop that has finished trading, so the copy states the rule and shows the
+ * record, rather than telling the cashier they did something wrong.
+ *
+ * [PosDialog] rather than [PosContainedForm] precisely because that container always
+ * renders a confirm button, and there is nothing left to confirm.
+ */
+@Composable
+private fun DayAlreadyClosedDialog(record: DayClose, currency: String, onDismiss: () -> Unit) {
+    val t = LocalPosTokens.current
+    val short = record.variance < -0.005
+    val over = record.variance > 0.005
+    PosDialog(title = "Day already closed", onDismiss = onDismiss) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                Icons.Filled.CheckCircle, contentDescription = null,
+                tint = t.success, modifier = Modifier.size(18.dp)
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                "Today has already been counted and closed. A day is counted once.",
+                color = t.inkPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold
+            )
+        }
+
+        // The record itself, in the order the count was made: what the books expected,
+        // what was actually found, and the difference between them stated in words.
+        PosFormCard {
+            Row(Modifier.fillMaxWidth()) {
+                Text("Expected in the till", color = t.inkSecondary, fontSize = 13.sp, modifier = Modifier.weight(1f))
+                Text(money(record.expectedCash, currency), color = t.inkPrimary, fontSize = 13.sp)
+            }
+            Row(Modifier.fillMaxWidth()) {
+                Text("Counted in the till", color = t.inkSecondary, fontSize = 13.sp, modifier = Modifier.weight(1f))
+                Text(
+                    money(record.countedCash, currency),
+                    color = t.inkPrimary, fontWeight = FontWeight.Bold, fontSize = 15.sp
+                )
+            }
+            HorizontalDivider(color = t.surfaceBorder)
+            Text(
+                when {
+                    short -> "Short by ${money(-record.variance, currency)} — recorded as a loss."
+                    over -> "Over by ${money(record.variance, currency)} — recorded as a gain."
+                    else -> "Balanced — the drawer matched the books."
+                },
+                color = when {
+                    short -> t.danger
+                    over -> t.warning
+                    else -> t.success
+                },
+                fontSize = 13.sp, fontWeight = FontWeight.Bold
+            )
+        }
+
+        // Where the money went, so the person reading this can reconcile the two locations
+        // against what is physically in front of them without opening another screen.
+        PosFormCard {
+            Row(Modifier.fillMaxWidth()) {
+                Text("Left in the till", color = t.inkSecondary, fontSize = 13.sp, modifier = Modifier.weight(1f))
+                Text(money(record.floatTarget, currency), color = t.inkPrimary, fontSize = 13.sp)
+            }
+            Row(Modifier.fillMaxWidth()) {
+                Text("Moved to the safe", color = t.inkSecondary, fontSize = 13.sp, modifier = Modifier.weight(1f))
+                Text(
+                    money(record.movedToSafe, currency),
+                    color = t.brand.s600, fontWeight = FontWeight.Bold, fontSize = 13.sp
+                )
+            }
+        }
+
+        Text(
+            "Closed ${CASH_DAY_FMT.format(Date(record.closedAt))}" +
+                (record.closedByName?.let { " by $it" } ?: ""),
+            color = t.inkTertiary, fontSize = 11.sp
+        )
+        record.note?.let {
+            Text(it, color = t.inkTertiary, fontSize = 11.sp)
+        }
+
+        OutlinedButton(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) { Text("Done") }
     }
 }
 

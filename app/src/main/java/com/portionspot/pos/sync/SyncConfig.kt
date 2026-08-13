@@ -168,9 +168,11 @@ class SyncConfig(private val dao: SettingDao) {
             // either — `stock_movements` is the authority and `items.stock_qty` is a
             // derived cache every device recomputes after a pull.
             "items",
-            // The tags on each item — here, the cars a part fits. Pull-only for the same
-            // reason as `items`, and on its own cursor so a catalogue that gains 600
-            // fitments doesn't re-read the whole product list to find them.
+            // The tags on each item — here, the cars a part fits. TWO-WAY, unlike `items`
+            // itself: the owner learns a part also fits a Vezel while holding it at the
+            // counter, so the till has to be able to say so. On its own cursor, so a
+            // catalogue that gains 600 fitments doesn't re-read the whole product list to
+            // find them.
             "item_attributes",
             "customers",
             // A sale is three rows, not one JSON blob: the header plus its line and tender
@@ -205,9 +207,13 @@ class SyncConfig(private val dao: SettingDao) {
          *  - `notifications`   the alert feed. Cross-device alerting needs a shared table;
          *                      until then an alert raised on a cashier phone stays there.
          *  - `staff_requests`  the admin⇄cashier approval channel (credit-limit asks).
-         *  - `day_closes`      the till/safe day-close record. Its cloud analogue is
-         *                      `cash_sessions`, but the two are not the same shape —
-         *                      mapping them is its own piece of work.
+         *  - `day_closes`      the till/safe day-close record. Still local-only, but no
+         *                      longer stranded: now that a shift IS a trading day, closing a
+         *                      day writes its count, float target and moved-to-safe straight
+         *                      onto that day's `cash_sessions` row, which DOES go up. So the
+         *                      shared summary is covered and this table stays as the device's
+         *                      own detailed record — there is deliberately no `day_closes`
+         *                      cloud table to invent. See `PosRepository.closeDay`.
          *  - `outside_funds`   owner money vs loan. No cloud column expresses the split.
          *  - `settings`        device settings (printer, theme). Deliberately never synced.
          */

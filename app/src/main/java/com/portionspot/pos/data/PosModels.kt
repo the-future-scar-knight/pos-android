@@ -215,13 +215,21 @@ val Item.sellableBlocked: Boolean get() = pendingNew && onHand <= 0.0
  * fits, so without these a customer asking for "brake pads for a Hilux" only finds
  * anything when the word happens to have been typed into the product name.
  *
- * **PULL-ONLY, and there is deliberately no `pendingSync` column.** The web owns the
- * catalogue exactly as it owns [Item], so there is no field here for the push side to
- * read even by accident. A tag entered on the till would have nowhere to go.
+ * **TWO-WAY, unlike [Item].** The catalogue itself is still the web's, but the fitments
+ * are edited on the till — the owner is the one holding the part when he learns it also
+ * fits a Vezel — so this table pushes as well as pulls. See [PosSyncEngine]'s
+ * `item_attributes` block.
+ *
+ * ★ [id] IS NOT RANDOM. It is derived from (business, item, canonical key, canonical value)
+ * by [attributeId], and that is what makes two offline tills adding the same fitment
+ * converge onto one row instead of racing each other into a duplicate the cloud's live
+ * unique index would then reject — failing the whole push batch. Never mint one with
+ * [newId]; go through the repository, which derives it.
  *
  * [keyNorm] / [valueNorm] are computed on THIS side rather than taken from the wire: both
  * cloud columns are nullable, and a null on a hand-inserted row would silently drop that
- * fitment out of every search. Search reads the normalised pair, so it has to exist.
+ * fitment out of every search. Search reads the normalised pair, so it has to exist. They
+ * are GENERATED ALWAYS on the cloud, which is why the push DTO must not name them.
  */
 @Entity(
     tableName = "item_attributes",
@@ -232,7 +240,7 @@ val Item.sellableBlocked: Boolean get() = pendingNew && onHand <= 0.0
     ]
 )
 data class ItemAttribute(
-    @PrimaryKey val id: String = newId(),
+    @PrimaryKey val id: String,
     val businessId: String,
     val itemId: String,
     val key: String,
@@ -241,6 +249,12 @@ data class ItemAttribute(
     val valueNorm: String = attrNorm(value),
     val updatedAt: Long = now(),
     val deleted: Boolean = false,
+    /** Local-only: true => has unsynced local edits to push. Never sent to cloud.
+     *  Defaults FALSE, the opposite of every other synced entity here: the overwhelming
+     *  majority of these rows are born on the wire (671 of them arrived in one pull), and
+     *  a default of true would queue the shop's entire tag list straight back up on the
+     *  first pass. The three repository writes that create a tag locally set it. */
+    val pendingSync: Boolean = false,
 )
 
 /**
@@ -322,6 +336,32 @@ fun SaleEntity.isEditable(windowMinutes: Int, now: Long = now()): Boolean =
         !deleted &&
         windowMinutes > 0 &&
         now - soldAt <= windowMinutes * 60_000L
+
+/**
+ * The [SaleEntity.status] values that mean "this row is a real receipt": money moved and
+ * goods left the shop.
+ *
+ * `sales` also stores documents that are NOT sales — a `quote` priced for a customer who
+ * paid nothing, a `parked` cart still on the counter — and a `void` row is a sale that has
+ * already been reversed. Every list that presents receipts to a human, and every action
+ * that reverses one, has to say which of those it means.
+ */
+val RECEIPT_STATUSES = setOf("completed", "refunded")
+
+/**
+ * Can this row be refunded?
+ *
+ * ★ THE GUARD SITS AT THE ACTION, not only on the list that offers it. The Receipts query
+ * ([SaleDao.observeRecent]) no longer returns quotes or parked carts, but a query
+ * is a presentation decision and the next screen that wants a sale list can be written
+ * without knowing that. Refunding a quote restocks goods that never left the shop and
+ * books a real `refund_owed` debt against a document that was never a sale — a hole worth
+ * closing twice, so the money path checks for itself.
+ *
+ * A `refunded` sale is refundable again on purpose: refunds are per line and partial, and
+ * [PosRepository.qtyReturnedForLine] is what caps a second return at what is still owed.
+ */
+fun SaleEntity.isRefundable(): Boolean = !deleted && status in RECEIPT_STATUSES
 
 /** One line of a completed sale. name/unitPrice are SNAPSHOTS at sale time. */
 @Entity(
@@ -795,8 +835,8 @@ data class CashTxn(
     @PrimaryKey val id: String = newId(),
     val localId: String = id,
     val businessId: String,
-    // sale | expense | purchase | refund | change_payout | payout | capital | adjust
-    // | transfer_out | transfer_in | variance | drawing | loan
+    // sale | expense | purchase | refund | change_payout | credit_payment | payout
+    // | capital | adjust | transfer_out | transfer_in | variance | drawing | loan
     val type: String,
     val amount: Double = 0.0,             // signed: + into that location, − out of it
     /** LOCAL-ONLY: which on-site location this movement happened in ([CashLocation]). */
@@ -827,12 +867,20 @@ data class CashTxn(
  * as part of the same confirmation; it is recorded in the cash ledger as a matching
  * transfer PAIR, so the till and safe balances both move and the combined total does not.
  *
- * LOCAL-ONLY but sync-ready (carries [localId] / [updatedAt] / [pendingSync] like every
- * other syncable entity). No push/pull is wired: the cloud schema has no `day_closes`.
+ * LOCAL-ONLY, and staying that way on purpose. The cloud has no `day_closes` and does not
+ * need one: a close is the closing half of the day's [CashSession], so [PosRepository.closeDay]
+ * writes the count, the float target and the amount moved to the safe straight onto that
+ * row, which does go up. Two cloud answers to "what was the till short on the 8th?" would be
+ * one too many. This stays as the device's own fuller record.
  */
 /**
- * One trading SHIFT — the drawer being open from the moment someone counts a float in to
- * the moment someone counts it out.
+ * One trading SHIFT — and a shift here IS A TRADING DAY, opened by the calendar rather
+ * than by anyone pressing a button. There are deliberately no open/close shift controls:
+ * the period runs from local midnight to local midnight, and the row is created lazily by
+ * the first sale of the day. See [planDayRollover] for why, and for the rule that closes
+ * a day that has ended before it can block the next one. A day CLOSE fills in the second
+ * half of the same row — [countedCash], [expectedCash], [movedToSafe], [floatTarget] —
+ * which is why `day_closes` needs no cloud table of its own.
  *
  * ★ ONE OPEN SESSION PER SHOP, NOT PER TILL. Gridline has one physical drawer, so it has
  * exactly one thing to count; the shared database enforces it with a partial unique index
@@ -855,7 +903,7 @@ data class CashTxn(
 data class CashSession(
     @PrimaryKey override val id: String = newId(),
     val businessId: String,
-    val status: String = SessionStatus.OPEN,
+    override val status: String = SessionStatus.OPEN,
     override val openedAt: Long = now(),
     val openedBy: String? = null,
     val openedByName: String? = null,
@@ -863,17 +911,22 @@ data class CashSession(
     val closedAt: Long? = null,
     val closedBy: String? = null,
     val closedByName: String? = null,
-    val countedCash: Double? = null,
+    override val countedCash: Double? = null,
     val expectedCash: Double? = null,
+    /** Excess takings physically moved into the safe at the close. Mirrors the cloud's
+     *  `cash_sessions.moved_to_safe`, so the shared summary carries what [DayClose] does. */
+    @ColumnInfo(defaultValue = "0") val movedToSafe: Double = 0.0,
+    /** The float left in the till at the close. Mirrors `cash_sessions.float_target`. */
+    @ColumnInfo(defaultValue = "0") val floatTarget: Double = 0.0,
     /** Free note. Also where a merged-away shift records what became of it. */
     val note: String? = null,
     /** Which device opened the shift. Recorded, never part of its identity. */
     val tillCode: String? = null,
     val updatedAt: Long = now(),
-    val deleted: Boolean = false,
+    override val deleted: Boolean = false,
     /** Local-only: true => has unsynced local edits to push. Never sent to cloud. */
     val pendingSync: Boolean = true
-) : MergeableSession {
+) : DaySessionRow {
     val isOpen: Boolean get() = status == SessionStatus.OPEN && !deleted
 
     /**

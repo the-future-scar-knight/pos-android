@@ -131,6 +131,11 @@ fun cashMovementTypeToWire(localType: String, location: String, amount: Double):
         "float_topup", "float", "topup" -> "float_topup"
         "safe_in" -> "safe_in"
         "bank_deposit", "deposit", "bank" -> "bank_deposit"
+        // A customer settling a debt in cash. `pay_in` is not a fallback here, it is the
+        // right word: money arriving at the till for a reason other than a sale is exactly
+        // what the shared cash-up means by a pay-in, and a repayment has no other
+        // representation on that side at all (see [cashMovementCountedElsewhere]).
+        "credit_payment" -> "pay_in"
         else -> when {
             location.equals(CashLocation.SAFE, ignoreCase = true) && amount > 0 -> "safe_in"
             amount >= 0 -> "pay_in"

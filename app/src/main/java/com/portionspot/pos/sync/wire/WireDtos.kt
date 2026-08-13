@@ -297,11 +297,10 @@ fun Item.toPush(): ItemPushDto = ItemPushDto(
 private fun ItemDto.boxSizeInt(): Int =
     (boxSize?.toDoubleOrNull() ?: 1.0).toInt().coerceAtLeast(1)
 
-// ─────────────────────── item_attributes (PULL ONLY) ───────────────────────
+// ─────────────────────── item_attributes (two-way) ───────────────────────
 
 /**
- * An item's key/value tag. **Pull only**, for the same reason as [ItemDto]: the catalogue
- * belongs to the web, and these are part of the catalogue.
+ * An item's key/value tag, as it comes DOWN.
  *
  * In the live shop every row is `key = "car"` and the value is a vehicle the part fits —
  * 671 rows over 80 items, which is 671 ways to find a product that its own name never
@@ -342,8 +341,54 @@ fun ItemAttributeDto.toItemAttribute(businessId: String): ItemAttribute? {
         valueNorm = valueNorm?.trim()?.ifBlank { null } ?: attrNorm(v),
         updatedAt = IsoTime.toMillis(updatedAt),
         deleted = deleted,
+        // The cloud already has this row — it is where it just came from. Stated rather
+        // than left to the default so the read direction can never queue an upload.
+        pendingSync = false,
     )
 }
+
+/**
+ * A tag as it goes UP.
+ *
+ * ★ `key_norm` and `value_norm` ARE ABSENT, and naming either one would fail the ENTIRE
+ * batch. They are `GENERATED ALWAYS` columns on the cloud — the database folds `key` and
+ * `value` itself, precisely so it can never disagree with a client about what "the same
+ * tag" means — and Postgres rejects any write that mentions a generated column. Same trap
+ * as `line_cost` / `line_profit` on [SaleItemPushDto].
+ *
+ * `updated_at` is absent for the usual reason: it is the server's cursor column, and a
+ * device with a skewed clock stamping it makes every other device skip everything behind
+ * it. The edit clock travels as `client_updated_at`.
+ *
+ * `id` is the DERIVED id (see [com.portionspot.pos.data.attributeId]) and the upsert
+ * conflict target. That is what turns two tills adding the same fitment into one row, and
+ * what lets a re-add resurrect a tombstone instead of colliding with it on the live unique
+ * index. It must be derived from the SHOP's business id, not this device's local one —
+ * [com.portionspot.pos.sync.PosSyncEngine] re-keys before sending.
+ */
+@Serializable
+data class ItemAttributePushDto(
+    val id: String,
+    @SerialName("business_id") val businessId: String,
+    @SerialName("item_id") val itemId: String,
+    val key: String,
+    val value: String,
+    val deleted: Boolean = false,
+    @SerialName("client_updated_at") val clientUpdatedAt: String,
+)
+
+fun ItemAttribute.toPush(): ItemAttributePushDto = ItemAttributePushDto(
+    id = id,
+    businessId = businessId,
+    itemId = itemId,
+    // As typed, not folded: the normalised pair is the database's to compute, and the
+    // owner's own casing is what the counter reads back ("Ford Ranger T6", not "ford
+    // ranger t6").
+    key = key,
+    value = value,
+    deleted = deleted,
+    clientUpdatedAt = IsoTime.toIso(updatedAt),
+)
 
 // ────────────────────────────────── customers ──────────────────────────────────
 
@@ -1082,10 +1127,19 @@ fun StockMovement.toPush(): StockMovementPushDto = StockMovementPushDto(
 // ──────────────────────────── cash sessions & movements ────────────────────────────
 
 /**
- * A trading shift. **`variance` is GENERATED on the cloud** (`counted_cash − expected_cash`)
- * and so is absent from the push DTO — naming it fails the whole batch, exactly like
+ * A trading shift — which, on this app, is a trading DAY (see
+ * [com.portionspot.pos.data.planDayRollover]).
+ *
+ * **`variance` is GENERATED on the cloud** (`counted_cash − expected_cash`) and so is
+ * absent from the push DTO — naming it fails the whole batch, exactly like
  * `sale_items.line_cost`. It is readable on the way down but not mapped: [CashSession]
  * derives its own, and holding two copies of one figure is how they come to disagree.
+ *
+ * `moved_to_safe` / `float_target` are the closing half of a day and are the reason the
+ * device's own [com.portionspot.pos.data.DayClose] record now HAS a cloud analogue: the
+ * day-close writes both onto the day's session, so a shop reading the shared table sees
+ * what was counted, what was left as float and what went to the safe, without `day_closes`
+ * ever having to be a cloud table.
  */
 @Serializable
 data class CashSessionDto(
@@ -1100,6 +1154,8 @@ data class CashSessionDto(
     @SerialName("closed_by_name") val closedByName: String? = null,
     @SerialName("counted_cash") val countedCash: String? = null,
     @SerialName("expected_cash") val expectedCash: String? = null,
+    @SerialName("moved_to_safe") val movedToSafe: String? = null,
+    @SerialName("float_target") val floatTarget: String? = null,
     val note: String? = null,
     @SerialName("till_code") val tillCode: String? = null,
     @SerialName("updated_at") val updatedAt: String? = null,
@@ -1123,6 +1179,8 @@ fun CashSessionDto.toCashSession(businessId: String, local: CashSession?): CashS
         closedByName = closedByName ?: base.closedByName,
         countedCash = countedCash?.toDoubleOrNull(),
         expectedCash = expectedCash?.toDoubleOrNull(),
+        movedToSafe = movedToSafe.toMoney(),
+        floatTarget = floatTarget.toMoney(),
         note = note ?: base.note,
         tillCode = tillCode ?: base.tillCode,
         updatedAt = IsoTime.toMillis(cursorStamp()),
@@ -1145,6 +1203,8 @@ data class CashSessionPushDto(
     @SerialName("closed_by_name") val closedByName: String? = null,
     @SerialName("counted_cash") val countedCash: Double? = null,
     @SerialName("expected_cash") val expectedCash: Double? = null,
+    @SerialName("moved_to_safe") val movedToSafe: Double = 0.0,
+    @SerialName("float_target") val floatTarget: Double = 0.0,
     val note: String? = null,
     @SerialName("till_code") val tillCode: String? = null,
     val deleted: Boolean = false,
@@ -1164,6 +1224,8 @@ fun CashSession.toPush(): CashSessionPushDto = CashSessionPushDto(
     closedByName = closedByName,
     countedCash = countedCash,
     expectedCash = expectedCash,
+    movedToSafe = movedToSafe,
+    floatTarget = floatTarget,
     note = note,
     tillCode = tillCode,
     deleted = deleted,

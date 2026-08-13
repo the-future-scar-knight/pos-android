@@ -1013,6 +1013,51 @@ val MIGRATION_39_40 = object : Migration(39, 40) {
     }
 }
 
+/**
+ * v40 → v41: a shift becomes a TRADING DAY, and the day-close writes its figures onto it.
+ *
+ * Two columns are added to `cash_sessions` — `movedToSafe` and `floatTarget` — so the
+ * closing half of a day close has somewhere to live on the row the cloud actually shares.
+ * They are the last two of the shape `public.cash_sessions` already carries; `variance`
+ * stays GENERATED on that side and DERIVED here, and is deliberately not a column in
+ * either place.
+ *
+ * DEFAULT 0 and NOT NULL: a session that predates this migration was never counted out
+ * through the new path, so zero is not a guess — it is the truthful statement that nothing
+ * was recorded as moved and no float target was recorded as left. Any other default would
+ * put money in the safe that never went there.
+ *
+ * No data migration for the sessions themselves. Attaching historical sales to day
+ * sessions is done by [PosRepository.backfillDaySessions] at runtime, not here: it has to
+ * MINT session ids and decide which day each sale belongs to in the device's own timezone,
+ * and neither is something SQL in a migration can do honestly.
+ */
+val MIGRATION_40_41 = object : Migration(40, 41) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE cash_sessions ADD COLUMN movedToSafe REAL NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE cash_sessions ADD COLUMN floatTarget REAL NOT NULL DEFAULT 0")
+    }
+}
+
+/**
+ * v41 → v42 — ITEM TAGS BECOME TWO-WAY. Adds `item_attributes.pendingSync`, the flag the
+ * new push block selects on, so a fitment added at the counter reaches the shop instead of
+ * living and dying on one phone.
+ *
+ * ★ DEFAULT 0, not 1, and that is the whole point of writing this by hand. Every existing
+ * row in this table CAME FROM the cloud — 671 of them in the live shop — so marking them
+ * dirty would upload the shop's entire tag list back to the row it was read from on the
+ * very next pass. Nothing would break; it would just be several hundred rows of pointless
+ * traffic on a phone paying for its own data, once per device.
+ *
+ * Additive column on an existing table, so no data moves and nothing can be lost.
+ */
+val MIGRATION_41_42 = object : Migration(41, 42) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE item_attributes ADD COLUMN pendingSync INTEGER NOT NULL DEFAULT 0")
+    }
+}
+
 @Database(
     entities = [
         Business::class,
@@ -1042,7 +1087,7 @@ val MIGRATION_39_40 = object : Migration(39, 40) {
         CashSession::class,
         StaffMember::class
     ],
-    version = 40,
+    version = 42,
     exportSchema = false
 )
 abstract class PosDatabase : RoomDatabase() {
@@ -1099,7 +1144,8 @@ abstract class PosDatabase : RoomDatabase() {
                         MIGRATION_29_30, MIGRATION_30_31, MIGRATION_31_32,
                         MIGRATION_32_33, MIGRATION_33_34, MIGRATION_34_35,
                         MIGRATION_35_36, MIGRATION_36_37, MIGRATION_37_38,
-                        MIGRATION_38_39, MIGRATION_39_40
+                        MIGRATION_38_39, MIGRATION_39_40, MIGRATION_40_41,
+                        MIGRATION_41_42
                     )
                     .fallbackToDestructiveMigration()
                     .build()

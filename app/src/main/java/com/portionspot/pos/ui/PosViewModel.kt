@@ -8,7 +8,9 @@ import com.portionspot.pos.data.CartLine
 import com.portionspot.pos.data.CashBasis
 import com.portionspot.pos.data.CashBasisSaleRow
 import com.portionspot.pos.data.CashLocation
+import com.portionspot.pos.data.CashSession
 import com.portionspot.pos.data.CashTxn
+import com.portionspot.pos.data.startOfDay
 import com.portionspot.pos.data.CreditTxn
 import com.portionspot.pos.data.DayClose
 import com.portionspot.pos.data.OutsideFund
@@ -22,6 +24,9 @@ import com.portionspot.pos.data.Supplier
 import com.portionspot.pos.data.Item
 import com.portionspot.pos.data.TagValue
 import com.portionspot.pos.data.tagIndex
+import com.portionspot.pos.data.AttrVocabulary
+import com.portionspot.pos.data.ItemAttribute
+import com.portionspot.pos.data.attrVocabulary
 import com.portionspot.pos.data.AppNotification
 import com.portionspot.pos.data.AuditEntry
 import com.portionspot.pos.data.CashierDay
@@ -40,6 +45,7 @@ import com.portionspot.pos.data.SaleEntity
 import com.portionspot.pos.data.SaleLine
 import com.portionspot.pos.data.SalePayment
 import com.portionspot.pos.data.isEditable
+import com.portionspot.pos.data.isRefundable
 import com.portionspot.pos.data.SalesSummary
 import com.portionspot.pos.data.SaleStamp
 import com.portionspot.pos.data.StaffRequest
@@ -50,6 +56,7 @@ import com.portionspot.pos.auth.Capability
 import com.portionspot.pos.auth.Permissions
 import com.portionspot.pos.auth.isCapabilityAllowed
 import com.portionspot.pos.auth.lockedCapabilities
+import com.portionspot.pos.payments.PaymentMethod
 import com.portionspot.pos.payments.PaynowClient
 import com.portionspot.pos.payments.PaynowInit
 import com.portionspot.pos.payments.PaynowPoll
@@ -302,15 +309,55 @@ class PosViewModel(
             .map { tagIndex(it) }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyMap())
 
+    /**
+     * Every key and value the shop has already used, most-used first — the attribute
+     * editor's typeahead.
+     *
+     * Folded here for the same reason [itemTags] is: it is a pass over every tag in the
+     * shop, and doing it per keystroke in the editor would re-read 671 rows to answer
+     * "what did we call this last time".
+     */
+    val attributeVocabulary: StateFlow<AttrVocabulary> =
+        businessId.filterNotNull()
+            .flatMapLatest { repo.itemAttributesFlow(it) }
+            .map { attrVocabulary(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), AttrVocabulary.EMPTY)
+
+    /** One item's live tags, for the editor and the read-only sheet. */
+    fun itemAttributes(itemId: String): Flow<List<ItemAttribute>> =
+        repo.itemAttributesForItemFlow(itemId)
+
+    /**
+     * Add a tag to an item. Gated on MANAGE_INVENTORY, like every other catalogue write:
+     * a fitment is a claim about what the shop sells, and it changes what the till finds.
+     */
+    fun addItemAttribute(itemId: String, key: String, value: String) {
+        val bid = businessId.value ?: return
+        if (!can(Capability.MANAGE_INVENTORY)) return
+        viewModelScope.launch { repo.addItemAttribute(bid, itemId, key, value) }
+    }
+
+    /** Change a tag's key or value — a tombstone plus a new row, see the repository. */
+    fun editItemAttribute(row: ItemAttribute, key: String, value: String) {
+        if (!can(Capability.MANAGE_INVENTORY)) return
+        viewModelScope.launch { repo.editItemAttribute(row, key, value) }
+    }
+
+    /** Remove a tag (tombstoned, so the removal reaches the other phones). */
+    fun removeItemAttribute(row: ItemAttribute) {
+        if (!can(Capability.MANAGE_INVENTORY)) return
+        viewModelScope.launch { repo.removeItemAttribute(row.id) }
+    }
+
     val recentSales: StateFlow<List<SaleEntity>> =
         businessId.filterNotNull()
             .flatMapLatest { repo.recentSalesFlow(it) }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
-    val todayTakings: StateFlow<Double> =
-        businessId.filterNotNull()
-            .flatMapLatest { repo.takingsSinceFlow(it, startOfToday()) }
-            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0.0)
+    // NOTE: today's takings are NOT declared here. The Receipts hero reads
+    // [todayCashBasis], which is derived from [cashBasisInputs] further down this file and
+    // therefore has to be declared after it — see the comment there for why the old
+    // SUM(total) figure was wrong and why both screens now share one source.
 
     val todayCount: StateFlow<Int> =
         businessId.filterNotNull()
@@ -454,6 +501,38 @@ class PosViewModel(
     private val cashBasisAllTime: StateFlow<CashBasis.Period> =
         cashBasisInputs
             .map { (sales, ledger) -> CashBasis.compute(sales, ledger, 0L, Long.MAX_VALUE) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), CashBasis.Period())
+
+    /**
+     * TODAY on the cash basis — the Receipts screen's hero figure.
+     *
+     * ══ What this replaced, and why ══
+     * The hero used to be `SUM(total)` over today's completed sales: the BILLED value,
+     * blind to [SaleEntity.amountPaid]. A $100 sale handed over entirely on account read
+     * "Today $100" here while the Dashboard, already on the cash basis, read $0 collected
+     * — two headline answers to the same question, and the bigger one was the wrong one.
+     * By the owner's rule unpaid credit is not revenue; it counts on the day the money is
+     * COLLECTED.
+     *
+     * It reads [cashBasisInputs] — the SAME source the Dashboard's [dashCashBasis] reads,
+     * not a second copy of the arithmetic. That is the point: a screen that recomputed
+     * "collected" its own way would drift from the Dashboard the first time either was
+     * touched, and `SaleMath.kt`'s header explains what that costs.
+     *
+     * So this figure INCLUDES repayments of older debts landing today, and excludes
+     * today's sales that have not been paid for. That is intended and it is exactly what
+     * the Dashboard shows: money that arrived today, whatever it was for.
+     * [CashBasis.Period.uncollected] carries the other half of the story — value billed
+     * today and still owed — which the screen shows underneath rather than inside.
+     *
+     * The window is recomputed on each emission rather than captured once, so a till left
+     * open across midnight rolls over instead of reporting yesterday forever.
+     */
+    val todayCashBasis: StateFlow<CashBasis.Period> =
+        cashBasisInputs
+            .map { (sales, ledger) ->
+                CashBasis.compute(sales, ledger, startOfToday(), Long.MAX_VALUE)
+            }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), CashBasis.Period())
 
     /** Everything the split needs off the cash ledger, gathered in one combine. */
@@ -744,6 +823,16 @@ class PosViewModel(
         viewModelScope.launch { _themeChoice.value = loadTheme() }
         viewModelScope.launch { _shopPrefs.value = loadPrefs() }
         viewModelScope.launch { businessId.filterNotNull().collect { _openingFloat.value = repo.openingFloat(it) } }
+        // Sales and refunds written before a shift meant anything belong to the day they
+        // happened on, not to nothing. Safe to run on every launch — it only ever selects
+        // rows with no session, so a repaired shop selects none. It also rolls any day that
+        // has ended closed, which is what stops a forgotten session blocking today's.
+        viewModelScope.launch { businessId.filterNotNull().collect { repo.backfillDaySessions(it) } }
+        // Sales and refunds pulled from another till before the reconciliation existed have
+        // no cash-ledger row on this device, so this drawer is understating itself by
+        // exactly the other phone's takings. Run once at launch as well as on every sync
+        // pass: it reconciles balances, so a device already in agreement writes nothing.
+        viewModelScope.launch { businessId.filterNotNull().collect { repo.reconcilePulledCash(it) } }
         viewModelScope.launch {
             _floatTarget.value = repo.floatTarget()
             _varianceNoteThreshold.value = repo.varianceNoteThreshold()
@@ -1569,12 +1658,33 @@ class PosViewModel(
         }
     }
 
-    /** Pay down a customer's outstanding balance. */
-    fun recordRepayment(customerId: String, amount: Double, note: String? = null) {
+    /**
+     * Pay down a customer's outstanding balance.
+     *
+     * [method] is a checkout tender code ([PaymentMethod]) and it is not cosmetic: only a
+     * CASH repayment puts money in the drawer, so it is the only one that moves the till.
+     * Defaulted to cash because that is what the counter takes, and because every call
+     * that existed before the tender was asked for was a cash repayment in practice —
+     * it just never told the cash ledger.
+     */
+    fun recordRepayment(
+        customerId: String,
+        amount: Double,
+        note: String? = null,
+        method: String = PaymentMethod.CASH.code
+    ) {
         val bid = businessId.value ?: return
         if (amount <= 0) return
         viewModelScope.launch {
-            repo.recordRepayment(bid, customerId, amount, note, currentCashierId, currentCashierName)
+            repo.recordRepayment(
+                businessId = bid,
+                customerId = customerId,
+                amount = amount,
+                note = note,
+                method = method,
+                cashierId = currentCashierId,
+                cashierName = currentCashierName
+            )
             nudgeSync("repayment")
         }
     }
@@ -1637,6 +1747,11 @@ class PosViewModel(
         val bid = businessId.value ?: return
         if (returns.isEmpty()) return
         if (!can(Capability.PROCESS_REFUNDS)) return
+        // ★ Only a real receipt can be reversed. The Receipts list no longer shows quotes
+        // or parked carts, but the list is not the last word — refunding a quote would
+        // restock goods that never left the shop and book a `refund_owed` debt against a
+        // document nobody ever paid for, so the money path refuses it on its own terms.
+        if (!sale.isRefundable()) return
         viewModelScope.launch {
             val customer = sale.customerId?.let { repo.customerById(it) }
             repo.createRefund(
@@ -1910,6 +2025,46 @@ class PosViewModel(
         eodKey.flatMapLatest { (b, d) -> repo.changeGivenFlow(b, d, d + DAY_MS) }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0.0)
 
+    /**
+     * The SHIFT for the day the end-of-day screen is showing — the same day the takings
+     * above are counted over, because a shift here is a trading day.
+     *
+     * Null means the shop did not trade that day: shifts are created by the first sale, not
+     * by a timer, so a day with no sales genuinely has none. That is a fact worth showing
+     * rather than an empty state to hide.
+     */
+    val eodSession: StateFlow<CashSession?> =
+        eodKey.flatMapLatest { (b, d) -> repo.daySessionFlow(b, d) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    // The trading day the CASH screen is talking about. Held as state rather than read from
+    // the clock at collection time because a flow does not re-derive its key on its own: a
+    // phone left open across midnight would keep reporting yesterday's close as today's.
+    // [refreshCashDay] is called when the cash section appears and when the close dialog
+    // opens, which is every moment the answer is about to matter.
+    private val _cashDay = MutableStateFlow(startOfToday())
+    fun refreshCashDay() { _cashDay.value = startOfToday() }
+
+    /**
+     * The close already recorded for today, or null if the day has not been counted.
+     *
+     * ONE COUNT PER TRADING DAY is the owner's rule, not an implementation limit — see
+     * [PosRepository.closeDay]. This is what lets the cash screen say so BEFORE the cashier
+     * counts the drawer, instead of letting them type a figure into a button that would
+     * silently do nothing.
+     */
+    val todayClose: StateFlow<DayClose?> =
+        combine(businessId.filterNotNull(), _cashDay) { b, d -> b to d }
+            .flatMapLatest { (b, d) -> repo.dayCloseForFlow(b, d) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    /** The authoritative read the close dialog makes as it opens, so the decision is never
+     *  taken from a flow that has not emitted yet. */
+    suspend fun dayCloseForToday(): DayClose? {
+        val bid = businessId.value ?: return null
+        return repo.dayCloseFor(bid, startOfToday())
+    }
+
     /** Per-customer debt split into 30/60/90 aging buckets (recomputed live). */
     val debtAging: StateFlow<List<DebtAgingRow>> =
         businessId.filterNotNull()
@@ -2127,6 +2282,11 @@ class PosViewModel(
         moveToSafe: Double,
         floatTarget: Double,
         note: String?,
+        /** Which trading day is being closed. Defaults to today, and is passed through
+         *  rather than re-derived downstream: closing yesterday late at night must close
+         *  YESTERDAY's shift, and a repository that resolved it from the clock would write
+         *  last night's count onto this morning's takings. */
+        dayStart: Long = startOfToday(),
         onDone: (DayClose?) -> Unit = {}
     ) {
         if (!can(Capability.CLOSE_DAY)) return
@@ -2134,7 +2294,7 @@ class PosViewModel(
         viewModelScope.launch {
             val close = repo.closeDay(
                 businessId = bid, countedCash = countedCash, moveToSafe = moveToSafe,
-                floatTarget = floatTarget, note = note,
+                floatTarget = floatTarget, note = note, dayStart = dayStart,
                 cashierId = currentCashierId, cashierName = currentCashierName
             )
             _floatTarget.value = floatTarget.coerceAtLeast(0.0)
@@ -2748,14 +2908,10 @@ class PosViewModel(
         }
     }
 
-    private fun startOfToday(): Long {
-        val c = Calendar.getInstance()
-        c.set(Calendar.HOUR_OF_DAY, 0)
-        c.set(Calendar.MINUTE, 0)
-        c.set(Calendar.SECOND, 0)
-        c.set(Calendar.MILLISECOND, 0)
-        return c.timeInMillis
-    }
+    /** Delegates to the ONE day boundary in [com.portionspot.pos.data.startOfDay]. The
+     *  dashboard's "today", the end-of-day screen's day and the trading day a shift covers
+     *  have to be the same edge, or a day's takings add up differently on two screens. */
+    private fun startOfToday(): Long = startOfDay(System.currentTimeMillis())
 
     private fun startOfMonth(): Long {
         val c = Calendar.getInstance()

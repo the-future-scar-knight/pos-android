@@ -42,6 +42,7 @@ class PosRepository(private val db: PosDatabase) {
     private val staffRequestDao = db.staffRequestDao()
     private val dayCloseDao = db.dayCloseDao()
     private val outsideFundDao = db.outsideFundDao()
+    private val cashSessionDao = db.cashSessionDao()
     private val staffDao = db.staffDao()
 
     /**
@@ -100,10 +101,117 @@ class PosRepository(private val db: PosDatabase) {
         itemDao.observeForBusiness(businessId)
 
     /** Every live item tag for the shop — the cars each part fits. Feeds catalogue search
-     *  (see [tagIndex]) and the fitment line on a product card. */
+     *  (see [tagIndex]), the fitment line on a product card, and the editor's typeahead
+     *  (see [attrVocabulary]). */
     fun itemAttributesFlow(businessId: String): Flow<List<ItemAttribute>> =
         itemAttributeDao.observeForBusiness(businessId)
 
+    /** One item's live tags, key then value, for the attribute editor. */
+    fun itemAttributesForItemFlow(itemId: String): Flow<List<ItemAttribute>> =
+        itemAttributeDao.observeForItem(itemId)
+
+    // ---- Item attributes: add / edit / remove ------------------------------
+    //
+    // ★ Every write here goes through [attributeId]. The id is the tag's IDENTITY, derived
+    // from (business, item, canonical key, canonical value), and it is what makes two
+    // offline phones tagging the same part converge on one row instead of racing into a
+    // duplicate the cloud's live unique index refuses — which fails the whole push batch,
+    // not just the tag. Never write one of these rows with [newId].
+    //
+    // The id is derived from the LOCAL business id, which is not the shop's. That is
+    // deliberate and handled at the boundary: `PosSyncEngine.rekeyPendingAttributes` re-mints
+    // an unsent row under the shop's id just before it is uploaded. Reading the cloud id
+    // here would put a sync concept into the repository for no gain — a till in local mode
+    // has no cloud id to read anyway.
+
+    /**
+     * Add (or resurrect) one tag on an item.
+     *
+     * A removed tag is a TOMBSTONE, not a missing row, so adding "Vezel" back after
+     * removing it derives the same id and this upsert simply flips `deleted` off with a
+     * fresh stamp. That is the whole reason the id is derived: with a random one the
+     * re-add would be a second live row for the same fitment, which the cloud rejects.
+     *
+     * Blank key or blank value is a no-op — a tag with no value is not a fitment, it is a
+     * row that matches every search for the empty string.
+     */
+    suspend fun addItemAttribute(businessId: String, itemId: String, key: String, value: String) {
+        val k = key.trim()
+        val v = value.trim()
+        if (k.isEmpty() || v.isEmpty()) return
+        itemAttributeDao.upsert(
+            ItemAttribute(
+                id = attributeId(businessId, itemId, k, v),
+                businessId = businessId,
+                itemId = itemId,
+                key = k,
+                value = v,
+                updatedAt = now(),
+                deleted = false,
+                pendingSync = true,
+            )
+        )
+        nudgeSync("itemAttribute")
+    }
+
+    /**
+     * Change a tag's key or value.
+     *
+     * ★ This is NOT an in-place edit, and it cannot be. The key and the value ARE the row's
+     * identity — change either and the derived id changes with it — so an edit is a
+     * tombstone of the old tag plus an upsert of the new one, committed together. Writing
+     * the new text onto the old row would leave a row whose id no longer describes its
+     * contents, and the next device to add that same tag would mint the correct id and
+     * create a duplicate beside it.
+     *
+     * When only the casing or the spacing changed, the derived id is unchanged and this
+     * collapses to a single upsert that stores the new spelling — no tombstone, because
+     * there is nothing to tombstone.
+     */
+    suspend fun editItemAttribute(row: ItemAttribute, key: String, value: String) {
+        val k = key.trim()
+        val v = value.trim()
+        if (k.isEmpty() || v.isEmpty()) return
+        val newId = attributeId(row.businessId, row.itemId, k, v)
+        val stamp = now()
+        db.withTransaction {
+            if (newId != row.id) {
+                itemAttributeDao.upsert(
+                    row.copy(deleted = true, updatedAt = stamp, pendingSync = true)
+                )
+            }
+            itemAttributeDao.upsert(
+                ItemAttribute(
+                    id = newId,
+                    businessId = row.businessId,
+                    itemId = row.itemId,
+                    key = k,
+                    value = v,
+                    updatedAt = stamp,
+                    deleted = false,
+                    pendingSync = true,
+                )
+            )
+        }
+        nudgeSync("itemAttribute")
+    }
+
+    /**
+     * Remove one tag — as a tombstone, never as a delete.
+     *
+     * The row has to survive so the removal can travel: a fitment that simply vanished from
+     * this phone is a fitment every other phone still holds, and the till keeps offering a
+     * part for a car the shop has decided it does not fit.
+     */
+    suspend fun removeItemAttribute(id: String) {
+        val row = itemAttributeDao.getById(id) ?: return
+        if (row.deleted) return
+        itemAttributeDao.upsert(row.copy(deleted = true, updatedAt = now(), pendingSync = true))
+        nudgeSync("itemAttribute")
+    }
+
+    /** Real receipts only — completed and refunded. Quotes and parked carts live in
+     *  `sales` too and are deliberately excluded; see [SaleDao.observeRecent]. */
     fun recentSalesFlow(businessId: String): Flow<List<SaleEntity>> =
         saleDao.observeRecent(businessId)
 
@@ -114,8 +222,9 @@ class PosRepository(private val db: PosDatabase) {
     fun discountedSalesFlow(businessId: String): Flow<List<SaleEntity>> =
         saleDao.observeDiscountedSales(businessId)
 
-    fun takingsSinceFlow(businessId: String, since: Long): Flow<Double> =
-        saleDao.observeTakingsSince(businessId, since)
+    // No `takingsSinceFlow`: "what came in today" is a CASH-BASIS question and belongs to
+    // [CashBasis], fed by [cashBasisSalesFlow] + [creditLedgerFlow]. See the note in
+    // [SaleDao] where the billed-total query used to live.
 
     fun saleCountSinceFlow(businessId: String, since: Long): Flow<Int> =
         saleDao.observeCountSince(businessId, since)
@@ -344,30 +453,54 @@ class PosRepository(private val db: PosDatabase) {
      * Record a repayment against a customer's account. Settles the debt with a
      * `credit_paid` row up to what's owed; any OVERPAYMENT is booked as a `change_owed`
      * row, so the excess flows into the shop-owes-customer balance (payable back later
-     * via [recordChangePayment]) instead of driving the debt negative. Both rows commit
-     * together.
+     * via [recordChangePayment]) instead of driving the debt negative.
+     *
+     * ══ CASH-ON-HAND: the drawer moves, and it used not to ══
+     * This whole chain wrote credit-ledger rows and NOTHING else. So a customer settling a
+     * debt in cash put money in the till and the app's cash-on-hand did not move — on any
+     * phone. At day close the drawer counted OVER by every repayment ever collected, and
+     * by the owner's rule [closeDay] writes that difference permanently as a `variance`,
+     * which is a hit to profit. A day that balanced perfectly was recorded as a windfall.
+     *
+     * So the repayment now has to say HOW it was paid, and only [method] `cash` writes a
+     * [CashTxn] — a positive one, into [CashLocation.TILL], because the money arrives at
+     * the counter exactly like a sale's does. An EcoCash or card repayment settles the same
+     * debt and moves no drawer, the same rule [checkout] applies to its tenders and
+     * [createRefund] applies to its payouts. The amount booked is what was HANDED OVER,
+     * including any overpayment: that cash is physically in the till, and the `change_owed`
+     * row is what records that it has to go back out again.
+     *
+     * ══ PUSHED, deliberately ══
+     * The row carries `refType = "customer"`, which [cashMovementCountedElsewhere] does NOT
+     * exclude, so it goes up to `cash_movements` as a `pay_in`. That is right and it is the
+     * convention [recordChangePayment] already set for the mirror-image payout: the shared
+     * cash-up derives a SALE's cash from the tenders and a REFUND's from the payouts, but it
+     * has no other representation of a debt repayment at all, so without this row a shop
+     * counting its drawer on the web is short by every debt collected on a phone.
+     *
+     * All rows for one repayment commit together.
      */
     suspend fun recordRepayment(
         businessId: String,
         customerId: String,
         amount: Double,
         note: String? = null,
+        method: String = "cash",
         cashierId: String? = null,
         cashierName: String? = null
     ) {
         if (amount <= 0) return
-        val debt = creditDao.balanceOnce(customerId).coerceAtLeast(0.0)
-        val paid = minOf(amount, debt)      // never past zero: debt won't go negative
-        val excess = amount - paid          // overpayment → shop now owes the customer
+        val debt = creditDao.balanceOnce(customerId)
+        val plan = planRepayment(amount, debt, method)
         val stamp = now()
         db.withTransaction {
-            if (paid > 0.0) {
+            if (plan.paid > 0.0) {
                 creditDao.insert(
                     CreditTxn(
                         businessId = businessId,
                         customerId = customerId,
                         type = "credit_paid",
-                        amount = paid,
+                        amount = plan.paid,
                         note = note,
                         createdBy = cashierId,
                         createdByName = cashierName,
@@ -376,18 +509,33 @@ class PosRepository(private val db: PosDatabase) {
                     )
                 )
             }
-            if (excess > 0.0) {
+            if (plan.excess > 0.0) {
                 creditDao.insert(
                     CreditTxn(
                         businessId = businessId,
                         customerId = customerId,
                         type = "change_owed",
-                        amount = excess,
-                        note = if (paid > 0.0) "Overpayment" else note ?: "Overpayment",
+                        amount = plan.excess,
+                        note = if (plan.paid > 0.0) "Overpayment" else note ?: "Overpayment",
                         createdBy = cashierId,
                         createdByName = cashierName,
                         createdAt = stamp,
                         updatedAt = stamp
+                    )
+                )
+            }
+            // Cash only, and inside the same transaction as the ledger rows: a crash that
+            // recorded the debt as settled without the money arriving (or the reverse)
+            // would be a discrepancy nobody could later reconstruct.
+            if (plan.cashIn > CENT) {
+                cashTxnDao.insert(
+                    CashTxn(
+                        businessId = businessId, type = "credit_payment", amount = plan.cashIn,
+                        location = CashLocation.TILL,
+                        source = "cash", note = note ?: "Debt repayment",
+                        refType = "customer", refId = customerId,
+                        createdBy = cashierId, createdByName = cashierName,
+                        createdAt = stamp, updatedAt = stamp
                     )
                 )
             }
@@ -576,9 +724,18 @@ class PosRepository(private val db: PosDatabase) {
      * short/over" line — see [cashVarianceFlow]. It is deliberately NOT folded into gross
      * profit: a shortage is a shortage, not a margin problem.
      *
+     * A close is also the CLOSING HALF OF THE DAY'S SHIFT. Since a shift here is a trading
+     * day, the count, the float left in the till and the amount moved to the safe are
+     * written onto that day's [CashSession] in the same transaction — which is how a shop
+     * reading the shared `cash_sessions` table sees what was counted without `day_closes`
+     * ever needing to become a cloud table.
+     *
+     * IDEMPOTENT. Closing the same trading day twice returns the close already recorded and
+     * changes nothing: the second run must not move the takings into the safe a second time.
+     *
      * [note] is required by the caller when `|variance|` exceeds [varianceNoteThreshold];
-     * below that the owner is not made to type. Returns the recorded close, or null when
-     * there is no business/nothing to record.
+     * below that the owner is not made to type. Returns the recorded close (including the
+     * one already on file for a day closed before), or null when there is nothing to record.
      */
     suspend fun closeDay(
         businessId: String,
@@ -590,6 +747,32 @@ class PosRepository(private val db: PosDatabase) {
         cashierId: String? = null,
         cashierName: String? = null
     ): DayClose? {
+        // ★★ ONE COUNT PER TRADING DAY. THIS IS THE OWNER'S DECISION, NOT A LIMITATION.
+        //
+        // He was asked directly and ruled that a day is counted once, and that he will tell
+        // the cashiers so. A second-count / spot-count path was considered and deliberately
+        // NOT built. Do not "fix" this into allowing a re-close.
+        //
+        // The reason it cannot simply be relaxed: closing is not only a record. It writes a
+        // variance row AND physically moves the excess takings from the till to the safe. A
+        // second close moves cash that has already left the drawer — the till then reads
+        // negative against a safe holding money twice — and the variance it invents lands on
+        // profit. A retap, or the owner's phone and a cashier's both closing the same
+        // shop-day, is enough to cause it.
+        //
+        // Keyed on the trading day, so it holds even for a day that was never traded through
+        // the till and therefore has no shift to check. The UI reads the same fact ahead of
+        // time (see [dayCloseForFlow]) so nobody counts a drawer for a button that will
+        // silently do nothing.
+        dayCloseDao.forDayOnce(businessId, dayStart)?.let { return it }
+        // The shift for the day BEING CLOSED — resolved from [dayStart], never from now.
+        // Closing yesterday late at night must close YESTERDAY's shift; resolving by the
+        // clock would write last night's count onto this morning's takings.
+        val daySession =
+            pickSurvivingSession(cashSessionDao.forDayOnce(businessId, dayStart, startOfNextDay(dayStart)))
+        // Already counted: the DayClose row above is normally what catches a repeat, but a
+        // shift counted from another device and pulled down gets here first. Same rule.
+        if (daySession?.countedCash != null) return null
         val stamp = now()
         val expected = tillBalanceOnce(businessId)
         val counted = countedCash.coerceAtLeast(0.0)
@@ -630,6 +813,36 @@ class PosRepository(private val db: PosDatabase) {
             )
             // 3. The permanent, per-cashier record.
             dayCloseDao.insert(close)
+            // 3b. THE SAME COUNT, ONTO THE DAY'S SHIFT — in the same transaction as the
+            // record above, because a recorded close whose shift stayed open is exactly the
+            // state the one-open-per-business index rejects on the next push. `day_closes`
+            // stays local-only and detailed; `cash_sessions` is the summary the shop and
+            // the web POS share, and these four columns are the half of it a close fills in.
+            // `variance` is never written: it is GENERATED on the cloud and derived here.
+            planDayClose(
+                session = daySession,
+                closedAt = stamp,
+                countedCash = counted,
+                expectedCash = expected,
+                movedToSafe = moved,
+                floatTarget = target,
+                closedBy = cashierId,
+                closedByName = cashierName,
+                note = close.note,
+            )?.let { c ->
+                cashSessionDao.closeWithCount(
+                    id = c.id,
+                    closedAt = c.closedAt,
+                    closedBy = c.closedBy,
+                    closedByName = c.closedByName,
+                    countedCash = c.countedCash,
+                    expectedCash = c.expectedCash,
+                    movedToSafe = c.movedToSafe,
+                    floatTarget = c.floatTarget,
+                    note = c.note,
+                    at = stamp,
+                )
+            }
             // 4. Audit trail (a discrepancy is a sensitive event).
             if (kotlin.math.abs(variance) > CENT) {
                 logAudit(
@@ -680,6 +893,16 @@ class PosRepository(private val db: PosDatabase) {
     /** The most recent close, for the "last closed …" line on the cash card. */
     fun latestDayCloseFlow(businessId: String): Flow<DayClose?> =
         dayCloseDao.observeLatest(businessId)
+
+    /** The close recorded for one trading day, observed — non-null means that day has been
+     *  counted and cannot be counted again (see [closeDay]). What the cash screen reads so
+     *  it can say so BEFORE anyone counts the drawer. */
+    fun dayCloseForFlow(businessId: String, dayStart: Long): Flow<DayClose?> =
+        dayCloseDao.observeForDay(businessId, dayStart)
+
+    /** Same, read once — the authoritative check the close dialog makes when it opens. */
+    suspend fun dayCloseFor(businessId: String, dayStart: Long): DayClose? =
+        dayCloseDao.forDayOnce(businessId, dayStart)
 
     /** Signed CASH SHORT/OVER for a window — the profit line day-close variances feed. */
     fun cashVarianceFlow(businessId: String, from: Long, to: Long): Flow<Double> =
@@ -776,16 +999,239 @@ class PosRepository(private val db: PosDatabase) {
         nudgeSync("cash-event")
     }
 
-    /** Start-of-day millis for [at], in the device's timezone. */
-    private fun startOfDay(at: Long): Long {
-        val c = java.util.Calendar.getInstance().apply {
-            timeInMillis = at
-            set(java.util.Calendar.HOUR_OF_DAY, 0)
-            set(java.util.Calendar.MINUTE, 0)
-            set(java.util.Calendar.SECOND, 0)
-            set(java.util.Calendar.MILLISECOND, 0)
+    // Start-of-day now lives in DaySession.kt as a top-level `startOfDay(at)`, because the
+    // shift, the dashboard and the end-of-day screen all have to measure a day from the
+    // same edge. A private copy here was the second of three; a third would have made a
+    // day's takings land in one bucket on one screen and another on the next.
+
+    // ─────────────────────── THE TRADING DAY IS THE SHIFT ───────────────────────
+
+    /**
+     * The id of the shift every sale, refund and cash movement made right now belongs to —
+     * creating today's if the shop has not traded yet.
+     *
+     * Safe to call on EVERY sale, and meant to be: there is no button that opens a shift,
+     * so the first sale of the day is what opens it. Rolling the day over is part of the
+     * same call for the same reason — the moment a sale arrives is the moment the app can
+     * be sure which day it is trading in.
+     *
+     * ★ THE ROLLOVER CLOSE COMES FIRST AND IS NOT OPTIONAL. The shared database allows one
+     * open session per BUSINESS, so yesterday's forgotten session physically blocks today's
+     * from ever reaching the cloud. Closing it is not tidiness; it is the precondition for
+     * today existing at all.
+     *
+     * ★ CREATION IS LAZY ON PURPOSE. A shop that opens the app and sells nothing gets no
+     * session. Manufacturing one on launch would have every idle phone in the shop racing
+     * to create the day's row every morning, and every one of those races is a rejected
+     * push. Only a real sale opens a day.
+     *
+     * Two phones offline from each other can still both create one; that is what
+     * [planSessionMerge] settles, and it settles it the same way on both because both
+     * stamp `openedAt` at the day's midnight (see [DaySessionOpen.openedAt]).
+     */
+    suspend fun currentDaySessionId(businessId: String, at: Long = now()): String {
+        var opened = false
+        val id = db.withTransaction {
+            val roll = planDayRollover(cashSessionDao.openSessions(businessId), at)
+            val stamp = now()
+            for (c in roll.closes) cashSessionDao.closeForDay(c.id, c.note, c.closedAt, stamp)
+            roll.current?.id ?: run {
+                // `roll.open` is non-null whenever `current` is; the fallback is belt and
+                // braces so a day can never fail to open over a nullability technicality.
+                val openAt = roll.open?.openedAt ?: startOfDay(at)
+                val session = CashSession(
+                    businessId = businessId,
+                    status = SessionStatus.OPEN,
+                    openedAt = openAt,
+                    // No tillCode: the calendar opened this shift, not a device. Recording
+                    // whichever phone happened to ring the first sale would read as "this
+                    // till's shift" for a period that belongs to the whole shop.
+                    updatedAt = stamp,
+                )
+                cashSessionDao.upsert(session)
+                opened = true
+                session.id
+            }
         }
-        return c.timeInMillis
+        // Outside the transaction: a sync nudge is fire-and-forget and has no business
+        // holding a write lock open while it schedules work.
+        if (opened) nudgeSync("day-session")
+        return id
+    }
+
+    /** Close out any day that has ended, without opening today's. What the sync engine and
+     *  app start need: the blocking session gone, but no session minted for a shop that has
+     *  not sold anything yet. */
+    suspend fun rolloverDaySessions(businessId: String, at: Long = now()) {
+        val roll = planDayRollover(cashSessionDao.openSessions(businessId), at)
+        if (roll.closes.isEmpty()) return
+        val stamp = now()
+        db.withTransaction {
+            for (c in roll.closes) cashSessionDao.closeForDay(c.id, c.note, c.closedAt, stamp)
+        }
+        nudgeSync("day-rollover")
+    }
+
+    /** The shift standing for one trading day — what the end-of-day screen reads so that
+     *  picking a day shows that day's shift, not "the shift that happens to be open". */
+    fun daySessionFlow(businessId: String, dayStart: Long): Flow<CashSession?> =
+        cashSessionDao.observeForDay(businessId, dayStart, startOfNextDay(dayStart))
+            .map { rows -> pickSurvivingSession(rows) }
+
+    /**
+     * Attach sales and refunds written before shifts existed to the day they happened on.
+     *
+     * A one-time repair that is safe to re-run, and re-running it is the design rather than
+     * a concession: it only ever selects rows whose `sessionId IS NULL`, so a second pass
+     * over a repaired shop selects nothing. It is also capped per pass — attaching a session
+     * marks the row dirty, and a long history repaired in one go would queue every sale the
+     * shop has ever made for re-upload at once.
+     *
+     * ★ It creates only CLOSED sessions, and only for days strictly before today. That is
+     * what makes it safe to run against the live database at all: it is structurally unable
+     * to add a second OPEN session and trip the one-open-per-business index. Rows dated
+     * today wait for a real sale to open today's session and are picked up next pass.
+     *
+     * A row whose date cannot be read is left alone. Filing it under "probably today" would
+     * put someone else's takings into today's count, and a cash-up that is quietly wrong is
+     * worse than one that is visibly incomplete.
+     *
+     * Returns how many rows were attached.
+     */
+    suspend fun backfillDaySessions(businessId: String, at: Long = now(), limit: Int = 500): Int {
+        rolloverDaySessions(businessId, at)
+        val today = startOfDay(at)
+        val attached = db.withTransaction {
+            val sales = cashSessionDao.salesWithoutSession(businessId, limit)
+            val refunds = cashSessionDao.refundsWithoutSession(businessId, limit)
+            if (sales.isEmpty() && refunds.isEmpty()) return@withTransaction 0
+            // Which set an id came from decides which table the UPDATE lands on. Ids are
+            // uuids, so a sale and a refund can never collide in this set.
+            val saleIds = sales.mapTo(HashSet<String>()) { it.id }
+            val byDay = indexSessionsByDay(cashSessionDao.allLive(businessId))
+            val plan = planDayBackfill(sales + refunds, byDay, today)
+            val stamp = now()
+            val resolved = byDay.toMutableMap()
+            for (day in plan.daysToCreate) {
+                val session = CashSession(
+                    businessId = businessId,
+                    status = SessionStatus.CLOSED,
+                    openedAt = day,
+                    closedAt = endOfDay(day),
+                    note = DAY_BACKFILL_NOTE,
+                    updatedAt = stamp,
+                )
+                cashSessionDao.upsert(session)
+                resolved[day] = session.id
+            }
+            var n = 0
+            for ((day, ids) in plan.assignments) {
+                val sessionId = resolved[day] ?: continue
+                val forSales = ids.filter { it in saleIds }
+                val forRefunds = ids.filter { it !in saleIds }
+                if (forSales.isNotEmpty()) {
+                    cashSessionDao.attachSalesToSession(sessionId, forSales)
+                    n += forSales.size
+                }
+                if (forRefunds.isNotEmpty()) {
+                    cashSessionDao.attachRefundsToSession(sessionId, forRefunds)
+                    n += forRefunds.size
+                }
+            }
+            n
+        }
+        if (attached > 0) nudgeSync("day-session-backfill")
+        return attached
+    }
+
+    // ─────────────── ANOTHER TILL'S CASH IS STILL IN THIS DRAWER ───────────────
+
+    /**
+     * Bring the cash ledger into line with every sale and refund the device knows about,
+     * whichever till originated them.
+     *
+     * A pull writes another phone's sale, its lines and its tenders, and no [CashTxn] —
+     * every cash-ledger insert in this class is a local user action. With one shared drawer
+     * and two phones that leaves each phone's cash-on-hand counting only its own takings,
+     * and the day close then measures the REAL drawer against a figure covering half of it.
+     * The difference is written permanently as a `variance`, which is a hit to profit. See
+     * [planCashMirror] for the full reasoning.
+     *
+     * Runs on every sync pass and is meant to: it reconciles BALANCES rather than reacting
+     * to events, so a second run finds nothing to do, and a device that pulled a refund and
+     * later pulls the void of it converges on the same ledger as the device that voided it.
+     * It is also the backfill — rows already sitting on a device from earlier pulls are
+     * simply the first pass's work.
+     *
+     * ★ MUST RUN AFTER THE TENDERS ARE DOWN. A sale's cash is `sale_payments` less the
+     * change given, so reconciling before [PosSyncEngine.pullSalePayments] would read a
+     * sale with no tenders yet, book zero, and then have to correct itself on the next pass
+     * — briefly showing a drawer short by a real sale.
+     *
+     * Returns the number of correcting rows written (0 on a device already in agreement).
+     */
+    suspend fun reconcilePulledCash(businessId: String): Int {
+        val stamp = now()
+        val plans = db.withTransaction {
+            // Sales: expected-set keys only. "Absent from the expected set" covers a parked
+            // sale, a quote and a sale mid-edit as well as a deleted one, and reversing real
+            // takings on the strength of an absence is a way to lose money nobody would
+            // trace back to here. A sale that needs reversing is reversed where it is voided.
+            val sales = planCashMirror(
+                refType = "sale",
+                expected = saleDao.expectedCashBySale(businessId),
+                existing = cashTxnDao.sumsByRef(businessId, "sale"),
+                reverseOrphans = false,
+            )
+            // Refunds: orphans ARE reversed. A void soft-deletes the refund and the voiding
+            // phone writes its own reversing row, so a phone that had mirrored the payout
+            // must write the same one or that cash stays out of its drawer forever.
+            val refunds = planCashMirror(
+                refType = "refund",
+                expected = refundDao.expectedCashByRefund(businessId),
+                existing = cashTxnDao.sumsByRef(businessId, "refund"),
+                reverseOrphans = true,
+            )
+            sales + refunds
+        }
+        if (plans.isEmpty()) return 0
+        db.withTransaction {
+            for (p in plans) {
+                val isSale = p.refType == "sale"
+                // The row reads like the local one it stands in for: same type vocabulary,
+                // same TILL location, same `refType`/`refId` — which is also what keeps it
+                // out of the push (see [cashMovementCountedElsewhere]). A correction running
+                // AGAINST the natural direction of its kind is an `adjust`, matching what
+                // [voidRefund] already writes for the same situation.
+                val naturalDirection = if (isSale) p.amount > 0 else p.amount < 0
+                val label = p.label ?: p.refId.take(8)
+                cashTxnDao.insert(
+                    CashTxn(
+                        businessId = businessId,
+                        type = if (naturalDirection) p.refType else "adjust",
+                        amount = p.amount,
+                        // A sale and a refund both happen at the counter (§4).
+                        location = CashLocation.TILL,
+                        source = "cash",
+                        // Says outright that this is a correction and where it came from.
+                        // A drawer figure the owner cannot explain is one they stop trusting.
+                        note = (if (isSale) "Sale #$label" else "Refund on #$label") +
+                            " (reconciled from another till)",
+                        refType = p.refType, refId = p.refId,
+                        // Attribution follows the sale, not the phone that happened to sync.
+                        createdBy = p.createdBy, createdByName = p.createdByName,
+                        // ★ The SOURCE row's own instant, so the movement lands in the
+                        // trading day it belongs to. Stamped with the sync time instead, a
+                        // phone coming back online after midnight would file yesterday's
+                        // takings in today's cash-up. A reversal has no source row left to
+                        // read, so it honestly carries now.
+                        createdAt = if (p.at > 0L) p.at else stamp,
+                        updatedAt = stamp,
+                    )
+                )
+            }
+        }
+        return plans.size
     }
 
     // ---- §4 FUNDING WATERFALL: TILL → SAFE → OUTSIDE FUNDS → abort -------
@@ -1928,6 +2374,12 @@ class PosRepository(private val db: PosDatabase) {
         }
         val singleCash = tenders.size == 1 && tenders.first().method == "cash"
 
+        // Every sale belongs to a trading day, and the day IS the shift. Resolved here
+        // rather than by the caller so no checkout path can forget: an unstamped sale
+        // pushes with `session_id = NULL`, and a cash-up that cannot resolve a sale's
+        // session leaves its takings out of the drawer count without saying so.
+        val daySessionId = currentDaySessionId(businessId, stamp)
+
         val sale = SaleEntity(
             id = saleId,
             businessId = businessId,
@@ -1951,6 +2403,7 @@ class PosRepository(private val db: PosDatabase) {
             customerId = customer?.id,
             customerName = customer?.name,
             soldAt = stamp,
+            sessionId = daySessionId,
             createdBy = cashierId,
             createdByName = cashierName,
             updatedAt = stamp,
@@ -2869,6 +3322,9 @@ class PosRepository(private val db: PosDatabase) {
     ): Refund {
         val stamp = now()
         val refundId = newId()
+        // Money leaving the drawer is counted against the same trading day the takings are,
+        // so a payout gets its shift the same way a sale does.
+        val daySessionId = currentDaySessionId(businessId, stamp)
 
         // Returned goods valued net of each line's OWN discount/markup, measured against
         // the whole sale on the SAME basis; the ratio then folds in the whole-sale
@@ -2898,6 +3354,7 @@ class PosRepository(private val db: PosDatabase) {
             createdBy = cashierId,
             createdByName = cashierName,
             createdAt = stamp,
+            sessionId = daySessionId,
             updatedAt = stamp
         )
         val refundLines = lines.map { inp ->
@@ -3810,7 +4267,51 @@ class PosRepository(private val db: PosDatabase) {
                 }
             }
         }
+
+        /**
+         * Split one debt repayment into the three things it does, given what the customer
+         * owed and HOW they paid.
+         *
+         * ON THE COMPANION for the same reason [planFunding] is: this decides whether real
+         * money enters the drawer, and it must be checkable without Room. `RepaymentTest`
+         * asserts the two halves that matter — that the credit ledger does the identical
+         * thing whatever the tender, and that only cash moves the till.
+         *
+         *  - [RepaymentPlan.paid]   settles debt (`credit_paid`), never past zero.
+         *  - [RepaymentPlan.excess] is an OVERPAYMENT and becomes `change_owed`: money the
+         *    shop now owes back, rather than a negative debt.
+         *  - [RepaymentPlan.cashIn] is what physically arrives at the counter. It is the
+         *    WHOLE [amount], not just the settling part — an overpayment is handed across
+         *    the counter too, and the drawer holds it while the ledger records that it is
+         *    owed back. Zero for any non-cash tender: EcoCash and a card swipe settle the
+         *    debt without a note ever reaching the till.
+         *
+         * [method] is a checkout tender code ([com.portionspot.pos.payments.PaymentMethod]);
+         * only `cash` opens a drawer, the same rule [checkout] and [createRefund] apply.
+         */
+        fun planRepayment(amount: Double, debt: Double, method: String): RepaymentPlan {
+            val given = amount.coerceAtLeast(0.0)
+            if (given <= CENT) return RepaymentPlan()
+            val owed = debt.coerceAtLeast(0.0)
+            val paid = minOf(given, owed)
+            return RepaymentPlan(
+                paid = paid,
+                excess = given - paid,
+                cashIn = if (method.trim().equals("cash", ignoreCase = true)) given else 0.0
+            )
+        }
     }
+
+    /**
+     * What one debt repayment does: how much debt it settles, how much of it was an
+     * overpayment the shop now owes back, and how much cash actually arrived in the till.
+     * Built by [planRepayment]; written by [recordRepayment].
+     */
+    data class RepaymentPlan(
+        val paid: Double = 0.0,
+        val excess: Double = 0.0,
+        val cashIn: Double = 0.0
+    )
 
     // ---- reports: tender breakdown from actual split amounts --------------
 

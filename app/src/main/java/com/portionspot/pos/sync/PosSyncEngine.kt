@@ -9,6 +9,7 @@ import com.portionspot.pos.data.ExpenseDao
 import com.portionspot.pos.data.Item
 import com.portionspot.pos.data.ItemAttribute
 import com.portionspot.pos.data.ItemAttributeDao
+import com.portionspot.pos.data.attributeId
 import com.portionspot.pos.data.ItemDao
 import com.portionspot.pos.data.MobileMoneyDao
 import com.portionspot.pos.data.NotificationDao
@@ -37,6 +38,9 @@ import com.portionspot.pos.data.StockMovementDao
 import com.portionspot.pos.data.stockOnHandFromDelta
 import com.portionspot.pos.data.cashMovementCountedElsewhere
 import com.portionspot.pos.data.planSessionMerge
+import com.portionspot.pos.data.planDayRollover
+import com.portionspot.pos.data.indexSessionsByDay
+import com.portionspot.pos.data.startOfDay
 import com.portionspot.pos.sync.wire.RefundDto
 import com.portionspot.pos.sync.wire.RefundItemDto
 import com.portionspot.pos.sync.wire.RefundPaymentDto
@@ -169,6 +173,17 @@ class PosSyncEngine(
     private val accessToken: () -> String? = { null },
     /** Hook to refresh a near-expiry token before a pass (see AuthManager). */
     private val ensureFreshToken: suspend () -> Unit = {},
+    /**
+     * Turn the sales and refunds this pass pulled into cash-ledger rows — see
+     * [com.portionspot.pos.data.PosRepository.reconcilePulledCash].
+     *
+     * Injected rather than reimplemented here. The till's own arithmetic for "what cash did
+     * this sale put in the drawer" lives in the repository, and a second copy of it in the
+     * sync engine would drift from the first; once it drifted, every pass would find a
+     * disagreement and write a correcting row for it, forever. A no-op default keeps the
+     * engine constructible without the repository.
+     */
+    private val reconcileCash: suspend (String) -> Unit = {},
 ) {
     suspend fun sync(): SyncOutcome = withContext(Dispatchers.IO) {
         val conn = config.connection() ?: return@withContext SyncOutcome.NotConfigured
@@ -332,6 +347,32 @@ class PosSyncEngine(
             rows.size
         }
 
+        // item_attributes — the fitments. Straight after the catalogue, since a tag is
+        // about a product, and a product this till invented has to exist up there first.
+        //
+        // ★ The id is DERIVED from (business, item, key, value), and the business in that
+        // derivation has to be the SHOP's, not this device's. A till in local mode has
+        // never heard of the shop's id, so every tag typed before the first connect was
+        // minted under the device's own business uuid — pushed as-is, each one would
+        // arrive as a NEW row alongside the web's identical tag and be refused by
+        // `uq_item_attributes_live` with a 23505, failing this entire batch.
+        // [rekeyPendingAttributes] re-mints them first; it is a no-op once the ids already
+        // agree, which is the normal case on every pass after the first.
+        pushTable("item_attributes") {
+            rekeyPendingAttributes(cloudBid)
+            // Re-read AFTER the re-key: it rewrites primary keys, so anything read before
+            // it is a stale copy of a row that no longer exists under that id.
+            val rows = itemAttributeDao.pending()
+            if (rows.isEmpty()) return@pushTable 0
+            api.upsert(
+                "item_attributes",
+                syncJson.encodeToString(rows.map { it.toPush().copy(businessId = cloudBid) }),
+                "id",
+            )
+            itemAttributeDao.markSynced(rows.map { it.id })
+            rows.size
+        }
+
         // customers — upsert on the Android uuid, which IS the cloud primary key now.
         // No `local_id` bridge and nothing to resolve: the row goes up under the id it
         // already has, so a sale referencing it can never arrive before its customer.
@@ -482,11 +523,21 @@ class PosSyncEngine(
             // learns to ignore it and then it cannot tell them when something IS stuck.
             if (counted.isNotEmpty()) cashTxnDao.markSynced(counted.map { it.id })
             if (ours.isEmpty()) return@pushTable 0
-            val openShift = cashSessionDao.openSessions(bid).firstOrNull()?.id
+            // ★ Stamped by the movement's OWN day, not by "whichever shift is open now".
+            // `cash_movements` has no local sessionId column, so this is the only moment the
+            // link is made — and a batch that has been sitting on a phone since before
+            // midnight would otherwise land yesterday's petty cash inside today's shift and
+            // put the discrepancy in the wrong day's cash-up. A day with no session yet
+            // stamps null, which is the same fallback as before: the other side counts an
+            // unstamped movement whose timestamp falls inside the shift window.
+            val sessionByDay = indexSessionsByDay(cashSessionDao.allLive(bid))
             api.upsert(
                 "cash_movements",
                 syncJson.encodeToString(
-                    ours.map { it.toMovementPush(openShift).copy(businessId = cloudBid) }
+                    ours.map {
+                        it.toMovementPush(sessionByDay[startOfDay(it.createdAt)])
+                            .copy(businessId = cloudBid)
+                    }
                 ),
                 "id",
             )
@@ -650,6 +701,36 @@ class PosSyncEngine(
         return PushResult(n, errors)
     }
 
+    /**
+     * Re-mint any UNSENT tag whose id was derived from the wrong business.
+     *
+     * An attribute's id is `uuidV5(namespace, business ‖ item ‖ key ‖ value)` and both
+     * clients depend on computing the same one. The repository can only derive it from the
+     * business id the row is filed under LOCALLY, which is this device's own uuid — the
+     * shop's id is a sync concept and is not known at all until the first connect. So every
+     * tag added in local mode carries an id the web would never produce. Sent as-is it
+     * would land as a second row for a tag the shop already has, and the live partial
+     * unique index would reject the batch.
+     *
+     * Only `pendingSync` rows are touched, and the re-key is a hard delete plus an insert
+     * under the correct id: the row has never been uploaded, so there is nothing out there
+     * holding the old id and nothing to tombstone. A pulled row is never re-keyed — its id
+     * came from the web and is by definition the agreed one.
+     *
+     * Oldest first, so that when a removal and a re-add of the same tag both collapse onto
+     * one id, the later write is the one left standing — and so the batch cannot contain
+     * the same id twice, which Postgres refuses outright ("cannot affect row a second
+     * time") and would again cost the whole push.
+     */
+    private suspend fun rekeyPendingAttributes(cloudBid: String) {
+        for (row in itemAttributeDao.pending().sortedBy { it.updatedAt }) {
+            val wanted = attributeId(cloudBid, row.itemId, row.key, row.value)
+            if (wanted == row.id) continue
+            itemAttributeDao.hardDelete(row.id)
+            itemAttributeDao.upsert(row.copy(id = wanted))
+        }
+    }
+
     // ── pull ──────────────────────────────────────────────────────────────
     /**
      * Pull the shared catalogue, customers and sales onto this device. Read-only:
@@ -681,6 +762,14 @@ class PosSyncEngine(
         n += pullRefunds(api, bid, cloudBid)
         n += pullRefundItems(api, bid, cloudBid)
         n += pullRefundPayments(api, bid, cloudBid)
+        // AFTER both tender pulls: a pull writes another till's sale, its lines and its
+        // tenders but NO cash-ledger row, so without this each phone's drawer counts only
+        // its own takings — and the day close then measures the real, shared drawer against
+        // half a figure and books the difference as a variance against profit. Placed here
+        // for the same reason recomputeStockFromLedger sits after its ledger: a sale's cash
+        // is its tenders less the change given, so reconciling before `sale_payments` and
+        // `refund_payments` have landed would read a sale with no tenders and book zero.
+        reconcileCash(bid)
         n += pullStockMovements(api, bid, cloudBid)
         // AFTER the ledger lands: items.stock_qty is a CACHE of these rows, so the
         // pulled cache is only as good as the movements behind it. Recomputing here is
@@ -907,6 +996,18 @@ class PosSyncEngine(
      * rather than living only on the device that happened to notice.
      */
     private suspend fun mergeOpenSessions(bid: String) {
+        // ★ ROLL THE DAY OVER FIRST. A shift is a trading DAY, and the merge rule keeps the
+        // OLDEST open session — correct among sessions of the same day, and badly wrong
+        // across days. With yesterday's session still open the merge would keep YESTERDAY
+        // and repoint today's sales back into it, moving a day's takings into the wrong
+        // period on every device at once. Closing the ended days first means the merge only
+        // ever ranks candidates from a single day, which is the state its rule assumes.
+        val stamp = System.currentTimeMillis()
+        val rollover = planDayRollover(cashSessionDao.openSessions(bid), stamp)
+        for (c in rollover.closes) cashSessionDao.closeForDay(c.id, c.note, c.closedAt, stamp)
+        // Deliberately no OPENING here: only a real sale opens a day (see
+        // [PosRepository.currentDaySessionId]). A sync pass on an idle phone that minted the
+        // day's session would have every phone in the shop racing to create the same row.
         val plan = planSessionMerge(cashSessionDao.openSessions(bid)) ?: return
         cashSessionDao.applyMerge(
             winnerId = plan.winner.id,
@@ -975,6 +1076,11 @@ class PosSyncEngine(
      *
      * Tombstones apply like any other row: a fitment deleted on the web must stop matching
      * here, or the till keeps offering a part for a car the shop has decided it does not fit.
+     *
+     * Last-write-wins on the stamp, with no special case for a locally-pending row: the
+     * push half of the pass has already run by the time this does (see [sync]), so a
+     * tag typed on this phone is up there before anything comes back down, and the row that
+     * returns is its own echo.
      */
     private suspend fun pullItemAttributes(api: SupabaseRest, bid: String, cloudBid: String): Int {
         val body = try {

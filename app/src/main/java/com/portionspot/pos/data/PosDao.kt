@@ -131,8 +131,10 @@ interface ItemDao {
 /**
  * Item key/value tags — in this shop, the cars each part fits.
  *
- * No `pending`/`markSynced` pair here, unlike every other syncing DAO: [ItemAttribute] is
- * pull-only, so there is nothing for a push to select.
+ * Two-way now: the owner adds and removes fitments on the till, so this DAO carries the
+ * `pending`/`markSynced` pair every other syncing DAO has. A removal is a TOMBSTONE
+ * ([softDelete]) and never a row disappearing — a hard delete is invisible to the other
+ * phones, which would keep offering a part for a car the shop has decided it does not fit.
  */
 @Dao
 interface ItemAttributeDao {
@@ -151,7 +153,25 @@ interface ItemAttributeDao {
     suspend fun getById(id: String): ItemAttribute?
 
     @Upsert
+    suspend fun upsert(row: ItemAttribute)
+
+    @Upsert
     suspend fun upsertAll(rows: List<ItemAttribute>)
+
+    // ---- sync ----
+    @Query("SELECT * FROM item_attributes WHERE pendingSync = 1")
+    suspend fun pending(): List<ItemAttribute>
+
+    @Query("UPDATE item_attributes SET pendingSync = 0 WHERE id IN (:ids)")
+    suspend fun markSynced(ids: List<String>)
+
+    /**
+     * Hard-delete one tag, and ONLY as part of re-keying a row that has never been uploaded
+     * (see `PosSyncEngine.rekeyPendingAttributes`). A user-facing removal must tombstone
+     * instead, or the other phones never hear about it.
+     */
+    @Query("DELETE FROM item_attributes WHERE id = :id")
+    suspend fun hardDelete(id: String)
 
     /** Danger zone: drop every tag for a business (device reset before a fresh pull). */
     @Query("DELETE FROM item_attributes WHERE businessId = :businessId")
@@ -166,9 +186,34 @@ interface SaleDao {
     @Insert
     suspend fun insertLines(lines: List<SaleLine>)
 
+    /**
+     * Real RECEIPTS, newest first — the Receipts list and the dashboard's "Recent sales".
+     *
+     * ★ THE STATUS FILTER IS A SAFETY GATE, NOT A TIDY-UP. This query used to return every
+     * live row in `sales`, and `sales` is not a table of sales: a QUOTE and a PARKED cart
+     * are stored there too, under their own [SaleEntity.status]. So a quote — a piece of
+     * paper priced for a customer who never paid and never took the goods — rendered in
+     * the Receipts list beside real takings, with reprint, share, and for anyone holding
+     * PROCESS_REFUNDS a Refund button. Refunding it would put stock back on a shelf it
+     * never left and book a real `refund_owed` debt against a document that was never a
+     * sale. Quotes have their own tab ([observeQuotes]) and parked carts their own count
+     * ([observeParkedCount]); neither belongs here.
+     *
+     * WHAT STAYS: `completed` and `refunded`. A refunded sale IS a receipt — the money
+     * moved, the goods moved, and the return is recorded against it in `refunds` — so it
+     * must stay visible and reprintable, with its refunded badge.
+     *
+     * WHAT GOES, DELIBERATELY: `void`. A voided sale has been reversed on purpose; its
+     * goods and money have already been put back by whatever voided it. Showing it as a
+     * receipt would offer a second reversal of the same transaction, which is the exact
+     * hole this filter closes. It is not lost — the audit log holds the void.
+     *
+     * Callers that legitimately want a narrower or wider set must ask their own question:
+     * the Z-Report re-filters this flow to `completed` for its cash-up, which still holds.
+     */
     @Query(
         "SELECT * FROM sales WHERE businessId = :businessId AND deleted = 0 " +
-            "ORDER BY soldAt DESC LIMIT :limit"
+            "AND status IN ('completed', 'refunded') ORDER BY soldAt DESC LIMIT :limit"
     )
     fun observeRecent(businessId: String, limit: Int = 100): Flow<List<SaleEntity>>
 
@@ -197,6 +242,30 @@ interface SaleDao {
 
     @Query("SELECT * FROM sale_items WHERE saleId = :saleId AND deleted = 0")
     suspend fun linesForSale(saleId: String): List<SaleLine>
+
+    /**
+     * Net cash every completed sale should have put in the drawer — cash tenders less the
+     * change actually handed back — whichever till rang it up.
+     *
+     * The arithmetic is [PosRepository.checkout]'s, in SQL: `changeDue` is the amount
+     * ACTUALLY handed over (not the amount owed), and only `cash` tenders open a drawer.
+     * The LEFT JOIN matters — a sale settled entirely on credit has no tender rows at all,
+     * and an INNER JOIN would drop it rather than reporting the zero.
+     *
+     * Whole history, unfiltered: this is the backfill as well as the ongoing reconciliation,
+     * and rows that already agree are discarded by [planCashMirror] rather than by the query.
+     */
+    @Query(
+        "SELECT s.id AS refId, " +
+            "COALESCE(SUM(CASE WHEN p.method = 'cash' THEN p.amount ELSE 0 END), 0) - " +
+            "COALESCE(s.changeDue, 0) AS total, " +
+            "s.soldAt AS at, s.receiptNo AS label, " +
+            "s.createdBy AS createdBy, s.createdByName AS createdByName " +
+            "FROM sales s LEFT JOIN sale_payments p ON p.saleId = s.id " +
+            "WHERE s.businessId = :businessId AND s.deleted = 0 AND s.status = 'completed' " +
+            "GROUP BY s.id"
+    )
+    suspend fun expectedCashBySale(businessId: String): List<ExpectedCashRow>
 
     // ---- parked / held sales (status = 'parked') ----
     @Query(
@@ -230,12 +299,18 @@ interface SaleDao {
     @Query("DELETE FROM sale_payments WHERE saleId = :saleId")
     suspend fun hardDeletePayments(saleId: String)
 
-    @Query(
-        "SELECT COALESCE(SUM(total), 0) FROM sales " +
-            "WHERE businessId = :businessId AND deleted = 0 AND status = 'completed' " +
-            "AND soldAt >= :since"
-    )
-    fun observeTakingsSince(businessId: String, since: Long): Flow<Double>
+    // ★ THERE IS DELIBERATELY NO "takings since" QUERY HERE.
+    //
+    // `SUM(total)` over completed sales is the BILLED value — it ignores `amountPaid`, so
+    // a sale handed over entirely on account counts in full the day it is rung up. By the
+    // owner's rule unpaid credit is not revenue; it counts on the day the money is
+    // COLLECTED. That query fed the Receipts hero and had it reporting $100 for a sale the
+    // drawer never saw, while the Dashboard correctly reported $0.
+    //
+    // Money collected is [CashBasis]'s question, not SQL's: it has to match repayments
+    // FIFO back to the credit lots they settle, which no single aggregate can express.
+    // Ask [PosRepository.cashBasisSalesFlow] + [PosRepository.creditLedgerFlow] instead —
+    // one source, so no two screens can answer "what came in today" differently.
 
     @Query(
         "SELECT COUNT(*) FROM sales " +
@@ -762,6 +837,26 @@ interface RefundDao {
     @Query("SELECT * FROM refunds WHERE saleId = :saleId AND deleted = 0")
     suspend fun forSaleOnce(saleId: String): List<Refund>
 
+    /**
+     * Cash every live refund should have taken OUT of the drawer, as a NEGATIVE figure —
+     * the sign the local payout rows are written with, so the two are directly comparable.
+     *
+     * Voided refunds are excluded by `deleted = 0` rather than reported as zero, and that
+     * is what makes the void converge: the id drops out of this result, [planCashMirror]
+     * sees cash held against an id it no longer recognises, and reverses it — which is
+     * exactly what the phone that did the voiding wrote for itself.
+     */
+    @Query(
+        "SELECT r.id AS refId, " +
+            "-COALESCE(SUM(CASE WHEN p.method = 'cash' THEN p.amount ELSE 0 END), 0) AS total, " +
+            "r.createdAt AS at, r.saleReceiptNo AS label, " +
+            "r.createdBy AS createdBy, r.createdByName AS createdByName " +
+            "FROM refunds r LEFT JOIN refund_payments p ON p.refundId = r.id " +
+            "WHERE r.businessId = :businessId AND r.deleted = 0 " +
+            "GROUP BY r.id"
+    )
+    suspend fun expectedCashByRefund(businessId: String): List<ExpectedCashRow>
+
     /** Money already refunded against one sale — the gate on editing it in place (B5). */
     @Query("SELECT COALESCE(SUM(refundTotal), 0) FROM refunds WHERE saleId = :saleId AND deleted = 0")
     suspend fun refundedTotalForSaleOnce(saleId: String): Double
@@ -1199,6 +1294,22 @@ interface CashTxnDao {
     suspend fun locationSumOnce(businessId: String, location: String): Double
 
     /**
+     * Cash already booked against each source row of one kind — the "what the ledger
+     * already holds" half of [planCashMirror].
+     *
+     * SUMMED, not counted. A refund accumulates one payout row per instalment and a void
+     * writes a reversing row against the same id, so asking whether a row EXISTS answers
+     * the wrong question; only the running total says how much of the event the drawer has
+     * actually seen.
+     */
+    @Query(
+        "SELECT refId AS refId, COALESCE(SUM(amount), 0) AS total FROM cash_txns " +
+            "WHERE businessId = :businessId AND deleted = 0 AND refType = :refType " +
+            "AND refId IS NOT NULL GROUP BY refId"
+    )
+    suspend fun sumsByRef(businessId: String, refType: String): List<CashRefSum>
+
+    /**
      * CASH SHORT / OVER for a window: the signed sum of close-of-day `variance` rows.
      * Negative = the drawer came up short (a real loss); positive = over (a gain). Kept
      * OUT of gross profit deliberately — it is a separate line so a shortage is visible
@@ -1278,6 +1389,35 @@ interface DayCloseDao {
             "ORDER BY closedAt DESC LIMIT 1"
     )
     fun observeLatest(businessId: String): Flow<DayClose?>
+
+    /**
+     * The close already recorded for one trading day, if any.
+     *
+     * This is the outer interlock on closing a day twice, and it exists because closing is
+     * not just a record: it moves the excess takings out of the till and into the safe. A
+     * second close moves cash that has already left the drawer. Keyed on [DayClose.dayStart]
+     * — the same trading-day key the shift is keyed on — so the guard holds even for a day
+     * that was never traded through the till and therefore has no session to check.
+     */
+    @Query(
+        "SELECT * FROM day_closes WHERE businessId = :businessId AND dayStart = :dayStart " +
+            "AND deleted = 0 ORDER BY closedAt DESC LIMIT 1"
+    )
+    suspend fun forDayOnce(businessId: String, dayStart: Long): DayClose?
+
+    /**
+     * The same close, observed — so the UI can say a day is already counted BEFORE anyone
+     * counts the drawer, rather than after they press a button that silently does nothing.
+     *
+     * Its own query rather than a filter over [observeForBusiness]: that one is capped at 90
+     * rows for the history list, and a day older than the cap would come back as "not
+     * closed" and offer to close it a second time.
+     */
+    @Query(
+        "SELECT * FROM day_closes WHERE businessId = :businessId AND dayStart = :dayStart " +
+            "AND deleted = 0 ORDER BY closedAt DESC LIMIT 1"
+    )
+    fun observeForDay(businessId: String, dayStart: Long): Flow<DayClose?>
 
     // ---- sync-ready (no push/pull wired: the cloud has no `day_closes` table) ----
     @Query("SELECT * FROM day_closes WHERE pendingSync = 1")

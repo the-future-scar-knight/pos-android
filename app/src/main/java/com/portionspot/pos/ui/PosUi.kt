@@ -215,6 +215,11 @@ import com.portionspot.pos.data.Item
 import com.portionspot.pos.data.TagValue
 import com.portionspot.pos.data.searchCatalog
 import com.portionspot.pos.data.tagCaption
+import com.portionspot.pos.data.ItemAttribute
+import com.portionspot.pos.data.attrNorm
+import com.portionspot.pos.data.groupAttributes
+import com.portionspot.pos.data.keySuggestions
+import com.portionspot.pos.data.valueSuggestions
 import com.portionspot.pos.data.isMeasured
 import com.portionspot.pos.data.onHand
 import com.portionspot.pos.data.sellableBlocked
@@ -1617,6 +1622,7 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
     val methods by vm.eodMethods.collectAsState()
     val changeGiven by vm.eodChangeGiven.collectAsState()
     val eodDay by vm.eodDay.collectAsState()
+    val eodSession by vm.eodSession.collectAsState()
     val aging by vm.debtAging.collectAsState()
     val refunds by vm.refunds.collectAsState()
     val audit by vm.auditLog.collectAsState()
@@ -1855,6 +1861,25 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
                     .border(1.dp, t.surfaceBorder, RoundedCornerShape(14.dp))
                     .padding(14.dp)
             ) {
+                    // The day's SHIFT. A shift is the trading day here, so this line says
+                    // what state the day the owner is looking at is actually in — open and
+                    // still trading, ended but never counted, or counted and settled. A
+                    // figure with no idea which of those it is behind it is not a cash-up.
+                    eodSession?.let { s ->
+                        val counted = s.countedCash
+                        Row(Modifier.fillMaxWidth().padding(bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text("Shift", color = t.inkSecondary, fontSize = 12.sp, modifier = Modifier.weight(1f))
+                            Text(
+                                when {
+                                    counted != null -> "Counted · ${money(counted, currency)}"
+                                    s.isOpen -> "Open"
+                                    else -> "Ended, not counted"
+                                },
+                                color = if (counted != null) t.success else t.inkSecondary,
+                                fontSize = 12.sp, fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                    }
                     if (cashiers.isEmpty()) {
                         Text("No sales this day.", color = t.inkTertiary, fontSize = 13.sp)
                     } else {
@@ -2543,11 +2568,10 @@ private fun StaffPermissionsDialog(
     }
 }
 
-private fun todayStartMs(): Long {
-    val c = Calendar.getInstance()
-    c.set(Calendar.HOUR_OF_DAY, 0); c.set(Calendar.MINUTE, 0); c.set(Calendar.SECOND, 0); c.set(Calendar.MILLISECOND, 0)
-    return c.timeInMillis
-}
+/** Delegates to the ONE day boundary, in [com.portionspot.pos.data.startOfDay]. A private
+ *  copy here was a second definition of "today" and the shift is now a third consumer of
+ *  it — three implementations is how one screen's day quietly stops matching another's. */
+private fun todayStartMs(): Long = com.portionspot.pos.data.startOfDay(System.currentTimeMillis())
 
 /**
  * A count rendered inside a small circular badge. Compose's default text layout
@@ -5812,6 +5836,11 @@ private fun ItemsScreen(
     var showAdd by remember { mutableStateOf(false) }
     var showPriceList by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<Item?>(null) }
+    // What a cashier gets instead of the editor: the part's tags, read-only. The whole
+    // value of a fitment is at the counter, and the person holding the part is exactly the
+    // one who needs to know what it fits — but the editor is admin-only, so without this
+    // the tap simply did nothing and the answer was unreachable.
+    var viewingTags by remember { mutableStateOf<Item?>(null) }
     var search by remember { mutableStateOf("") }
 
     // Deep link. Keyed on [items] as well because the catalogue arrives a frame or two
@@ -5867,7 +5896,7 @@ private fun ItemsScreen(
                 LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(12.dp)) {
                     items(shown, key = { it.id }) { item ->
                         Card(
-                            onClick = { if (canManageInventory) editing = item },
+                            onClick = { if (canManageInventory) editing = item else viewingTags = item },
                             modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
                         ) {
                             Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -5960,6 +5989,9 @@ private fun ItemsScreen(
     }
     editing?.let { current ->
         ItemDialog(vm = vm, existing = current, onClose = { editing = null })
+    }
+    viewingTags?.let { current ->
+        ItemAttributesSheet(vm = vm, item = current, onDismiss = { viewingTags = null })
     }
 }
 
@@ -6568,6 +6600,25 @@ private fun ItemDialog(
             }
         }
 
+        // ── Attributes (the cars this part fits, the brand, the part number) ──
+        // Only once the product exists. A tag is its own row against an item id, so there
+        // is nothing to attach one to until the item has been saved — and a form that
+        // accepted tags and then dropped them on save would be worse than not offering
+        // them. Inside the dialog's scrolling column, so a part with a dozen fitments
+        // scrolls rather than pushing the Save button off a small screen.
+        if (existing != null) {
+            AttributeEditorCard(vm = vm, item = existing)
+        } else {
+            PosFormCard {
+                PosSectionLabel("Attributes")
+                Text(
+                    "Save the item first, then add what staff would search by — the car it " +
+                        "fits, the brand, the part number.",
+                    style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
+                )
+            }
+        }
+
         // ── Stock ──
         PosFormCard {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -6642,6 +6693,249 @@ private fun ItemDialog(
             onResult = { code -> barcode = code; scanning = false },
             onDismiss = { scanning = false }
         )
+    }
+}
+
+/**
+ * The tags on one item — "car: Vezel", "brand: NewBlu", "part_number: A111K" — with add,
+ * edit and remove.
+ *
+ * These are what make a parts counter searchable. A product's NAME can only name one or two
+ * of the cars it fits; "Oil Filter 164" fits seventy-two and says so nowhere, so before
+ * these existed a customer asking for an oil filter for a Navara was told the shop had none
+ * while two dozen sat on the shelf. Everything typed here is matched by the till's search.
+ *
+ * ★ Tags save the moment they are added, not with the rest of the form. They are their own
+ * rows with their own derived ids, so there is nothing to hold back — and holding them
+ * would only risk losing them if the dialog were dismissed. That does mean the editor needs
+ * a SAVED item to hang off, which is why a brand-new product is asked to be saved first
+ * rather than given a form that silently discards what is typed into it.
+ */
+@Composable
+private fun AttributeEditorCard(vm: PosViewModel, item: Item) {
+    val t = LocalPosTokens.current
+    // Remembered on the item id, not rebuilt per recomposition: this composable
+    // recomposes on every keystroke in the two fields below, and a fresh Flow each time
+    // would restart the Room query on each letter typed.
+    val tagFlow = remember(item.id) { vm.itemAttributes(item.id) }
+    val rows by tagFlow.collectAsState(initial = emptyList())
+    val vocab by vm.attributeVocabulary.collectAsState()
+
+    var key by remember { mutableStateOf("") }
+    var value by remember { mutableStateOf("") }
+    // Non-null while an EXISTING tag is being changed rather than a new one added. The
+    // distinction matters: changing a tag's text changes its identity, so it is a
+    // tombstone plus a new row, not an edit in place (see PosRepository.editItemAttribute).
+    var editing by remember { mutableStateOf<ItemAttribute?>(null) }
+
+    val groups = remember(rows) { groupAttributes(rows) }
+    // Values this item already carries under the key being typed — excluded from the
+    // suggestions, since tapping one could only be a no-op.
+    val onItem = remember(rows, key) {
+        val k = attrNorm(key)
+        rows.filter { !it.deleted && it.keyNorm == k }.map { it.valueNorm }.toSet()
+    }
+    val keyOptions = remember(vocab, key) { keySuggestions(vocab, key) }
+    val valueOptions = remember(vocab, key, value, onItem) {
+        if (key.isBlank()) emptyList<String>() else valueSuggestions(vocab, key, onItem, value)
+    }
+    val canSave = key.isNotBlank() && value.isNotBlank()
+
+    fun commit(v: String = value) {
+        if (key.isBlank() || v.isBlank()) return
+        val target = editing
+        if (target == null) {
+            vm.addItemAttribute(item.id, key, v)
+        } else {
+            vm.editItemAttribute(target, key, v)
+        }
+        // The KEY stays behind. Tagging one part with three cars in a row is the normal
+        // case, and retyping "car" each time would be friction for nothing.
+        value = ""
+        editing = null
+    }
+
+    PosFormCard {
+        PosSectionLabel("Attributes")
+        Text(
+            "Anything staff might search by at the counter — the car it fits, the brand, " +
+                "the part number. These are searchable on the till.",
+            style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
+        )
+
+        groups.forEach { group ->
+            Column(Modifier.fillMaxWidth()) {
+                Text(
+                    group.label, fontSize = 11.sp, fontWeight = FontWeight.Bold,
+                    color = t.inkTertiary, maxLines = 1
+                )
+                group.rows.forEach { row ->
+                    val isEditing = editing?.id == row.id
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(top = 4.dp)
+                            .clip(RoundedCornerShape(9.dp))
+                            .background(if (isEditing) t.brand.s50 else t.surface2)
+                            .border(
+                                width = if (isEditing) 1.5.dp else 1.dp,
+                                color = if (isEditing) t.brand.s500 else t.surfaceBorder,
+                                shape = RoundedCornerShape(9.dp)
+                            )
+                            .padding(start = 11.dp, top = 6.dp, bottom = 6.dp, end = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            row.value, fontSize = 14.sp, fontWeight = FontWeight.Medium,
+                            color = t.inkPrimary, maxLines = 2, overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
+                        )
+                        IconButton(onClick = {
+                            editing = row
+                            key = row.key
+                            value = row.value
+                        }) {
+                            Icon(
+                                Icons.Filled.Edit,
+                                contentDescription = "Change ${group.label} ${row.value}",
+                                tint = t.inkSecondary, modifier = Modifier.size(18.dp)
+                            )
+                        }
+                        IconButton(onClick = {
+                            if (editing?.id == row.id) {
+                                editing = null; key = ""; value = ""
+                            }
+                            vm.removeItemAttribute(row)
+                        }) {
+                            Icon(
+                                Icons.Filled.Close,
+                                contentDescription = "Remove ${group.label} ${row.value}",
+                                tint = t.danger, modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            PosField(
+                value = key, onValueChange = { key = it }, label = "Attribute",
+                placeholder = "car", modifier = Modifier.weight(0.85f)
+            )
+            PosField(
+                value = value, onValueChange = { value = it }, label = "Value",
+                placeholder = "Honda Fit", modifier = Modifier.weight(1.15f)
+            )
+        }
+
+        // Existing keys first, then the standard ones the shop has not adopted. Free text
+        // either way — the field is not a dropdown, because the next shop will want
+        // something this list has never heard of.
+        if (keyOptions.isNotEmpty()) {
+            Row(
+                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                keyOptions.forEach { k -> AttrSuggestionChip(k) { key = k } }
+            }
+        }
+
+        // One tap to reuse a value the shop already uses. This is the control that stops
+        // the catalogue rotting: "Toyota Hilux" retyped slightly differently is a second
+        // tag that no amount of folding will ever merge back into the first.
+        if (valueOptions.isNotEmpty()) {
+            Text(
+                "Already used for ${key.trim().lowercase()} — tap to add",
+                fontSize = 10.sp, color = t.inkTertiary
+            )
+            Row(
+                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                valueOptions.forEach { v ->
+                    AttrSuggestionChip(v) {
+                        // While ADDING, one tap is the whole interaction — that is the
+                        // point of the chip. While EDITING it only fills the box, because
+                        // changing a tag rewrites an existing row and should be confirmed.
+                        if (editing == null) {
+                            commit(v)
+                        } else {
+                            value = v
+                        }
+                    }
+                }
+            }
+        }
+
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (editing != null) {
+                OutlinedButton(
+                    onClick = { editing = null; key = ""; value = "" },
+                    modifier = Modifier.weight(1f)
+                ) { Text("Cancel") }
+            }
+            FilledTonalButton(
+                onClick = { commit() },
+                enabled = canSave,
+                modifier = Modifier.weight(1f)
+            ) {
+                Icon(
+                    if (editing == null) Icons.Filled.Add else Icons.Filled.Check,
+                    contentDescription = null, modifier = Modifier.size(18.dp)
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(if (editing == null) "Add" else "Save change")
+            }
+        }
+    }
+}
+
+/** A tappable suggestion pill — a value or key the shop has already used. */
+@Composable
+private fun AttrSuggestionChip(label: String, onClick: () -> Unit) {
+    val t = LocalPosTokens.current
+    Text(
+        label,
+        fontSize = 12.sp, fontWeight = FontWeight.Medium, color = t.inkSecondary, maxLines = 1,
+        modifier = Modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(t.surface2)
+            .border(1.dp, t.surfaceBorder, RoundedCornerShape(999.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 6.dp)
+    )
+}
+
+/**
+ * Read-only tags for one item — what a counter hand gets when they tap a product they are
+ * not allowed to edit.
+ *
+ * The whole value of these tags is at the counter, and a cashier holding the part is
+ * exactly the person who needs to know what it fits. Without this the only way to see the
+ * fitments is the editor, which a cashier cannot open.
+ */
+@Composable
+private fun ItemAttributesSheet(vm: PosViewModel, item: Item, onDismiss: () -> Unit) {
+    val t = LocalPosTokens.current
+    val tagFlow = remember(item.id) { vm.itemAttributes(item.id) }
+    val rows by tagFlow.collectAsState(initial = emptyList())
+    val groups = remember(rows) { groupAttributes(rows) }
+    PosDialog(title = item.name, onDismiss = onDismiss) {
+        if (groups.isEmpty()) {
+            Text("No attributes recorded for this item.", color = t.inkTertiary)
+        } else {
+            groups.forEach { group ->
+                Column(Modifier.fillMaxWidth()) {
+                    PosSectionLabel(group.label)
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        group.rows.joinToString(", ") { it.value },
+                        color = t.inkPrimary, style = MaterialTheme.typography.bodyMedium
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -7290,12 +7584,23 @@ private fun CustomerDetailDialog(
         }
     }
     if (showPay) {
+        // ★ ASK HOW THEY PAID. Only cash reaches the drawer, and until this was asked the
+        // whole repayment chain wrote credit rows and no cash movement at all — so a debt
+        // settled in notes left the till holding money the app did not know about, and the
+        // day close booked the difference as a variance against profit.
+        // Falls back to Cash alone if the shop has somehow disabled every tender, so the
+        // dialog can never present an empty picker.
+        val biz = bizForPdf
+        val repaymentMethods = remember(biz) {
+            (biz?.enabledPaymentMethods() ?: emptyList()).ifEmpty { listOf(PaymentMethod.CASH) }
+        }
         RecordPaymentDialog(
             maxAmount = balance,
             currency = currency,
+            methods = repaymentMethods,
             onDismiss = { showPay = false }
-        ) { amount, note ->
-            vm.recordRepayment(customer.id, amount, note.ifBlank { null })
+        ) { amount, note, method ->
+            vm.recordRepayment(customer.id, amount, note.ifBlank { null }, method)
             showPay = false
         }
     }
@@ -7311,7 +7616,11 @@ private fun CustomerDetailDialog(
                 "You're handing back ${money(over, currency)} more than we owe — the customer will owe it back."
             },
             onDismiss = { showPayout = false }
-        ) { amount, note ->
+        ) { amount, note, _ ->
+            // No tender picker here on purpose: change and refunds owed are handed back
+            // over the counter in notes, and [PosRepository.recordChangePayment] already
+            // takes the full amount out of the till. The method is ignored rather than
+            // asked for, because there is only one answer.
             // Paying out MORE than we owe is allowed: the repository settles what we owe
             // and books the excess as customer debt ("Over-paid change") — never dropped.
             vm.recordChangePayment(customer.id, amount, note.ifBlank { null })
@@ -7498,6 +7807,13 @@ private fun creditRowMeta(type: String): CreditRowMeta = when (type) {
  * amount may EXCEED [maxAmount] and the excess is surfaced before confirming (the
  * caller books it — see the change-payout path). Left false, behaviour is unchanged
  * for every other caller.
+ *
+ * [methods] is the TENDER the money came in as, and it is opt-in for the same reason:
+ * pass the shop's enabled tenders to ask "how did they pay", or leave it empty for a
+ * flow where the answer is already known. It matters because only CASH moves the till —
+ * a debt settled by EcoCash clears the account without a note reaching the drawer, and a
+ * repayment chain that assumed cash left the day close counting over. The selected code
+ * is handed back to [onConfirm]; with no picker that is always [PaymentMethod.CASH].
  */
 @Composable
 private fun RecordPaymentDialog(
@@ -7509,11 +7825,16 @@ private fun RecordPaymentDialog(
     allowOverpay: Boolean = false,
     overLabel: String = "Over-paid (customer owes)",
     overWarning: (Double) -> String = { "" },
+    methods: List<PaymentMethod> = emptyList(),
     onDismiss: () -> Unit,
-    onConfirm: (Double, String) -> Unit
+    onConfirm: (Double, String, String) -> Unit
 ) {
     var amountText by remember { mutableStateOf("") }
     var note by remember { mutableStateOf("") }
+    // Unkeyed on purpose: the shop's tender list cannot change while this dialog is open,
+    // and keying on the list would re-default the cashier's choice on every recomposition
+    // (the caller builds a fresh List each time it recomposes).
+    var method by remember { mutableStateOf(methods.firstOrNull() ?: PaymentMethod.CASH) }
     val amount = amountText.toDoubleOrNull()
     val valid = amount != null && amount > 0
     val over = if (allowOverpay) ((amount ?: 0.0) - maxAmount).coerceAtLeast(0.0) else 0.0
@@ -7522,7 +7843,7 @@ private fun RecordPaymentDialog(
         onDismiss = onDismiss,
         confirmLabel = actionLabel,
         confirmEnabled = valid,
-        onConfirm = { onConfirm(amount ?: 0.0, note) }
+        onConfirm = { onConfirm(amount ?: 0.0, note, method.code) }
     ) {
         val t = LocalPosTokens.current
         Text("$owedLabel: ${money(maxAmount, currency)}", style = MaterialTheme.typography.bodySmall, color = t.inkTertiary)
@@ -7532,6 +7853,17 @@ private fun RecordPaymentDialog(
                 onValueChange = { amountText = it.filter { ch -> ch.isDigit() || ch == '.' } },
                 label = "Amount received", keyboardType = KeyboardType.Decimal, modifier = Modifier.fillMaxWidth()
             )
+            if (methods.isNotEmpty()) {
+                // Same picker the till uses at checkout, so "how did they pay" is asked
+                // and stored in one vocabulary across the app.
+                PaymentMethodPicker(methods, method) { method = it }
+                if (method != PaymentMethod.CASH) {
+                    Text(
+                        "${method.label} does not go into the till — the drawer stays as it is.",
+                        style = MaterialTheme.typography.bodySmall, color = t.inkTertiary
+                    )
+                }
+            }
             PosField(value = note, onValueChange = { note = it }, label = "Note  (optional)", modifier = Modifier.fillMaxWidth())
         }
         if (over > 0.005) {
@@ -9659,7 +9991,11 @@ private fun ReceiptsScreen(
     val sales by vm.recentSales.collectAsState()
     val quotes by vm.quotes.collectAsState()
     val refundedBySale by vm.refundedBySale.collectAsState()
-    val takings by vm.todayTakings.collectAsState()
+    // ★ CASH BASIS (§5), the same source the Dashboard hero reads. The figure is money
+    // that ARRIVED today — today's settled sales plus repayments of older debts — not the
+    // day's billed value. An unpaid credit sale is a receipt and a debt; it is not takings
+    // until the money comes in, and it shows underneath as exactly that.
+    val todayMoney by vm.todayCashBasis.collectAsState()
     val countToday by vm.todayCount.collectAsState()
     var refundFor by remember { mutableStateOf<SaleEntity?>(null) }
     var detailFor by remember { mutableStateOf<SaleEntity?>(null) }
@@ -9684,13 +10020,27 @@ private fun ReceiptsScreen(
         Column(Modifier.padding(12.dp)) {
             Text("Receipts", color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 22.sp)
             Spacer(Modifier.height(10.dp))
-            // Today's takings hero.
+            // Today's MONEY COLLECTED hero (§5) — not the day's billed total.
             Column(
                 Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(t.brand.s600).padding(16.dp)
             ) {
-                Text("Today", color = t.inkOnBrand.copy(alpha = 0.85f), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                Text(money(takings, currency), color = t.inkOnBrand, fontWeight = FontWeight.Black, fontSize = 28.sp)
+                // Says what it is, in the Dashboard's words: a reader must be able to tell
+                // this is money RECEIVED and not the day's billed total, or the two
+                // screens read as a contradiction rather than as two different questions.
+                Text(
+                    "Money collected today", color = t.inkOnBrand.copy(alpha = 0.85f),
+                    fontSize = 13.sp, fontWeight = FontWeight.SemiBold
+                )
+                Text(money(todayMoney.revenue, currency), color = t.inkOnBrand, fontWeight = FontWeight.Black, fontSize = 28.sp)
                 Text("$countToday sale${if (countToday == 1) "" else "s"}", color = t.inkOnBrand.copy(alpha = 0.85f), fontSize = 12.sp)
+                if (todayMoney.uncollected > 0.005) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Plus ${money(todayMoney.uncollected, currency)} sold on credit and not " +
+                            "yet paid — it counts when the money comes in.",
+                        color = t.inkOnBrand.copy(alpha = 0.85f), fontSize = 11.sp
+                    )
+                }
             }
             Spacer(Modifier.height(10.dp))
             // Receipts ⇄ Quotes (§1.2 parity). Quotes are local documents, never a sale.
