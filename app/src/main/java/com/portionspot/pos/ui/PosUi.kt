@@ -9531,8 +9531,12 @@ private fun DashboardScreen(vm: PosViewModel, business: Business) {
                 if (cashBasis.uncollected > 0.005) {
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "Plus ${money(cashBasis.uncollected, currency)} sold on credit and not " +
-                            "yet paid — it counts when the money comes in.",
+                        // NOT "not yet paid": this figure is frozen at what left the
+                        // till unpaid on the day, and a repayment never reduces it —
+                        // reducing it would restate a day already counted and closed.
+                        // What is STILL owed lives in Change & credit.
+                        "Plus ${money(cashBasis.uncollected, currency)} that left the till " +
+                            "unpaid — it counts on the day the money comes in.",
                         color = t.inkOnBrand.copy(alpha = 0.85f), fontSize = 11.sp
                     )
                 }
@@ -10085,7 +10089,7 @@ private fun ReportsScreen(vm: PosViewModel, business: Business) {
                 )
             }
             if (cashBasis.uncollected > 0.005) {
-                ReportStatRow("Sold on credit, not yet paid", money(cashBasis.uncollected, currency))
+                ReportStatRow("Left the till unpaid", money(cashBasis.uncollected, currency))
             }
             Text(
                 "A sale counts when the money arrives, not when the receipt is written. " +
@@ -10212,8 +10216,8 @@ private fun ReceiptsScreen(
                 if (todayMoney.uncollected > 0.005) {
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "Plus ${money(todayMoney.uncollected, currency)} sold on credit and not " +
-                            "yet paid — it counts when the money comes in.",
+                        "Plus ${money(todayMoney.uncollected, currency)} that left the till " +
+                            "unpaid — it counts on the day the money comes in.",
                         color = t.inkOnBrand.copy(alpha = 0.85f), fontSize = 11.sp
                     )
                 }

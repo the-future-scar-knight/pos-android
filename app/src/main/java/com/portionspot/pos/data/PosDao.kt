@@ -463,6 +463,18 @@ interface SaleDao {
      * so the collected revenue of any window depends on sales outside it. The FIFO
      * attribution that repayments need cannot be expressed in SQL, so the aggregation
      * stops here and [CashBasis] decides what counts as revenue and when.
+     *
+     * ★ Filtered on [RECEIPT_STATUSES], NOT on `status = 'completed'`, and that has to
+     * stay in step with [SaleDao.drawerReceipts]. The two filters answer the same
+     * question about the same row — "was this a real sale" — and when they disagreed,
+     * a sale carrying `refunded` had its CASH counted toward the expected drawer while
+     * its REVENUE AND PROFIT vanished from the books entirely. The drawer would balance
+     * and the day would show takings that were nowhere in the sales figures.
+     *
+     * Nothing writes `refunded` onto a sale today — [PosRepository.createRefund] is a
+     * linked reversal and never edits the sale — so this is a guard against legacy rows
+     * and against anything that syncs down from the shared cloud carrying it. The web
+     * client's `cashBasisSales` input is filtered the same way, deliberately.
      */
     @Query(
         "SELECT s.id AS id, s.soldAt AS soldAt, s.total AS total, s.taxTotal AS taxTotal, " +
@@ -480,9 +492,9 @@ interface SaleDao {
             "  WHERE li.saleId = s.id AND li.deleted = 0 " +
             "  AND COALESCE(li.unitCost, i.cost) IS NOT NULL), 0) AS costedLinesCost " +
             "FROM sales s WHERE s.businessId = :businessId AND s.deleted = 0 " +
-            "AND s.status = 'completed'"
+            "AND s.status IN (:statuses)"
     )
-    fun observeAllSaleMargins(businessId: String): Flow<List<SaleMarginRow>>
+    fun observeAllSaleMargins(businessId: String, statuses: Set<String>): Flow<List<SaleMarginRow>>
 
     /** Bare (timestamp,total) rows since [from], bucketed in-app into the 7-day chart. */
     @Query(

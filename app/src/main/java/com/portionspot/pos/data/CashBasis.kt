@@ -135,10 +135,17 @@ object CashBasis {
      *  - [cogs]          cost of the goods behind [costedRevenue] (pro-rated, net of
      *                    refunds). VAT-exclusive.
      *  - [grossProfit]   `costedRevenue − cogs`, exactly, to the cent.
-     *  - [uncollected]   sale value BILLED in the window that has not been collected yet.
-     *                    Shown as a figure/alert, never as sales. Windowed on the SALE's
-     *                    day and therefore not reduced by a later refund — the same
+     *  - [uncollected]   sale value that LEFT THE TILL UNPAID in the window. Shown as a
+     *                    figure/alert, never as sales. Windowed on the SALE's day and
+     *                    read off [CashBasisSaleRow.amountPaid] alone, so it is reduced
+     *                    by neither a later refund NOR a later repayment — the same
      *                    never-restate rule that dates reversals on the refund's day.
+     *
+     *                    ★ It is therefore NOT "still owed", and no screen may word it
+     *                    that way: yesterday's figure stays whole after the debt is
+     *                    settled today. What is still outstanding is the customer
+     *                    ledger's answer, not this one. The web client words it
+     *                    "left unpaid at the till" for the same reason.
      *
      * ★ THE TWO IDENTITIES, and why there are two rather than one:
      *

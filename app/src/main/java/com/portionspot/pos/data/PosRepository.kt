@@ -1622,9 +1622,14 @@ class PosRepository(private val db: PosDatabase) {
     /**
      * Raw per-sale input to [CashBasis] — see that object for what "revenue" now means.
      * Unwindowed on purpose: a repayment today can settle a sale from last year.
+     *
+     * [RECEIPT_STATUSES] is the SAME constant [expectedDrawer] passes, and passing it
+     * from one place is the point: recognition and the drawer have to agree about which
+     * rows are real sales, or a day balances on cash the sales figures never mention.
      */
     fun cashBasisSalesFlow(businessId: String): Flow<List<CashBasisSaleRow>> =
-        saleDao.observeAllSaleMargins(businessId).map { rows -> rows.map { it.toCashBasisRow() } }
+        saleDao.observeAllSaleMargins(businessId, RECEIPT_STATUSES)
+            .map { rows -> rows.map { it.toCashBasisRow() } }
 
     /**
      * The reversal side of the same question: every live refund, so [CashBasis] can take
