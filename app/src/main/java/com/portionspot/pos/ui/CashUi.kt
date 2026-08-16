@@ -289,8 +289,16 @@ private fun CashLocationCard(
 
 /**
  * §6 — the four-part split of the cash actually held. The parts add up to the held cash
- * exactly, because profit is the residual: whatever is left once the float, the restock
- * money and the customers' money are set aside.
+ * exactly, because the profit slice is the residual: whatever is left once the float, the
+ * restock money and the customers' money are set aside.
+ *
+ * ★ "Profit still in cash" IS NOT THE PROFIT FIGURE ON THE DASHBOARD, and the labels here
+ * exist to keep those two apart. The dashboard's is EARNED profit (the P&L), which a
+ * drawing never touches. This one is a position: of the notes in the till and the safe
+ * right now, how many are the owner's. Taking $100 out lowers this by $100, because the
+ * $100 is in his pocket instead of the drawer — which is a move, not a loss, and the card
+ * says so in as many words. See [PosRepository.CashSplit] for why the terms are named the
+ * way they are and why owner funds are clamped at zero rather than allowed to go negative.
  */
 @Composable
 private fun CashSplitCard(split: PosRepository.CashSplit, currency: String) {
@@ -302,8 +310,8 @@ private fun CashSplitCard(split: PosRepository.CashSplit, currency: String) {
             color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 18.sp
         )
         SplitRow(
-            "Float & capital", split.floatCapital, currency, t.inkSecondary,
-            "The float plus money you put in. Never profit."
+            "Float & your money in", split.ownerFunds, currency, t.inkSecondary,
+            "The float plus money you put in, less what you have taken back out. Never profit."
         )
         SplitRow(
             "Stock money", split.stockMoney, currency, t.inkSecondary,
@@ -315,10 +323,22 @@ private fun CashSplitCard(split: PosRepository.CashSplit, currency: String) {
         )
         HorizontalDivider(color = t.surfaceBorder)
         SplitRow(
-            "Yours to take", split.profit, currency,
-            if (split.profit < 0) t.danger else t.success,
-            "What is genuinely profit, in cash, right now."
+            "Profit still in cash", split.cashProfit, currency,
+            if (split.cashProfit < 0) t.danger else t.success,
+            "Yours to take. Money you take out comes out of here — it is not a cost."
         )
+        // An over-drawn owner is a real and meaningful state, so it is said out loud
+        // rather than hidden inside a clamp. Without this line the row above simply reads
+        // lower with no explanation, which is what made a drawing look like a loss.
+        if (split.ownerOverdrawn > 0.005) {
+            Text(
+                "You have taken out ${money(split.ownerOverdrawn, currency)} more than you " +
+                    "have put in, so that much of your profit is already in your pocket. " +
+                    "It is money taken, not money lost — the profit you earned is on the " +
+                    "Dashboard and does not change when you take cash out.",
+                color = t.warning, fontSize = 11.sp
+            )
+        }
         if (split.creditOutstanding > 0.005) {
             Text(
                 "Plus ${money(split.creditOutstanding, currency)} owed to you on credit — " +

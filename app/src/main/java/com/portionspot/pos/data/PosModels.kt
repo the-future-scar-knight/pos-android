@@ -1061,8 +1061,13 @@ fun SaleMarginRow.margin(): SaleMargin = computeSaleMargin(
  * model, see [CashBasis]), so the Kotlin side can do the FIFO repayment attribution
  * that SQL cannot express.
  *
+ *  - [total]         = the VAT-INCLUSIVE money billed. The denominator every ratio in
+ *    [CashBasis] is taken against, and the same basis a refund's `refundTotal` is on.
+ *  - [taxTotal]      = the VAT inside [total]. Carried so VAT can be pro-rated on the
+ *    SAME ratio as everything else instead of being left inside a "revenue" figure it
+ *    was never part of — VAT is ZIMRA's money, never the shop's.
  *  - [costedRevenue] = the costed lines' take, after their pro-rata share of the
- *    whole-sale discount.
+ *    whole-sale discount. VAT-EXCLUSIVE, like everything out of [computeSaleMargin].
  *  - [lineProfit]    = that take less the cost of those goods.
  *    So the cost of goods on those lines is exactly `costedRevenue − lineProfit`.
  */
@@ -1070,6 +1075,7 @@ data class CashBasisSaleRow(
     val id: String,
     val soldAt: Long,
     val total: Double,
+    val taxTotal: Double,
     val amountPaid: Double,
     val customerId: String?,
     val costedRevenue: Double,
@@ -1083,12 +1089,36 @@ fun SaleMarginRow.toCashBasisRow(): CashBasisSaleRow {
         id = id,
         soldAt = soldAt,
         total = total,
+        taxTotal = taxTotal,
         amountPaid = amountPaid,
         customerId = customerId,
         costedRevenue = m.costedRevenue,
         lineProfit = m.profit
     )
 }
+
+/**
+ * One live refund reduced to exactly what CASH-BASIS recognition needs (read model, see
+ * [RefundDao.observeCashBasisRefunds]) so [CashBasis] can reverse the sale it undoes
+ * WITHOUT the sale row ever being edited.
+ *
+ *  - [at] is the refund's own creation time. The reversal is booked HERE, never back on
+ *    the day the sale was rung up: that day may already carry a [DayClose] whose counted
+ *    short/over was computed against the old figure, and restating it would invalidate a
+ *    count a human physically performed.
+ *  - [refundTotal] is on the SAME basis as [CashBasisSaleRow.total] — VAT- and
+ *    discount-inclusive — because [computeRefundTotal] builds it as
+ *    `returnedGoods / saleGoodsValue × saleTotal`. That is what makes
+ *    `refundTotal / sale.total` the share of the GOODS that came back.
+ *
+ * Voided refunds are tombstoned, and the query filters them, so they never appear here.
+ */
+data class CashBasisRefundRow(
+    val id: String,
+    val saleId: String,
+    val at: Long,
+    val refundTotal: Double
+)
 
 /**
  * A goods supplier / vendor. Purchase orders denormalise the supplier's name onto

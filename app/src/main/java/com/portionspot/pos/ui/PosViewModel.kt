@@ -6,11 +6,14 @@ import androidx.lifecycle.viewModelScope
 import com.portionspot.pos.data.Business
 import com.portionspot.pos.data.CartLine
 import com.portionspot.pos.data.CashBasis
+import com.portionspot.pos.data.CashBasisRefundRow
 import com.portionspot.pos.data.CashBasisSaleRow
 import com.portionspot.pos.data.CashLocation
 import com.portionspot.pos.data.CashSession
 import com.portionspot.pos.data.CashTxn
 import com.portionspot.pos.data.startOfDay
+import com.portionspot.pos.data.startOfNextDay
+import com.portionspot.pos.data.ExpectedDrawer
 import com.portionspot.pos.data.CreditTxn
 import com.portionspot.pos.data.DayClose
 import com.portionspot.pos.data.OutsideFund
@@ -483,24 +486,49 @@ class PosViewModel(
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), OutsideFundTotals())
 
     /**
-     * Raw cash-basis inputs (§5): every live completed sale with its costed economics,
-     * paired with the whole credit ledger. Unwindowed — a repayment today can settle a
-     * sale from last year, so [CashBasis] needs the full picture to attribute it.
+     * The three raw inputs §5 recognition reads, gathered once so no screen can assemble
+     * its own subset. A named shape rather than a Triple because the third member arrived
+     * later (refunds) and a positional tuple hides which list is which at every call site.
      */
-    private val cashBasisInputs: Flow<Pair<List<CashBasisSaleRow>, List<CreditTxn>>> =
+    private data class CashBasisInputs(
+        val sales: List<CashBasisSaleRow> = emptyList(),
+        val ledger: List<CreditTxn> = emptyList(),
+        val refunds: List<CashBasisRefundRow> = emptyList()
+    )
+
+    /** One window's figures from one set of inputs — the only place [CashBasis.compute] is
+     *  called with its arguments spelled out, so a screen cannot forget the refunds. */
+    private fun CashBasisInputs.period(from: Long, to: Long): CashBasis.Period =
+        CashBasis.compute(sales, ledger, refunds, from, to)
+
+    /**
+     * Raw cash-basis inputs (§5): every live completed sale with its costed economics, the
+     * whole credit ledger, and every live refund. Unwindowed — a repayment today can
+     * settle a sale from last year and a refund today reverses a sale from last month, so
+     * [CashBasis] needs the full picture to attribute either.
+     */
+    private val cashBasisInputs: Flow<CashBasisInputs> =
         businessId.filterNotNull().flatMapLatest { bid ->
-            combine(repo.cashBasisSalesFlow(bid), repo.creditLedgerFlow(bid)) { sales, ledger ->
-                sales to ledger
-            }
+            combine(
+                repo.cashBasisSalesFlow(bid),
+                repo.creditLedgerFlow(bid),
+                repo.cashBasisRefundsFlow(bid)
+            ) { sales, ledger, refunds -> CashBasisInputs(sales, ledger, refunds) }
         }
 
     /**
      * ALL-TIME cash-basis figures. Its [CashBasis.Period.cogs] is the cost of every good
      * that has been sold AND collected — the "stock money" input to the four-part split.
+     *
+     * NET OF REFUNDS, and that matters here more than anywhere: goods that came back are
+     * on the shelf again, so their cost is no longer money tied up in sold stock. Left
+     * gross, a refunded sale would keep its cost in [PosRepository.CashSplit.stockMoney]
+     * while the cash that backed it had already been handed to the customer, and the
+     * four pots would stop reconciling to the cash actually held.
      */
     private val cashBasisAllTime: StateFlow<CashBasis.Period> =
         cashBasisInputs
-            .map { (sales, ledger) -> CashBasis.compute(sales, ledger, 0L, Long.MAX_VALUE) }
+            .map { it.period(0L, Long.MAX_VALUE) }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), CashBasis.Period())
 
     /**
@@ -530,9 +558,7 @@ class PosViewModel(
      */
     val todayCashBasis: StateFlow<CashBasis.Period> =
         cashBasisInputs
-            .map { (sales, ledger) ->
-                CashBasis.compute(sales, ledger, startOfToday(), Long.MAX_VALUE)
-            }
+            .map { it.period(startOfToday(), Long.MAX_VALUE) }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), CashBasis.Period())
 
     /** Everything the split needs off the cash ledger, gathered in one combine. */
@@ -559,15 +585,23 @@ class PosViewModel(
      * §6 — "how much of this money is actually mine". The cash physically held (till +
      * safe) split into four pots that ADD UP to it exactly:
      *
-     *   float & capital + stock money + owed to customers + profit  =  till + safe
+     *   your money in + stock money + owed to customers + profit still in cash = till + safe
      *
-     *  - float & capital = the opening float, plus owner injections and borrowings still
+     *  - your money in     = the opening float, plus owner injections and borrowings still
      *    sitting in the cash, less anything drawn back out. Never profit.
-     *  - stock money     = the collected cost of goods sold that has NOT yet been spent
+     *  - stock money       = the collected cost of goods sold that has NOT yet been spent
      *    restocking. It must buy the next lot.
      *  - owed to customers = change owed + unpaid refunds. NOT his money.
-     *  - profit          = the residual. Making it the residual is what guarantees the
+     *  - profit still in cash = the residual. Making it the residual is what guarantees the
      *    four parts reconcile to the cent instead of nearly adding up.
+     *
+     * ★ THE ARITHMETIC MOVED OUT OF HERE, into [PosRepository.CashSplit.of]. Not tidying:
+     * the drawings rule ("taking money out is not a loss") is the one part of this screen
+     * that can quietly turn the owner's own money into a reported loss, and a rule that
+     * lives inside a `combine` over five Room flows cannot be tested. It is now pure, and
+     * `CashSplitTest` asserts it. Read that companion's KDoc before changing any term here
+     * — in particular why the zero clamp on owner funds stays and what [ownerOverdrawn]
+     * is for.
      *
      * SCOPE, honestly: this splits cash that is HERE. It says nothing about unsold stock
      * (no projected profit — the owner explicitly does not want it), and profit earned on
@@ -581,21 +615,37 @@ class PosViewModel(
             cashBasisAllTime,
             customers
         ) { inputs, float, allTime, custs ->
-            val till = float + inputs.tillMoves
-            // Float + outside money still in the cash. Clamped at zero: if the owner has
-            // drawn out more than they ever put in, the shop is not holding their money.
-            val floatCapital = (float + inputs.equityCash).coerceAtLeast(0.0)
-            // Cost of what has sold and been paid for, less what restocking already spent.
-            val stockMoney = (allTime.cogs - inputs.purchaseCash).coerceAtLeast(0.0)
-            PosRepository.CashSplit(
-                till = till,
+            PosRepository.CashSplit.of(
+                openingFloat = float,
+                tillMovements = inputs.tillMoves,
                 safe = inputs.safe,
-                floatCapital = floatCapital,
-                stockMoney = stockMoney,
-                owedToCustomers = inputs.owedToCustomers.coerceAtLeast(0.0),
-                creditOutstanding = custs.sumOf { it.balance.coerceAtLeast(0.0) }
+                equityCash = inputs.equityCash,
+                // Net of refunds already: returned goods are back on the shelf, so their
+                // cost is no longer money set aside to buy the next lot.
+                collectedCogs = allTime.cogs,
+                purchaseCash = inputs.purchaseCash,
+                owedToCustomers = inputs.owedToCustomers,
+                creditOutstanding = custs.sumOf { it.balance.coerceAtLeast(0.0) },
             )
         }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), PosRepository.CashSplit())
+
+    /**
+     * THE Z-REPORT CASH-UP for today, read once when the dialog opens.
+     *
+     * One-shot rather than a [StateFlow] on purpose. A cash-up is a measurement: someone is
+     * holding a pile of notes and comparing it to a figure. A live figure that moved while
+     * they counted would make the variance depend on how long the counting took — and the
+     * variance is what a day close writes down permanently against a cashier's name.
+     *
+     * The window is today's trading day, resolved HERE from the clock and bounded by
+     * [startOfNextDay] rather than `+ 24h`, so the two days a year that are 23 or 25 hours
+     * long do not file the evening's takings under tomorrow.
+     */
+    suspend fun expectedDrawerToday(): ExpectedDrawer {
+        val bid = businessId.value ?: return ExpectedDrawer()
+        val from = startOfToday()
+        return repo.expectedDrawerFor(bid, from, startOfNextDay(from))
+    }
 
     /** All (non-deleted) suppliers for the shop, A→Z by name. */
     val suppliers: StateFlow<List<Supplier>> =
@@ -715,9 +765,9 @@ class PosViewModel(
      * arrived — surfaced as a figure/alert, never as sales.
      */
     val dashCashBasis: StateFlow<CashBasis.Period> =
-        combine(cashBasisInputs, _dashRange) { (sales, ledger), range ->
+        combine(cashBasisInputs, _dashRange) { inputs, range ->
             val (from, to) = rangeBounds(range)
-            CashBasis.compute(sales, ledger, from, to)
+            inputs.period(from, to)
         }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), CashBasis.Period())
 
     /**
@@ -736,9 +786,9 @@ class PosViewModel(
 
     /** Cash-basis figures for the REPORTS window (same meaning as [dashCashBasis]). */
     val reportCashBasis: StateFlow<CashBasis.Period> =
-        combine(cashBasisInputs, _reportRange) { (sales, ledger), range ->
+        combine(cashBasisInputs, _reportRange) { inputs, range ->
             val (from, to) = rangeBounds(range)
-            CashBasis.compute(sales, ledger, from, to)
+            inputs.period(from, to)
         }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), CashBasis.Period())
 
     /** Cash short/over over the REPORTS window. */

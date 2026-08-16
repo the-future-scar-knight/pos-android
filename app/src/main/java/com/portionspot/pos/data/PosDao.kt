@@ -267,6 +267,34 @@ interface SaleDao {
     )
     suspend fun expectedCashBySale(businessId: String): List<ExpectedCashRow>
 
+    /**
+     * The window's RECEIPTS, for the Z-report cash-up (see `ExpectedDrawer.kt`).
+     *
+     * ★ NO `LIMIT`. The figure this feeds is an expected cash drawer, and the bug it
+     * replaces was exactly a cap — the dashboard's `observeRecent(100)` — silently
+     * truncating a busy day and turning the 101st receipt onward into an unexplained
+     * shortage. Bounded by TIME and by nothing else.
+     *
+     * ★ [statuses] is passed in rather than written here so the caller can hand over
+     * [RECEIPT_STATUSES] itself. `status = 'completed'` — the filter this replaces —
+     * DROPS a sale that has since been partly refunded, whose cash is still in the drawer.
+     *
+     * `changeDue` is the change ACTUALLY handed over (see [expectedCashBySale] and
+     * [netCashForSale]); COALESCE because it is null on every sale that gave none.
+     */
+    @Query(
+        "SELECT s.id AS saleId, s.status AS status, s.total AS total, " +
+            "COALESCE(s.changeDue, 0) AS changeGiven FROM sales s " +
+            "WHERE s.businessId = :businessId AND s.deleted = 0 AND s.status IN (:statuses) " +
+            "AND s.soldAt >= :from AND s.soldAt < :to"
+    )
+    suspend fun drawerReceipts(
+        businessId: String,
+        from: Long,
+        to: Long,
+        statuses: Collection<String>,
+    ): List<DrawerReceipt>
+
     // ---- parked / held sales (status = 'parked') ----
     @Query(
         "SELECT * FROM sales WHERE businessId = :businessId AND deleted = 0 " +
@@ -577,6 +605,35 @@ interface SalePaymentDao {
     )
     fun observeMethodBreakdown(businessId: String, from: Long, to: Long): Flow<List<MethodBreakdown>>
 
+    /**
+     * Every TENDER behind the window's receipts — the Z-report's cash drawer (see
+     * `ExpectedDrawer.kt`).
+     *
+     * ★ THIS IS THE FIX FOR SPLIT PAYMENTS. [SaleEntity.paymentMethod] is a single code,
+     * or the literal `"split"` when a sale has more than one tender, so reading the header
+     * contributed **zero cash** for a $50-cash + $30-EcoCash sale. One row per tender is
+     * the only shape that can answer "how much of this receipt was cash".
+     *
+     * The dual-currency trio travels with the row for the cash-up's currency split; the
+     * base-currency `amount` is what every sum reads — see [DrawerTender].
+     *
+     * Uncapped and windowed on the SALE's `soldAt`, so a tender belongs to the trading day
+     * the receipt does, and [statuses] is [RECEIPT_STATUSES] from the caller.
+     */
+    @Query(
+        "SELECT p.saleId AS saleId, p.method AS method, p.amount AS amount, " +
+            "p.tenderCurrency AS tenderCurrency, p.tenderAmount AS tenderAmount " +
+            "FROM sale_payments p JOIN sales s ON p.saleId = s.id " +
+            "WHERE s.businessId = :businessId AND s.deleted = 0 AND s.status IN (:statuses) " +
+            "AND s.soldAt >= :from AND s.soldAt < :to"
+    )
+    suspend fun drawerTenders(
+        businessId: String,
+        from: Long,
+        to: Long,
+        statuses: Collection<String>,
+    ): List<DrawerTender>
+
     @Query("DELETE FROM sale_payments WHERE businessId = :businessId")
     suspend fun wipe(businessId: String)
 }
@@ -834,6 +891,26 @@ interface RefundDao {
     )
     fun observeRefundedBySale(businessId: String): Flow<List<SaleRefundSum>>
 
+    /**
+     * Every LIVE refund reduced to the three things cash-basis recognition needs (§5) —
+     * which sale it reverses, when, and how much of it. Raw input to [CashBasis], which
+     * turns `refundTotal / sale.total` into the share of the sale to un-recognise.
+     *
+     * ★ UNWINDOWED, exactly like [SaleDao.observeAllSaleMargins] and for the same reason:
+     * a refund written today reverses a sale from last month, so the figures of ANY window
+     * depend on refunds outside it. Windowing here would hide the reversal from every
+     * period except the one the refund happens to fall in.
+     *
+     * `deleted = 0` is what makes an admin void converge: [PosRepository.voidRefund]
+     * tombstones the refund, the id drops out of this result, and the reversal stops
+     * existing rather than having to be reversed a second time.
+     */
+    @Query(
+        "SELECT id AS id, saleId AS saleId, createdAt AS at, refundTotal AS refundTotal " +
+            "FROM refunds WHERE businessId = :businessId AND deleted = 0"
+    )
+    fun observeCashBasisRefunds(businessId: String): Flow<List<CashBasisRefundRow>>
+
     @Query("SELECT * FROM refunds WHERE saleId = :saleId AND deleted = 0")
     suspend fun forSaleOnce(saleId: String): List<Refund>
 
@@ -856,6 +933,29 @@ interface RefundDao {
             "GROUP BY r.id"
     )
     suspend fun expectedCashByRefund(businessId: String): List<ExpectedCashRow>
+
+    /**
+     * Refund PAYOUTS made in the window — money handed back over the counter, which the
+     * old Z-report never subtracted at all (see `ExpectedDrawer.kt`).
+     *
+     * ★ WINDOWED ON THE PAYOUT'S OWN `createdAt`, NOT THE REFUND'S. A refund can be owed
+     * and settled over days ([PosRepository.recordRefundPayout]); the drawer empties on the
+     * day the notes leave it, and dating an instalment by its parent refund would take
+     * today's cash off yesterday's count.
+     *
+     * The method comes down with the row instead of being filtered in SQL so a non-cash
+     * reversal — which never opened the drawer — can be shown and proven not to move the
+     * expected figure. Voided refunds drop out through `r.deleted = 0`, the same way they
+     * do for the cash mirror.
+     */
+    @Query(
+        "SELECT p.method AS method, p.amount AS amount, " +
+            "p.tenderCurrency AS tenderCurrency, p.tenderAmount AS tenderAmount " +
+            "FROM refund_payments p JOIN refunds r ON p.refundId = r.id " +
+            "WHERE r.businessId = :businessId AND r.deleted = 0 " +
+            "AND p.createdAt >= :from AND p.createdAt < :to"
+    )
+    suspend fun drawerPayouts(businessId: String, from: Long, to: Long): List<DrawerPayout>
 
     /** Money already refunded against one sale — the gate on editing it in place (B5). */
     @Query("SELECT COALESCE(SUM(refundTotal), 0) FROM refunds WHERE saleId = :saleId AND deleted = 0")
@@ -1292,6 +1392,57 @@ interface CashTxnDao {
             "WHERE businessId = :businessId AND deleted = 0 AND location = :location"
     )
     suspend fun locationSumOnce(businessId: String, location: String): Double
+
+    /**
+     * Net movements in one location STRICTLY BEFORE [before] — what the drawer held when
+     * the window opened.
+     *
+     * This is what replaced the Z-report's "Opening float" TEXT BOX. Asking a cashier to
+     * type the opening float makes the expected drawer a function of what someone
+     * remembers, and the number they type is the number the count is measured against —
+     * so a typo becomes a permanent shortage with a name attached to it. The ledger
+     * already knows: it is the same running balance [PosRepository.tillBalanceOnce] reads,
+     * cut off at the window's edge.
+     */
+    @Query(
+        "SELECT COALESCE(SUM(amount), 0) FROM cash_txns " +
+            "WHERE businessId = :businessId AND deleted = 0 AND location = :location " +
+            "AND createdAt < :before"
+    )
+    suspend fun locationSumBefore(businessId: String, location: String, before: Long): Double
+
+    /**
+     * Everything OTHER than sales and refunds that moved one location in a window, netted
+     * per [CashTxn.type] — the third thing the old Z-report ignored (see `ExpectedDrawer.kt`).
+     *
+     * ★ THE `refType NOT IN ('sale', 'refund')` EXCLUSION IS LOAD-BEARING. Both the till
+     * that rang a sale up ([PosRepository.checkout]) and a till that merely pulled it
+     * ([planCashMirror]) write a cash row stamped with those refTypes, and the cash-up
+     * rebuilds a receipt's contribution from its TENDER rows instead. Counting both would
+     * put every sale in the expected drawer twice. Any new `refType` used for a sale- or
+     * refund-derived movement has to be added here in the same change — the same coupling
+     * `cashMovementCountedElsewhere` already carries.
+     *
+     * Everything else genuinely moved this drawer and belongs in the count: an expense or
+     * purchase paid out of the till, a till↔safe transfer either way, change paid out to a
+     * customer later (`refType = 'customer'`), owner money in, an owner drawing, and a
+     * day-close true-up. Grouped by type so the cash-up can say WHICH, because "expected
+     * is lower than the day's takings" is only a fair thing to tell a cashier if the
+     * screen also says where the difference went.
+     */
+    @Query(
+        "SELECT type AS type, COALESCE(SUM(amount), 0) AS amount FROM cash_txns " +
+            "WHERE businessId = :businessId AND deleted = 0 AND location = :location " +
+            "AND createdAt >= :from AND createdAt < :to " +
+            "AND (refType IS NULL OR refType NOT IN ('sale', 'refund')) " +
+            "GROUP BY type"
+    )
+    suspend fun drawerMovements(
+        businessId: String,
+        location: String,
+        from: Long,
+        to: Long,
+    ): List<DrawerMovement>
 
     /**
      * Cash already booked against each source row of one kind — the "what the ledger

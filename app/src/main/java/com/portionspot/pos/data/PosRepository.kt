@@ -908,6 +908,40 @@ class PosRepository(private val db: PosDatabase) {
     fun cashVarianceFlow(businessId: String, from: Long, to: Long): Flow<Double> =
         cashTxnDao.observeVarianceSum(businessId, from, to)
 
+    /**
+     * THE Z-REPORT CASH-UP for `[from, to)` — see `ExpectedDrawer.kt` for the three
+     * defects this exists to close and why the drawer is shop-wide rather than per till.
+     *
+     * A ONE-SHOT SNAPSHOT, not a flow, and that is the honest shape: a cash-up is a
+     * measurement taken at an instant and compared against notes someone is holding. A
+     * live figure that moved while the drawer was being counted would be worse than
+     * useless — the count would be measured against a total that has since changed.
+     *
+     * Five reads, four of them uncapped and windowed only by time:
+     *  - OPENING is the till ledger cut off at [from] ([CashTxnDao.locationSumBefore]) plus
+     *    the device's opening float, i.e. exactly [tillBalanceOnce] as of the window's edge.
+     *    It is read, never typed.
+     *  - RECEIPTS and TENDERS come from `sales` + `sale_payments`, filtered on
+     *    [RECEIPT_STATUSES] — so a split tender contributes its cash part and a
+     *    part-refunded receipt still counts.
+     *  - PAYOUTS come from `refund_payments`, dated by the payout.
+     *  - MOVEMENTS are the till's own ledger with the sale/refund rows held back, because
+     *    those are rebuilt from the tenders above.
+     *
+     * This deliberately does NOT feed [closeDay]. The close writes a permanent variance and
+     * must measure against the ledger balance the rest of the money model is built on;
+     * this is the independent cross-check that says whether the ledger has caught up.
+     */
+    suspend fun expectedDrawerFor(businessId: String, from: Long, to: Long): ExpectedDrawer =
+        expectedDrawer(
+            opening = openingFloat(businessId) +
+                cashTxnDao.locationSumBefore(businessId, CashLocation.TILL, from),
+            receipts = saleDao.drawerReceipts(businessId, from, to, RECEIPT_STATUSES),
+            tenders = paymentDao.drawerTenders(businessId, from, to, RECEIPT_STATUSES),
+            payouts = refundDao.drawerPayouts(businessId, from, to),
+            movements = cashTxnDao.drawerMovements(businessId, CashLocation.TILL, from, to),
+        )
+
     // ---- §3 TOP UP THE FLOAT (on command) --------------------------------
 
     /** What the top-up sheet opens with: where the till is against its target. */
@@ -1592,14 +1626,24 @@ class PosRepository(private val db: PosDatabase) {
     fun cashBasisSalesFlow(businessId: String): Flow<List<CashBasisSaleRow>> =
         saleDao.observeAllSaleMargins(businessId).map { rows -> rows.map { it.toCashBasisRow() } }
 
+    /**
+     * The reversal side of the same question: every live refund, so [CashBasis] can take
+     * back the revenue and profit of a sale whose goods came back — on the REFUND's day,
+     * without the immutable sale row being touched. Unwindowed for the same reason
+     * [cashBasisSalesFlow] is: a refund written today reverses a sale from last month.
+     */
+    fun cashBasisRefundsFlow(businessId: String): Flow<List<CashBasisRefundRow>> =
+        refundDao.observeCashBasisRefunds(businessId)
+
     // ---- §6 THE SPLIT: how much of this money is actually mine -----------
 
     /**
      * The cash held (till + safe) split into the four pots the owner thinks in (§6).
      *
-     *  - [floatCapital]   — the float plus outside money still sitting in the cash: the
+     *  - [ownerFunds]     — the float plus outside money still sitting in the cash: the
      *                       opening float, owner injections and borrowings, less anything
-     *                       the owner has drawn back out. **Never profit.**
+     *                       the owner has drawn back out or repaid. **Never profit.**
+     *                       (Named `floatCapital` until the drawings fix below.)
      *  - [stockMoney]     — the cost of the goods already SOLD AND COLLECTED that has not
      *                       yet been ploughed back into the shelves. It must buy the next
      *                       lot. (Collected cost of goods, less cash already spent on
@@ -1607,25 +1651,123 @@ class PosRepository(private val db: PosDatabase) {
      *  - [owedToCustomers]— change owed plus unpaid refunds. **Explicitly NOT the owner's
      *                       money** — it is sitting in the drawer waiting to be handed
      *                       back, and must never inflate his figures.
-     *  - [profit]         — what is genuinely his to take. Deliberately the RESIDUAL, so
-     *                       the four parts add up to the cash actually held, to the cent.
+     *  - [cashProfit]     — what is genuinely his to take, IN CASH, RIGHT NOW. Deliberately
+     *                       the RESIDUAL, so the four parts add up to the cash actually
+     *                       held, to the cent.
+     *
+     * ══ ★ THE WORD "PROFIT" WAS DOING TWO JOBS, AND THEY DISAGREE ══
+     *
+     * This field used to be called `profit`, and the owner's rule — "a drawing must never
+     * reduce profit" — appeared to be broken here. It was not one rule failing; it was two
+     * different figures sharing one name:
+     *
+     *  • EARNED PROFIT is the P&L figure: [CashBasis.Period.grossProfit], less posted
+     *    expenses, less till short/over. A drawing is not a cost, never reaches `expenses`,
+     *    and does not appear in it. See [recordOwnerDrawing]. That rule already held and
+     *    still holds — nothing in this class can change it.
+     *
+     *  • [cashProfit] is a CASH-POSITION residual: of the notes physically in the till and
+     *    the safe, how many are the owner's rather than the customers' or the next lot's.
+     *    When the owner takes $100 out, that $100 is no longer in the drawer, so this
+     *    figure MUST fall. Anything else would tell him to take money that is not there.
+     *
+     * They are now separately named, and the UI labels them separately, for the same reason
+     * `Period.revenue` was renamed rather than redefined: a figure whose basis is ambiguous
+     * gets read as whichever basis the reader had in mind.
+     *
+     * ══ ★ WHY THE ZERO CLAMP ON [ownerFunds] STAYS ══
+     *
+     * The obvious fix looked like "delete the `coerceAtLeast(0.0)` and let owner funds go
+     * negative". It was considered and REJECTED, because the clamp is what guarantees the
+     * one property that matters here:
+     *
+     *     ownerFunds >= 0, stockMoney >= 0, owedToCustomers >= 0   ⇒   cashProfit <= held
+     *
+     * Unclamped, an owner who had drawn $60 more than he ever put in would get
+     * `ownerFunds = -60` and therefore `cashProfit = held + 60` — a screen reading "yours
+     * to take $100" over a drawer holding $40. A negative term in a subtraction silently
+     * inverts into an overstatement, which is the exact failure mode a residual split is
+     * supposed to be immune to.
+     *
+     * What the clamp got WRONG was being SILENT. Once it bit, every further dollar drawn
+     * came out of [cashProfit] with nothing anywhere saying why, so a drawing read as a
+     * business loss. [ownerOverdrawn] is that missing explanation: the amount by which
+     * drawings and repayments have exceeded the float plus everything put in, as a positive
+     * figure, sitting OUTSIDE the four-way sum. It does not change any total; it names the
+     * reason [cashProfit] fell, so the screen can say "you have already taken this" instead
+     * of leaving it to look like money lost.
+     *
+     * ══ The invariant, stated so a test can assert it ══
+     *
+     *     ownerFunds + stockMoney + owedToCustomers + cashProfit  ==  held    (always)
+     *     ownerFunds + cashProfit                                              (the owner's
+     *         total claim on the cash) falls by EXACTLY the amount of a drawing — never by
+     *         more. That is what "a drawing is not a loss" means arithmetically.
      *
      * SCOPE, stated honestly: this splits CASH THAT IS HERE. It says nothing about the
      * value of unsold stock (the owner explicitly does not want projected profit on goods
      * that have not sold), and money still owed on credit is profit EARNED but not yet
-     * cash HELD — it shows in [creditOutstanding], not in [profit].
+     * cash HELD — it shows in [creditOutstanding], not in [cashProfit].
      */
     data class CashSplit(
         val till: Double = 0.0,
         val safe: Double = 0.0,
-        val floatCapital: Double = 0.0,
+        val ownerFunds: Double = 0.0,
+        /** How far drawings have gone PAST the float + capital + loans, positive. Not one
+         *  of the four pots and never in the sum — it explains a smaller [cashProfit]. */
+        val ownerOverdrawn: Double = 0.0,
         val stockMoney: Double = 0.0,
         val owedToCustomers: Double = 0.0,
         val creditOutstanding: Double = 0.0
     ) {
         val held: Double get() = till + safe
-        /** The residual — what is left once the other three pots are set aside. */
-        val profit: Double get() = held - floatCapital - stockMoney - owedToCustomers
+
+        /** The residual — what is left once the other three pots are set aside. Can be
+         *  negative for real reasons (a till shortage, a restock bigger than the takings);
+         *  a drawing is never one of them, because a drawing lowers [held] and this term
+         *  by the same amount it lowers what the owner can actually pick up. */
+        val cashProfit: Double get() = held - ownerFunds - stockMoney - owedToCustomers
+
+        /** Everything in the cash that is the owner's rather than a customer's or the next
+         *  lot's. Falls by exactly what a drawing takes — the "not a loss" figure. */
+        val ownerClaim: Double get() = ownerFunds + cashProfit
+
+        companion object {
+            /**
+             * Build the split from the raw ledger figures. PURE — no Room, no clock — so
+             * the drawings rules above are provable rather than merely asserted.
+             *
+             * [equityCash] is the signed net of the `capital` / `loan` / `drawing` cash
+             * rows (see [CashTxnDao.observeEquityCashSum]): money in is positive, a drawing
+             * or a loan repayment negative. [collectedCogs] is the cost of goods behind
+             * money actually COLLECTED — [CashBasis.Period.cogs], already net of refunds,
+             * because goods that came back are on the shelf again and their cost is no
+             * longer money that has to buy the next lot.
+             */
+            fun of(
+                openingFloat: Double,
+                tillMovements: Double,
+                safe: Double,
+                equityCash: Double,
+                collectedCogs: Double,
+                purchaseCash: Double,
+                owedToCustomers: Double,
+                creditOutstanding: Double,
+            ): CashSplit {
+                // The owner's own money still in the cash. Negative means he has taken out
+                // more than he ever put in — real, and surfaced rather than clamped away.
+                val ownerNet = openingFloat + equityCash
+                return CashSplit(
+                    till = openingFloat + tillMovements,
+                    safe = safe,
+                    ownerFunds = ownerNet.coerceAtLeast(0.0),
+                    ownerOverdrawn = (-ownerNet).coerceAtLeast(0.0),
+                    stockMoney = (collectedCogs - purchaseCash).coerceAtLeast(0.0),
+                    owedToCustomers = owedToCustomers.coerceAtLeast(0.0),
+                    creditOutstanding = creditOutstanding.coerceAtLeast(0.0),
+                )
+            }
+        }
     }
 
     // ---- misc cash reads --------------------------------------------------

@@ -210,6 +210,7 @@ import com.portionspot.pos.data.MobileMoneyReceipt
 import com.portionspot.pos.device.rememberContactPicker
 import com.portionspot.pos.data.Tender
 import com.portionspot.pos.data.Expense
+import com.portionspot.pos.data.ExpectedDrawer
 import com.portionspot.pos.data.Supplier
 import com.portionspot.pos.data.Item
 import com.portionspot.pos.data.TagValue
@@ -9422,7 +9423,9 @@ private fun DashboardScreen(vm: PosViewModel, business: Business) {
     val topProducts by vm.dashTopProducts.collectAsState()
     // ★ CASH BASIS (§5): revenue and profit now count money that has actually ARRIVED.
     // An unpaid credit sale is not revenue; a repayment is revenue on the day it lands;
-    // cost of goods is pro-rated to the collected share. See CashBasis for the contract.
+    // cost of goods is pro-rated to the collected share; a refund takes the sale back on
+    // the day the goods came back; VAT is broken out because it is never revenue.
+    // See CashBasis for the contract and what each field is on the basis of.
     val cashBasis by vm.dashCashBasis.collectAsState()
     val cashVariance by vm.dashCashVariance.collectAsState()
     val grossProfit = cashBasis.grossProfit
@@ -9480,14 +9483,51 @@ private fun DashboardScreen(vm: PosViewModel, business: Business) {
         // recorded, stocked and owed, but it is not revenue until the money arrives; when
         // it does, it counts on that day. The billed-but-unpaid figure sits underneath as
         // a figure, never as sales.
+        //
+        // ★ The big number is GROSS COLLECTED: cash that physically arrived, VAT included.
+        // It deliberately does NOT net off refunds or VAT, because "money collected" has
+        // to keep meaning what the drawer saw — that is the figure a cash-up reconciles
+        // against. What was handed back and what belongs to ZIMRA are subtracted on their
+        // own lines underneath, so the reader can get from the drawer to the revenue the
+        // profit tiles are built on without either figure pretending to be the other.
         Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = t.brand.s600)) {
             Column(Modifier.fillMaxWidth().padding(20.dp)) {
                 Text("Money collected", color = t.inkOnBrand.copy(alpha = 0.85f), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                Text(money(cashBasis.revenue, currency), color = t.inkOnBrand, fontWeight = FontWeight.Black, fontSize = 32.sp)
+                Text(money(cashBasis.collected, currency), color = t.inkOnBrand, fontWeight = FontWeight.Black, fontSize = 32.sp)
                 Text(
                     "${summary.count} sale${if (summary.count == 1) "" else "s"} · ${range.label}",
                     color = t.inkOnBrand.copy(alpha = 0.85f), fontSize = 12.sp
                 )
+                // This sentence is the identity `collected − refunds − VAT = netRevenue`
+                // written out in words, so EVERY term that is non-zero has to appear in it
+                // with the right sign or the line stops adding up — which is the exact
+                // class of bug the Period reshape exists to kill.
+                //
+                // ★ VAT is tested on its ABSOLUTE value, not `> 0`. A window holding only a
+                // refund has NEGATIVE VAT: the tax went back out of the drawer with the
+                // goods. Hiding it there (which `> 0.005` did) printed "less $46 refunded"
+                // beside a netRevenue of −$40 and left the reader $6 short with nothing on
+                // screen to explain it.
+                val vatAbs = kotlin.math.abs(cashBasis.vat)
+                if (cashBasis.refunded > 0.005 || vatAbs > 0.005) {
+                    Spacer(Modifier.height(4.dp))
+                    val taken = buildList {
+                        if (cashBasis.refunded > 0.005) add("${money(cashBasis.refunded, currency)} refunded")
+                        if (cashBasis.vat > 0.005) add("${money(cashBasis.vat, currency)} VAT")
+                    }
+                    val sentence = buildString {
+                        if (taken.isNotEmpty()) append("Less ${taken.joinToString(" and ")}")
+                        if (cashBasis.vat < -0.005) {
+                            append(if (isNotEmpty()) ", plus " else "Plus ")
+                            append("${money(vatAbs, currency)} VAT handed back")
+                        }
+                        append(" — ${money(cashBasis.netRevenue, currency)} kept as revenue.")
+                    }
+                    Text(
+                        sentence,
+                        color = t.inkOnBrand.copy(alpha = 0.85f), fontSize = 11.sp
+                    )
+                }
                 if (cashBasis.uncollected > 0.005) {
                     Spacer(Modifier.height(4.dp))
                     Text(
@@ -9584,8 +9624,10 @@ private fun DashboardScreen(vm: PosViewModel, business: Business) {
         if (showProfit) {
             Spacer(Modifier.height(4.dp))
             Text(
-                "Profit counts goods sold AND paid for. Cost is shared out to match what " +
-                    "has been collected, so a part-paid sale never looks like a loss.",
+                "Profit counts goods sold AND paid for, before VAT — VAT is ZIMRA's money, " +
+                    "not takings. Cost is shared out to match what has been collected, so a " +
+                    "part-paid sale never looks like a loss, and a refund takes the sale " +
+                    "back on the day the goods came back.",
                 color = t.inkTertiary, fontSize = 10.sp
             )
         }
@@ -9691,7 +9733,7 @@ private fun DashboardScreen(vm: PosViewModel, business: Business) {
         Spacer(Modifier.height(24.dp))
     }
 
-    if (showZ) ZReportDialog(business, recent) { showZ = false }
+    if (showZ) ZReportDialog(vm, business) { showZ = false }
 }
 
 /**
@@ -9764,33 +9806,96 @@ private fun DashAlertRow(label: String, count: Int, dot: Color) {
     }
 }
 
-/** Z-Report cash-up: reconcile today's cash drawer (opening float + cash sales vs counted). */
+/**
+ * Z-Report cash-up: what should be in the shop's ONE drawer today, against what was
+ * counted.
+ *
+ * ★ EVERY FIGURE HERE NOW COMES FROM [PosViewModel.expectedDrawerToday]. This screen used
+ * to compute the expected drawer itself, out of the dashboard's `recent` sales list, and
+ * got it wrong three ways at once — a split-tender sale contributed no cash at all, the
+ * 101st receipt of the day stopped counting, and refunds, cash-paid expenses and till↔safe
+ * transfers were invisible. `ExpectedDrawer.kt` documents each of those and why the
+ * replacement is shop-wide rather than per till. Do not re-derive anything in here.
+ *
+ * The opening float is no longer TYPED. It is the till ledger as at midnight, because the
+ * figure someone types is the figure a shortage gets measured against, and a shortage is
+ * recorded permanently against a cashier's name.
+ */
 @Composable
-private fun ZReportDialog(business: Business, recent: List<SaleEntity>, onDismiss: () -> Unit) {
+private fun ZReportDialog(vm: PosViewModel, business: Business, onDismiss: () -> Unit) {
     val t = LocalPosTokens.current
     val currency = business.currency
-    val startToday = startOfTodayMs()
-    val todays = recent.filter { it.soldAt >= startToday && it.status == "completed" }
-    val cashSales = todays.filter { it.paymentMethod == "cash" }.sumOf { it.total }
-    val totalSales = todays.sumOf { it.total }
 
-    var opening by remember { mutableStateOf("") }
+    // Read ONCE, when the dialog opens. A cash-up compares a pile of notes against a
+    // figure; a figure that moved while the notes were being counted would make the
+    // variance depend on how long the counting took.
+    var drawer by remember { mutableStateOf<ExpectedDrawer?>(null) }
+    LaunchedEffect(Unit) { drawer = vm.expectedDrawerToday() }
+
     var counted by remember { mutableStateOf("") }
-    val open = opening.toDoubleOrNull() ?: 0.0
-    val cnt = counted.toDoubleOrNull()
-    val expected = open + cashSales
-    val variance = (cnt ?: expected) - expected
 
     PosDialog(title = "Z-Report · Cash up", onDismiss = onDismiss) {
-        Text("Today, ${todays.size} sale${if (todays.size == 1) "" else "s"}", color = t.inkTertiary, fontSize = 12.sp)
+        val d = drawer
+        if (d == null) {
+            Text("Reading the day's takings…", color = t.inkTertiary, fontSize = 12.sp)
+            return@PosDialog
+        }
+        val cnt = counted.toDoubleOrNull()
+        val variance = d.variance(cnt ?: d.expected)
+
+        Text(
+            "Today, ${d.receipts} receipt${if (d.receipts == 1) "" else "s"} · the whole shop, " +
+                "every till",
+            color = t.inkTertiary, fontSize = 12.sp
+        )
         PosFormCard {
-            ZRow("Sales today", money(totalSales, currency))
-            ZRow("Cash sales", money(cashSales, currency))
-            PosField(
-                opening, { opening = it.filter { c -> c.isDigit() || c == '.' } },
-                "Opening float", keyboardType = KeyboardType.Decimal, modifier = Modifier.fillMaxWidth()
-            )
-            ZRow("Expected in drawer", money(expected, currency))
+            PosSectionLabel("Sold today")
+            ZRow("Receipts total", money(d.salesValue, currency))
+            ZRow("Cash taken", money(d.cashIn, currency))
+            if (d.nonCashIn > 0.005) ZRow("Card / mobile money", money(d.nonCashIn, currency))
+            if (d.changeGiven > 0.005) ZRow("Change given back", "- ${money(d.changeGiven, currency)}")
+            // Named so nobody reads the drawer being lighter than the sales figure as a
+            // shortage: card and mobile money never open a drawer.
+            if (d.nonCashIn > 0.005) {
+                Text(
+                    "Card and mobile money never reach the drawer, so they are not in the " +
+                        "expected figure below.",
+                    color = t.inkTertiary, fontSize = 10.sp
+                )
+            }
+            d.foreignTenders.forEach { (code, amount) ->
+                Text(
+                    "Of the cash, $code ${trimQty(amount)} was handed over in $code.",
+                    color = t.inkTertiary, fontSize = 10.sp
+                )
+            }
+        }
+        PosFormCard {
+            PosSectionLabel("Money out of the drawer")
+            if (d.cashRefunded <= 0.005 && d.movements.isEmpty()) {
+                Text("Nothing left the drawer today.", color = t.inkTertiary, fontSize = 12.sp)
+            }
+            if (d.cashRefunded > 0.005) ZRow("Refunds paid in cash", "- ${money(d.cashRefunded, currency)}")
+            if (d.nonCashRefunded > 0.005) {
+                Text(
+                    "Another ${money(d.nonCashRefunded, currency)} was reversed to a card or " +
+                        "wallet — that never came out of the drawer.",
+                    color = t.inkTertiary, fontSize = 10.sp
+                )
+            }
+            // Signed already: an outgoing movement is negative, a top-up from the safe
+            // positive. Printed with its own sign so the arithmetic can be followed.
+            d.movements.forEach { m ->
+                ZRow(
+                    drawerMovementLabel(m.type),
+                    (if (m.amount < 0) "- " else "+ ") + money(kotlin.math.abs(m.amount), currency)
+                )
+            }
+        }
+        PosFormCard {
+            PosSectionLabel("The count")
+            ZRow("In the drawer at open", money(d.opening, currency))
+            ZRow("Expected in drawer", money(d.expected, currency))
             PosField(
                 counted, { counted = it.filter { c -> c.isDigit() || c == '.' } },
                 "Counted cash", keyboardType = KeyboardType.Decimal, modifier = Modifier.fillMaxWidth()
@@ -9803,8 +9908,31 @@ private fun ZReportDialog(business: Business, recent: List<SaleEntity>, onDismis
                 }
                 Text(lbl, color = col, fontWeight = FontWeight.Black, fontSize = 16.sp)
             }
+            Text(
+                "This is a check, not a close. Closing the day is on the Cash screen — that " +
+                    "is what records a short or over and moves the takings to the safe.",
+                color = t.inkTertiary, fontSize = 10.sp
+            )
         }
     }
+}
+
+/** Plain-English name for a till movement's [CashTxn.type], for the cash-up breakdown.
+ *  Unknown types fall through to the raw code rather than being hidden: a movement nobody
+ *  can name still moved the drawer, and leaving it out would break the arithmetic. */
+private fun drawerMovementLabel(type: String): String = when (type) {
+    "transfer_out" -> "Moved to the safe"
+    "transfer_in" -> "Brought in from the safe"
+    "expense" -> "Expenses paid from the till"
+    "purchase" -> "Stock bought from the till"
+    "change_payout" -> "Change paid out later"
+    "capital" -> "Money you put in"
+    "drawing" -> "Money you took out"
+    "loan" -> "Borrowing"
+    "variance" -> "Earlier count adjustment"
+    "payout" -> "Cash paid out"
+    "adjust" -> "Cash adjustment"
+    else -> type
 }
 
 @Composable
@@ -9816,13 +9944,12 @@ private fun ZRow(label: String, value: String) {
     }
 }
 
-/** Local midnight today, in epoch millis (UI-side mirror of the VM helper). */
-private fun startOfTodayMs(): Long {
-    val c = Calendar.getInstance()
-    c.set(Calendar.HOUR_OF_DAY, 0); c.set(Calendar.MINUTE, 0)
-    c.set(Calendar.SECOND, 0); c.set(Calendar.MILLISECOND, 0)
-    return c.timeInMillis
-}
+// ★ The UI-side `startOfTodayMs()` that used to live here is GONE. The Z-report was its
+// only caller, and it now takes its window from [PosViewModel.expectedDrawerToday], which
+// uses `startOfDay`/`startOfNextDay` — the ONE day boundary the dashboard, the shift
+// record and the web client's daily buckets all measure from. A private second copy of
+// "midnight" in the UI layer is how a day's takings end up in one bucket on one screen and
+// another bucket on the next.
 
 private fun dashTime(ms: Long): String =
     SimpleDateFormat("d MMM, h:mm a", Locale.getDefault()).format(Date(ms))
@@ -9842,8 +9969,10 @@ private fun ReportsScreen(vm: PosViewModel, business: Business) {
     val breakdown by vm.reportBreakdown.collectAsState()
     val refunds by vm.reportRefunds.collectAsState()
     val fullyRefunded by vm.reportFullyRefunded.collectAsState()
-    // ★ CASH BASIS (§5): what was actually COLLECTED in this window, and the cost of the
-    // goods behind it. Billed-but-unpaid credit is reported separately, never as sales.
+    // ★ CASH BASIS (§5): what was actually COLLECTED in this window, what was handed back,
+    // what belongs to ZIMRA, and the cost of the goods behind the rest. Billed-but-unpaid
+    // credit is reported separately, never as sales. Each Period field states its own
+    // basis — see CashBasis.Period — and the card below picks deliberately.
     val cashBasis by vm.reportCashBasis.collectAsState()
     val cashVariance by vm.reportCashVariance.collectAsState()
     // Net takings: refunded money comes off gross, and a fully-refunded sale stops
@@ -9909,10 +10038,44 @@ private fun ReportsScreen(vm: PosViewModel, business: Business) {
         // BASIS: money that arrived. The two differ by exactly the credit that has not
         // been collected, which is why both are shown rather than one silently replacing
         // the other.
+        //
+        // ★ EVERY LINE HERE IS ON A STATED BASIS AND THE COLUMN ADDS UP. It used to
+        // subtract a VAT-INCLUSIVE "collected" from a VAT-EXCLUSIVE cost and print the
+        // difference as gross profit: the profit was right (it comes from the one margin
+        // function) but the line above it was on the wrong basis, so the arithmetic a
+        // reader could do on screen did not hold. Two subtractions now stand between the
+        // drawer and the profit, and both are exact:
+        //
+        //   collected − refunds − VAT            = revenue kept   (CashBasis' identity)
+        //   costed revenue − cost of those goods = gross profit   (always, to the cent)
+        //
+        // The step between them is the revenue with NO cost price behind it. Profit is
+        // knowable only over costed lines — an item with no cost is unknown-cost, not
+        // zero-cost — so that gap is shown rather than smuggled into the margin.
         PosFormCard {
             PosSectionLabel("Money actually collected")
-            ReportStatRow("Collected in this period", money(cashBasis.revenue, currency))
-            ReportStatRow("Cost of what was sold", "-${money(cashBasis.cogs, currency)}")
+            ReportStatRow("Collected in this period", money(cashBasis.collected, currency))
+            if (cashBasis.refunded > 0.005) {
+                ReportStatRow("Refunded (goods came back)", "-${money(cashBasis.refunded, currency)}")
+            }
+            if (kotlin.math.abs(cashBasis.vat) > 0.005) {
+                ReportStatRow(
+                    "VAT collected for ZIMRA",
+                    (if (cashBasis.vat < 0) "+" else "-") + money(kotlin.math.abs(cashBasis.vat), currency)
+                )
+            }
+            HorizontalDivider(color = t.surfaceBorder)
+            ReportStatRow("Revenue kept (excl. VAT)", money(cashBasis.netRevenue, currency))
+            if (cashBasis.uncostedRevenue > 0.005) {
+                ReportStatRow("Of that, no cost price recorded", money(cashBasis.uncostedRevenue, currency))
+                ReportStatRow("Revenue with a cost price", money(cashBasis.costedRevenue, currency))
+            }
+            // Signed, because a window containing only refunds has NEGATIVE cost of goods
+            // (stock went back on the shelf) and "-$-24.00" is not a figure.
+            ReportStatRow(
+                "Cost of those goods",
+                (if (cashBasis.cogs < 0) "+" else "-") + money(kotlin.math.abs(cashBasis.cogs), currency)
+            )
             HorizontalDivider(color = t.surfaceBorder)
             ReportStatRow("Gross profit", money(cashBasis.grossProfit, currency))
             if (kotlin.math.abs(cashVariance) > 0.005) {
@@ -9926,8 +10089,9 @@ private fun ReportsScreen(vm: PosViewModel, business: Business) {
             }
             Text(
                 "A sale counts when the money arrives, not when the receipt is written. " +
-                    "A later repayment counts on its own day, and the cost of the goods is " +
-                    "shared out to match — so nothing is ever counted twice.",
+                    "A later repayment counts on its own day, a refund takes the sale back " +
+                    "on the day the goods return, and the cost of the goods is shared out " +
+                    "to match — so nothing is ever counted twice.",
                 color = t.inkTertiary, fontSize = 10.sp
             )
         }
@@ -10031,8 +10195,20 @@ private fun ReceiptsScreen(
                     "Money collected today", color = t.inkOnBrand.copy(alpha = 0.85f),
                     fontSize = 13.sp, fontWeight = FontWeight.SemiBold
                 )
-                Text(money(todayMoney.revenue, currency), color = t.inkOnBrand, fontWeight = FontWeight.Black, fontSize = 28.sp)
+                // GROSS collected on purpose: this hero is the drawer's answer to "what
+                // came in today", so it must not be netted down by refunds or VAT. What
+                // was handed back gets its own line below; the VAT-exclusive revenue the
+                // profit figures are built on lives on the Dashboard and in Reports.
+                Text(money(todayMoney.collected, currency), color = t.inkOnBrand, fontWeight = FontWeight.Black, fontSize = 28.sp)
                 Text("$countToday sale${if (countToday == 1) "" else "s"}", color = t.inkOnBrand.copy(alpha = 0.85f), fontSize = 12.sp)
+                if (todayMoney.refunded > 0.005) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Less ${money(todayMoney.refunded, currency)} refunded today — " +
+                            "those goods are back on the shelf.",
+                        color = t.inkOnBrand.copy(alpha = 0.85f), fontSize = 11.sp
+                    )
+                }
                 if (todayMoney.uncollected > 0.005) {
                     Spacer(Modifier.height(4.dp))
                     Text(
