@@ -260,6 +260,19 @@ class PosSyncEngine(
             // than the tidiness of one more line in its list).
             val policyErrors = if (cloudBid == null) emptyList() else syncShopPolicy(api, cloudBid)
             val pulled = if (cloudBid == null) 0 else pull(api, cloudBid)
+            // ★ ONE MORE SHIFT PUSH, because the merge happens INSIDE the pull and the push
+            // is already behind us. Two tills that each opened a shift for the same day only
+            // discover each other during the pull; the merge then resolves them and may
+            // carry a counted drawer onto the survivor ([countToRescue]). Left until the
+            // next pass, that count sits on the phone — and the whole point of writing it
+            // onto the shared row is that every OTHER device stops offering to close a day
+            // somebody has already counted. Requiring a second sync to publish it is the
+            // same bug wearing a shorter delay.
+            //
+            // Cheap and self-silencing: it sends only rows still marked dirty, which is
+            // nothing at all on the overwhelming majority of passes.
+            val settleErrors = if (cloudBid == null) emptyList()
+            else pushSettledShifts(api, cloudBid)
             // Said out loud rather than left as a quiet no-op. With push disabled — the
             // default on a freshly repointed device — an unidentified shop would
             // otherwise report a clean pass that moved nothing, every time, forever.
@@ -268,7 +281,7 @@ class PosSyncEngine(
                     "Waiting to identify this shop in the database. It must hold exactly " +
                         "one business before this till can sync; check the Sync screen."
                     )
-            } else pushResult.errors + policyErrors
+            } else pushResult.errors + policyErrors + settleErrors
             val at = System.currentTimeMillis()
             config.setLastSyncAt(at)
             // Split timestamps so the owner can SEE the two directions independently:
@@ -1135,6 +1148,31 @@ class PosSyncEngine(
      * Every touched row is marked dirty, so the correction goes UP on the same pass
      * rather than living only on the device that happened to notice.
      */
+    /**
+     * Send any shift the pull left dirty — in practice, one the merge just settled a count
+     * onto. Runs AFTER the pull because that is when the merge happens, and the ordinary
+     * push has already been and gone by then.
+     *
+     * Errors are returned rather than thrown for the same reason every other push here
+     * does it: a failure to publish a count is worth naming on the Sync screen, and is not
+     * worth failing the whole pass over when the sale and cash data it carried went up fine.
+     */
+    private suspend fun pushSettledShifts(api: SupabaseRest, cloudBid: String): List<String> {
+        val rows = cashSessionDao.pending()
+        if (rows.isEmpty()) return emptyList()
+        return try {
+            api.upsert(
+                "cash_sessions",
+                syncJson.encodeToString(rows.map { it.toPush().copy(businessId = cloudBid) }),
+                "id",
+            )
+            cashSessionDao.markSynced(rows.map { it.id })
+            emptyList()
+        } catch (e: Exception) {
+            listOf("cash_sessions: ${e.message ?: "could not publish the day's count"}")
+        }
+    }
+
     private suspend fun mergeOpenSessions(bid: String) {
         // ★ ROLL THE DAY OVER FIRST. A shift is a trading DAY, and the merge rule keeps the
         // OLDEST open session — correct among sessions of the same day, and badly wrong
