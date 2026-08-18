@@ -1,7 +1,6 @@
 package com.portionspot.pos.sync
 
 import com.portionspot.pos.data.AppNotification
-import com.portionspot.pos.data.CashTxn
 import com.portionspot.pos.data.CreditTxn
 import com.portionspot.pos.data.Customer
 import com.portionspot.pos.data.Item
@@ -840,94 +839,22 @@ fun MobileMoneyReceipt.toPush() = MobileMoneyPushDto(
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// cash_txns — the last survivor of the old `local_id`-bridged contract in this
-// file, and UNCALLED: there is no `cash_txns` table on the shared schema. That
-// ledger is split across `cash_movements` and `cash_sessions`, which live in
-// sync/wire/WireDtos.kt like every other repointed table.
+// cash_txns is GONE from this file, along with the last of the old
+// `local_id`-bridged contract. There is no `cash_txns` table on the shared schema
+// and there never was: that ledger is split across `cash_movements` and
+// `cash_sessions`, which live in sync/wire/WireDtos.kt like every other repointed
+// table — in BOTH directions now, which is the point. The DTOs that used to sit
+// here were reachable code aimed at a 404, and one of them was still being called
+// by a pull that could never return a row; deleting them is what makes it obvious
+// that `cash_movements` is the only cash ledger on the wire.
 //
 // Its neighbours here — expenses, suppliers, purchase_orders,
-// purchase_order_items, audit_log and staff_requests — have been DELETED rather
-// than left to be called by accident. The first five are wired against the real
-// uuid-keyed cloud tables in WireDtos.kt; `staff_requests` has no cloud table at
-// all, on this database or any other, and asking for one only ever produced a
+// purchase_order_items, audit_log and staff_requests — went the same way rather
+// than being left to be called by accident. The first five are wired against the
+// real uuid-keyed cloud tables in WireDtos.kt; `staff_requests` has no cloud table
+// at all, on this database or any other, and asking for one only ever produced a
 // 404 that the owner saw as a sync error.
 // ─────────────────────────────────────────────────────────────────────────────
-
-// ── cash_txns ────────────────────────────────────────────────────────────────
-@Serializable
-data class CashTxnDto(
-    @SerialName("local_id") val localId: String? = null,
-    @SerialName("business_id") val businessId: String? = null,
-    val type: String = "adjust",
-    val amount: String? = null,
-    val source: String? = null,
-    val note: String? = null,
-    @SerialName("ref_type") val refType: String? = null,
-    @SerialName("ref_id") val refId: String? = null,
-    @SerialName("created_by") val createdBy: String? = null,
-    @SerialName("created_by_name") val createdByName: String? = null,
-    @SerialName("created_at") val createdAt: String? = null,
-    @SerialName("updated_at") val updatedAt: String? = null,
-    val deleted: Boolean = false,
-) {
-    fun bridgeId(): String = localId?.ifBlank { null } ?: "cash-${newId()}"
-    fun cursorStamp(): String = updatedAt ?: createdAt ?: IsoTime.EPOCH
-}
-
-fun CashTxnDto.toCashTxn(businessId: String, local: CashTxn?): CashTxn {
-    val bid = local?.id ?: bridgeId()
-    val base = local ?: CashTxn(id = bid, businessId = businessId, type = type)
-    return base.copy(
-        id = bid,
-        localId = bid,
-        businessId = businessId,
-        type = type,
-        amount = amount.toMoney(),
-        source = source,
-        note = note,
-        refType = refType,
-        refId = refId,
-        createdBy = createdBy,
-        createdByName = createdByName,
-        createdAt = IsoTime.toMillis(createdAt).takeIf { it > 0 } ?: base.createdAt,
-        updatedAt = IsoTime.toMillis(updatedAt),
-        deleted = deleted,
-        pendingSync = false,
-    )
-}
-
-@Serializable
-data class CashTxnPushDto(
-    @SerialName("local_id") val localId: String,
-    @SerialName("business_id") val businessId: String,
-    val type: String,
-    val amount: Double = 0.0,
-    val source: String? = null,
-    val note: String? = null,
-    @SerialName("ref_type") val refType: String? = null,
-    @SerialName("ref_id") val refId: String? = null,
-    @SerialName("created_by") val createdBy: String? = null,
-    @SerialName("created_by_name") val createdByName: String? = null,
-    @SerialName("created_at") val createdAt: String,
-    @SerialName("updated_at") val updatedAt: String,
-    val deleted: Boolean = false,
-)
-
-fun CashTxn.toCashTxnPush() = CashTxnPushDto(
-    localId = localId.ifBlank { id },
-    businessId = businessId,
-    type = type,
-    amount = amount,
-    source = source,
-    note = note,
-    refType = refType,
-    refId = refId,
-    createdBy = createdBy,
-    createdByName = createdByName,
-    createdAt = IsoTime.toIso(createdAt),
-    updatedAt = IsoTime.toIso(updatedAt),
-    deleted = deleted,
-)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // notifications — the admin alert feed, shared across the cashier phones and the

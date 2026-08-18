@@ -71,4 +71,98 @@ class RefundMathTest {
         assertEquals(0.0, q.returnedSubtotal, eps)
         assertEquals(0.0, q.refundTotal, eps)
     }
+
+    // ── The settlement split: debt cancelled vs money payable ─────────────────
+    //
+    // Every case here is a real till behaviour the owner reported on 16-17 August, when a
+    // refund was worth its full face value in CASH whatever the customer had paid.
+
+    @Test
+    fun fullyPaidSale_refundedInFull_paysBackEverything_andClearsNoDebt() {
+        val s = planRefundSettlement(
+            refundTotal = 100.0, saleTotal = 100.0, collectedOnSale = 100.0, alreadyRefunded = 0.0
+        )
+        assertEquals(0.0, s.debtRelieved, eps)
+        assertEquals(100.0, s.payable, eps)
+    }
+
+    @Test
+    fun partPaidCreditSale_refundedInFull_paysBackOnlyWhatArrived() {
+        // ★ THE −$60 TILL. $100 sale, $40 taken at the counter, $60 on account, all of it
+        // returned. The old code handed back $100 and left the drawer at minus sixty.
+        val s = planRefundSettlement(
+            refundTotal = 100.0, saleTotal = 100.0, collectedOnSale = 40.0, alreadyRefunded = 0.0
+        )
+        assertEquals(60.0, s.debtRelieved, eps)
+        assertEquals(40.0, s.payable, eps)
+    }
+
+    @Test
+    fun unpaidCreditSale_refundedInFull_paysBackNothing_andClearsTheWholeDebt() {
+        // The owner's own words: it should just restock and clear the account.
+        val s = planRefundSettlement(
+            refundTotal = 100.0, saleTotal = 100.0, collectedOnSale = 0.0, alreadyRefunded = 0.0
+        )
+        assertEquals(100.0, s.debtRelieved, eps)
+        assertEquals(0.0, s.payable, eps)
+    }
+
+    @Test
+    fun partPaidSale_partiallyRefunded_eatsTheDebtFirst() {
+        // $100 sale, $40 paid, $60 owed. Return $40 of goods: it comes off the debt, and
+        // no cash crosses the counter to somebody who still owes for the same receipt.
+        val s = planRefundSettlement(
+            refundTotal = 40.0, saleTotal = 100.0, collectedOnSale = 40.0, alreadyRefunded = 0.0
+        )
+        assertEquals(40.0, s.debtRelieved, eps)
+        assertEquals(0.0, s.payable, eps)
+    }
+
+    @Test
+    fun partPaidSale_thenTheRest_settlesToNothingOwedEitherWay() {
+        // Continues the case above: the remaining $60 of goods goes back. $20 of debt is
+        // left to cancel, and the $40 the customer actually handed over comes back to them.
+        val s = planRefundSettlement(
+            refundTotal = 60.0, saleTotal = 100.0, collectedOnSale = 40.0, alreadyRefunded = 40.0
+        )
+        assertEquals(20.0, s.debtRelieved, eps)
+        assertEquals(40.0, s.payable, eps)
+    }
+
+    @Test
+    fun refundsOfOneSale_neverPayOutMoreThanItCollected() {
+        // The invariant, walked: three partial refunds of a part-paid sale must hand back
+        // at most the $40 that ever arrived, however they are sliced.
+        var refundedSoFar = 0.0
+        var paidOut = 0.0
+        repeat(3) {
+            val s = planRefundSettlement(
+                refundTotal = 100.0 / 3.0,
+                saleTotal = 100.0,
+                collectedOnSale = 40.0,
+                alreadyRefunded = refundedSoFar,
+            )
+            refundedSoFar += s.refundTotal
+            paidOut += s.payable
+        }
+        assertEquals(40.0, paidOut, 1e-6)
+    }
+
+    @Test
+    fun payable_isClampedToCollected_evenOnNonsenseInput() {
+        // A refund bigger than the sale (a caller that skipped the line-quantity cap) must
+        // not become a licence to empty the drawer.
+        val s = planRefundSettlement(
+            refundTotal = 500.0, saleTotal = 100.0, collectedOnSale = 40.0, alreadyRefunded = 0.0
+        )
+        assertEquals(40.0, s.payable, eps)
+    }
+
+    @Test
+    fun walkInSaleThatCollectedNothing_hasNothingToPayBack() {
+        val s = planRefundSettlement(
+            refundTotal = 25.0, saleTotal = 25.0, collectedOnSale = 0.0, alreadyRefunded = 0.0
+        )
+        assertEquals(0.0, s.payable, eps)
+    }
 }

@@ -7,6 +7,7 @@ import com.portionspot.pos.data.AuditEntry
 import com.portionspot.pos.data.CashSession
 import com.portionspot.pos.data.CashTxn
 import com.portionspot.pos.data.CreditTxn
+import com.portionspot.pos.data.cashMovementTypeFromWire
 import com.portionspot.pos.data.cashMovementTypeToWire
 import com.portionspot.pos.data.Customer
 import com.portionspot.pos.data.Expense
@@ -990,6 +991,18 @@ fun RefundDto.toRefund(businessId: String, local: Refund?): Refund? {
         customerName = customerName?.ifBlank { null } ?: base.customerName,
         reason = reason ?: base.reason,
         refundTotal = refundTotal?.toDoubleOrNull() ?: base.refundTotal,
+        // ★ LOCAL WINS, AND A CLOUD REFUND FALLS BACK TO ITS TOTAL. `payableTotal` has no
+        // cloud column: it is this app's cap on how much of a refund may cross the counter
+        // once the unpaid part has been cancelled off the account (see
+        // [PosRepository.createRefund]). Two ways to get this wrong, both of them money:
+        //  - take the wire's silence as zero, and a refund raised in the WEB arrives with
+        //    nothing payable, so the phone quietly refuses to pay the customer at all;
+        //  - overwrite from the wire, and an Android refund that capped its payout at $40
+        //    comes back down un-capped at the full goods value on the next pull.
+        // The web does not settle debt first, so for a refund it raised the total IS what
+        // it will hand back, which is exactly the fallback below.
+        payableTotal = local?.payableTotal
+            ?: refundTotal?.toDoubleOrNull() ?: base.refundTotal,
         status = status,
         createdBy = createdBy?.ifBlank { null } ?: base.createdBy,
         createdByName = createdByName?.ifBlank { null } ?: base.createdByName,
@@ -1274,6 +1287,109 @@ fun CashTxn.toMovementPush(sessionId: String?): CashMovementPushDto = CashMoveme
     clientUpdatedAt = IsoTime.toIso(updatedAt),
 )
 
+/**
+ * The same movement on the way DOWN — and the half that was missing.
+ *
+ * `cash_movements` was pushed and never pulled. So a phone that closed the trading day
+ * (which writes a `variance` true-up and a till→safe transfer) and recorded an owner
+ * drawing sent all of it to the database, and none of it ever reached the second phone.
+ * Two tills standing over ONE physical drawer therefore disagreed about what was in it and
+ * what was in the safe, and the day-close count on the phone that had not heard measured
+ * the real drawer against a figure missing the other phone's cash handling — booking the
+ * difference permanently as a variance, which by the owner's rule is a hit to profit.
+ *
+ * `client_updated_at` is deliberately NOT read. That column is the AUTHORING device's
+ * clock, while the pull cursor runs on `updated_at`, the server's. Mixing the two is how a
+ * phone with a fast clock writes a stamp that every other device then treats as "already
+ * seen", and rows nobody ever pulled are skipped forever with nothing reporting it.
+ *
+ * There is no `ref_type` / `ref_id` on this table, so a pulled row can say nothing about
+ * what it belonged to. That is not a gap to work around: it is the reason a sale's and a
+ * refund's drawer movement are never pushed in the first place (see
+ * [com.portionspot.pos.data.cashMovementCountedElsewhere]), which is what keeps this pull
+ * from importing money the local mirror has already counted.
+ */
+@Serializable
+data class CashMovementDto(
+    val id: String,
+    // Read but not applied: [CashTxn] has no session column, and never needed one — the
+    // shift a movement belongs to is derived from its own day, which is what the push
+    // stamps it with on the way out. Kept on the DTO so the wire shape is complete and so
+    // the next reader does not have to go and find out whether the column exists.
+    @SerialName("session_id") val sessionId: String? = null,
+    val type: String = "pay_in",
+    val amount: String? = null,
+    val reason: String? = null,
+    @SerialName("created_by") val createdBy: String? = null,
+    @SerialName("created_by_name") val createdByName: String? = null,
+    @SerialName("created_at") val createdAt: String? = null,
+    @SerialName("updated_at") val updatedAt: String? = null,
+    val deleted: Boolean = false,
+) {
+    fun cursorStamp(): String = updatedAt ?: createdAt ?: IsoTime.EPOCH
+}
+
+/**
+ * One wire movement as a local ledger row.
+ *
+ * ★ AN EXISTING LOCAL ROW IS NEVER RE-TYPED FROM THE WIRE, and that is the whole reason
+ * this takes [local] at all. The trip out is LOSSY: this app's vocabulary is far wider
+ * than the seven types the cloud allows, so a `drawing` goes up as `pay_out` and a
+ * `variance` as `pay_in`/`pay_out`. Let the row come back down onto itself — which it will,
+ * because the server stamps `updated_at` later than the client wrote it — and the phone
+ * that recorded the owner taking $100 out would rewrite its own row as a bare payout. The
+ * drawer total would still be right and `observeEquityCashSum` would silently drop the
+ * drawing, so the four-part cash split would report money that was never profit as profit.
+ * A cash movement is append-only and immutable by design anyway (a correction is a new
+ * `adjust` row, never an edit), so the only thing that can legitimately change on one is
+ * the tombstone — and a tombstone is the one field that is not lossy.
+ *
+ * `pendingSync` is carried across rather than forced to false for the same reason a pulled
+ * row is never marked dirty: a row that has NOT been uploaded yet must not be told it has.
+ * A brand-new row is pulled clean, which is what stops a device re-uploading what it just
+ * downloaded and bouncing it round the shop forever.
+ */
+fun CashMovementDto.toCashTxn(businessId: String, local: CashTxn?): CashTxn {
+    if (local != null) {
+        return local.copy(
+            deleted = deleted,
+            // Bumped to the server's stamp so the same row cannot qualify again on a later
+            // pass and rewrite a row that did not change.
+            updatedAt = maxOf(local.updatedAt, IsoTime.toMillis(cursorStamp())),
+            pendingSync = local.pendingSync,
+        )
+    }
+    val wire = cashMovementTypeFromWire(type, amount.toMoney())
+    return CashTxn(
+        id = id,
+        localId = id,
+        businessId = businessId,
+        type = wire.type,
+        amount = wire.amount,
+        location = wire.location,
+        // No cloud column for `source`. Named for what it honestly is, because a drawer
+        // figure the owner cannot account for is a figure they stop trusting.
+        source = "sync",
+        // The cloud calls it `reason`; locally the same text is a free `note`.
+        note = reason,
+        // ★ LEFT NULL, NOT GUESSED. `refType` is what marks a row as a sale's or refund's
+        // own drawer movement, and those are excluded from the ledger's cash-up sums by
+        // name. Inventing one here would hide a real movement from the count; the wire has
+        // no such column, so null is the only true answer.
+        refType = null,
+        refId = null,
+        createdBy = createdBy,
+        createdByName = createdByName,
+        // The movement's OWN instant, never the moment of the sync. Stamped with the pull
+        // time, a phone coming back online after midnight would file yesterday's petty cash
+        // in today's cash-up and put the discrepancy in the wrong day.
+        createdAt = IsoTime.toMillis(createdAt).takeIf { it > 0 } ?: IsoTime.toMillis(cursorStamp()),
+        updatedAt = IsoTime.toMillis(cursorStamp()),
+        deleted = deleted,
+        pendingSync = false,
+    )
+}
+
 // ───────────────────────────── mobile_money_receipts ─────────────────────────────
 
 /**
@@ -1371,6 +1487,10 @@ fun CreditDto.toCreditTxn(businessId: String, local: CreditTxn?): CreditTxn {
         type = type,
         amount = amount.toMoney(),
         note = note,
+        // How the money moved. The web has always written this column and this app did not
+        // read it, so a repayment taken in the browser reached the phone with no tender
+        // against it — and the phone had no way to tell an EcoCash settlement from notes.
+        method = method ?: base.method,
         createdBy = createdBy ?: base.createdBy,
         createdByName = createdByName ?: base.createdByName,
         createdAt = IsoTime.toMillis(createdAt),
@@ -1407,6 +1527,10 @@ fun CreditTxn.toPush(): CreditPushDto = CreditPushDto(
     type = type,
     amount = amount,
     note = note,
+    // The column has existed on the shared schema the whole time and only the web filled
+    // it in. Null on a row that is pure bookkeeping — a `credit_owed` is a debt arising,
+    // and no tender was involved in it.
+    method = method,
     createdBy = createdBy,
     createdByName = createdByName,
     createdAt = IsoTime.toIso(createdAt),

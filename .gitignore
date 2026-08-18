@@ -34,3 +34,8 @@ replay_pid*.log
 # session build/verify logs (local only)
 compile-verify.log
 *.verify.log
+
+# Build outputs handed to the owner for device testing. They are rebuilt from
+# any commit and weigh ~25 MB each; two were already sitting untracked in the
+# root, one command away from being committed by accident.
+*.apk

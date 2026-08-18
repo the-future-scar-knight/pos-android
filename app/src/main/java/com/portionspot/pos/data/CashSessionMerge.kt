@@ -92,21 +92,6 @@ data class SessionMerge<T : MergeableSession>(
 }
 
 /**
- * Which of the shared schema's movement types a cash movement is, given how this app
- * models the same money. The cloud CHECK-constrains the vocabulary:
- *
- *     pay_in · pay_out · drop · petty · float_topup · safe_in · bank_deposit
- *
- * and has NO `location` column — TILL / SAFE / OUTSIDE is DERIVED from the type. This
- * app stores the location explicitly on [CashTxn.location], so the mapping has to be
- * made rather than copied.
- *
- * A CHECK violation fails the whole batch, not the offending row, so an unmapped type
- * must resolve to a legal value rather than travel as-is. Unknown movements land on
- * `pay_in`/`pay_out` by sign, which is the honest fallback: the money definitely moved
- * in that direction, and the shop can see it, even if the finer category is lost.
- */
-/**
  * Is this movement's cash ALREADY counted by the other client, from the sale or refund
  * it belongs to?
  *
@@ -124,6 +109,21 @@ data class SessionMerge<T : MergeableSession>(
 fun cashMovementCountedElsewhere(refType: String?): Boolean =
     refType == "sale" || refType == "refund"
 
+/**
+ * Which of the shared schema's movement types a cash movement is, given how this app
+ * models the same money. The cloud CHECK-constrains the vocabulary:
+ *
+ *     pay_in · pay_out · drop · petty · float_topup · safe_in · bank_deposit
+ *
+ * and has NO `location` column — TILL / SAFE / OUTSIDE is DERIVED from the type. This
+ * app stores the location explicitly on [CashTxn.location], so the mapping has to be
+ * made rather than copied.
+ *
+ * A CHECK violation fails the whole batch, not the offending row, so an unmapped type
+ * must resolve to a legal value rather than travel as-is. Unknown movements land on
+ * `pay_in`/`pay_out` by sign, which is the honest fallback: the money definitely moved
+ * in that direction, and the shop can see it, even if the finer category is lost.
+ */
 fun cashMovementTypeToWire(localType: String, location: String, amount: Double): String =
     when (localType.trim().lowercase()) {
         "drop" -> "drop"
@@ -142,3 +142,70 @@ fun cashMovementTypeToWire(localType: String, location: String, amount: Double):
             else -> "pay_out"
         }
     }
+
+/**
+ * What one `cash_movements` row from the shared schema means to THIS app's ledger: the
+ * local [CashTxn.type], WHICH pocket the money moved in or out of, and the SIGN.
+ */
+data class CashMovementFromWire(
+    val type: String,
+    /** A [CashLocation] constant — never the raw wire word. */
+    val location: String,
+    /** SIGNED in this app's convention: + INTO [location], − OUT of it. */
+    val amount: Double,
+)
+
+/**
+ * The inverse of [cashMovementTypeToWire] — the function that lets a pulled movement land
+ * in the right pocket, in the right direction, instead of quietly inverting it.
+ *
+ * Two facts have to be REBUILT here, because the wire carries neither:
+ *
+ *  - **The sign.** `amount` goes up as a MAGNITUDE with the direction encoded in `type`
+ *    (see [com.portionspot.pos.sync.wire.CashMovementPushDto], which spells out why).
+ *    Take the wire figure at face value and a $5 payout made on the other phone ADDS $5
+ *    to this one's drawer — the same double-inversion the push guards against, arriving
+ *    from the other end.
+ *  - **The location.** There is no `location` column at all; TILL / SAFE is derived from
+ *    the type, so it has to be derived back.
+ *
+ * The five types [cashMovementTypeToWire] passes through verbatim come back verbatim, so a
+ * movement that leaves one phone and lands on another is the SAME row on both, and a row
+ * that goes up a second time goes up under the word it went up under the first time.
+ * `pay_in` / `pay_out` are the two the push COLLAPSES onto and they cannot be un-collapsed:
+ * they mean no more than "money in" / "money out", so that is exactly what they become,
+ * and the movement's `reason` — kept as the local `note` — is what still says why.
+ *
+ * `drop` and `bank_deposit` reduce the TILL and credit nothing, which is what they mean on
+ * the side that writes them: the web has no safe, so its drop is simply cash out of the
+ * drawer. A till→safe move made on THIS app never arrives as a `drop` — it goes up as the
+ * transfer PAIR it is (`pay_out` + `safe_in`), so both halves travel and both balances move.
+ *
+ * ★ ONE LOSS THAT CANNOT BE MAPPED AWAY, stated rather than papered over. Money leaving
+ * the SAFE goes up as a bare `pay_out`, indistinguishable on the wire from money leaving
+ * the till, so it comes back down against the TILL. Cash-on-hand still agrees across
+ * devices to the cent — the amount and the direction are exact — but a safe withdrawal
+ * made on one phone reads as a till payout on another, so the till/safe SPLIT can drift
+ * until the next day-close count trues it up. Closing that gap needs a column on the wire;
+ * a cleverer guess here would just be a wrong number nobody could trace.
+ */
+fun cashMovementTypeFromWire(wireType: String, amount: Double): CashMovementFromWire {
+    val magnitude = kotlin.math.abs(amount)
+    return when (wireType.trim().lowercase()) {
+        "safe_in" -> CashMovementFromWire("safe_in", CashLocation.SAFE, magnitude)
+        "float_topup" -> CashMovementFromWire("float_topup", CashLocation.TILL, magnitude)
+        "pay_in" -> CashMovementFromWire("pay_in", CashLocation.TILL, magnitude)
+        "drop" -> CashMovementFromWire("drop", CashLocation.TILL, -magnitude)
+        "petty" -> CashMovementFromWire("petty", CashLocation.TILL, -magnitude)
+        "bank_deposit" -> CashMovementFromWire("bank_deposit", CashLocation.TILL, -magnitude)
+        "pay_out" -> CashMovementFromWire("pay_out", CashLocation.TILL, -magnitude)
+        // The CHECK constraint says this cannot arrive, and the day it does is the day the
+        // constraint was relaxed on the other side without anyone telling this one. The
+        // money still moved, so it is booked as an `adjust` at the till in whatever
+        // direction the row was actually written in — the raw signed figure, since with no
+        // recognisable type there is no direction to restore. Dropping the row instead
+        // would take real cash out of one phone's drawer and leave it in another's, which
+        // is the failure this whole pull exists to end.
+        else -> CashMovementFromWire("adjust", CashLocation.TILL, amount)
+    }
+}

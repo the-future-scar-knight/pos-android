@@ -106,6 +106,32 @@ object CashBasis {
     /** The note [PosRepository.writeOffDebt] stamps. A write-off is not a collection. */
     const val WRITE_OFF_NOTE = "Debt write-off"
 
+    /**
+     * The note [PosRepository.createRefund] stamps on the `credit_paid` row that CANCELS
+     * the unpaid part of a refunded sale. Prefix, not exact match: the receipt number is
+     * appended so the customer's ledger reads like a statement rather than a code.
+     *
+     * ★ WHY THE CANCELLATION IS A `credit_paid` ROW AT ALL. The debt genuinely goes away
+     * — the goods came back — so the balance the shop chases must drop, and it must drop
+     * on BOTH clients. `credit_owed − credit_paid` is the only arithmetic the web knows,
+     * and `credit_txns.type` carries no CHECK constraint the web would reject a new word
+     * on; it simply would not understand one, and the customer would keep showing a debt
+     * on the browser that the phone says is settled.
+     *
+     * ★ WHY IT MUST BE EXCLUDED HERE. A plain `credit_paid` is money arriving, and door 2
+     * would recognise the whole cancelled balance as revenue ON THE REFUND'S DAY — the
+     * shop would book income for goods sitting back on its own shelf. It is the write-off
+     * case exactly: the lot is CONSUMED (the debt really is gone, and a later payment must
+     * not be matched to it) and NOTHING is recognised.
+     */
+    const val DEBT_CANCELLED_NOTE = "Debt cancelled by refund"
+
+    /** Does this `credit_paid` row represent money that actually arrived? */
+    private fun isCollection(note: String?): Boolean {
+        val n = note?.trim() ?: return true
+        return n != WRITE_OFF_NOTE && !n.startsWith(DEBT_CANCELLED_NOTE)
+    }
+
     /** Half-a-cent tolerance, matching the repository's money comparisons. */
     private const val CENT = 0.005
 
@@ -219,53 +245,9 @@ object CashBasis {
         // Two passes rather than one because the repayment door needs a per-CUSTOMER FIFO
         // walk to learn which sale a payment belongs to, while the refund ceiling needs a
         // per-SALE walk in time order. Neither can be expressed as the other.
-        val raw = HashMap<String, MutableList<RawEvent>>(sales.size)
+        val raw = moneyEvents(sales, ledger, byId)
         fun record(saleId: String, at: Long, amount: Double, isRefund: Boolean) {
             raw.getOrPut(saleId) { ArrayList(2) }.add(RawEvent(at, amount, isRefund))
-        }
-
-        // ── Door 1: what was settled on the day of the sale. ──
-        for (s in sales) {
-            val collected = s.amountPaid.coerceIn(0.0, s.total.coerceAtLeast(0.0))
-            if (collected <= CENT) continue
-            record(s.id, s.soldAt, collected, isRefund = false)
-        }
-
-        // ── Door 2: repayments, FIFO-matched to the credit lots they settle. ──
-        // Walk the ledger chronologically PER CUSTOMER, keeping a queue of open lots.
-        // Only credit_owed / credit_paid participate: change_owed / refund_owed and
-        // their payouts are the shop's "we owe you" balance, a different ledger entirely.
-        val lots = HashMap<String, ArrayDeque<Lot>>()
-        for (row in ledger.sortedBy { it.createdAt }) {
-            if (row.deleted) continue
-            when (row.type) {
-                "credit_owed" -> {
-                    if (row.amount <= CENT) continue
-                    lots.getOrPut(row.customerId) { ArrayDeque() }
-                        .addLast(Lot(row.saleId, row.amount))
-                }
-                "credit_paid" -> {
-                    var left = row.amount
-                    if (left <= CENT) continue
-                    // A write-off clears the debt but is NOT money — it consumes lots and
-                    // recognises nothing.
-                    val isCollection = row.note?.trim() != WRITE_OFF_NOTE
-                    val queue = lots[row.customerId] ?: continue
-                    while (left > CENT && queue.isNotEmpty()) {
-                        val lot = queue.first()
-                        val take = minOf(left, lot.remaining)
-                        lot.remaining -= take
-                        left -= take
-                        if (lot.remaining <= CENT) queue.removeFirst()
-                        if (!isCollection || take <= CENT) continue
-                        // A lot with no sale behind it (an over-given-change correction)
-                        // recovers a till shortage — real money, but not a sale. It
-                        // recognises nothing so revenue always has goods behind it.
-                        val sale = lot.saleId?.let { byId[it] } ?: continue
-                        record(sale.id, row.createdAt, take, isRefund = false)
-                    }
-                }
-            }
         }
 
         // ── The reversal side: refunds, on their own day. ──
@@ -379,6 +361,94 @@ object CashBasis {
             cogsShare = ratio * saleCogs
         )
     }
+
+    /**
+     * The two MONEY doors — everything that put cash against a sale, before any refund
+     * ceiling is applied. Extracted so [contributions] and [rawCollectedBySale] cannot
+     * drift apart: a second copy of the FIFO walk is the one way this object could start
+     * answering "how much did this sale collect" differently depending on who asked.
+     *
+     * Sales absent from [byId] still CONSUME their lots — consumption happens before the
+     * lookup — so a caller may pass a single sale row and get that sale's collections
+     * correctly, without loading every other sale the customer ever made.
+     */
+    private fun moneyEvents(
+        sales: List<CashBasisSaleRow>,
+        ledger: List<CreditTxn>,
+        byId: Map<String, CashBasisSaleRow>,
+    ): HashMap<String, MutableList<RawEvent>> {
+        val raw = HashMap<String, MutableList<RawEvent>>(sales.size)
+        fun record(saleId: String, at: Long, amount: Double) {
+            raw.getOrPut(saleId) { ArrayList(2) }.add(RawEvent(at, amount, isRefund = false))
+        }
+
+        // ── Door 1: what was settled on the day of the sale. ──
+        for (s in sales) {
+            val collected = s.amountPaid.coerceIn(0.0, s.total.coerceAtLeast(0.0))
+            if (collected <= CENT) continue
+            record(s.id, s.soldAt, collected)
+        }
+
+        // ── Door 2: repayments, FIFO-matched to the credit lots they settle. ──
+        // Walk the ledger chronologically PER CUSTOMER, keeping a queue of open lots.
+        // Only credit_owed / credit_paid participate: change_owed / refund_owed and
+        // their payouts are the shop's "we owe you" balance, a different ledger entirely.
+        val lots = HashMap<String, ArrayDeque<Lot>>()
+        for (row in ledger.sortedBy { it.createdAt }) {
+            if (row.deleted) continue
+            when (row.type) {
+                "credit_owed" -> {
+                    if (row.amount <= CENT) continue
+                    lots.getOrPut(row.customerId) { ArrayDeque() }
+                        .addLast(Lot(row.saleId, row.amount))
+                }
+                "credit_paid" -> {
+                    var left = row.amount
+                    if (left <= CENT) continue
+                    // A write-off, or a debt cancelled because the goods came back, clears
+                    // the debt but is NOT money — it consumes lots and recognises nothing.
+                    val collects = isCollection(row.note)
+                    val queue = lots[row.customerId] ?: continue
+                    while (left > CENT && queue.isNotEmpty()) {
+                        val lot = queue.first()
+                        val take = minOf(left, lot.remaining)
+                        lot.remaining -= take
+                        left -= take
+                        if (lot.remaining <= CENT) queue.removeFirst()
+                        if (!collects || take <= CENT) continue
+                        // A lot with no sale behind it (an over-given-change correction)
+                        // recovers a till shortage — real money, but not a sale. It
+                        // recognises nothing so revenue always has goods behind it.
+                        val sale = lot.saleId?.let { byId[it] } ?: continue
+                        record(sale.id, row.createdAt, take)
+                    }
+                }
+            }
+        }
+        return raw
+    }
+
+    /**
+     * RAW money collected against each sale — both doors, NO refund ceiling.
+     *
+     * This is the figure a refund needs and [Period.collected] is not: it answers "how
+     * much of this sale's money has actually reached the shop", which is the ONLY honest
+     * cap on how much can be handed back across the counter. Refunding a part-paid
+     * account sale used to hand back the whole sale total, which drove a real till to
+     * −$60 on a $100 sale with $40 paid — the shop paying out money it had never been
+     * given. See [PosRepository.createRefund], which settles the unpaid part against the
+     * customer's DEBT and only lets [payable] leave the drawer.
+     *
+     * Deliberately NOT net of refunds: what a sale has collected does not change because
+     * goods came back. The caller subtracts what it has already refunded, because only
+     * the caller knows whether the refund it is about to write is included yet.
+     */
+    fun rawCollectedBySale(
+        sales: List<CashBasisSaleRow>,
+        ledger: List<CreditTxn>,
+    ): Map<String, Double> =
+        moneyEvents(sales, ledger, sales.associateBy { it.id })
+            .mapValues { (_, events) -> events.sumOf { it.amount } }
 
     /** One open credit lot: the unpaid remainder of a sale, awaiting FIFO settlement. */
     private class Lot(val saleId: String?, var remaining: Double)

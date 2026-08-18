@@ -51,6 +51,8 @@ import com.portionspot.pos.sync.wire.StockMovementDto
 import com.portionspot.pos.sync.wire.toStockMovement
 import com.portionspot.pos.sync.wire.CashSessionDto
 import com.portionspot.pos.sync.wire.toCashSession
+import com.portionspot.pos.sync.wire.CashMovementDto
+import com.portionspot.pos.sync.wire.toCashTxn
 import com.portionspot.pos.sync.wire.ItemAttributeDto
 import com.portionspot.pos.sync.wire.toItemAttribute
 import com.portionspot.pos.sync.wire.toMoney
@@ -780,6 +782,15 @@ class PosSyncEngine(
         // offline from each other finally see each other's shift. Resolving before it
         // would just re-decide a conflict this device cannot yet know exists.
         mergeOpenSessions(bid)
+        // The other half of the drawer, and it sits HERE for two reasons. A movement names
+        // the shift it happened in, so the shifts land first — nothing local enforces that
+        // link, but a pass that showed a phone a day's cash before it had heard of the day
+        // is a pass whose order nobody could reason about later. And it is AFTER
+        // reconcileCash above, which is the pass that rebuilds another till's SALE cash:
+        // these two write to the same ledger from opposite sources and must not be read as
+        // one step, because only reconcileCash is allowed to touch a sale's or refund's
+        // drawer row and only this is allowed to import anything else.
+        n += pullCashMovements(api, bid, cloudBid)
         // ── Accounting spine + supplier orders ──
         // Suppliers before the orders that name them, and orders before their lines.
         n += pullSuppliers(api, bid, cloudBid)
@@ -1014,6 +1025,59 @@ class PosSyncEngine(
             losers = plan.losers.map { it.id to plan.closingNote(it) },
             at = System.currentTimeMillis(),
         )
+    }
+
+    /**
+     * `cash_movements` → the local cash ledger. **The half that was missing.**
+     *
+     * This table was pushed and never pulled, and the owner found it with two phones over
+     * one drawer: phone A closed the trading day — which writes a `variance` true-up and a
+     * till→safe transfer — and recorded an owner drawing. All of it reached the database.
+     * None of it ever reached phone B, so the two phones disagreed about what was in the
+     * till and what was in the safe, and neither could say why.
+     *
+     * ── WHY THIS CANNOT DOUBLE-COUNT A SALE ───────────────────────────────────────
+     *
+     * A sale's and a refund's drawer movement are rebuilt locally from the pulled tenders
+     * by [reconcileCash], NOT imported. If a wire row could also carry that same money, the
+     * two mechanisms would each book it once and every synced sale would appear in the
+     * drawer twice. The guard is STRUCTURAL and it lives on the push, not here: no client
+     * ever sends one. This app excludes them by [cashMovementCountedElsewhere], and the web
+     * never writes them at all — its cash-up derives takings from `sale_payments`, change
+     * from `sales.change_due` and payouts from `refund_payments`, and its own screen says
+     * so. So the invariant is "the table does not contain sale money", not "the pull
+     * filters sale money out", and it holds because BOTH writers uphold it.
+     *
+     * ★ That invariant is not checkable from a wire row. `cash_movements` has no `ref_type`
+     * and no `ref_id`, so a row that violated it would be indistinguishable from an honest
+     * pay-in. The one check that IS possible is made below — an id this device already
+     * holds as a sale's or refund's own row is never overwritten — and it is a backstop, not
+     * the mechanism. Anything that starts writing sale-derived rows into this table breaks
+     * the drawer on every device in the shop, and the place to stop it is there.
+     *
+     * Keyed by id, which is the push's own key: a device re-reading a row it wrote finds
+     * its own local row and leaves the money alone (see [toCashTxn]).
+     */
+    private suspend fun pullCashMovements(api: SupabaseRest, bid: String, cloudBid: String): Int {
+        val rows = syncJson.decodeFromString<List<CashMovementDto>>(
+            api.selectSince("cash_movements", cloudBid, config.cursor("cash_movements"), PAGE)
+        )
+        if (rows.isEmpty()) return 0
+        var applied = 0
+        for (dto in rows) {
+            val local = cashTxnDao.getById(dto.id)
+            // The backstop described above. A local sale/refund row is the mirror's to own
+            // and nothing on the wire may touch it — not even its tombstone, because
+            // [planCashMirror] converges that money by BALANCE and would immediately write
+            // a correction row for whatever this took away.
+            if (local != null && cashMovementCountedElsewhere(local.refType)) continue
+            if (local == null || IsoTime.toMillis(dto.cursorStamp()) > local.updatedAt) {
+                cashTxnDao.upsert(dto.toCashTxn(bid, local))
+                applied++
+            }
+        }
+        config.setCursor("cash_movements", rows.maxOf { it.cursorStamp() })
+        return applied
     }
 
     /**
@@ -1273,24 +1337,6 @@ class PosSyncEngine(
             }
         }
         config.setCursor("expenses", rows.maxOf { it.updatedAt ?: IsoTime.EPOCH })
-        return applied
-    }
-
-    /** cash_txns → local cash ledger, bridged by local_id. */
-    private suspend fun pullCashTxns(api: SupabaseRest, bid: String, cloudBid: String): Int {
-        val rows = syncJson.decodeFromString<List<CashTxnDto>>(
-            api.selectSince("cash_txns", cloudBid, config.cursor("cash_txns"), PAGE)
-        )
-        if (rows.isEmpty()) return 0
-        var applied = 0
-        for (dto in rows) {
-            val local = cashTxnDao.getById(dto.bridgeId())
-            if (local == null || IsoTime.toMillis(dto.updatedAt) > local.updatedAt) {
-                cashTxnDao.upsert(dto.toCashTxn(bid, local))
-                applied++
-            }
-        }
-        config.setCursor("cash_txns", rows.maxOf { it.cursorStamp() })
         return applied
     }
 

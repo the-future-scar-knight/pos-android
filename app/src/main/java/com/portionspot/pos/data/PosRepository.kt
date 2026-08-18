@@ -7,6 +7,7 @@ import com.portionspot.pos.notify.NotifThresholds
 import com.portionspot.pos.notify.NotificationEngine
 import com.portionspot.pos.sms.ParsedPayment
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 
 /** Half-a-cent tolerance for money comparisons (guards Double rounding on totals). */
@@ -502,6 +503,7 @@ class PosRepository(private val db: PosDatabase) {
                         type = "credit_paid",
                         amount = plan.paid,
                         note = note,
+                        method = method,
                         createdBy = cashierId,
                         createdByName = cashierName,
                         createdAt = stamp,
@@ -517,6 +519,7 @@ class PosRepository(private val db: PosDatabase) {
                         type = "change_owed",
                         amount = plan.excess,
                         note = if (plan.paid > 0.0) "Overpayment" else note ?: "Overpayment",
+                        method = method,
                         createdBy = cashierId,
                         createdByName = cashierName,
                         createdAt = stamp,
@@ -894,15 +897,79 @@ class PosRepository(private val db: PosDatabase) {
     fun latestDayCloseFlow(businessId: String): Flow<DayClose?> =
         dayCloseDao.observeLatest(businessId)
 
-    /** The close recorded for one trading day, observed — non-null means that day has been
-     *  counted and cannot be counted again (see [closeDay]). What the cash screen reads so
-     *  it can say so BEFORE anyone counts the drawer. */
+    /**
+     * The close recorded for one trading day, observed — non-null means that day has been
+     * counted and cannot be counted again (see [closeDay]). What the cash screen reads so
+     * it can say so BEFORE anyone counts the drawer.
+     *
+     * ★ FALLS BACK TO THE SHIFT, because `day_closes` IS A LOCAL TABLE AND NEVER SYNCS.
+     * Asking it alone means each phone only knows about closes IT performed. On two phones
+     * (device test §G, 17 Aug): the cashier counted the drawer and moved the takings to the
+     * safe; the owner's phone synced, saw no local close row, and cheerfully offered to
+     * count the same day again. [closeDay] itself was never in danger — it re-checks the
+     * pulled shift and returns null — but a money button that silently does nothing is the
+     * exact failure the dialog's own comment says is worse than an error.
+     *
+     * The day's [CashSession] IS shared: `counted_cash`, `expected_cash`, `moved_to_safe`
+     * and `float_target` all go up at the close and come back down on every device's pull.
+     * That is a complete [DayClose] minus its id, so one is SYNTHESISED for display. It is
+     * never inserted and never pushed — it is this device reporting what another device
+     * did, and the `day_closes` row stays where the count was actually taken.
+     */
     fun dayCloseForFlow(businessId: String, dayStart: Long): Flow<DayClose?> =
-        dayCloseDao.observeForDay(businessId, dayStart)
+        combine(
+            dayCloseDao.observeForDay(businessId, dayStart),
+            cashSessionDao.observeForDay(businessId, dayStart, startOfNextDay(dayStart)),
+        ) { local, sessions -> local ?: countedElsewhere(businessId, dayStart, sessions) }
 
     /** Same, read once — the authoritative check the close dialog makes when it opens. */
     suspend fun dayCloseFor(businessId: String, dayStart: Long): DayClose? =
         dayCloseDao.forDayOnce(businessId, dayStart)
+            ?: countedElsewhere(
+                businessId, dayStart,
+                cashSessionDao.forDayOnce(businessId, dayStart, startOfNextDay(dayStart)),
+            )
+
+    /**
+     * A day counted on ANOTHER device, seen through this one, as the [DayClose] the screens
+     * already know how to render. Null when nobody has counted the day yet.
+     *
+     * Resolved with [pickSurvivingSession] rather than "the first row", so two phones that
+     * both opened a shift before seeing each other read the count off the SAME session —
+     * the one the merge will keep — instead of disagreeing about whether the day is closed.
+     *
+     * `variance` is recomputed from counted − expected rather than carried: it is GENERATED
+     * on the cloud and derived everywhere else, and a third copy is how a shop ends up with
+     * two answers to "how short were we".
+     */
+    private fun countedElsewhere(
+        businessId: String,
+        dayStart: Long,
+        sessions: List<CashSession>,
+    ): DayClose? {
+        val s = pickSurvivingSession(sessions.filter { !it.deleted }) ?: return null
+        val counted = s.countedCash ?: return null
+        val expected = s.expectedCash ?: 0.0
+        return DayClose(
+            // Keyed off the shift so repeated reads produce a stable identity, and so it can
+            // never be mistaken for a locally-recorded close.
+            id = s.id,
+            businessId = businessId,
+            dayStart = dayStart,
+            expectedCash = expected,
+            countedCash = counted,
+            variance = counted - expected,
+            movedToSafe = s.movedToSafe,
+            floatTarget = s.floatTarget,
+            note = s.note,
+            closedBy = s.closedBy,
+            closedByName = s.closedByName,
+            closedAt = s.closedAt ?: s.updatedAt,
+            updatedAt = s.updatedAt,
+            // Never pushed: this row does not exist in `day_closes` and must not be made to.
+            pendingSync = false,
+        )
+    }
 
     /** Signed CASH SHORT/OVER for a window — the profit line day-close variances feed. */
     fun cashVarianceFlow(businessId: String, from: Long, to: Long): Flow<Double> =
@@ -3338,10 +3405,19 @@ class PosRepository(private val db: PosDatabase) {
      * becomes customer DEBT — a `credit_owed` row noted "Over-paid change" — exactly
      * mirroring the over-given-change branch of [checkout]. Both rows commit together.
      *
-     * CASH-ON-HAND: this is change handed over the counter, so the drawer loses the FULL
+     * CASH-ON-HAND: only a CASH payout empties the drawer, and then it loses the FULL
      * [amount] — a single NEGATIVE `change_payout` [CashTxn]. Both halves of an over-pay
      * physically leave the till, so the cash row is the whole amount even though the
      * ledger splits it into `change_paid` + `credit_owed`.
+     *
+     * ★ [method] EXISTS BECAUSE THE SHOP DOES NOT ONLY PAY IN NOTES. This used to assume
+     * cash and always move the till, so settling a customer's change by EcoCash took money
+     * out of a drawer it had never been in — the till then read short by every non-cash
+     * payout ever made, and the day close books that difference permanently as a variance
+     * against profit. Same rule as everywhere else in this file: a card or mobile-money
+     * movement settles the ledger and leaves the drawer alone. The method is recorded on
+     * the credit rows too (`credit_txns.method` is a shared column), so the customer's
+     * statement says how they were paid rather than implying notes across the counter.
      *
      * NO DOUBLE-COUNT: change handed back AT THE TILL is already netted out by [checkout]
      * (`cashTendered − changeGivenActual`). This function only ever pays out change that
@@ -3352,6 +3428,7 @@ class PosRepository(private val db: PosDatabase) {
         customerId: String,
         amount: Double,
         note: String? = null,
+        method: String = "cash",
         cashierId: String? = null,
         cashierName: String? = null
     ) {
@@ -3369,6 +3446,7 @@ class PosRepository(private val db: PosDatabase) {
                         type = "change_paid",
                         amount = settled,
                         note = note,
+                        method = method,
                         createdBy = cashierId,
                         createdByName = cashierName,
                         createdAt = stamp,
@@ -3384,6 +3462,7 @@ class PosRepository(private val db: PosDatabase) {
                         type = "credit_owed",
                         amount = over,
                         note = if (settled > CENT) "Over-paid change" else note ?: "Over-paid change",
+                        method = method,
                         createdBy = cashierId,
                         createdByName = cashierName,
                         createdAt = stamp,
@@ -3391,18 +3470,22 @@ class PosRepository(private val db: PosDatabase) {
                     )
                 )
             }
-            // The whole handed-over amount left the drawer — settled part AND any excess.
-            // Change is handed over the counter, so it comes out of the TILL (§4).
-            cashTxnDao.insert(
-                CashTxn(
-                    businessId = businessId, type = "change_payout", amount = -amount,
-                    location = CashLocation.TILL,
-                    source = "cash", note = note ?: "Change paid out",
-                    refType = "customer", refId = customerId,
-                    createdBy = cashierId, createdByName = cashierName,
-                    createdAt = stamp, updatedAt = stamp
+            // The whole handed-over amount left the drawer — settled part AND any excess —
+            // but ONLY when it was handed over in notes. An EcoCash payout settles the same
+            // ledger and never opens the till; moving the drawer for it is how a physical
+            // count comes out short against books that were right.
+            if (method == "cash") {
+                cashTxnDao.insert(
+                    CashTxn(
+                        businessId = businessId, type = "change_payout", amount = -amount,
+                        location = CashLocation.TILL,
+                        source = method, note = note ?: "Change paid out",
+                        refType = "customer", refId = customerId,
+                        createdBy = cashierId, createdByName = cashierName,
+                        createdAt = stamp, updatedAt = stamp
+                    )
                 )
-            )
+            }
         }
     }
 
@@ -3432,6 +3515,46 @@ class PosRepository(private val db: PosDatabase) {
         refundDao.qtyReturnedForLine(saleLineId)
 
     /**
+     * How a refund of [refundTotal] against [sale] would settle: what it cancels off the
+     * customer's debt, and the MOST that may be handed back in money.
+     *
+     * Public because the refund dialog has to quote the same figure the till will honour.
+     * [createRefund] clamps to this regardless, but a dialog offering $100 back on a sale
+     * that will only pay out $40 is a cashier promising a customer money at the counter —
+     * so both sides ask the one function.
+     *
+     * [customer] is passed in rather than re-read so the caller's already-resolved row is
+     * used; null means a walk-in, who has no account to carry a debt and therefore gets
+     * back whatever they paid.
+     */
+    suspend fun refundSettlement(
+        sale: SaleEntity,
+        refundTotal: Double,
+        customer: Customer?,
+    ): RefundSettlement {
+        val collectedOnSale = customer?.let { c ->
+            CashBasis.rawCollectedBySale(
+                // Only id/soldAt/total/amountPaid are read; the costed economics belong to
+                // recognition, which this question is not about.
+                sales = listOf(
+                    CashBasisSaleRow(
+                        id = sale.id, soldAt = sale.soldAt, total = sale.total,
+                        taxTotal = 0.0, amountPaid = sale.amountPaid, customerId = c.id,
+                        costedRevenue = 0.0, lineProfit = 0.0
+                    )
+                ),
+                ledger = creditDao.forCustomerOnce(c.id),
+            )[sale.id] ?: 0.0
+        } ?: sale.amountPaid.coerceIn(0.0, sale.total.coerceAtLeast(0.0))
+        return planRefundSettlement(
+            refundTotal = refundTotal,
+            saleTotal = sale.total,
+            collectedOnSale = collectedOnSale,
+            alreadyRefunded = refundDao.refundedTotalForSaleOnce(sale.id),
+        )
+    }
+
+    /**
      * Issue a refund against a completed sale (prompt §11). Cashier-performed and
      * offline-first. Everything commits in ONE transaction so a crash can't restock
      * without recording the refund (or book money owed without the goods movement):
@@ -3451,7 +3574,13 @@ class PosRepository(private val db: PosDatabase) {
      *    posts a NEGATIVE `refund` [CashTxn] in the same transaction. Card/mobile-money
      *    reversals never touched the drawer and post nothing — the mirror of checkout,
      *    which only counts cash tenders.
-     *  - Any shortfall (refundTotal − paid-now) is booked as a `refund_owed` credit
+     *  - ★ IT SETTLES DEBT BEFORE IT PAYS MONEY. The shop can only hand back what it was
+     *    given, so the unpaid part of the sale is CANCELLED off the customer's account
+     *    (a `credit_paid` row noted [CashBasis.DEBT_CANCELLED_NOTE]) and only
+     *    [RefundSettlement.payable] may cross the counter. Refunding a $100 sale that had
+     *    collected $40 used to hand over $100 and leave a real drawer at −$60, with the
+     *    $60 still showing as a debt against goods back on the shelf.
+     *  - Any shortfall (payable − paid-now) is booked as a `refund_owed` credit
      *    row when a [customer] is set, so it ages in Change & Credit like change owed.
      *    A walk-in (no customer) can't carry a balance — pay such refunds in full.
      *
@@ -3482,8 +3611,13 @@ class PosRepository(private val db: PosDatabase) {
         val goodsValue = saleGoodsValue(saleDao.linesForSale(sale.id))
         val refundTotal = computeRefundTotal(returnedSubtotal, goodsValue, sale.total).refundTotal
 
+        // ★ WHAT MAY ACTUALLY BE HANDED BACK — see [refundSettlement].
+        val settlement = refundSettlement(sale, refundTotal, customer)
+        // Clamped, not merely validated: the dialog offers at most `payable`, but a stale
+        // screen or a caller that skipped it must not be able to empty the drawer.
         val paidNow = payouts.filter { it.amount != 0.0 }.sumOf { it.amount }
-        val outstanding = (refundTotal - paidNow).coerceAtLeast(0.0)
+            .coerceIn(0.0, settlement.payable)
+        val outstanding = (settlement.payable - paidNow).coerceAtLeast(0.0)
         // A balance can only be tracked/aged against a known customer (like change_owed).
         val owedToCustomer = outstanding > CENT && customer != null
         val status = if (outstanding <= CENT) "settled" else "owed"
@@ -3497,6 +3631,7 @@ class PosRepository(private val db: PosDatabase) {
             customerName = customer?.name,
             reason = reason,
             refundTotal = refundTotal,
+            payableTotal = settlement.payable,
             status = status,
             createdBy = cashierId,
             createdByName = cashierName,
@@ -3523,12 +3658,21 @@ class PosRepository(private val db: PosDatabase) {
                 createdAt = stamp
             )
         }
-        val payoutRows = payouts.filter { it.amount != 0.0 }.map { t ->
+        // Allocate the payout across the tenders in the order they were entered, stopping
+        // at `payable`. Trimming the LAST tender rather than scaling all of them keeps
+        // every earlier row equal to the money that physically changed hands under that
+        // method — a split refund of $40 cash + $30 EcoCash capped at $50 is $40 of cash
+        // and $10 of EcoCash, not 71% of each, which is not a thing a drawer can hold.
+        var payoutLeft = settlement.payable
+        val payoutRows = payouts.filter { it.amount > 0.0 }.mapNotNull { t ->
+            if (payoutLeft <= CENT) return@mapNotNull null
+            val amount = minOf(t.amount, payoutLeft)
+            payoutLeft -= amount
             RefundPayment(
                 refundId = refundId,
                 businessId = businessId,
                 method = t.method,
-                amount = t.amount,
+                amount = amount,
                 reference = t.reference?.takeIf { it.isNotBlank() },
                 tenderCurrency = t.currency,
                 tenderAmount = t.tenderAmount,
@@ -3586,6 +3730,30 @@ class PosRepository(private val db: PosDatabase) {
                     )
                 )
             }
+            // ★ THE GOODS CAME BACK, SO THE DEBT GOES AWAY. The unpaid part of a refunded
+            // sale is cancelled here — without this the customer kept owing for goods
+            // sitting back on the shelf, AND was shown a refund owed to them for the same
+            // money, two live balances netting to nothing (device test §B, 16 Aug).
+            //
+            // It is a `credit_paid` row because that is the only arithmetic both clients
+            // share, and it carries [CashBasis.DEBT_CANCELLED_NOTE] so recognition knows
+            // no money arrived — see the constant for why each half matters.
+            if (settlement.debtRelieved > CENT && customer != null) {
+                creditDao.insert(
+                    CreditTxn(
+                        businessId = businessId,
+                        customerId = customer.id,
+                        saleId = sale.id,
+                        type = "credit_paid",
+                        amount = settlement.debtRelieved,
+                        note = "${CashBasis.DEBT_CANCELLED_NOTE} $receiptLabel".trim(),
+                        createdBy = cashierId,
+                        createdByName = cashierName,
+                        createdAt = stamp,
+                        updatedAt = stamp
+                    )
+                )
+            }
             // Money still owed to the customer after the immediate payout → ageable row.
             if (owedToCustomer) {
                 creditDao.insert(
@@ -3626,6 +3794,13 @@ class PosRepository(private val db: PosDatabase) {
     ) {
         if (tender.amount <= 0.0) return
         val refund = refundDao.getById(refundId) ?: return
+        // ★ NEVER PAST WHAT IS OWED. Instalments accumulate, so without this the same
+        // refund could be paid out twice — and on a refund whose unpaid part was cancelled
+        // off the account, a single payout of the GOODS value would hand over money the
+        // sale never collected. Same ceiling the refund was created under.
+        val stillOwed = (refund.payableTotal - refundDao.paidSoFar(refundId)).coerceAtLeast(0.0)
+        val amount = minOf(tender.amount, stillOwed)
+        if (amount <= CENT) return
         val stamp = now()
         db.withTransaction {
             refundDao.insertPayment(
@@ -3633,7 +3808,7 @@ class PosRepository(private val db: PosDatabase) {
                     refundId = refundId,
                     businessId = refund.businessId,
                     method = tender.method,
-                    amount = tender.amount,
+                    amount = amount,
                     reference = tender.reference?.takeIf { it.isNotBlank() },
                     tenderCurrency = tender.currency,
                     tenderAmount = tender.tenderAmount,
@@ -3644,10 +3819,10 @@ class PosRepository(private val db: PosDatabase) {
                 )
             )
             // Cash actually handed over now leaves the drawer.
-            if (tender.method == "cash" && tender.amount > CENT) {
+            if (tender.method == "cash" && amount > CENT) {
                 cashTxnDao.insert(
                     CashTxn(
-                        businessId = refund.businessId, type = "refund", amount = -tender.amount,
+                        businessId = refund.businessId, type = "refund", amount = -amount,
                         location = CashLocation.TILL,   // over the counter, out of the drawer
                         source = "cash",
                         note = "Refund payout on #${refund.saleReceiptNo ?: refund.saleId.take(8)}",
@@ -3664,7 +3839,8 @@ class PosRepository(private val db: PosDatabase) {
                         customerId = refund.customerId,
                         saleId = refund.saleId,
                         type = "refund_paid",
-                        amount = tender.amount,
+                        amount = amount,
+                        method = tender.method,
                         createdBy = cashierId,
                         createdByName = cashierName,
                         createdAt = stamp,
@@ -3674,7 +3850,10 @@ class PosRepository(private val db: PosDatabase) {
             }
             // paidSoFar already includes the row just inserted (same transaction).
             val paid = refundDao.paidSoFar(refundId)
-            val newStatus = if (paid + CENT >= refund.refundTotal) "settled" else "owed"
+            // Measured against what may be PAID, not against the goods' value: on a refund
+            // whose unpaid part was cancelled off the account, the two differ and comparing
+            // with the total would leave it `owed` forever, chasing a balance nobody owes.
+            val newStatus = if (paid + CENT >= refund.payableTotal) "settled" else "owed"
             if (newStatus != refund.status) {
                 refundDao.upsert(refund.copy(status = newStatus, updatedAt = stamp))
             }

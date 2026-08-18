@@ -153,4 +153,89 @@ class CashSessionMergeTest {
         assertEquals("drop", cashMovementTypeToWire("  DROP ", CashLocation.TILL, -50.0))
         assertEquals("bank_deposit", cashMovementTypeToWire("Deposit", CashLocation.SAFE, -200.0))
     }
+
+    // ──────────────────────── coming back the other way ────────────────────────
+    //
+    // `cash_movements` was pushed and never pulled, so a day closed on one phone — a
+    // variance true-up plus a till→safe transfer — and an owner drawing taken on it
+    // never reached the second phone, and two tills over one drawer disagreed about
+    // what was in it. These pin the inverse: the wire carries a MAGNITUDE with the
+    // direction hidden in `type` and no location column at all, so both the sign and
+    // the pocket have to be rebuilt, and getting either backwards moves real money the
+    // wrong way on a device that was only reading.
+
+    @Test
+    fun theWireAmountIsAMagnitude_soTheDirectionIsRebuiltFromTheType() {
+        // The push's own comment: send a signed figure and a $5 payout arrives as −5,
+        // is negated again, and ADDS $5 to the drawer. Coming down, the same mistake
+        // credits the till for money that was handed out.
+        assertEquals(-5.0, cashMovementTypeFromWire("pay_out", 5.0).amount, 1e-9)
+        assertEquals(60.0, cashMovementTypeFromWire("pay_in", 60.0).amount, 1e-9)
+        // A client that sent a signed figure anyway must not flip the direction twice.
+        assertEquals(-5.0, cashMovementTypeFromWire("pay_out", -5.0).amount, 1e-9)
+    }
+
+    @Test
+    fun moneyIntoTheSafeLandsInTheSafeAndNotTheDrawer() {
+        val row = cashMovementTypeFromWire("safe_in", 250.0)
+        assertEquals(CashLocation.SAFE, row.location)
+        assertEquals(250.0, row.amount, 1e-9)
+    }
+
+    @Test
+    fun everyOtherTypeMovesTheTill_inTheDirectionItsNameMeans() {
+        // A drop and a bank deposit take cash OUT of the drawer; a float top-up and a
+        // pay-in put it in. Reversing any one of these is a phone that shows the till
+        // fuller than it is, which is a shortage nobody discovers until the count.
+        for (out in listOf("drop", "petty", "bank_deposit", "pay_out")) {
+            val row = cashMovementTypeFromWire(out, 40.0)
+            assertEquals("$out must leave the till", CashLocation.TILL, row.location)
+            assertEquals("$out must be money going out", -40.0, row.amount, 1e-9)
+        }
+        for (into in listOf("float_topup", "pay_in")) {
+            val row = cashMovementTypeFromWire(into, 40.0)
+            assertEquals("$into must land in the till", CashLocation.TILL, row.location)
+            assertEquals("$into must be money coming in", 40.0, row.amount, 1e-9)
+        }
+    }
+
+    @Test
+    fun everyLegalWireTypeSurvivesTheRoundTripUnchanged() {
+        // ★ THE INTEROP TEST. A movement that leaves one phone and lands on another has
+        // to be the SAME row on both, and a row re-pushed later has to go up under the
+        // word it went up under the first time — otherwise two devices sharing one
+        // drawer keep rewriting each other's history with slightly different words.
+        val legal = listOf(
+            "pay_in", "pay_out", "drop", "petty", "float_topup", "safe_in", "bank_deposit"
+        )
+        for (wire in legal) {
+            val local = cashMovementTypeFromWire(wire, 75.0)
+            assertEquals(
+                "$wire did not survive the round trip",
+                wire,
+                cashMovementTypeToWire(local.type, local.location, local.amount)
+            )
+        }
+    }
+
+    @Test
+    fun anUnrecognisedTypeIsBookedRatherThanDropped() {
+        // The CHECK constraint says this cannot arrive; the day it does is the day the
+        // other side relaxed it without telling this one. A row silently discarded is
+        // cash that vanishes from one phone's drawer and stays in another's, with
+        // nothing anywhere saying why — so it is booked as an adjustment at the till,
+        // keeping the direction the row was actually written in.
+        val out = cashMovementTypeFromWire("something_the_web_invented", -30.0)
+        assertEquals("adjust", out.type)
+        assertEquals(CashLocation.TILL, out.location)
+        assertEquals(-30.0, out.amount, 1e-9)
+        val into = cashMovementTypeFromWire("something_the_web_invented", 30.0)
+        assertEquals(30.0, into.amount, 1e-9)
+    }
+
+    @Test
+    fun theInverseIsAlsoForgivingAboutCaseAndSpacing() {
+        assertEquals(CashLocation.SAFE, cashMovementTypeFromWire("  SAFE_IN ", 10.0).location)
+        assertEquals(-10.0, cashMovementTypeFromWire("Pay_Out", 10.0).amount, 1e-9)
+    }
 }

@@ -699,8 +699,11 @@ val MIGRATION_30_31 = object : Migration(30, 31) {
  * version there was only the drawer, so all historical cash was till cash. The safe
  * starts empty and fills on the first close of day.
  *
- * LOCAL-ONLY: the cloud `cash_txns` table has no `location`, so the column is absent from
- * CashTxnDto and never pushed; a pulled row keeps whatever this device recorded.
+ * NO CLOUD COLUMN: the shared schema's `cash_movements` derives TILL / SAFE from the
+ * movement's `type` instead of storing it, so this column is translated at the boundary in
+ * both directions ([cashMovementTypeToWire] / [cashMovementTypeFromWire]) rather than sent.
+ * A row this device already holds is never re-typed from the wire — the translation out is
+ * lossy — so a local movement keeps the location it was recorded with.
  */
 val MIGRATION_31_32 = object : Migration(31, 32) {
     override fun migrate(db: SupportSQLiteDatabase) {
@@ -1058,6 +1061,35 @@ val MIGRATION_41_42 = object : Migration(41, 42) {
     }
 }
 
+/**
+ * v42 → v43 — THE CREDIT LEDGER LEARNS HOW IT WAS PAID. Adds `credit_transactions.method`.
+ *
+ * The shared `credit_txns.method` column has existed the whole time and the web populates
+ * it; this app did not, so a debt settled on a phone arrived in the browser with no tender
+ * against it, and every payout out of the customer ledger was assumed to be cash. That
+ * assumption moved the till for an EcoCash payout — a drawer reading short by money that
+ * was never in it, which the day close then records permanently as a variance.
+ *
+ * NULL, not 'cash', for existing rows. Every one of them predates the question, and a
+ * ledger that CANNOT say how it was paid is honest; one that says "cash" because nothing
+ * else was recorded is a guess wearing a fact's clothes. Nothing reads this column as
+ * cash-by-default: the drawer rules test for `cash` explicitly.
+ *
+ * Also adds `refunds.payableTotal` — the part of a refund that may be handed back in money,
+ * as against what the returned goods were worth. The two used to be one number, which is
+ * how a $100 refund of a sale that had only ever collected $40 paid out the full hundred.
+ * BACKFILLED to `refundTotal` rather than left at the column default: every existing refund
+ * was measured against the total at the time, so that IS its payable figure, and a zero
+ * would make each of them look like a settled refund that had paid out nothing.
+ */
+val MIGRATION_42_43 = object : Migration(42, 43) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE credit_transactions ADD COLUMN method TEXT")
+        db.execSQL("ALTER TABLE refunds ADD COLUMN payableTotal REAL NOT NULL DEFAULT 0")
+        db.execSQL("UPDATE refunds SET payableTotal = refundTotal")
+    }
+}
+
 @Database(
     entities = [
         Business::class,
@@ -1087,7 +1119,7 @@ val MIGRATION_41_42 = object : Migration(41, 42) {
         CashSession::class,
         StaffMember::class
     ],
-    version = 42,
+    version = 43,
     exportSchema = false
 )
 abstract class PosDatabase : RoomDatabase() {
@@ -1145,7 +1177,7 @@ abstract class PosDatabase : RoomDatabase() {
                         MIGRATION_32_33, MIGRATION_33_34, MIGRATION_34_35,
                         MIGRATION_35_36, MIGRATION_36_37, MIGRATION_37_38,
                         MIGRATION_38_39, MIGRATION_39_40, MIGRATION_40_41,
-                        MIGRATION_41_42
+                        MIGRATION_41_42, MIGRATION_42_43
                     )
                     .fallbackToDestructiveMigration()
                     .build()

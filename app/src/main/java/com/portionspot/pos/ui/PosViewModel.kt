@@ -41,6 +41,7 @@ import com.portionspot.pos.data.PosRepository
 import com.portionspot.pos.data.PurchaseOrder
 import com.portionspot.pos.data.PurchaseOrderLine
 import com.portionspot.pos.data.PurchaseOrderWithLines
+import com.portionspot.pos.data.RefundSettlement
 import com.portionspot.pos.data.RefundLineInput
 import com.portionspot.pos.data.RefundPayment
 import com.portionspot.pos.data.RefundWithLines
@@ -1748,12 +1749,20 @@ class PosViewModel(
     fun totalChangeOwedFlow(): Flow<Double> =
         businessId.filterNotNull().flatMapLatest { repo.totalChangeOwedFlow(it) }
 
-    /** Hand over change the shop previously owed a customer. */
-    fun recordChangePayment(customerId: String, amount: Double, note: String? = null) {
+    /** Hand over change the shop previously owed a customer. [method] decides whether the
+     *  drawer moves — only cash leaves the till. */
+    fun recordChangePayment(
+        customerId: String,
+        amount: Double,
+        note: String? = null,
+        method: String = "cash"
+    ) {
         val bid = businessId.value ?: return
         if (amount <= 0) return
         viewModelScope.launch {
-            repo.recordChangePayment(bid, customerId, amount, note, currentCashierId, currentCashierName)
+            repo.recordChangePayment(
+                bid, customerId, amount, note, method, currentCashierId, currentCashierName
+            )
             nudgeSync("changePayment")
         }
     }
@@ -1783,14 +1792,25 @@ class PosViewModel(
         repo.refundPaymentsFor(refundId)
 
     /**
-     * Issue a refund against [sale]. [returns] are the chosen lines/quantities; [payout]
-     * is the money handed back now (null or a short amount ⇒ the remainder is owed and
-     * ages in Change & Credit). The owed-tracking customer is resolved from the sale.
+     * How a refund of [refundTotal] against [sale] would settle — what comes off the
+     * customer's account and what may actually be handed back. The dialog asks so it can
+     * quote the figure the till will honour, instead of promising a customer money the
+     * repository is about to clamp away.
+     */
+    suspend fun refundSettlementFor(sale: SaleEntity, refundTotal: Double): RefundSettlement =
+        repo.refundSettlement(sale, refundTotal, sale.customerId?.let { repo.customerById(it) })
+
+    /**
+     * Issue a refund against [sale]. [returns] are the chosen lines/quantities; [payouts]
+     * is the money handed back now, which may be SPLIT across tenders exactly as a sale's
+     * payment can be — a customer who paid half in cash and half by EcoCash gets it back
+     * the same way. Empty or short ⇒ the remainder is owed and ages in Change & Credit.
+     * The owed-tracking customer is resolved from the sale.
      */
     fun createRefund(
         sale: SaleEntity,
         returns: List<RefundLineInput>,
-        payout: Tender?,
+        payouts: List<Tender>,
         reason: String?,
         onDone: () -> Unit = {}
     ) {
@@ -1808,7 +1828,7 @@ class PosViewModel(
                 businessId = bid,
                 sale = sale,
                 lines = returns,
-                payouts = payout?.let { listOf(it) } ?: emptyList(),
+                payouts = payouts,
                 reason = reason,
                 customer = customer,
                 cashierId = currentCashierId,

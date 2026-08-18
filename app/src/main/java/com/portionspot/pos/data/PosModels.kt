@@ -497,7 +497,25 @@ data class Refund(
     val customerId: String? = null,        // null => walk-in (must be paid out in full now)
     val customerName: String? = null,      // snapshot
     val reason: String? = null,
-    val refundTotal: Double = 0.0,         // money owed back to the customer for the return
+    val refundTotal: Double = 0.0,         // what the returned goods were worth on the sale
+    /**
+     * The part of [refundTotal] that may actually be handed back in money — the rest was
+     * never paid for and is cancelled off the customer's account instead (see
+     * [planRefundSettlement]).
+     *
+     * ★ SEPARATE FROM [refundTotal] BECAUSE THE TWO ARE GENUINELY DIFFERENT NUMBERS, and
+     * conflating them is what let a $100 refund of a sale that had collected $40 pay out
+     * the full hundred. [refundTotal] stays the goods figure — recognition pro-rates the
+     * sale by it, and the printed slip states it — while THIS is what "paid in full" means
+     * for a refund. Without it a capped refund could never reach `settled`: the payout
+     * would stop at $40 and the status test would keep comparing it against $100, leaving
+     * the shop chasing a balance it does not owe.
+     *
+     * Defaults to [refundTotal] for rows written before the distinction existed, which is
+     * exactly right for them — every one was a fully-collected sale or was over-paid, and
+     * either way the figure it was measured against at the time was the total.
+     */
+    @ColumnInfo(defaultValue = "0") val payableTotal: Double = refundTotal,
     val status: String = "settled",        // settled (paid in full) | owed (balance outstanding)
     val createdBy: String? = null,         // cashier auth uuid (Phase 2)
     val createdByName: String? = null,
@@ -687,6 +705,17 @@ data class CreditTxn(
     val type: String,
     val amount: Double = 0.0,
     val note: String? = null,
+    /**
+     * HOW the money moved, for the rows where money moved at all — `cash`, `ecocash`,
+     * `card`, and the rest of the shop's tenders. Null on a row that is pure bookkeeping:
+     * a `credit_owed` records a debt arising, and no tender was involved.
+     *
+     * Mirrors the shared `credit_txns.method` column, which the web has always written and
+     * this app did not, so a repayment taken on a phone reached the browser with no tender
+     * against it. It also decides the drawer: only `cash` moves the till, which is what
+     * stops an EcoCash payout from making a physical drawer read short.
+     */
+    val method: String? = null,
     val createdAt: Long = now(),
     // ──── Attribution & audit (Phase 2): which cashier created this ledger row ────
     val createdBy: String? = null,
@@ -824,11 +853,20 @@ object CashLocation {
  *    profit). Mirrors the existing "capital" (owner putting money in).
  *  - "loan" — outside borrowed money coming in (a liability to repay, not income).
  *
- * Append-only and immutable: a correction is a new "adjust" row, never an edit.
- * SYNCED: the cloud `cash_txns` table upserts on [localId]. [location] is LOCAL-ONLY —
- * the cloud table has no such column, so [com.portionspot.pos.sync.CashTxnDto] does not
- * carry it and a pulled row keeps whatever this device already recorded (defaulting to
- * the till, which is what every pre-split row was).
+ * Append-only and immutable: a correction is a new "adjust" row, never an edit. That is
+ * also why the PULL only ever inserts: there is nothing on one of these a later write may
+ * legitimately change except the tombstone.
+ *
+ * SYNCED, both ways, as the cloud's `cash_movements` keyed on [id] — there is no
+ * `cash_txns` table on the shared schema and there never was.
+ *
+ * [location] has NO cloud column: up there, TILL / SAFE is DERIVED from `type`, whose
+ * vocabulary is a CHECK-constrained seven. So a row going out is translated by
+ * [cashMovementTypeToWire] and a row coming in is translated back by
+ * [cashMovementTypeFromWire], which restores the pocket AND the sign the wire dropped
+ * (`amount` travels as a magnitude). The trip is lossy on [type] — a "drawing" goes up as
+ * a bare `pay_out` — which is precisely why a row already held locally is never re-typed
+ * from the wire: see [com.portionspot.pos.sync.wire.toCashTxn].
  */
 @Entity(tableName = "cash_txns", indices = [Index("businessId")])
 data class CashTxn(

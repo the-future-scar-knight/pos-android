@@ -91,6 +91,73 @@ fun returnedLineValue(line: SaleLine, qtyReturned: Double): Double =
 fun saleGoodsValue(lines: List<SaleLine>): Double =
     lines.sumOf { returnedLineValue(it, it.qty) }
 
+/**
+ * How a refund SETTLES: what it cancels off the customer's debt, and what may actually
+ * cross the counter.
+ *
+ *  - [debtRelieved] the unpaid part of the sale that this refund cancels. Goods that came
+ *    back are not owed for.
+ *  - [payable]      the MOST that may be handed back in money — cash, EcoCash, anything.
+ *    The remainder of [refundTotal] after the debt is cancelled.
+ */
+data class RefundSettlement(
+    val refundTotal: Double,
+    val debtRelieved: Double,
+    val payable: Double,
+)
+
+/**
+ * Split a refund into debt cancelled and money payable — DEBT FIRST.
+ *
+ * ══ THE BUG THIS EXISTS FOR ══
+ * A refund used to be worth [refundTotal] in CASH, whatever the customer had actually
+ * paid. On a real till: a $100 sale taking $40 cash with $60 on account, refunded in
+ * full, handed back $100 — and left the drawer reading MINUS $60. The shop paid out
+ * money it was never given, and the $60 the customer still owed sat untouched on their
+ * account. Both halves of that are this function.
+ *
+ * ══ WHY DEBT FIRST AND NOT PRO-RATA ══
+ * A part-returned, part-paid sale could plausibly split either way. Debt first is the
+ * owner's rule and it is the conservative one: the shop does not hand cash across the
+ * counter to somebody who still owes it money for the same receipt. Worked through, on a
+ * $100 sale with $40 paid and $60 owed:
+ *
+ *  - return $40 of goods → cancels $40 of debt, pays out nothing. Debt $20, and the
+ *    customer has paid $40 for the $60 of goods they kept. Correct.
+ *  - then return the remaining $60 → cancels the last $20 of debt, pays back the $40.
+ *    Nothing owed either way, and the money that arrived is the money that went back.
+ *
+ * ══ THE INVARIANT ══
+ * Summed over every refund of one sale, [payable] can never exceed what the sale
+ * COLLECTED. The debt is `saleTotal − alreadyRefunded − collectedOnSale` and is eaten
+ * before any money is payable, so the payouts left over come to at most `collectedOnSale`
+ * — which is precisely the drawer never going negative on a refund again. [payable] is
+ * also clamped at [collectedOnSale] outright, so a bad input cannot break the invariant
+ * a subtraction was relied on to hold.
+ *
+ * [collectedOnSale] is [CashBasis.rawCollectedBySale] for this sale: money settled at the
+ * till PLUS later repayments FIFO-matched to it, so a debt paid off next week is
+ * refundable in cash the week after. [alreadyRefunded] is the sum of prior live refunds'
+ * `refundTotal` against the same sale, which is how the debt shrinks as goods go back.
+ */
+fun planRefundSettlement(
+    refundTotal: Double,
+    saleTotal: Double,
+    collectedOnSale: Double,
+    alreadyRefunded: Double,
+): RefundSettlement {
+    val total = refundTotal.coerceAtLeast(0.0)
+    val collected = collectedOnSale.coerceIn(0.0, saleTotal.coerceAtLeast(0.0))
+    val saleDebt =
+        (saleTotal - alreadyRefunded.coerceAtLeast(0.0) - collected).coerceAtLeast(0.0)
+    val relieved = minOf(total, saleDebt)
+    return RefundSettlement(
+        refundTotal = total,
+        debtRelieved = relieved,
+        payable = (total - relieved).coerceIn(0.0, collected),
+    )
+}
+
 fun computeRefundTotal(
     returnedSubtotal: Double,
     saleGoodsValue: Double,

@@ -233,6 +233,7 @@ import com.portionspot.pos.data.RefundLine
 import com.portionspot.pos.data.RefundLineInput
 import com.portionspot.pos.data.RefundPayment
 import com.portionspot.pos.data.RefundWithLines
+import com.portionspot.pos.data.RefundSettlement
 import com.portionspot.pos.data.computeRefundTotal
 import com.portionspot.pos.data.returnedLineValue
 import com.portionspot.pos.data.saleGoodsValue
@@ -4825,7 +4826,14 @@ private fun PaymentDialog(
         // exact-payment sale still completes in one tap. If the cashier DID hand money
         // back by mistake, this opens the same prompt with a change due of zero —
         // whatever is entered books as "over-given (customer owes)".
-        if (tenders.isNotEmpty() && fullyPaid && overpay <= 0.005) {
+        //
+        // ★ CASH TENDERS ONLY. Change is notes out of a drawer; there is no such thing as
+        // handing back change on a card or EcoCash sale, so on those this offered a button
+        // that could only ever describe something that did not happen. The owner read it as
+        // clutter on every exact sale (device test §B, 16 Aug) and he is right — an action
+        // that cannot apply should not be on screen for the cashier to wonder about.
+        val paidAnyCash = tenders.any { it.method == "cash" }
+        if (paidAnyCash && fullyPaid && overpay <= 0.005) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                 TextButton(
                     onClick = { showChangePrompt = true },
@@ -7606,6 +7614,15 @@ private fun CustomerDetailDialog(
         }
     }
     if (showPayout) {
+        // ★ ASK HOW IT WAS PAID OUT. This used to assume notes across the counter, and the
+        // repository took the amount out of the till whatever the shop had actually done —
+        // so settling a customer's change by EcoCash left a real drawer reading short by
+        // money that had never been in it. Same picker, same reasoning and same fallback as
+        // the repayment dialog above; only `cash` moves the drawer now.
+        val biz = bizForPdf
+        val payoutMethods = remember(biz) {
+            (biz?.enabledPaymentMethods() ?: emptyList()).ifEmpty { listOf(PaymentMethod.CASH) }
+        }
         RecordPaymentDialog(
             maxAmount = changeOwed,
             currency = currency,
@@ -7613,18 +7630,15 @@ private fun CustomerDetailDialog(
             owedLabel = "We owe",
             actionLabel = "Pay out",
             allowOverpay = true,
+            methods = payoutMethods,
             overWarning = { over ->
                 "You're handing back ${money(over, currency)} more than we owe — the customer will owe it back."
             },
             onDismiss = { showPayout = false }
-        ) { amount, note, _ ->
-            // No tender picker here on purpose: change and refunds owed are handed back
-            // over the counter in notes, and [PosRepository.recordChangePayment] already
-            // takes the full amount out of the till. The method is ignored rather than
-            // asked for, because there is only one answer.
+        ) { amount, note, method ->
             // Paying out MORE than we owe is allowed: the repository settles what we owe
             // and books the excess as customer debt ("Over-paid change") — never dropped.
-            vm.recordChangePayment(customer.id, amount, note.ifBlank { null })
+            vm.recordChangePayment(customer.id, amount, note.ifBlank { null }, method)
             showPayout = false
         }
     }
@@ -10956,6 +10970,10 @@ private fun RefundDialog(
     var payoutText by remember(sale.id) { mutableStateOf("") }
     var methodOpen by remember { mutableStateOf(false) }
     var submitting by remember { mutableStateOf(false) }
+    // Money handed back NOW, which may be split across tenders exactly as a sale's payment
+    // can be — a customer who paid half in cash and half by EcoCash is entitled to have it
+    // returned the same way, and before this the dialog could only offer one method.
+    val payouts = remember(sale.id) { mutableStateListOf<Tender>() }
 
     LaunchedEffect(sale.id) {
         val loaded = vm.loadLines(sale.id)
@@ -10974,11 +10992,24 @@ private fun RefundDialog(
     val returnedSubtotal = ls?.sumOf { returnedLineValue(it, returnQty[it.id] ?: 0.0) } ?: 0.0
     val refundTotal =
         computeRefundTotal(returnedSubtotal, saleGoodsValue(ls.orEmpty()), sale.total).refundTotal
-    val payoutNow = (payoutText.toDoubleOrNull() ?: refundTotal).coerceIn(0.0, refundTotal)
-    val outstanding = (refundTotal - payoutNow).coerceAtLeast(0.0)
+
+    // ★ HOW MUCH OF THIS THE SHOP MAY ACTUALLY HAND OVER. Asked of the repository so the
+    // dialog quotes the same figure the till will honour — [PosRepository.createRefund]
+    // clamps to it regardless, and a screen promising a customer $100 on a sale that will
+    // only pay out $40 is a cashier making a promise at the counter that the app breaks.
+    // The unpaid part of the sale comes off the customer's account instead.
+    var settlement by remember(sale.id) { mutableStateOf<RefundSettlement?>(null) }
+    LaunchedEffect(refundTotal) {
+        settlement = if (refundTotal > 0.0) vm.refundSettlementFor(sale, refundTotal) else null
+    }
+    val payable = settlement?.payable ?: 0.0
+    val debtRelieved = settlement?.debtRelieved ?: 0.0
+    // Any tender already entered is trimmed if the returned quantities shrink underneath it.
+    val paidNow = payouts.sumOf { it.amount }.coerceAtMost(payable)
+    val outstanding = (payable - paidNow).coerceAtLeast(0.0)
     val canOwe = sale.customerId != null
     val payoutOk = canOwe || outstanding <= 0.005
-    val confirmEnabled = refundTotal > 0.0 && payoutOk && !submitting
+    val confirmEnabled = refundTotal > 0.0 && settlement != null && payoutOk && !submitting
 
     val t = LocalPosTokens.current
     PosContainedForm(
@@ -10998,8 +11029,7 @@ private fun RefundDialog(
                     restock = restock[line.id] ?: true
                 )
             }
-            val payout = if (payoutNow > 0.0) Tender(method = payoutMethod, amount = payoutNow) else null
-            vm.createRefund(sale, returns, payout, reason.ifBlank { null }) {
+            vm.createRefund(sale, returns, payouts.toList(), reason.ifBlank { null }) {
                 Toast.makeText(context, "Refund recorded", Toast.LENGTH_SHORT).show()
                 onDismiss()
             }
@@ -11054,36 +11084,109 @@ private fun RefundDialog(
                 Text("Refund total", fontWeight = FontWeight.Medium, color = t.inkPrimary)
                 Text(money(refundTotal, currency), fontWeight = FontWeight.Bold, color = t.inkPrimary)
             }
-            Box {
-                OutlinedButton(onClick = { methodOpen = true }) {
-                    Text("Refund via: ${refundMethodLabel(payoutMethod)}")
-                }
-                DropdownMenu(expanded = methodOpen, onDismissRequest = { methodOpen = false }) {
-                    REFUND_METHODS.forEach { m ->
-                        DropdownMenuItem(
-                            text = { Text(refundMethodLabel(m)) },
-                            onClick = { payoutMethod = m; methodOpen = false }
-                        )
-                    }
+            // The goods went back, so what was never paid for is not owed. Stated on its own
+            // line because it is the half of a credit refund that involves no money at all,
+            // and a cashier who cannot see it happen will assume it did not.
+            if (debtRelieved > 0.005) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text(
+                        "Cleared off their account",
+                        fontSize = 12.sp, color = t.inkSecondary
+                    )
+                    Text(money(debtRelieved, currency), fontSize = 12.sp, color = t.inkSecondary)
                 }
             }
-            PosField(
-                value = payoutText,
-                onValueChange = { payoutText = it.filter { ch -> ch.isDigit() || ch == '.' } },
-                label = "Paying back now",
-                placeholder = money(refundTotal, currency),
-                keyboardType = KeyboardType.Decimal,
-                modifier = Modifier.fillMaxWidth()
-            )
-            if (outstanding > 0.005) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("To hand back", fontWeight = FontWeight.Medium, color = t.inkPrimary)
+                Text(money(payable, currency), fontWeight = FontWeight.Bold, color = t.inkPrimary)
+            }
+
+            if (settlement == null) {
+                Text("Working out what was paid…", fontSize = 12.sp, color = t.inkTertiary)
+            } else if (payable <= 0.005) {
+                // Nothing arrived on this sale, so nothing can go back. The goods and the
+                // debt are the whole of it — the case that used to hand a customer the full
+                // sale value in cash for a sale they had never paid a cent of.
                 Text(
-                    if (canOwe)
-                        "Owed to ${sale.customerName ?: "customer"}: ${money(outstanding, currency)} — tracked in Change & Credit"
-                    else
-                        "Walk-in refund must be paid in full (${money(refundTotal, currency)}). Leave the amount blank to pay it all now.",
-                    fontSize = 12.sp,
-                    color = if (canOwe) t.inkTertiary else t.danger
+                    "Nothing to hand back — the customer had not paid for these goods, so the " +
+                        "refund clears what they owe instead.",
+                    fontSize = 12.sp, color = t.inkTertiary
                 )
+            } else {
+                // Tenders already entered, each removable — the same shape checkout uses.
+                payouts.forEachIndexed { idx, tn ->
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(refundMethodLabel(tn.method), fontSize = 13.sp, color = t.inkSecondary)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                money(tn.amount, currency),
+                                fontWeight = FontWeight.SemiBold, color = t.inkPrimary
+                            )
+                            IconButton(onClick = { payouts.removeAt(idx) }) {
+                                Icon(
+                                    Icons.Filled.Close, contentDescription = "Remove payout",
+                                    tint = t.inkTertiary
+                                )
+                            }
+                        }
+                    }
+                }
+                val leftToPay = (payable - payouts.sumOf { it.amount }).coerceAtLeast(0.0)
+                if (leftToPay > 0.005) {
+                    Box {
+                        OutlinedButton(onClick = { methodOpen = true }) {
+                            Text("Refund via: ${refundMethodLabel(payoutMethod)}")
+                        }
+                        DropdownMenu(expanded = methodOpen, onDismissRequest = { methodOpen = false }) {
+                            REFUND_METHODS.forEach { m ->
+                                DropdownMenuItem(
+                                    text = { Text(refundMethodLabel(m)) },
+                                    onClick = { payoutMethod = m; methodOpen = false }
+                                )
+                            }
+                        }
+                    }
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        PosField(
+                            value = payoutText,
+                            onValueChange = {
+                                payoutText = it.filter { ch -> ch.isDigit() || ch == '.' }
+                            },
+                            label = if (payouts.isEmpty()) "Paying back now" else "Add another payout",
+                            placeholder = money(leftToPay, currency),
+                            keyboardType = KeyboardType.Decimal,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        // Blank means "the rest of it", so the common case — hand it all
+                        // back one way — stays a single tap.
+                        TextButton(
+                            onClick = {
+                                val amt = (payoutText.toDoubleOrNull() ?: leftToPay)
+                                    .coerceIn(0.0, leftToPay)
+                                if (amt > 0.005) {
+                                    payouts.add(Tender(method = payoutMethod, amount = amt))
+                                    payoutText = ""
+                                }
+                            },
+                            colors = ButtonDefaults.textButtonColors(contentColor = t.brand.s600)
+                        ) { Text("Add") }
+                    }
+                }
+                if (outstanding > 0.005) {
+                    Text(
+                        if (canOwe)
+                            "Owed to ${sale.customerName ?: "customer"}: ${money(outstanding, currency)} — tracked in Change & Credit"
+                        else
+                            "A walk-in refund must be paid in full (${money(payable, currency)}) — there is no account to owe it against.",
+                        fontSize = 12.sp,
+                        color = if (canOwe) t.inkTertiary else t.danger
+                    )
+                }
             }
             PosField(
                 value = reason,
@@ -11210,8 +11313,15 @@ private fun RefundPayoutDialog(
             }
         }
     ) {
+        // States what may be HANDED BACK, not what the goods were worth. On a refund whose
+        // unpaid part was cancelled off the customer's account the two differ, and quoting
+        // the goods figure here would invite a cashier to pay out money that never arrived.
         Text(
-            "Refund on #${refund.saleReceiptNo ?: refund.saleId.takeLast(6).uppercase()} — total ${money(refund.refundTotal, currency)}",
+            "Refund on #${refund.saleReceiptNo ?: refund.saleId.takeLast(6).uppercase()} — " +
+                "${money(refund.payableTotal, currency)} to hand back" +
+                if (refund.payableTotal + 0.005 < refund.refundTotal)
+                    " (of ${money(refund.refundTotal, currency)} returned; the rest came off their account)"
+                else "",
             fontSize = 12.sp, color = t.inkTertiary
         )
         Box {

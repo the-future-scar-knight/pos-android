@@ -647,4 +647,90 @@ class CashBasisTest {
         assertEquals(whole.grossProfit, whole.costedRevenue - whole.cogs, CENT)
         days.forEach { assertEquals(it.grossProfit, it.costedRevenue - it.cogs, CENT) }
     }
+
+    // ── A refund that cancels a debt is not a collection ──────────────────
+
+    /**
+     * ★ THE ROW THAT COULD HAVE INVENTED REVENUE. [PosRepository.createRefund] cancels the
+     * unpaid part of a refunded sale by writing a `credit_paid` row — the only arithmetic
+     * both clients share for "this debt is gone". Read naively that is money arriving, and
+     * door 2 would recognise the whole cancelled balance as revenue ON THE REFUND'S DAY:
+     * the shop booking income for goods sitting back on its own shelf.
+     */
+    @Test
+    fun `a debt cancelled by a refund recognises nothing and consumes its lot`() {
+        val sales = listOf(sale("s", d1, total = 100.0, paid = 40.0, cost = 60.0))
+        val ledger = listOf(
+            owed("s", 60.0, d1),
+            // What the refund writes on day 2 to clear what was never paid.
+            paid(60.0, d2, note = "${CashBasis.DEBT_CANCELLED_NOTE} #1042"),
+        )
+        val refunds = listOf(refund("r", "s", 100.0, d2))
+
+        // Day 1 recognised the $40 that actually arrived; day 2 takes exactly that back.
+        assertEquals(40.0, CashBasis.compute(sales, ledger, refunds, d1, d2).collected, CENT)
+        val dayTwo = CashBasis.compute(sales, ledger, refunds, d2, d3)
+        assertEquals(0.0, dayTwo.collected, CENT)
+        assertEquals(40.0, dayTwo.refunded, CENT)
+        // Profit reverses only the 40% that was ever recognised — never the whole sale.
+        assertEquals(-16.0, dayTwo.grossProfit, CENT)
+
+        // And over all time the sale nets to nothing: money in, money back out.
+        assertEquals(0.0, netBySale(sales, ledger, refunds)["s"] ?: 0.0, CENT)
+    }
+
+    /**
+     * The lot really is consumed, not merely skipped. A customer who later pays money that
+     * cannot be matched to any live debt must not have it recognised against a sale whose
+     * goods are back on the shelf.
+     */
+    @Test
+    fun `money arriving after a cancelled debt is not recognised against the refunded sale`() {
+        val sales = listOf(sale("s", d1, total = 100.0, paid = 40.0, cost = 60.0))
+        val ledger = listOf(
+            owed("s", 60.0, d1),
+            paid(60.0, d2, note = "${CashBasis.DEBT_CANCELLED_NOTE} #1042"),
+            paid(60.0, d3),   // a stray payment with no lot left to settle
+        )
+        val refunds = listOf(refund("r", "s", 100.0, d2))
+        assertEquals(0.0, CashBasis.compute(sales, ledger, refunds, d3, d4).collected, CENT)
+        assertEquals(0.0, netBySale(sales, ledger, refunds)["s"] ?: 0.0, CENT)
+    }
+
+    // ── The figure a refund is allowed to hand back ───────────────────────
+
+    /**
+     * [CashBasis.rawCollectedBySale] is what caps a refund payout, so it has to agree with
+     * the recognition engine about what arrived — through BOTH doors, and unaffected by any
+     * refund. A single sale row is passed on purpose: that is how the repository calls it,
+     * and lots belonging to other sales must still be consumed so the FIFO lands correctly.
+     */
+    @Test
+    fun `raw collected counts both doors and ignores refunds`() {
+        val s = sale("s", d1, total = 100.0, paid = 40.0, cost = 60.0)
+        val ledger = listOf(
+            owed("other", 25.0, d1),          // an earlier debt of the same customer
+            owed("s", 60.0, d1),
+            paid(85.0, d3),                   // settles `other` in full, then $60 of `s`
+        )
+        // Only `s` is passed; `other`'s lot is consumed but contributes nothing.
+        assertEquals(100.0, CashBasis.rawCollectedBySale(listOf(s), ledger)["s"] ?: 0.0, CENT)
+    }
+
+    @Test
+    fun `raw collected on a fully unpaid credit sale is zero`() {
+        val s = sale("s", d1, total = 100.0, paid = 0.0, cost = 60.0)
+        val ledger = listOf(owed("s", 100.0, d1))
+        assertEquals(0.0, CashBasis.rawCollectedBySale(listOf(s), ledger)["s"] ?: 0.0, CENT)
+    }
+
+    @Test
+    fun `a write-off still does not count as money collected`() {
+        val s = sale("s", d1, total = 100.0, paid = 0.0, cost = 60.0)
+        val ledger = listOf(
+            owed("s", 100.0, d1),
+            paid(100.0, d2, note = CashBasis.WRITE_OFF_NOTE),
+        )
+        assertEquals(0.0, CashBasis.rawCollectedBySale(listOf(s), ledger)["s"] ?: 0.0, CENT)
+    }
 }

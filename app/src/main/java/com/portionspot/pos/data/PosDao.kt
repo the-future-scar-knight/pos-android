@@ -837,6 +837,14 @@ interface CreditDao {
     )
     fun observeForBusiness(businessId: String): Flow<List<CreditTxn>>
 
+    /** One customer's ledger, oldest first — the FIFO input [CashBasis.rawCollectedBySale]
+     *  needs to work out how much of a single sale has actually been collected. */
+    @Query(
+        "SELECT * FROM credit_transactions WHERE customerId = :customerId AND deleted = 0 " +
+            "ORDER BY createdAt ASC"
+    )
+    suspend fun forCustomerOnce(customerId: String): List<CreditTxn>
+
     /** Chronological one-shot of the whole ledger — FIFO debt-aging computation. */
     @Query(
         "SELECT * FROM credit_transactions WHERE businessId = :businessId AND deleted = 0 " +
