@@ -138,6 +138,13 @@ fun cashMovementTypeToWire(localType: String, location: String, amount: Double):
         "credit_payment" -> "pay_in"
         else -> when {
             location.equals(CashLocation.SAFE, ignoreCase = true) && amount > 0 -> "safe_in"
+            // ★ THE OTHER HALF OF THE SAFE, and the reason `safe_out` had to exist. Money
+            // leaving the safe used to go up as a bare `pay_out` — indistinguishable on the
+            // wire from money leaving the till — so it came back down against the TILL on
+            // every other device. A float top-up made on one phone left the second phone's
+            // till short and its safe over by the same amount, and only a physical count
+            // ever put it right. `safe_in` had a word and its mirror image did not.
+            location.equals(CashLocation.SAFE, ignoreCase = true) -> "safe_out"
             amount >= 0 -> "pay_in"
             else -> "pay_out"
         }
@@ -181,18 +188,29 @@ data class CashMovementFromWire(
  * drawer. A till→safe move made on THIS app never arrives as a `drop` — it goes up as the
  * transfer PAIR it is (`pay_out` + `safe_in`), so both halves travel and both balances move.
  *
- * ★ ONE LOSS THAT CANNOT BE MAPPED AWAY, stated rather than papered over. Money leaving
- * the SAFE goes up as a bare `pay_out`, indistinguishable on the wire from money leaving
- * the till, so it comes back down against the TILL. Cash-on-hand still agrees across
- * devices to the cent — the amount and the direction are exact — but a safe withdrawal
- * made on one phone reads as a till payout on another, so the till/safe SPLIT can drift
- * until the next day-close count trues it up. Closing that gap needs a column on the wire;
- * a cleverer guess here would just be a wrong number nobody could trace.
+ * ★ `safe_out` IS A WORD THE SHARED VOCABULARY DID NOT HAVE, and adding it is what closed
+ * the last hole in this mapping. Money leaving the SAFE used to go up as a bare `pay_out`,
+ * indistinguishable from money leaving the till, and came back down against the TILL: a
+ * float top-up made on one phone left the second phone's till short and its safe over by
+ * the same amount, for ever, because nothing but a physical count ever corrected it. Cash
+ * on hand agreed to the cent the whole time, which is precisely what made it hard to see.
+ *
+ * The alternative considered and rejected was to rebuild the transfer PAIR from a single
+ * `float_topup` — reconstructing the safe half on the way in. It fixes only the paired
+ * case, leaves a safe-FUNDED expense (which has no till half at all) still landing on the
+ * drawer, and needs a derived row id that the originating phone must then be careful not
+ * to double-count. One symmetrical word costs a line of SQL and fixes both.
+ *
+ * ★★ SEQUENCING. The CHECK constraint fails the WHOLE BATCH, not the offending row, so no
+ * client may emit `safe_out` until the constraint allows it. The `alter table … add
+ * constraint` lives in [com.portionspot.pos.sync.SupabaseSetupSql]; run it against a
+ * project BEFORE a build that speaks this word points at it, or every cash push stops.
  */
 fun cashMovementTypeFromWire(wireType: String, amount: Double): CashMovementFromWire {
     val magnitude = kotlin.math.abs(amount)
     return when (wireType.trim().lowercase()) {
         "safe_in" -> CashMovementFromWire("safe_in", CashLocation.SAFE, magnitude)
+        "safe_out" -> CashMovementFromWire("safe_out", CashLocation.SAFE, -magnitude)
         "float_topup" -> CashMovementFromWire("float_topup", CashLocation.TILL, magnitude)
         "pay_in" -> CashMovementFromWire("pay_in", CashLocation.TILL, magnitude)
         "drop" -> CashMovementFromWire("drop", CashLocation.TILL, -magnitude)

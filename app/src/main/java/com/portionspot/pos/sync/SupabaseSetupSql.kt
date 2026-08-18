@@ -327,10 +327,20 @@ create table if not exists public.cash_movements (
     client_updated_at timestamptz
 );
 
-do ${'$'}${'$'} begin
-    alter table public.cash_movements add constraint cash_movements_type_check
-        check (type = any (array['pay_in','pay_out','drop','petty','float_topup','safe_in','bank_deposit']));
-exception when duplicate_object then null; end ${'$'}${'$'};
+-- `safe_out` is the newest word here and it was added to close a real hole: the
+-- vocabulary could say money went INTO the safe and had no way to say it came out,
+-- so a float top-up or a safe-funded expense went up as a bare `pay_out` and landed
+-- against the TILL on every other device. Cash on hand still agreed to the cent,
+-- which is what made it hard to spot — only the till/safe split drifted.
+--
+-- DROP THEN ADD, rather than `exception when duplicate_object`: an existing database
+-- already carries this constraint under this name with the OLD seven-word list, so
+-- the add would be swallowed as a duplicate and the constraint would keep rejecting
+-- `safe_out` for ever. A client that emits a word the CHECK refuses does not lose one
+-- row — the whole batch fails, and cash stops syncing entirely.
+alter table public.cash_movements drop constraint if exists cash_movements_type_check;
+alter table public.cash_movements add constraint cash_movements_type_check
+    check (type = any (array['pay_in','pay_out','drop','petty','float_topup','safe_in','safe_out','bank_deposit']));
 
 -- ---------------------------------------------------------------------------
 -- 5) Sales. A sale is THREE rows: header + lines + tenders.

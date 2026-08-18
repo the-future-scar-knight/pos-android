@@ -70,19 +70,39 @@ Sign both phones into the same project. Sync after each step, on both.
 |---|---|---|
 | C1 | Phone A: record an owner **drawing** from the till. Sync both | Phone B's till goes **down by it**. This is your test H, which did nothing across devices before |
 | C2 | Phone A: record a **cash expense**. Sync both | Phone B's till goes down by it, **once**. Not twice — the expense record and its cash movement are separate rows and only one of them moves the drawer |
-| C3 | Phone A: **top up the float** from the safe. Sync both | **Known gap — read the note below.** Total cash on hand agrees on both phones. The till/safe **split** will not |
+| C3 | Phone A: **top up the float** from the safe. Sync both | Phone B's till goes **up** and its safe goes **down**, by the same amount. **Run the SQL below first** |
 | C4 | Phone A (cashier): **close the day** — count the till, move the excess to the safe. Sync phone B | Phone B's till and safe both match phone A's, to the cent |
 | C5 | Phone B: open the Cash screen | The button reads **"Day closed"**, not "Close the day" |
 | C6 | Phone B: tap it | It shows the record — counted, expected, short/over, moved to safe — and says **who counted it**. There is no count field and no confirm button |
 | C7 | Phone B: ring up a sale, then sync both | Both phones agree on expected cash again. This is the exact sequence that gave you two different numbers |
 | C8 | Compare the **Z-report expected drawer** with the figure the close dialog shows before you count | The two agree. They are calculated independently on purpose |
 
-**C3 is a known limitation, not a regression.** The shared database can say "money went into the
-safe" but has no word for "money came out of it", so a safe withdrawal arrives on the other phone
-as a till payout. The amount and direction are exact and total cash on hand agrees to the cent —
-only the split between till and safe drifts, and the next day close trues it up. Fixing it properly
-needs a new column on the shared schema, which is a web-side change. Tell me if the split drifting
-between closes is a problem for you in practice and I will push for it.
+### ★ C3 needs one SQL statement run FIRST, on every project both clients point at
+
+The shared database could say "money went **into** the safe" and had no word for "money came
+**out** of it". So a float top-up or a safe-funded expense went up as a plain payout and landed
+against the **till** on every other device — that phone's till too low and its safe too high by the
+same amount, with cash on hand still adding up to the cent, which is exactly why it was invisible.
+
+The fix is the missing word. Run this on the throwaway project (and on production before this build
+ever points at it):
+
+```sql
+alter table public.cash_movements drop constraint if exists cash_movements_type_check;
+alter table public.cash_movements add constraint cash_movements_type_check
+    check (type = any (array['pay_in','pay_out','drop','petty','float_topup','safe_in','safe_out','bank_deposit']));
+```
+
+**Drop then add, not just add** — the constraint already exists under that name with the old
+seven-word list, so a bare `add` is swallowed as a duplicate and `safe_out` keeps being rejected.
+
+**Order matters and the failure is loud.** A CHECK violation fails the **entire push batch**, not
+the offending row. Install this build against a project that has not had the statement run and
+**cash stops syncing altogether**. Schema first, then the app.
+
+**The web needs telling too.** It will start seeing a movement type it has never met. Android
+treats an unrecognised type as money moving at the till in the direction it was written, rather
+than dropping it; the web should do something equally forgiving, or better, learn the word.
 
 ## D · Phone and browser together — still untested
 

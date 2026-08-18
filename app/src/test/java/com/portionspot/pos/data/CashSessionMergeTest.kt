@@ -123,7 +123,7 @@ class CashSessionMergeTest {
         // A CHECK violation fails the WHOLE batch, not the offending row, so "pass it
         // through and hope" would take every other movement in the push down with it.
         val legal = setOf(
-            "pay_in", "pay_out", "drop", "petty", "float_topup", "safe_in", "bank_deposit"
+            "pay_in", "pay_out", "drop", "petty", "float_topup", "safe_in", "safe_out", "bank_deposit"
         )
         val cases = listOf(
             Triple("something_new", CashLocation.TILL, 10.0),
@@ -206,7 +206,7 @@ class CashSessionMergeTest {
         // word it went up under the first time — otherwise two devices sharing one
         // drawer keep rewriting each other's history with slightly different words.
         val legal = listOf(
-            "pay_in", "pay_out", "drop", "petty", "float_topup", "safe_in", "bank_deposit"
+            "pay_in", "pay_out", "drop", "petty", "float_topup", "safe_in", "safe_out", "bank_deposit"
         )
         for (wire in legal) {
             val local = cashMovementTypeFromWire(wire, 75.0)
@@ -237,5 +237,57 @@ class CashSessionMergeTest {
     fun theInverseIsAlsoForgivingAboutCaseAndSpacing() {
         assertEquals(CashLocation.SAFE, cashMovementTypeFromWire("  SAFE_IN ", 10.0).location)
         assertEquals(-10.0, cashMovementTypeFromWire("Pay_Out", 10.0).amount, 1e-9)
+    }
+
+    @Test
+    fun moneyOutOfTheSafeLeavesTheSafeAndNotTheDrawer() {
+        // ★ THE C3 BUG. Money leaving the safe had no word on the wire, so it went up as a
+        // bare `pay_out` and came back down against the TILL. A float top-up made on one
+        // phone left the other phone's till short and its safe over by the same amount,
+        // and because cash-on-hand still added up to the cent, nothing ever flagged it.
+        val row = cashMovementTypeFromWire("safe_out", 250.0)
+        assertEquals(CashLocation.SAFE, row.location)
+        assertEquals(-250.0, row.amount, 1e-9)
+    }
+
+    @Test
+    fun aSafeToTillTransferMovesBOTHBalancesOnTheOtherPhone() {
+        // A float top-up is a PAIR of local rows, and the whole pair has to survive the
+        // trip or the two phones stop agreeing about where the money is. Walk it out and
+        // back exactly as the sync does.
+        val safeSide = cashMovementTypeToWire("transfer_out", CashLocation.SAFE, -60.0)
+        val tillSide = cashMovementTypeToWire("transfer_in", CashLocation.TILL, 60.0)
+        assertEquals("safe_out", safeSide)
+        assertEquals("pay_in", tillSide)
+
+        // The push sends magnitudes; the receiving phone rebuilds the signs.
+        val safeBack = cashMovementTypeFromWire(safeSide, 60.0)
+        val tillBack = cashMovementTypeFromWire(tillSide, 60.0)
+        assertEquals(CashLocation.SAFE, safeBack.location)
+        assertEquals(-60.0, safeBack.amount, 1e-9)
+        assertEquals(CashLocation.TILL, tillBack.location)
+        assertEquals(60.0, tillBack.amount, 1e-9)
+
+        // The shop is no richer or poorer, and the money is in the other pocket. Before
+        // `safe_out` the safe side landed on the till too, so both halves cancelled: the
+        // receiving phone's till never moved and its safe never came down.
+        assertEquals(0.0, safeBack.amount + tillBack.amount, 1e-9)
+    }
+
+    @Test
+    fun aTillToSafeTransferStillTravelsAsThePairItAlreadyWas() {
+        // The direction that already worked — pinned so `safe_out` cannot regress it.
+        assertEquals("pay_out", cashMovementTypeToWire("transfer_out", CashLocation.TILL, -60.0))
+        assertEquals("safe_in", cashMovementTypeToWire("transfer_in", CashLocation.SAFE, 60.0))
+    }
+
+    @Test
+    fun aSafeFundedExpenseComesOutOfTheSafe_notTheDrawer() {
+        // The case the rejected `float_topup` reconstruction would NOT have fixed: money
+        // paid straight out of the safe to a payee has no till half to pair with.
+        assertEquals("safe_out", cashMovementTypeToWire("expense", CashLocation.SAFE, -75.0))
+        val back = cashMovementTypeFromWire("safe_out", 75.0)
+        assertEquals(CashLocation.SAFE, back.location)
+        assertEquals(-75.0, back.amount, 1e-9)
     }
 }
