@@ -37,6 +37,7 @@ import com.portionspot.pos.data.CashSessionDao
 import com.portionspot.pos.data.StockMovementDao
 import com.portionspot.pos.data.stockOnHandFromDelta
 import com.portionspot.pos.data.cashMovementCountedElsewhere
+import com.portionspot.pos.data.countToRescue
 import com.portionspot.pos.data.planSessionMerge
 import com.portionspot.pos.data.planDayRollover
 import com.portionspot.pos.data.ShopPolicy
@@ -1148,10 +1149,31 @@ class PosSyncEngine(
         // [PosRepository.currentDaySessionId]). A sync pass on an idle phone that minted the
         // day's session would have every phone in the shop racing to create the same row.
         val plan = planSessionMerge(cashSessionDao.openSessions(bid)) ?: return
+        val mergedAt = System.currentTimeMillis()
         cashSessionDao.applyMerge(
             winnerId = plan.winner.id,
             losers = plan.losers.map { it.id to plan.closingNote(it) },
-            at = System.currentTimeMillis(),
+            at = mergedAt,
+        )
+        // ★ CARRY THE COUNT ACROSS, or the merge buries it. applyMerge moves the losers'
+        // sales and refunds and closes them; it says nothing about a drawer somebody
+        // physically counted. When the shift that lost the merge was the counted one, the
+        // survivor read as never counted, every other device went on offering to close the
+        // day, and counting it again moves the takings to the safe a second time — out of a
+        // drawer that no longer holds them. See [countToRescue].
+        val rescued = countToRescue(plan.winner, plan.losers) ?: return
+        val count = rescued.countedCash ?: return
+        cashSessionDao.closeWithCount(
+            id = plan.winner.id,
+            closedAt = rescued.closedAt ?: mergedAt,
+            closedBy = rescued.closedBy,
+            closedByName = rescued.closedByName,
+            countedCash = count,
+            expectedCash = rescued.expectedCash ?: 0.0,
+            movedToSafe = rescued.movedToSafe,
+            floatTarget = rescued.floatTarget,
+            note = rescued.note,
+            at = mergedAt,
         )
     }
 

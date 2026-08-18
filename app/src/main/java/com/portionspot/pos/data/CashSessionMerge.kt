@@ -110,6 +110,33 @@ fun cashMovementCountedElsewhere(refType: String?): Boolean =
     refType == "sale" || refType == "refund"
 
 /**
+ * The count a merge would otherwise BURY, or null when there is nothing to rescue.
+ *
+ * ══ THE BUG THIS EXISTS FOR ══
+ * A merge repoints the losers' sales onto the survivor and closes them with a note. It
+ * carries the ROWS and it did not carry the COUNT. So when two tills each opened a shift
+ * for the same day while offline from each other, and the one that lost the merge was the
+ * one somebody had physically counted the drawer against, the count went with it: the
+ * surviving shift read as never counted, every other device offered to count the day
+ * again, and the owner counting it a second time moved the takings to the safe twice.
+ *
+ * ★ `countedCash` IS THE SETTLED FLAG, not `status`. The rollover closes a day at midnight
+ * with nobody counting anything, so a closed shift and a counted one are different states —
+ * the same distinction [planDayClose] turns on.
+ *
+ * Ties are broken by id, not by "first found", for the same reason [pickSurvivingSession]
+ * is: two devices resolving the same merge independently must rescue the SAME count, or
+ * they write different figures onto one shift and each thinks the other is wrong.
+ *
+ * Returns null when the survivor already carries a count — its own count wins, because it
+ * is the one the shared row has been publishing.
+ */
+fun <T : DaySessionRow> countToRescue(winner: T, losers: List<T>): T? {
+    if (winner.countedCash != null) return null
+    return losers.filter { !it.deleted && it.countedCash != null }.minByOrNull { it.id }
+}
+
+/**
  * Which of the shared schema's movement types a cash movement is, given how this app
  * models the same money. The cloud CHECK-constrains the vocabulary:
  *

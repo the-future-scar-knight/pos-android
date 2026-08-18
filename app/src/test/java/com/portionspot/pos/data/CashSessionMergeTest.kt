@@ -366,4 +366,65 @@ class CashSessionMergeTest {
             )
         }
     }
+
+    // -- The count a merge used to bury ---------------------------------------
+
+    private data class D(
+        override val id: String,
+        override val openedAt: Long,
+        override val status: String = SessionStatus.OPEN,
+        override val deleted: Boolean = false,
+        override val countedCash: Double? = null,
+    ) : DaySessionRow
+
+    @Test
+    fun aMergeCarriesTheCountOffTheShiftThatLost() {
+        // Two tills each opened a shift for the same day while offline. The one somebody
+        // physically counted the drawer against is the one that loses on openedAt. Before
+        // this the count went with it: the surviving shift read as never counted, every
+        // other device offered to close the day again, and counting it twice moves the
+        // takings to the safe twice -- out of a drawer that no longer holds them.
+        val winner = D("aaa", 1_000L)
+        val loser = D("zzz", 2_000L, countedCash = 480.0)
+        assertEquals(loser, countToRescue(winner, listOf(loser)))
+    }
+
+    @Test
+    fun theSurvivorsOwnCountWins() {
+        // It is the figure the shared row has been publishing, so it is the one every
+        // other device has already seen.
+        val winner = D("aaa", 1_000L, countedCash = 500.0)
+        val loser = D("zzz", 2_000L, countedCash = 480.0)
+        assertNull(countToRescue(winner, listOf(loser)))
+    }
+
+    @Test
+    fun nothingToRescueWhenNobodyCounted() {
+        assertNull(countToRescue(D("aaa", 1_000L), listOf(D("zzz", 2_000L))))
+    }
+
+    @Test
+    fun aTombstonedLosersCountIsNotResurrected() {
+        val loser = D("zzz", 2_000L, deleted = true, countedCash = 480.0)
+        assertNull(countToRescue(D("aaa", 1_000L), listOf(loser)))
+    }
+
+    @Test
+    fun twoDevicesRescueTheSameCount_whateverOrderTheySeeTheRowsIn() {
+        // The same reason pickSurvivingSession breaks ties by id: two devices resolving one
+        // merge independently must write the SAME figure onto the shift, or each thinks the
+        // other is wrong and the day never settles.
+        val winner = D("aaa", 1_000L)
+        val losers = listOf(
+            D("mmm", 2_000L, countedCash = 300.0),
+            D("bbb", 3_000L, countedCash = 480.0),
+            D("zzz", 4_000L, countedCash = 900.0),
+        )
+        val expected = countToRescue(winner, losers)
+        assertEquals("bbb", expected!!.id)
+        val r = Random(7)
+        repeat(100) {
+            assertEquals(expected, countToRescue(winner, losers.shuffled(r)))
+        }
+    }
 }
