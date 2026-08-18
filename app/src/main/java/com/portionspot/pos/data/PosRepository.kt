@@ -643,8 +643,59 @@ class PosRepository(private val db: PosDatabase) {
         settingDao.get(KEY_VARIANCE_NOTE_THRESHOLD)?.toDoubleOrNull()
             ?: DEFAULT_VARIANCE_NOTE_THRESHOLD
 
+    /** Set it here and it becomes the SHOP's threshold, not this phone's — see
+     *  [ShopPolicy]. Routed through [putShopPolicy] so the change is stamped and travels;
+     *  writing the key directly would leave the other tills on the old number for ever. */
     suspend fun setVarianceNoteThreshold(amount: Double) =
-        putSetting(KEY_VARIANCE_NOTE_THRESHOLD, amount.coerceAtLeast(0.0).toString())
+        putShopPolicy(
+            shopPolicy().copy(varianceNoteThreshold = amount.coerceAtLeast(0.0)),
+            localEdit = true,
+        )
+
+    // ── Shop policy: the money rules that belong to the business ──────────────
+    // Stored in the same local key/value settings as everything else, because that is
+    // where the till reads them from and nothing about syncing them changes that. What
+    // changes is that they are now a MIRROR of `businesses.max_item_discount` /
+    // `.discount_threshold` / `.variance_note_threshold` rather than the only copy.
+
+    /** The three shared rules as this device currently enforces them. */
+    suspend fun shopPolicy(): ShopPolicy = ShopPolicy(
+        maxItemDiscount = settingDao.get(KEY_MAX_ITEM_DISCOUNT)?.toDoubleOrNull()
+            ?: DEFAULT_MAX_ITEM_DISCOUNT,
+        discountThresholdPct = settingDao.get(KEY_DISCOUNT_THRESHOLD)?.toDoubleOrNull()
+            ?: DEFAULT_DISCOUNT_THRESHOLD_PCT,
+        varianceNoteThreshold = settingDao.get(KEY_VARIANCE_NOTE_THRESHOLD)?.toDoubleOrNull()
+            ?: DEFAULT_VARIANCE_NOTE_THRESHOLD,
+    )
+
+    /**
+     * When a PERSON last changed one of the three on THIS device. 0 for never.
+     *
+     * Not "when the settings were last written" — an adopted value from the cloud must not
+     * bump it, or the device would immediately push back what it has just been told and
+     * the two clients would trade the same policy for ever, each pass looking like a real
+     * change to the other.
+     */
+    suspend fun shopPolicyChangedAt(): Long =
+        settingDao.get(KEY_SHOP_POLICY_CHANGED_AT)?.toLongOrNull() ?: 0L
+
+    /**
+     * Persist the three rules.
+     *
+     * [localEdit] is the whole distinction: true when a person moved the figure on this
+     * phone (stamp the clock, so the next sync sends it up), false when the sync engine is
+     * writing down what the shared row already says (leave the clock alone). The clock is
+     * stamped only if a value actually MOVED, so re-saving the settings screen without
+     * touching a discount does not hand this device a win over an edit the owner made in
+     * the browser five minutes ago.
+     */
+    suspend fun putShopPolicy(next: ShopPolicy, localEdit: Boolean) {
+        val changed = next != shopPolicy()
+        putSetting(KEY_MAX_ITEM_DISCOUNT, next.maxItemDiscount.toString())
+        putSetting(KEY_DISCOUNT_THRESHOLD, next.discountThresholdPct.toString())
+        putSetting(KEY_VARIANCE_NOTE_THRESHOLD, next.varianceNoteThreshold.toString())
+        if (localEdit && changed) putSetting(KEY_SHOP_POLICY_CHANGED_AT, now().toString())
+    }
 
     /**
      * Move cash between the shop's own two locations. Written as a matching PAIR of rows
@@ -822,8 +873,28 @@ class PosRepository(private val db: PosDatabase) {
             // stays local-only and detailed; `cash_sessions` is the summary the shop and
             // the web POS share, and these four columns are the half of it a close fills in.
             // `variance` is never written: it is GENERATED on the cloud and derived here.
+            // ★ A DAY WITH NO SHIFT STILL HAS TO BE COUNTABLE EXACTLY ONCE. [planDayClose]
+            // returns null when the day has no session, and the close then wrote its
+            // `day_closes` row, moved the cash to the safe, and told no other device
+            // anything at all — because `day_closes` is local-only and the shared summary
+            // rides on the shift row. The second phone saw an uncounted day and offered to
+            // count it again, which is the exact failure the one-count-per-day rule exists
+            // to prevent, and it is silent on both devices.
+            //
+            // So the day's shift is MINTED here rather than skipped. Born CLOSED and dated
+            // to the day it belongs to, it cannot trip the one-open-session-per-business
+            // index, and it carries the count up on the next push like any other.
+            val sessionForClose = daySession ?: CashSession(
+                businessId = businessId,
+                status = SessionStatus.CLOSED,
+                openedAt = dayStart,
+                openedBy = cashierId,
+                openedByName = cashierName,
+                note = DAY_BACKFILL_NOTE,
+                updatedAt = stamp,
+            ).also { cashSessionDao.upsert(it) }
             planDayClose(
-                session = daySession,
+                session = sessionForClose,
                 closedAt = stamp,
                 countedCash = counted,
                 expectedCash = expected,
@@ -4429,12 +4500,34 @@ class PosRepository(private val db: PosDatabase) {
                     )
                 )
             }
-            val outstanding = r.refundTotal - refundDao.paidSoFar(refundId)
-            if (r.customerId != null && outstanding > CENT) {
+            // ★ BOTH LEDGERS THE REFUND TOUCHED, measured against the right figures — see
+            // [planRefundVoid]. This used to credit the GOODS value against a liability
+            // that was only ever the PAYABLE one, and never restored the debt the refund
+            // had cancelled.
+            val undo = planRefundVoid(
+                refundTotal = r.refundTotal,
+                payableTotal = r.payableTotal,
+                paidOut = refundDao.paidSoFar(refundId),
+            )
+            if (r.customerId != null && undo.refundPaid > CENT) {
                 creditDao.insert(
                     CreditTxn(
                         businessId = r.businessId, customerId = r.customerId, saleId = r.saleId,
-                        type = "refund_paid", amount = outstanding, note = "Void refund",
+                        type = "refund_paid", amount = undo.refundPaid, note = "Void refund",
+                        createdBy = cashierId, createdByName = cashierName,
+                        createdAt = stamp, updatedAt = stamp
+                    )
+                )
+            }
+            // The goods are back with the customer, so they owe for them again. A NEW lot,
+            // never a deletion of the cancellation: that really happened, and a delete on
+            // one device races a pull on the other.
+            if (r.customerId != null && undo.debtRestored > CENT) {
+                creditDao.insert(
+                    CreditTxn(
+                        businessId = r.businessId, customerId = r.customerId, saleId = r.saleId,
+                        type = "credit_owed", amount = undo.debtRestored,
+                        note = "${CashBasis.DEBT_RESTORED_NOTE} #${r.saleReceiptNo ?: ""}".trim(),
                         createdBy = cashierId, createdByName = cashierName,
                         createdAt = stamp, updatedAt = stamp
                     )
@@ -4532,6 +4625,29 @@ class PosRepository(private val db: PosDatabase) {
         const val KEY_VARIANCE_NOTE_THRESHOLD = "cash_variance_note_threshold"
         /** Default: anything over a dollar has to be explained. */
         const val DEFAULT_VARIANCE_NOTE_THRESHOLD = 1.0
+
+        /**
+         * The other two thirds of the shop's policy ([ShopPolicy]). These keys were
+         * private to the view model until the rules started syncing; they live here now
+         * because the settings screen, the sync engine and the cash-up all have to read
+         * the SAME key, and three copies of a string literal is how one of them quietly
+         * ends up reading a setting nobody writes.
+         */
+        const val KEY_MAX_ITEM_DISCOUNT = "max_item_discount"
+        const val KEY_DISCOUNT_THRESHOLD = "discount_threshold_pct"
+
+        /** No per-line ceiling until somebody sets one. */
+        const val DEFAULT_MAX_ITEM_DISCOUNT = 0.0
+        /** Matches `businesses.discount_threshold default 5` on the shared schema, so a
+         *  shop that has never touched either side gets the same answer from both. */
+        const val DEFAULT_DISCOUNT_THRESHOLD_PCT = 5.0
+
+        /**
+         * When a PERSON last changed the policy on this device (epoch ms, 0 = never).
+         * Compared against `businesses.updated_at` to settle which side is newer — see
+         * [planShopPolicySync]. A value adopted FROM the cloud must never stamp it.
+         */
+        const val KEY_SHOP_POLICY_CHANGED_AT = "shop_policy_changed_at"
 
         /** Permanent per-device receipt prefix (see [deviceCode]). Write-once. */
         const val KEY_DEVICE_CODE = "device_receipt_code"

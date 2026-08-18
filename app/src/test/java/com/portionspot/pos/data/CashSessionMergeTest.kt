@@ -187,7 +187,12 @@ class CashSessionMergeTest {
         // A drop and a bank deposit take cash OUT of the drawer; a float top-up and a
         // pay-in put it in. Reversing any one of these is a phone that shows the till
         // fuller than it is, which is a shortage nobody discovers until the count.
-        for (out in listOf("drop", "petty", "bank_deposit", "pay_out")) {
+        // `bank_deposit` is deliberately NOT in this list any more. It used to be, and that
+        // assertion was pinning the bug: the web banks money OUT OF THE SAFE, so reading it
+        // against the till made a browser deposit show up as the phone's drawer being short
+        // by the whole amount. Its real behaviour is pinned in
+        // aWebBankDepositComesOutOfTheSafe_andLeavesTheTillAlone.
+        for (out in listOf("drop", "petty", "pay_out")) {
             val row = cashMovementTypeFromWire(out, 40.0)
             assertEquals("$out must leave the till", CashLocation.TILL, row.location)
             assertEquals("$out must be money going out", -40.0, row.amount, 1e-9)
@@ -289,5 +294,76 @@ class CashSessionMergeTest {
         val back = cashMovementTypeFromWire("safe_out", 75.0)
         assertEquals(CashLocation.SAFE, back.location)
         assertEquals(-75.0, back.amount, 1e-9)
+    }
+
+    // -- The web's own words, which move money between TWO pockets ------------
+    //
+    // The web keeps a full safe and writes each of these as ONE row meaning both halves.
+    // Android reads one row per location, so importing only the half the type names makes
+    // the other half vanish -- and unlike the safe_out bug, that breaks TOTAL cash on hand
+    // and not merely the split. Android never emits these words itself, which is what
+    // makes adopting the web's meaning safe.
+
+    @Test
+    fun aWebBankDepositComesOutOfTheSafe_andLeavesTheTillAlone() {
+        // The sharpest of the three: this used to debit the phone's TILL, so banking money
+        // in the browser made the phone's expected drawer read short by the whole deposit
+        // while the web's till was untouched.
+        val row = cashMovementTypeFromWire("bank_deposit", 400.0)
+        assertEquals(CashLocation.SAFE, row.location)
+        assertEquals(-400.0, row.amount, 1e-9)
+        assertNull("a bank deposit leaves the business; there is no second pocket", row.counterpart)
+    }
+
+    @Test
+    fun aWebDropMovesTheTillIntoTheSafe_bothHalves() {
+        val row = cashMovementTypeFromWire("drop", 250.0)
+        assertEquals(CashLocation.TILL, row.location)
+        assertEquals(-250.0, row.amount, 1e-9)
+        val other = row.counterpart!!
+        assertEquals(CashLocation.SAFE, other.location)
+        assertEquals(250.0, other.amount, 1e-9)
+        // A transfer moves money; it does not create or destroy any.
+        assertEquals(0.0, row.amount + other.amount, 1e-9)
+    }
+
+    @Test
+    fun aWebFloatTopUpMovesTheSafeIntoTheTill_bothHalves() {
+        val row = cashMovementTypeFromWire("float_topup", 60.0)
+        assertEquals(CashLocation.TILL, row.location)
+        assertEquals(60.0, row.amount, 1e-9)
+        val other = row.counterpart!!
+        assertEquals(CashLocation.SAFE, other.location)
+        assertEquals(-60.0, other.amount, 1e-9)
+        assertEquals(0.0, row.amount + other.amount, 1e-9)
+    }
+
+    @Test
+    fun theOneWordMovementsHaveNoCounterpart() {
+        // Only the two genuine transfers produce a second row. If any of these grew one,
+        // a pull would start inventing money that never moved.
+        for (w in listOf("pay_in", "pay_out", "petty", "safe_in", "safe_out", "bank_deposit")) {
+            assertNull("$w must not produce a second row", cashMovementTypeFromWire(w, 10.0).counterpart)
+        }
+    }
+
+    @Test
+    fun androidNeverEmitsTheTwoPocketWords_soAdoptingTheWebsMeaningIsSafe() {
+        // The premise the whole change rests on, pinned. Android's own transfers travel as
+        // a PAIR of one-pocket rows, so it can never receive back a two-pocket word of its
+        // own making and double-count it.
+        assertEquals("pay_out", cashMovementTypeToWire("transfer_out", CashLocation.TILL, -60.0))
+        assertEquals("safe_in", cashMovementTypeToWire("transfer_in", CashLocation.SAFE, 60.0))
+        assertEquals("safe_out", cashMovementTypeToWire("transfer_out", CashLocation.SAFE, -60.0))
+        assertEquals("pay_in", cashMovementTypeToWire("transfer_in", CashLocation.TILL, 60.0))
+        // And nothing this app writes maps onto them.
+        for (local in listOf("drawing", "expense", "variance", "adjust", "loan", "purchase",
+                             "safe_withdrawal", "credit_payment", "change_payout", "refund")) {
+            val wire = cashMovementTypeToWire(local, CashLocation.TILL, -10.0)
+            assertTrue(
+                "$local must not travel as a two-pocket word",
+                wire !in listOf("drop", "float_topup")
+            )
+        }
     }
 }

@@ -126,6 +126,20 @@ object CashBasis {
      */
     const val DEBT_CANCELLED_NOTE = "Debt cancelled by refund"
 
+    /**
+     * The note [PosRepository.voidRefund] stamps on the `credit_owed` row that puts a
+     * cancelled debt BACK when a refund is voided — the goods returned to the customer,
+     * so they owe for them again.
+     *
+     * ★ DELIBERATELY NOT WIRED INTO [isCollection], and the reason is worth stating: that
+     * test is applied only inside the `credit_paid` branch, and this is a `credit_owed`,
+     * which opens a lot rather than consuming one. A prefix that DID catch it would be
+     * quietly destructive — the lot would never open, and the sale could never be
+     * recognised again however much the customer paid. It is a separate string from
+     * [DEBT_CANCELLED_NOTE] rather than a reuse for exactly that reason.
+     */
+    const val DEBT_RESTORED_NOTE = "Debt restored by voided refund"
+
     /** Does this `credit_paid` row represent money that actually arrived? */
     private fun isCollection(note: String?): Boolean {
         val n = note?.trim() ?: return true

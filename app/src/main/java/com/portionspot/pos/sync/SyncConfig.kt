@@ -215,7 +215,15 @@ class SyncConfig(private val dao: SettingDao) {
          *                      own detailed record — there is deliberately no `day_closes`
          *                      cloud table to invent. See `PosRepository.closeDay`.
          *  - `outside_funds`   owner money vs loan. No cloud column expresses the split.
-         *  - `settings`        device settings (printer, theme). Deliberately never synced.
+         *  - `settings`        device settings (printer, theme, receipt look). The TABLE is
+         *                      never synced and must not be — it is per-handset by
+         *                      definition. Three of the keys inside it are not: the
+         *                      per-line discount cap, its PIN-gate percentage and the
+         *                      cash-variance note threshold are shop RULES, and they
+         *                      travel as three columns on the shared `businesses` row
+         *                      rather than as settings rows. See
+         *                      [com.portionspot.pos.data.ShopPolicy] for which three, and
+         *                      for why the rest of that row is deliberately left alone.
          */
         val LOCAL_ONLY_TABLES = listOf(
             "notifications", "staff_requests", "day_closes", "outside_funds", "settings"

@@ -3109,9 +3109,17 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
 
     var search by remember { mutableStateOf("") }
     var selectedCat by remember { mutableStateOf("All") }
-    // Grid (default) vs dense LIST browsing. Persisted for the session so the cashier's
-    // preference survives config changes / screen switches (rememberSaveable, no data layer).
-    var listView by rememberSaveable { mutableStateOf(false) }
+    // Grid vs dense LIST browsing, read from the stored preference and written back the
+    // moment it is toggled.
+    //
+    // ★ rememberSaveable WAS NOT ENOUGH, which is the whole reason this reaches the data
+    // layer. It survives a rotation, but only while the screen stays on the back stack —
+    // leave the POS screen and come back and the composable is built fresh, so a cashier
+    // who chose list view found themselves back on grid every single time they went to
+    // check stock and returned. Persisted per DEVICE, never shared: this is how one person
+    // likes to look at the shelf, not shop policy.
+    val prefsForView by vm.shopPrefs.collectAsState()
+    val listView = prefsForView.posListView
     var showCart by remember { mutableStateOf(false) }
     var showPayment by remember { mutableStateOf(false) }
     var quoteMode by remember { mutableStateOf(false) }
@@ -3150,7 +3158,10 @@ private fun SellScreen(vm: PosViewModel, business: Business, printer: PrinterUi)
                     SearchField(value = search, onValue = { search = it }, onClear = { search = "" })
                 }
                 Spacer(Modifier.width(8.dp))
-                ViewToggle(listView = listView, onToggle = { listView = it })
+                ViewToggle(
+                    listView = listView,
+                    onToggle = { vm.savePrefs(prefsForView.copy(posListView = it)) }
+                )
                 Spacer(Modifier.width(8.dp))
                 FilledTonalIconButton(onClick = { scanning = true }) {
                     Icon(Icons.Filled.QrCodeScanner, contentDescription = "Scan to cart")
@@ -8125,16 +8136,21 @@ private fun ExpensesScreen(vm: PosViewModel, currency: String) {
 @Composable
 private fun ExpenseStatusBadge(status: String) {
     val t = LocalPosTokens.current
+    // ★ THE WORDS ARE THE OWNER'S, NOT THE LEDGER'S. An approved expense used to read
+    // "Posted" — accounting language for the same event the rest of the app, and the owner,
+    // call approving. He reported not being able to tell a pending expense from an approved
+    // one; the badge was there, it was simply answering a question nobody had asked. The
+    // stored status vocabulary is unchanged: this is the label only.
     val (label, color) = when (status) {
-        "approved" -> "Posted" to t.success
+        "approved" -> "Approved" to t.success
         "rejected" -> "Rejected" to t.inkTertiary
         else -> "Pending" to t.warning
     }
     Box(
-        Modifier.clip(RoundedCornerShape(6.dp)).background(color.copy(alpha = 0.15f))
-            .padding(horizontal = 6.dp, vertical = 1.dp)
+        Modifier.clip(RoundedCornerShape(6.dp)).background(color.copy(alpha = 0.20f))
+            .padding(horizontal = 7.dp, vertical = 2.dp)
     ) {
-        Text(label, color = color, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+        Text(label, color = color, fontSize = 11.sp, fontWeight = FontWeight.Bold)
     }
 }
 
@@ -9888,19 +9904,35 @@ private fun ZReportDialog(vm: PosViewModel, business: Business, onDismiss: () ->
                 )
             }
         }
+        // ★ CARD AND MOBILE MONEY GET THEIR OWN ARITHMETIC. The takings figure above is
+        // GROSS, and a reversal used to appear only as a sentence at the bottom of the
+        // drawer card — never subtracted from anything. So a shop reconciling its EcoCash
+        // wallet against this screen read $130 taken when the wallet had actually netted
+        // $100, and nothing on the page did that sum for them. The drawer has had an
+        // in/out/expected story since the beginning; this is the same story for the money
+        // that never touches the drawer.
+        if (d.nonCashIn > 0.005 || d.nonCashRefunded > 0.005) {
+            PosFormCard {
+                PosSectionLabel("Card and mobile money")
+                ZRow("Taken today", money(d.nonCashIn, currency))
+                if (d.nonCashRefunded > 0.005) {
+                    ZRow("Reversed on refunds", "- ${money(d.nonCashRefunded, currency)}")
+                    HorizontalDivider(color = t.surfaceBorder)
+                    ZRow("Net into card / wallet", money(d.nonCashIn - d.nonCashRefunded, currency))
+                }
+                Text(
+                    "None of this is in the drawer count below — it never opened one. " +
+                        "Check it against your wallet and card statements.",
+                    color = t.inkTertiary, fontSize = 10.sp
+                )
+            }
+        }
         PosFormCard {
             PosSectionLabel("Money out of the drawer")
             if (d.cashRefunded <= 0.005 && d.movements.isEmpty()) {
                 Text("Nothing left the drawer today.", color = t.inkTertiary, fontSize = 12.sp)
             }
             if (d.cashRefunded > 0.005) ZRow("Refunds paid in cash", "- ${money(d.cashRefunded, currency)}")
-            if (d.nonCashRefunded > 0.005) {
-                Text(
-                    "Another ${money(d.nonCashRefunded, currency)} was reversed to a card or " +
-                        "wallet — that never came out of the drawer.",
-                    color = t.inkTertiary, fontSize = 10.sp
-                )
-            }
             // Signed already: an outgoing movement is negative, a top-up from the safe
             // positive. Printed with its own sign so the arithmetic can be followed.
             d.movements.forEach { m ->
@@ -11005,7 +11037,24 @@ private fun RefundDialog(
     val payable = settlement?.payable ?: 0.0
     val debtRelieved = settlement?.debtRelieved ?: 0.0
     // Any tender already entered is trimmed if the returned quantities shrink underneath it.
-    val paidNow = payouts.sumOf { it.amount }.coerceAtMost(payable)
+    val addedNow = payouts.sumOf { it.amount }
+    val leftToPay = (payable - addedNow).coerceAtLeast(0.0)
+    // ★ THE TYPED-BUT-NOT-ADDED AMOUNT COUNTS. Splitting a refund needs an "Add" button,
+    // and the moment one exists a cashier can type 50, press the confirm button, and have
+    // the 50 silently vanish — the refund recorded with nothing handed over. So the entry
+    // field is read as a tender in its own right, which also keeps the ordinary case (hand
+    // it all back one way) a single tap, exactly as it was before splitting existed.
+    //
+    // Blank means "the rest of it" ONLY while nothing has been added yet. Once the cashier
+    // has started splitting, blank means nothing more — otherwise adding $40 of cash and
+    // leaving the box empty would quietly pay the remainder out by whatever method the
+    // picker happened to be showing.
+    val pendingEntry = if (payoutText.isBlank()) {
+        if (payouts.isEmpty()) leftToPay else 0.0
+    } else {
+        (payoutText.toDoubleOrNull() ?: 0.0).coerceIn(0.0, leftToPay)
+    }
+    val paidNow = (addedNow + pendingEntry).coerceAtMost(payable)
     val outstanding = (payable - paidNow).coerceAtLeast(0.0)
     val canOwe = sale.customerId != null
     val payoutOk = canOwe || outstanding <= 0.005
@@ -11015,7 +11064,16 @@ private fun RefundDialog(
     PosContainedForm(
         title = "Refund #${sale.receiptNo ?: sale.id.takeLast(6).uppercase()}",
         onDismiss = { if (!submitting) onDismiss() },
-        confirmLabel = "Refund " + money(refundTotal, currency),
+        // ★ THE BUTTON NAMES THE MONEY, NOT THE GOODS. It read "Refund $100.00" while the
+        // cashier was handing over $50 and booking the rest as owed — caught on a real
+        // counter. What the refund is worth is already stated twice above it; what the
+        // person pressing it needs to know is how much is about to leave the till.
+        confirmLabel = when {
+            paidNow > 0.005 -> "Pay back " + money(paidNow, currency)
+            // Nothing crosses the counter: a fully-unpaid credit sale coming back, or a
+            // refund the shop is booking as owed for later.
+            else -> "Record refund"
+        },
         confirmEnabled = confirmEnabled,
         onConfirm = {
             val src = ls ?: return@PosContainedForm
@@ -11029,7 +11087,12 @@ private fun RefundDialog(
                     restock = restock[line.id] ?: true
                 )
             }
-            vm.createRefund(sale, returns, payouts.toList(), reason.ifBlank { null }) {
+            // The typed-but-not-added amount travels with the rest — see [pendingEntry].
+            val tenders = payouts.toList() +
+                listOfNotNull(
+                    pendingEntry.takeIf { it > 0.005 }?.let { Tender(method = payoutMethod, amount = it) }
+                )
+            vm.createRefund(sale, returns, tenders, reason.ifBlank { null }) {
                 Toast.makeText(context, "Refund recorded", Toast.LENGTH_SHORT).show()
                 onDismiss()
             }
@@ -11135,7 +11198,6 @@ private fun RefundDialog(
                         }
                     }
                 }
-                val leftToPay = (payable - payouts.sumOf { it.amount }).coerceAtLeast(0.0)
                 if (leftToPay > 0.005) {
                     Box {
                         OutlinedButton(onClick = { methodOpen = true }) {

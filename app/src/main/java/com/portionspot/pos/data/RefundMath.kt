@@ -158,6 +158,54 @@ fun planRefundSettlement(
     )
 }
 
+/** What voiding a refund has to put back: see [planRefundVoid]. */
+data class RefundVoid(
+    /** Compensating `refund_paid` — cancels the outstanding "we owe you" balance. */
+    val refundPaid: Double,
+    /** Compensating `credit_owed` — puts back the debt the refund cancelled. */
+    val debtRestored: Double,
+)
+
+/**
+ * Undo a refund, in the two ledgers it touched.
+ *
+ * ══ THE BUG THIS EXISTS FOR ══
+ * Voiding measured its compensating row against the GOODS value while the refund had
+ * booked its liability against what was PAYABLE. On a $100 sale that had collected $40:
+ * the refund owed the customer $40, and voiding it credited $100 — driving the shop's
+ * "we owe this customer" balance to MINUS $60, a customer owing money in a ledger that
+ * only runs the other way. The debt the refund cancelled was never restored either, so
+ * the customer kept $60 of goods free while the void un-restocked them.
+ *
+ * ★ IT HID IN THE HEADLINE FIGURE. The over-credit and the unrestored debt cancelled to
+ * the cent, so the customer's NET balance came out exactly right and any test asserting
+ * on it passed against the bug. It showed only in the we-owe figure and in a credit lot
+ * left consumed, which made the sale permanently unrecognisable. Assert on those two.
+ *
+ * ══ WHY BOTH ARE NEW ROWS ══
+ * Neither undoes anything by deletion or edit. A correction here is always an appended
+ * row — the same rule the cash ledger follows — because a deletion made on one device
+ * races a pull on the other, and the two would never converge. The restored `credit_owed`
+ * opens a FRESH FIFO lot carrying the sale id, which is right: the void put the goods back
+ * in the customer's hands, so a later repayment should recognise revenue for that sale.
+ *
+ * [paidOut] is what has actually been handed over against this refund so far.
+ */
+fun planRefundVoid(
+    refundTotal: Double,
+    payableTotal: Double,
+    paidOut: Double,
+): RefundVoid {
+    val total = refundTotal.coerceAtLeast(0.0)
+    // A refund written before the two figures were distinguished carries payable == total,
+    // so this is a no-op for every historical row.
+    val payable = payableTotal.coerceIn(0.0, total)
+    return RefundVoid(
+        refundPaid = (payable - paidOut.coerceAtLeast(0.0)).coerceAtLeast(0.0),
+        debtRestored = (total - payable).coerceAtLeast(0.0),
+    )
+}
+
 fun computeRefundTotal(
     returnedSubtotal: Double,
     saleGoodsValue: Double,

@@ -912,7 +912,17 @@ class PosViewModel(
         // timestamps and queue depth so the sync sheet/settings reflect it live.
         viewModelScope.launch {
             sync.status.collect { s ->
-                if (s is SyncStatus.Done) refreshSyncState()
+                if (s is SyncStatus.Done) {
+                    refreshSyncState()
+                    // ★ And re-read the SHOP POLICY, because a pass may have just adopted a
+                    // new one from the shared row. These flows are loaded once at startup,
+                    // so without this the owner raising the per-line discount cap in the
+                    // browser would reach the cashier's database and not her till — the
+                    // phone would go on enforcing yesterday's cap until it was restarted,
+                    // which is precisely the split this sync exists to end.
+                    _shopPrefs.value = loadPrefs()
+                    _varianceNoteThreshold.value = repo.varianceNoteThreshold()
+                }
             }
         }
     }
@@ -1021,12 +1031,13 @@ class PosViewModel(
             wholesaleRounding = repo.getSetting(KEY_ROUND_WS)?.toDoubleOrNull() ?: d.wholesaleRounding,
             checkoutRounding = repo.getSetting(KEY_ROUND_CO)?.toDoubleOrNull() ?: d.checkoutRounding,
             defaultQuoteValidityDays = repo.getSetting(KEY_QUOTE_DAYS)?.toIntOrNull() ?: d.defaultQuoteValidityDays,
-            discountThresholdPct = repo.getSetting(KEY_DISCOUNT_THRESHOLD)?.toDoubleOrNull() ?: d.discountThresholdPct,
-            maxItemDiscount = repo.getSetting(KEY_MAX_ITEM_DISCOUNT)?.toDoubleOrNull() ?: d.maxItemDiscount,
+            discountThresholdPct = repo.getSetting(PosRepository.KEY_DISCOUNT_THRESHOLD)?.toDoubleOrNull() ?: d.discountThresholdPct,
+            maxItemDiscount = repo.getSetting(PosRepository.KEY_MAX_ITEM_DISCOUNT)?.toDoubleOrNull() ?: d.maxItemDiscount,
             saleEditWindowMinutes = repo.getSetting(KEY_SALE_EDIT_WINDOW)?.toIntOrNull() ?: d.saleEditWindowMinutes,
             marginFormula = repo.getSetting(KEY_MARGIN_FORMULA) ?: d.marginFormula,
             autoConvertUnitsToBoxes = repo.getSetting(KEY_AUTO_BOXES)?.toBooleanStrictOrNull() ?: d.autoConvertUnitsToBoxes,
             printerType = repo.getSetting(KEY_PRINTER_TYPE) ?: d.printerType,
+            posListView = repo.getSetting(KEY_POS_LIST_VIEW)?.toBooleanStrictOrNull() ?: d.posListView,
             receiptPreset = repo.getSetting(KEY_RC_PRESET) ?: d.receiptPreset,
             secondCurrencyCode = repo.getSetting(KEY_CUR2_CODE) ?: d.secondCurrencyCode,
             secondCurrencyRate = repo.getSetting(KEY_CUR2_RATE)?.toDoubleOrNull() ?: d.secondCurrencyRate,
@@ -1055,12 +1066,35 @@ class PosViewModel(
             repo.putSetting(KEY_ROUND_WS, prefs.wholesaleRounding.toString())
             repo.putSetting(KEY_ROUND_CO, prefs.checkoutRounding.toString())
             repo.putSetting(KEY_QUOTE_DAYS, prefs.defaultQuoteValidityDays.toString())
-            repo.putSetting(KEY_DISCOUNT_THRESHOLD, prefs.discountThresholdPct.toString())
-            repo.putSetting(KEY_MAX_ITEM_DISCOUNT, prefs.maxItemDiscount.toString())
+            // ★ NOT putSetting. The discount cap and its PIN gate are SHOP rules, not
+            // device preferences: written straight to the key/value store they would stay
+            // on this handset, and the owner raising the cap here would leave the
+            // cashier's till enforcing the old one with nothing to say so. This stamps the
+            // policy clock so the change goes up on the next pass, and it stamps it only
+            // if a figure actually moved — re-saving this screen must not hand this phone
+            // a win over an edit made in the browser a minute ago. See [ShopPolicy].
+            repo.putShopPolicy(
+                com.portionspot.pos.data.ShopPolicy(
+                    maxItemDiscount = prefs.maxItemDiscount,
+                    discountThresholdPct = prefs.discountThresholdPct,
+                    // Carried through unchanged: it is the third rule on the same shared
+                    // row and has its own editor (the cash-up), so this screen must
+                    // re-state it rather than blank it.
+                    //
+                    // ★ Re-read from the store, NOT from the in-memory flow. The flow is
+                    // filled by a coroutine at construction and holds the DEFAULT until
+                    // that lands; saving the receipt settings in that window would write
+                    // 1.00 over an admin-set threshold, stamp the policy clock, and push
+                    // the clobbered figure out to every other till as the shop's rule.
+                    varianceNoteThreshold = repo.varianceNoteThreshold(),
+                ),
+                localEdit = true,
+            )
             repo.putSetting(KEY_SALE_EDIT_WINDOW, prefs.saleEditWindowMinutes.toString())
             repo.putSetting(KEY_MARGIN_FORMULA, prefs.marginFormula)
             repo.putSetting(KEY_AUTO_BOXES, prefs.autoConvertUnitsToBoxes.toString())
             repo.putSetting(KEY_PRINTER_TYPE, prefs.printerType)
+            repo.putSetting(KEY_POS_LIST_VIEW, prefs.posListView.toString())
             repo.putSetting(KEY_RC_PRESET, prefs.receiptPreset)
             repo.putSetting(KEY_CUR2_CODE, prefs.secondCurrencyCode)
             repo.putSetting(KEY_CUR2_RATE, prefs.secondCurrencyRate.toString())
@@ -3046,12 +3080,16 @@ class PosViewModel(
         private const val KEY_ROUND_WS = "round_wholesale"
         private const val KEY_ROUND_CO = "round_checkout"
         private const val KEY_QUOTE_DAYS = "quote_validity_days"
-        private const val KEY_DISCOUNT_THRESHOLD = "discount_threshold_pct"
-        private const val KEY_MAX_ITEM_DISCOUNT = "max_item_discount"
+        // The discount cap and its PIN gate moved to PosRepository.KEY_MAX_ITEM_DISCOUNT /
+        // KEY_DISCOUNT_THRESHOLD when they stopped being device preferences and became
+        // shop policy that syncs. One key, one owner: a private copy of the string here
+        // would be how the settings screen and the sync engine end up reading two
+        // different settings and each believing it holds the shop's discount cap.
         private const val KEY_SALE_EDIT_WINDOW = "sale_edit_window_min"
         private const val KEY_MARGIN_FORMULA = "margin_formula"
         private const val KEY_AUTO_BOXES = "auto_units_to_boxes"
         private const val KEY_PRINTER_TYPE = "printer_type"
+        private const val KEY_POS_LIST_VIEW = "pos_list_view"
         private const val KEY_RC_PRESET = "rc_preset"
         private const val KEY_CUR2_CODE = "second_currency_code"
         private const val KEY_CUR2_RATE = "second_currency_rate"

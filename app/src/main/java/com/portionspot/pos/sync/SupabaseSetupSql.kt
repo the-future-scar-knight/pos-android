@@ -635,6 +635,20 @@ alter table public.businesses add column if not exists paynow_integration_id tex
 alter table public.businesses add column if not exists second_currency text;
 alter table public.businesses add column if not exists second_currency_rate numeric default 0;
 
+-- The other two thirds of the shop's money POLICY. `discount_threshold` is on the
+-- create-table above and has been readable since the schema was written; these two
+-- were only ever kept in one phone's local settings, which meant the shop's discount
+-- cap was really whatever the handset in your hand was last told. The owner raising
+-- the cap on his phone left the cashier's till enforcing the old one, and lowering it
+-- left her till allowing the larger discount on every line of every sale, with nothing
+-- anywhere reporting a disagreement.
+--
+-- ★ NULL is "not stated", NOT zero, and the till reads it that way. A zero cap means NO
+-- LIMIT in this app, so defaulting these would take the ceiling off every cashier's
+-- discount on any database that had simply not set one yet. No defaults, deliberately.
+alter table public.businesses add column if not exists max_item_discount numeric;
+alter table public.businesses add column if not exists variance_note_threshold numeric;
+
 -- A DAY-CLOSE IS THE CLOSING HALF OF A SHIFT, NOT A SECOND KIND OF THING.
 --
 -- The till keeps a local `day_closes` table: expected / counted / variance /

@@ -160,6 +160,13 @@ data class CashMovementFromWire(
     val location: String,
     /** SIGNED in this app's convention: + INTO [location], − OUT of it. */
     val amount: Double,
+    /**
+     * The OTHER half, when one wire row means money left one pocket and arrived in
+     * another. The web writes a till→safe drop as a single row; this app keeps one row per
+     * location, so the caller writes both or the money half-vanishes. Null for the
+     * movements that genuinely touch one pocket.
+     */
+    val counterpart: CashMovementFromWire? = null,
 )
 
 /**
@@ -211,12 +218,36 @@ fun cashMovementTypeFromWire(wireType: String, amount: Double): CashMovementFrom
     return when (wireType.trim().lowercase()) {
         "safe_in" -> CashMovementFromWire("safe_in", CashLocation.SAFE, magnitude)
         "safe_out" -> CashMovementFromWire("safe_out", CashLocation.SAFE, -magnitude)
-        "float_topup" -> CashMovementFromWire("float_topup", CashLocation.TILL, magnitude)
         "pay_in" -> CashMovementFromWire("pay_in", CashLocation.TILL, magnitude)
-        "drop" -> CashMovementFromWire("drop", CashLocation.TILL, -magnitude)
         "petty" -> CashMovementFromWire("petty", CashLocation.TILL, -magnitude)
-        "bank_deposit" -> CashMovementFromWire("bank_deposit", CashLocation.TILL, -magnitude)
         "pay_out" -> CashMovementFromWire("pay_out", CashLocation.TILL, -magnitude)
+        // ── The three that move money between TWO pockets in a single row ──
+        //
+        // ★ THESE ARE THE WEB'S OWN WORDS AND THEY ALL USED TO LAND ON THE TILL. The web
+        // keeps a full safe and writes each of these as ONE row meaning both halves:
+        // `drop` is till→safe, `float_topup` is safe→till, `bank_deposit` is safe→out.
+        // Read as till-only, a browser bank deposit made the phone's expected drawer read
+        // short by the whole deposit, and a drop or a top-up broke the phone's TOTAL cash
+        // on hand — not merely the split — because one half of the move simply vanished.
+        //
+        // Adopting the web's meaning is safe precisely because THIS APP NEVER EMITS THESE
+        // WORDS: its own transfers go up as the pair `pay_out` + `safe_in` (or `safe_out` +
+        // `pay_in`), and a grep of every `CashTxn(type = …)` in the repository finds no
+        // drop, float_topup, bank_deposit or petty. So a row bearing one of them was
+        // written by the other client, and there is no risk of a device re-importing and
+        // doubling its own movement. [counterpart] is the second local row the caller must
+        // write; null when the movement really does touch one pocket only.
+        "drop" -> CashMovementFromWire(
+            "drop", CashLocation.TILL, -magnitude,
+            counterpart = CashMovementFromWire("drop", CashLocation.SAFE, magnitude),
+        )
+        "float_topup" -> CashMovementFromWire(
+            "float_topup", CashLocation.TILL, magnitude,
+            counterpart = CashMovementFromWire("float_topup", CashLocation.SAFE, -magnitude),
+        )
+        // Out of the SAFE and out of the business — the till is not involved at all, which
+        // is the one this got most wrong.
+        "bank_deposit" -> CashMovementFromWire("bank_deposit", CashLocation.SAFE, -magnitude)
         // The CHECK constraint says this cannot arrive, and the day it does is the day the
         // constraint was relaxed on the other side without anyone telling this one. The
         // money still moved, so it is booked as an `adjust` at the till in whatever

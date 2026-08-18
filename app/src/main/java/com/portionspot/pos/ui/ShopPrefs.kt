@@ -45,7 +45,14 @@ data class ShopPrefs(
     // ── Margins ──
     val marginFormula: String = "markup",    // "markup" (over cost) or "gross" (of price)
     val autoConvertUnitsToBoxes: Boolean = false, // show stock as N boxes + loose units
-    // ── Printer ──
+    // -- POS layout --
+    // Whether the POS product grid is shown as a LIST. Persisted rather than remembered:
+    // rememberSaveable only survives while the screen stays on the back stack, so leaving
+    // the POS screen and coming back silently reverted a cashier's choice to grid every
+    // time. Device-local on purpose -- it is how one person likes to look at the shelf,
+    // not shop policy, so it never goes near the shared schema.
+    val posListView: Boolean = false,
+    // -- Printer --
     val printerType: String = "bluetooth",   // "bluetooth" (ESC/POS) · "sunmi" (internal) · "rawbt" (RawBT service)
     // ── Receipt style preset ──
     // A quick look applied over the individual receipt toggles below (Phase 6, §10):

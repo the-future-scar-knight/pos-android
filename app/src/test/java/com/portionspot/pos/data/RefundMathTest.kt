@@ -165,4 +165,72 @@ class RefundMathTest {
         )
         assertEquals(0.0, s.payable, eps)
     }
+
+    // -- Undoing one: what a void has to put back ---------------------------
+
+    @Test
+    fun voidingAFullyPaidRefund_creditsWhatIsOwed_andRestoresNoDebt() {
+        // payable == total, which is every refund written before debt-first settlement,
+        // so this pins that the change is a no-op for historical rows.
+        val v = planRefundVoid(refundTotal = 100.0, payableTotal = 100.0, paidOut = 0.0)
+        assertEquals(100.0, v.refundPaid, eps)
+        assertEquals(0.0, v.debtRestored, eps)
+    }
+
+    @Test
+    fun voidingADebtFirstRefund_creditsOnlyThePayablePart() {
+        // THE MINUS SIXTY. $100 sale, $40 collected: the refund owed the customer $40, so
+        // voiding it must credit 40. Crediting the goods value drove the shop's "we owe
+        // you" balance to -60 -- a customer owing money in a ledger that only runs the
+        // other way.
+        val v = planRefundVoid(refundTotal = 100.0, payableTotal = 40.0, paidOut = 0.0)
+        assertEquals(40.0, v.refundPaid, eps)
+        assertEquals(60.0, v.debtRestored, eps)
+    }
+
+    @Test
+    fun voidingAfterAPartialPayout_creditsOnlyWhatIsStillOwed() {
+        val v = planRefundVoid(refundTotal = 100.0, payableTotal = 40.0, paidOut = 25.0)
+        assertEquals(15.0, v.refundPaid, eps)
+        assertEquals(60.0, v.debtRestored, eps)
+    }
+
+    @Test
+    fun voidingAFullyPaidOutRefund_creditsNothing_butStillRestoresTheDebt() {
+        // The money already went back across the counter, so there is no liability left to
+        // cancel. The debt still has to return: the void un-restocks, so the customer has
+        // the goods again and owes for them.
+        val v = planRefundVoid(refundTotal = 100.0, payableTotal = 40.0, paidOut = 40.0)
+        assertEquals(0.0, v.refundPaid, eps)
+        assertEquals(60.0, v.debtRestored, eps)
+    }
+
+    @Test
+    fun voidingAnUnpaidCreditSalesRefund_restoresTheWholeDebt() {
+        val v = planRefundVoid(refundTotal = 100.0, payableTotal = 0.0, paidOut = 0.0)
+        assertEquals(0.0, v.refundPaid, eps)
+        assertEquals(100.0, v.debtRestored, eps)
+    }
+
+    @Test
+    fun voidNeverReturnsANegative_onNonsenseInput() {
+        val over = planRefundVoid(refundTotal = 100.0, payableTotal = 500.0, paidOut = 900.0)
+        assertEquals(0.0, over.refundPaid, eps)
+        assertEquals(0.0, over.debtRestored, eps)
+    }
+
+    @Test
+    fun settlementAndVoidAgreeAboutWhatWasCancelled() {
+        // The two halves of the round trip, walked. Whatever the settlement cancelled off
+        // the account, the void must put back -- if these ever disagree a debt is either
+        // forgiven twice or charged twice, and nothing on screen would say so.
+        val s = planRefundSettlement(
+            refundTotal = 100.0, saleTotal = 100.0, collectedOnSale = 40.0, alreadyRefunded = 0.0
+        )
+        val v = planRefundVoid(
+            refundTotal = 100.0, payableTotal = s.payable, paidOut = 0.0
+        )
+        assertEquals(s.debtRelieved, v.debtRestored, eps)
+        assertEquals(s.payable, v.refundPaid, eps)
+    }
 }

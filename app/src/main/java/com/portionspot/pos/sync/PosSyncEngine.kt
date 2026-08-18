@@ -39,6 +39,11 @@ import com.portionspot.pos.data.stockOnHandFromDelta
 import com.portionspot.pos.data.cashMovementCountedElsewhere
 import com.portionspot.pos.data.planSessionMerge
 import com.portionspot.pos.data.planDayRollover
+import com.portionspot.pos.data.ShopPolicy
+import com.portionspot.pos.data.ShopPolicyPlan
+import com.portionspot.pos.data.planShopPolicySync
+import com.portionspot.pos.sync.wire.BusinessPolicyDto
+import com.portionspot.pos.sync.wire.toPatch
 import com.portionspot.pos.data.indexSessionsByDay
 import com.portionspot.pos.data.startOfDay
 import com.portionspot.pos.sync.wire.RefundDto
@@ -52,6 +57,7 @@ import com.portionspot.pos.sync.wire.toStockMovement
 import com.portionspot.pos.sync.wire.CashSessionDto
 import com.portionspot.pos.sync.wire.toCashSession
 import com.portionspot.pos.sync.wire.CashMovementDto
+import com.portionspot.pos.sync.wire.counterpartCashTxn
 import com.portionspot.pos.sync.wire.toCashTxn
 import com.portionspot.pos.sync.wire.ItemAttributeDto
 import com.portionspot.pos.sync.wire.toItemAttribute
@@ -135,6 +141,27 @@ private fun IOException.isMissingTable(): Boolean {
     return text.contains("HTTP 404") || text.contains("PGRST205") || text.contains("42P01")
 }
 
+/**
+ * "This COLUMN does not exist here" — Postgres 42703, or PGRST204 from PostgREST's own
+ * schema cache when a write names it.
+ *
+ * The schema moves by columns now rather than by whole tables, so this is the finer-
+ * grained sibling of [isMissingTable] and carries the same warning: it is only ever for
+ * letting an OPTIONAL field degrade to nothing. A database that has not grown a settings
+ * column yet has simply not stated that setting. Never widen it to a money column — a sale
+ * whose total the database would not accept must fail loudly, not quietly go up short.
+ */
+private fun IOException.isMissingColumn(): Boolean {
+    val text = message.orEmpty()
+    return text.contains("42703") || text.contains("PGRST204")
+}
+
+/** The only columns of the shared `businesses` row this app reads or writes. Named
+ *  explicitly rather than `select=*` so the narrow scope is visible at the request, not
+ *  just in a comment — see [PosSyncEngine.syncShopPolicy]. */
+private const val POLICY_COLUMNS =
+    "id,max_item_discount,discount_threshold,variance_note_threshold,updated_at"
+
 /** Just the `id` of a cloud `businesses` row — see [PosSyncEngine.adoptBusinessId]. */
 @kotlinx.serialization.Serializable
 private data class BusinessIdRow(val id: String = "")
@@ -186,6 +213,20 @@ class PosSyncEngine(
      * engine constructible without the repository.
      */
     private val reconcileCash: suspend (String) -> Unit = {},
+    /**
+     * The shop's money RULES as this device currently enforces them, plus when a person
+     * last changed them here (0 = never). Null means this engine was built without a
+     * policy source and the step is skipped entirely.
+     *
+     * Injected rather than read from a DAO for the same reason [reconcileCash] is: the
+     * settings keys, their defaults and the "was this a person's edit or an adopted
+     * value" distinction all belong to the repository, and a second copy of them here
+     * would be a second answer to what the shop's discount cap is.
+     */
+    private val readShopPolicy: suspend () -> Pair<ShopPolicy, Long>? = { null },
+    /** Write an ADOPTED policy down. Must not stamp the local "a person changed this"
+     *  clock — see [com.portionspot.pos.data.PosRepository.putShopPolicy]. */
+    private val writeShopPolicy: suspend (ShopPolicy) -> Unit = {},
 ) {
     suspend fun sync(): SyncOutcome = withContext(Dispatchers.IO) {
         val conn = config.connection() ?: return@withContext SyncOutcome.NotConfigured
@@ -211,6 +252,12 @@ class PosSyncEngine(
             // products it has never sold, with no error anywhere to say so. Refusing is
             // recoverable and visible; adopting a stranger's inventory is neither.
             val cloudBid = config.cloudBusinessId()
+            // Between the push and the pull, and its own step rather than part of either:
+            // it is the one thing here that reads and writes the SAME shared row, so it
+            // belongs neither in [push] (which only ever sends rows this device owns) nor
+            // in [pull] (which is read-only by design, and that invariant is worth more
+            // than the tidiness of one more line in its list).
+            val policyErrors = if (cloudBid == null) emptyList() else syncShopPolicy(api, cloudBid)
             val pulled = if (cloudBid == null) 0 else pull(api, cloudBid)
             // Said out loud rather than left as a quiet no-op. With push disabled — the
             // default on a freshly repointed device — an unidentified shop would
@@ -220,7 +267,7 @@ class PosSyncEngine(
                     "Waiting to identify this shop in the database. It must hold exactly " +
                         "one business before this till can sync; check the Sync screen."
                     )
-            } else pushResult.errors
+            } else pushResult.errors + policyErrors
             val at = System.currentTimeMillis()
             config.setLastSyncAt(at)
             // Split timestamps so the owner can SEE the two directions independently:
@@ -875,6 +922,87 @@ class PosSyncEngine(
     }
 
     /**
+     * The shop's money RULES, two-way — the per-line discount cap, the PIN-gate
+     * percentage and the cash-variance note threshold.
+     *
+     * ── WHY THIS EXISTS ───────────────────────────────────────────────────────
+     *
+     * Until now these three lived only in this phone's key/value settings, so "the shop's
+     * discount cap" was really "whatever the phone in your hand was last told". The owner
+     * raising the cap on his handset left the cashier's till enforcing the old one, and
+     * lowering it left the cashier's till still allowing the larger discount on every line
+     * of every sale. Neither phone errors, neither logs anything, and the only trace is a
+     * discount report that does not match the rule anybody thinks is in force.
+     *
+     * `businesses.discount_threshold` has been on the shared row the whole time and
+     * Android has never once read it: the only reference to this table in this file was
+     * [adoptBusinessId], which asks for `id` and nothing else.
+     *
+     * ── THE HAZARD, STATED WHERE IT WOULD BE INTRODUCED ───────────────────────
+     *
+     * ★★ The push is a PATCH, never an upsert. ★★ PostgREST resolves an upsert of a
+     * partial row by NULLING every column it was not handed, and this app is handed three
+     * columns of a row that carries the shop's bank account, its EcoCash merchant code,
+     * its VAT number, its receipt header and footer, its logo and seven payment-method
+     * flags. Upserting here would wipe all of them, return 2xx, and report a successful
+     * sync; the owner would find out on the next receipt he printed. See
+     * [SupabaseRest.updateById] and [com.portionspot.pos.sync.wire.BusinessPolicyPatchDto].
+     *
+     * ★ Filtered on `id`, which is the CLOUD business id, never the local one. The device
+     * mints its own `businesses.id` on first run and it is not this shop's — the same trap
+     * [pullStaff] documents, and it fails the same silent way: a PATCH filtered on an id
+     * the shared database has never heard of matches zero rows and returns 2xx.
+     *
+     * A database that predates the columns is treated as one that simply has not stated a
+     * policy: the step becomes a no-op rather than an error the owner sees every pass and
+     * cannot act on.
+     */
+    private suspend fun syncShopPolicy(api: SupabaseRest, cloudBid: String): List<String> {
+        val (local, changedAt) = readShopPolicy() ?: return emptyList()
+        val row = try {
+            syncJson.decodeFromString<List<BusinessPolicyDto>>(
+                api.selectRowById("businesses", cloudBid, POLICY_COLUMNS)
+            ).firstOrNull() ?: return emptyList()
+        } catch (e: IOException) {
+            if (e.isMissingTable() || e.isMissingColumn()) return emptyList()
+            return listOf("shop settings: ${e.message}")
+        } catch (e: Exception) {
+            return listOf("shop settings: ${e.message ?: e.javaClass.simpleName}")
+        }
+
+        val plan = planShopPolicySync(
+            local = local,
+            localChangedAt = changedAt,
+            wire = row.toPolicyValues(),
+            wireChangedAt = IsoTime.toMillis(row.cursorStamp()),
+        )
+        return when (plan) {
+            ShopPolicyPlan.Settled -> emptyList()
+            is ShopPolicyPlan.Adopt -> {
+                writeShopPolicy(plan.policy)
+                emptyList()
+            }
+            is ShopPolicyPlan.Push -> {
+                // Held back exactly like every other push while the till is pull-only. The
+                // local edit is NOT discarded and is NOT overwritten: the plan stays Push
+                // for as long as this device's clock is the newer one, so the owner's
+                // change goes up the moment he enables uploading rather than being lost.
+                if (!config.pushEnabled()) return emptyList()
+                try {
+                    api.updateById(
+                        "businesses",
+                        cloudBid,
+                        syncJson.encodeToString(plan.policy.toPatch(changedAt)),
+                    )
+                    emptyList()
+                } catch (e: Exception) {
+                    listOf("shop settings: ${e.message ?: e.javaClass.simpleName}")
+                }
+            }
+        }
+    }
+
+    /**
      * `refunds` → local refund headers.
      *
      * A refund whose wire row names no `sale_id`, on a device that has no local copy to
@@ -1073,6 +1201,23 @@ class PosSyncEngine(
             if (local != null && cashMovementCountedElsewhere(local.refType)) continue
             if (local == null || IsoTime.toMillis(dto.cursorStamp()) > local.updatedAt) {
                 cashTxnDao.upsert(dto.toCashTxn(bid, local))
+                applied++
+            }
+            // ★ THE OTHER POCKET. The web writes a till→safe drop, a safe→till float
+            // top-up and a bank deposit as ONE row each, because it derives the location
+            // from the type; this app keeps one row per location. Import only the half the
+            // type names and the money half-vanishes — a browser drop took cash out of the
+            // phone's till and never put it in the phone's safe, so the two clients
+            // disagreed about the shop's TOTAL cash on hand, not merely about where it was.
+            //
+            // Written under a derived, deterministic id so re-reading the source row on a
+            // later pass updates this half instead of inserting another one. Safe to adopt
+            // because this app never emits those words itself — see
+            // [cashMovementTypeFromWire].
+            val other = dto.counterpartCashTxn(bid) ?: continue
+            val otherLocal = cashTxnDao.getById(other.id)
+            if (otherLocal == null || IsoTime.toMillis(dto.cursorStamp()) > otherLocal.updatedAt) {
+                cashTxnDao.upsert(other)
                 applied++
             }
         }

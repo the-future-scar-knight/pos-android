@@ -194,6 +194,68 @@ class SupabaseRest(
     }
 
     /**
+     * GET selected [columns] of the ONE row of [table] whose `id` is [id].
+     *
+     * Distinct from [selectAll] (which has no filter at all) and from [selectSince]
+     * (which filters on `business_id`, a DIFFERENT column that `businesses` also has). On
+     * the `businesses` table those two are not interchangeable: `id` is the value every
+     * `items.business_id` actually references and the one this till adopts, so filtering a
+     * shop's own profile row on `business_id` would be reading a column nothing else keys
+     * off. One row, named by primary key, and no cursor — this is for a single shared row
+     * that is read every pass, not for a feed.
+     */
+    fun selectRowById(table: String, id: String, columns: String): String {
+        val url = (rest(table).toHttpUrlOrNull() ?: throw IOException("Bad URL"))
+            .newBuilder()
+            .addQueryParameter("select", columns)
+            .addQueryParameter("id", "eq.$id")
+            .addQueryParameter("limit", "1")
+            .build()
+        client.newCall(Request.Builder().url(url).get().authed().build()).execute().use { resp ->
+            val body = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) throw IOException("read $table: HTTP ${resp.code} $body")
+            return body
+        }
+    }
+
+    /**
+     * PATCH — write ONLY the columns present in [json] onto the row whose `id` is [id].
+     *
+     * ★★ THE VERB IS THE WHOLE POINT, AND IT IS NOT INTERCHANGEABLE WITH [upsert]. ★★
+     *
+     * PostgREST resolves an upsert of a partial row by writing the columns it was handed
+     * and NULLING every column it was not. On a table this app owns end to end that is
+     * harmless, because the push sends the whole row. On a SHARED row that another client
+     * owns most of — `businesses`, which carries the shop's bank details, mobile-money
+     * accounts, VAT number, receipt header/footer, logo and capability locks — an upsert
+     * of three columns silently destroys the other thirty. It returns 2xx. The sync
+     * reports success. The damage is only visible on the next printed receipt, and by then
+     * there is nothing on the device to restore it from.
+     *
+     * So: any time this app needs to write SOME of a row somebody else also writes, it
+     * comes through here. [json] is a JSON OBJECT (not the array [upsert] takes), the
+     * filter is required rather than defaulted, and there is no unfiltered variant —
+     * a PATCH with no filter rewrites every row in the table.
+     */
+    fun updateById(table: String, id: String, json: String) {
+        val url = (rest(table).toHttpUrlOrNull() ?: throw IOException("Bad URL"))
+            .newBuilder()
+            .addQueryParameter("id", "eq.$id")
+            .build()
+        val req = Request.Builder().url(url)
+            .patch(json.toRequestBody(jsonMedia))
+            .authed()
+            .header("Prefer", "return=minimal")
+            .build()
+        client.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) {
+                val body = resp.body?.string().orEmpty()
+                throw IOException("update $table: HTTP ${resp.code} $body")
+            }
+        }
+    }
+
+    /**
      * GET just the `id` column for the rows of [table] whose id is one of [ids].
      * One round-trip for the whole batch — used to confirm an ignore-duplicates push
      * actually landed (that resolution returns 201 even when the server dropped the

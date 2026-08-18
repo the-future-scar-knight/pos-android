@@ -7,6 +7,7 @@ import com.portionspot.pos.data.AuditEntry
 import com.portionspot.pos.data.CashSession
 import com.portionspot.pos.data.CashTxn
 import com.portionspot.pos.data.CreditTxn
+import com.portionspot.pos.data.CashMovementFromWire
 import com.portionspot.pos.data.cashMovementTypeFromWire
 import com.portionspot.pos.data.cashMovementTypeToWire
 import com.portionspot.pos.data.Customer
@@ -831,6 +832,15 @@ data class RefundDto(
     @SerialName("customer_name") val customerName: String? = null,
     val reason: String? = null,
     @SerialName("refund_total") val refundTotal: String? = null,
+    /**
+     * How much of [refundTotal] may actually cross the counter as money.
+     *
+     * NULL is NOT zero and must never be read as zero — see [toRefund]. It means the
+     * writer did not state a cap, which is true of every row written before the column
+     * existed and of every refund the web raises (it does not settle debt first, so for
+     * one of its refunds the goods value IS the payout).
+     */
+    @SerialName("payable_total") val payableTotal: String? = null,
     val status: String = "owed",
     @SerialName("created_by") val createdBy: String? = null,
     @SerialName("created_by_name") val createdByName: String? = null,
@@ -924,6 +934,17 @@ data class RefundPushDto(
     @SerialName("customer_name") val customerName: String? = null,
     val reason: String? = null,
     @SerialName("refund_total") val refundTotal: Double,
+    /**
+     * ★ THE CAP TRAVELS, OR THE NEXT PHONE PAYS THE CUSTOMER TWICE.
+     *
+     * A refund of $100 of goods against a customer who owed $60 hands back $40 and writes
+     * the other $60 off the debt. Without this column that refund went up as a plain $100
+     * refund with nothing anywhere recording the cap, so the next device to pull it read
+     * "owed: $100", showed $100 to hand back, and the shop gave away the $60 it had just
+     * collected in goods. Two tills, one till roll, and nothing in the books saying which
+     * one was right.
+     */
+    @SerialName("payable_total") val payableTotal: Double,
     val status: String,
     @SerialName("created_by") val createdBy: String? = null,
     @SerialName("created_by_name") val createdByName: String? = null,
@@ -991,17 +1012,31 @@ fun RefundDto.toRefund(businessId: String, local: Refund?): Refund? {
         customerName = customerName?.ifBlank { null } ?: base.customerName,
         reason = reason ?: base.reason,
         refundTotal = refundTotal?.toDoubleOrNull() ?: base.refundTotal,
-        // ★ LOCAL WINS, AND A CLOUD REFUND FALLS BACK TO ITS TOTAL. `payableTotal` has no
-        // cloud column: it is this app's cap on how much of a refund may cross the counter
-        // once the unpaid part has been cancelled off the account (see
-        // [PosRepository.createRefund]). Two ways to get this wrong, both of them money:
-        //  - take the wire's silence as zero, and a refund raised in the WEB arrives with
-        //    nothing payable, so the phone quietly refuses to pay the customer at all;
-        //  - overwrite from the wire, and an Android refund that capped its payout at $40
-        //    comes back down un-capped at the full goods value on the next pull.
-        // The web does not settle debt first, so for a refund it raised the total IS what
-        // it will hand back, which is exactly the fallback below.
-        payableTotal = local?.payableTotal
+        // ★ THE WIRE NOW HAS A SAY, AND SILENCE STILL MEANS "THE WHOLE TOTAL".
+        //
+        // `payableTotal` is the cap on how much of a refund may cross the counter once the
+        // unpaid part has been cancelled off the account (see [PosRepository.createRefund]).
+        // It travels now — `refunds.payable_total` exists — so a cap raised on one phone is
+        // no longer a private fact of that handset. The order below is the whole rule, and
+        // each step is a way this has already gone wrong or would:
+        //
+        //  1. A STATED wire value wins. This is what closes the hole: an Android refund that
+        //     correctly capped its payout at $40 of a $100 return used to travel as a plain
+        //     $100 refund, and the next device to pull it would hand over the other $60.
+        //     Reaching the local row first instead would re-open that hole from the other
+        //     end, because a device that has never seen the refund has no local row at all.
+        //  2. NULL is "not stated", NEVER zero. Read as zero, a refund raised in the WEB
+        //     arrives with nothing payable and the phone quietly refuses to pay the customer
+        //     anything at all. Rows written before the column existed carry NULL too.
+        //  3. On a NULL, the LOCAL cap is preserved. This is the sibling failure: a refund
+        //     this device capped at $40, re-pulled from a row the web later touched without
+        //     understanding the column, would come back down un-capped at the full goods
+        //     value and be paid out in full.
+        //  4. With neither a wire value nor a local row, the total IS the payout. That is
+        //     exactly right for a web-raised refund — the web does not settle debt first, so
+        //     it never caps — and it is the only safe reading of a legacy row.
+        payableTotal = payableTotal?.toDoubleOrNull()
+            ?: local?.payableTotal
             ?: refundTotal?.toDoubleOrNull() ?: base.refundTotal,
         status = status,
         createdBy = createdBy?.ifBlank { null } ?: base.createdBy,
@@ -1022,6 +1057,7 @@ fun Refund.toPush(): RefundPushDto = RefundPushDto(
     customerName = customerName,
     reason = reason,
     refundTotal = refundTotal,
+    payableTotal = payableTotal,
     status = status,
     createdBy = createdBy,
     createdByName = createdByName,
@@ -1360,9 +1396,40 @@ fun CashMovementDto.toCashTxn(businessId: String, local: CashTxn?): CashTxn {
         )
     }
     val wire = cashMovementTypeFromWire(type, amount.toMoney())
+    return buildCashTxn(wire, businessId, rowId = id)
+}
+
+/**
+ * The SECOND local row for a wire movement that moved money between two pockets, or null
+ * when the movement touched only one.
+ *
+ * The web writes a till→safe drop as ONE row; this app keeps one row per location, so both
+ * halves have to exist locally or half the money vanishes on this device. See
+ * [cashMovementTypeFromWire] for why adopting the web's meaning is safe.
+ *
+ * ★ THE ID IS DERIVED AND DETERMINISTIC — `<wire id>:2`. It has to be stable, because the
+ * pull re-reads a row every time the server stamps it and an invented id would insert a
+ * fresh duplicate on every pass, walking the safe balance away from the till's. It also
+ * must not collide with any real wire id, which a uuid with a suffix cannot.
+ */
+fun CashMovementDto.counterpartCashTxn(businessId: String): CashTxn? =
+    cashMovementTypeFromWire(type, amount.toMoney()).counterpart
+        ?.let { buildCashTxn(it, businessId, rowId = "$id:2") }
+
+/**
+ * One local ledger row, from a wire movement and an already-resolved [wire] meaning.
+ *
+ * Takes the row id rather than reading [CashMovementDto.id], because a movement between
+ * two pockets produces TWO local rows and only one of them can wear the wire's own id.
+ */
+private fun CashMovementDto.buildCashTxn(
+    wire: CashMovementFromWire,
+    businessId: String,
+    rowId: String,
+): CashTxn {
     return CashTxn(
-        id = id,
-        localId = id,
+        id = rowId,
+        localId = rowId,
         businessId = businessId,
         type = wire.type,
         amount = wire.amount,

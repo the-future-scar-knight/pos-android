@@ -59,7 +59,16 @@ class AppContainer(app: Application) {
         // pull writes the sale and its tenders but no cash-ledger row, so without this each
         // phone's cash-on-hand counts only its own takings and the day close books the
         // difference as a variance against profit.
-        reconcileCash = { bid -> repository.reconcilePulledCash(bid) }
+        reconcileCash = { bid -> repository.reconcilePulledCash(bid) },
+        // The shop's money RULES — the per-line discount cap, the PIN-gate percentage and
+        // the cash-variance note threshold. They used to live only in this phone's
+        // settings, which meant the owner raising the cap on his handset left the
+        // cashier's till enforcing the old one and nothing anywhere said so.
+        readShopPolicy = { repository.shopPolicy() to repository.shopPolicyChangedAt() },
+        // localEdit = false: this is the cloud's value being written DOWN, and stamping the
+        // "a person changed this" clock here would make the device push straight back what
+        // it has just been told, for ever.
+        writeShopPolicy = { policy -> repository.putShopPolicy(policy, localEdit = false) },
     )
     val syncManager: SyncManager =
         SyncManager(app.applicationContext, syncConfig, syncEngine, database.syncArmDao())
