@@ -67,6 +67,47 @@ class IsoTimeTest {
         )
     }
 
+    /**
+     * ★ THE REGRESSION THIS FILE COULD NOT OTHERWISE CATCH.
+     *
+     * The parser used to offer `yyyy-MM-dd'T'HH:mm:ss.SSSXXX`. The `X` pattern letter only
+     * exists in SimpleDateFormat from **API 24**; below that it throws. This app's minSdk
+     * is 23 and the shop runs a Sunmi handheld on Android 6, where every pattern threw,
+     * every cloud timestamp became 0L, and a freshly-stocked product read "Out of stock"
+     * because a `stockBaseAt` of 0 means "no baseline" and the ledger was never applied.
+     *
+     * Every other test in this file passed throughout — they run on desktop Java, where
+     * `X` has worked since Java 7. A behavioural test literally cannot see this bug. So
+     * the assertion is structural: the letter must not appear.
+     */
+    @Test
+    fun parsePatterns_avoidTheApi24OnlyZoneLetter() {
+        val offenders = IsoTime.PARSE_PATTERNS.filter { it.contains('X') }
+        assertTrue(
+            "SimpleDateFormat 'X' needs API 24; minSdk is 23. Offending patterns: $offenders",
+            offenders.isEmpty(),
+        )
+    }
+
+    @Test
+    fun parsesOffsetWithoutMinutes() {
+        // Postgres can render a whole-hour zone as "+00" with no minutes at all.
+        assertEquals(1_700_000_000_123L, IsoTime.toMillis("2023-11-14T22:13:20.123+00"))
+    }
+
+    @Test
+    fun parsesSpaceSeparatedTimestamp() {
+        // The shape psql prints, as opposed to PostgREST's 'T'.
+        assertEquals(1_700_000_000_123L, IsoTime.toMillis("2023-11-14 22:13:20.123+00:00"))
+    }
+
+    @Test
+    fun bareDate_isNotMangledByTheZoneRewrite() {
+        // "2026-08-20" ends in "-20", which a careless offset regex reads as a zone.
+        // It must parse as midnight UTC, not as nonsense or zero.
+        assertEquals(1_699_920_000_000L, IsoTime.toMillis("2023-11-14"))
+    }
+
     @Test
     fun unparseableString_returnsZero() {
         assertEquals(0L, IsoTime.toMillis("not-a-date"))

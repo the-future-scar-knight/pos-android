@@ -1536,6 +1536,11 @@ interface CashTxnDao {
 
     @Query("UPDATE cash_txns SET pendingSync = 0 WHERE id IN (:ids)")
     suspend fun markSynced(ids: List<String>)
+
+    /** Every drawer movement this device holds. See [com.portionspot.pos.data.PosRepository.resetLocalData]
+     *  for why a reset that skipped this table re-uploaded a week of another database's cash. */
+    @Query("DELETE FROM cash_txns WHERE businessId = :businessId")
+    suspend fun wipe(businessId: String)
 }
 
 @Dao

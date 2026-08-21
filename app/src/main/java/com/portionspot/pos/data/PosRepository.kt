@@ -308,6 +308,36 @@ class PosRepository(private val db: PosDatabase) {
         return removed
     }
 
+    /**
+     * Discard this device's copy of the shop and re-adopt it from the database.
+     *
+     * ★ THE CASH TABLES WERE MISSING FROM THIS LIST, AND THAT IS HOW A TEST DATABASE GOT
+     * INTO THE REAL ONE.
+     *
+     * On 2026-08-20 the app was repointed from the throwaway project to production and
+     * reset. Everything below was wiped and re-pulled correctly. `cash_txns`,
+     * `cash_sessions`, `day_closes` and `outside_funds` were not in the list, so they
+     * survived the reset with `pendingSync = 1` still set — and the next push uploaded a
+     * week of the throwaway's shifts and drawer movements into the shop's real books: 19
+     * cash movements and 7 closed days, including a counted drawer of $318 attributed to
+     * a cashier who never worked that day. Nothing errored. The reset reported success.
+     *
+     * The omission was not survivable in principle either: the whole premise of this
+     * function is that local rows are discarded and the shared ones come back from the
+     * cloud. A table left behind by a reset does not "keep its data" — it keeps data
+     * belonging to a DIFFERENT database and then pushes it into this one.
+     *
+     * ★ `day_closes` and `outside_funds` are LOCAL-ONLY (see SyncConfig) and do not come
+     * back from any pull. Wiping them destroys them, and that is the intended behaviour
+     * here rather than an accepted cost: after a repoint they describe a shop this device
+     * is no longer pointed at, and keeping them is what leaves a day close dated 1 January
+     * 1970 sitting in the Cash screen — a `closedAt` of 0 that no cloud row will ever
+     * correct because no cloud row owns it.
+     *
+     * `staff` is deliberately NOT wiped. It was never part of the contamination (the
+     * roster is pull-only), and clearing it while offline would leave nobody able to sign
+     * in to the till that just reset itself.
+     */
     suspend fun resetLocalData() {
         val bid = businessDao.getOnce()?.id ?: return
         db.withTransaction {
@@ -328,6 +358,14 @@ class PosRepository(private val db: PosDatabase) {
             // exists — invisible, un-searchable, and re-inserted alongside the fresh pull.
             itemAttributeDao.wipe(bid)
             customerDao.wipe(bid)
+            // ── The drawer. See the note above: these four are why this exists. ──
+            // Order is immaterial (no foreign keys), but they go together: a device left
+            // holding sessions without their movements would report a shift whose cash it
+            // cannot account for, which is worse than holding neither.
+            cashTxnDao.wipe(bid)
+            cashSessionDao.wipe(bid)
+            dayCloseDao.wipe(bid)
+            outsideFundDao.wipe(bid)
         }
     }
 
@@ -822,8 +860,12 @@ class PosRepository(private val db: PosDatabase) {
         // The shift for the day BEING CLOSED — resolved from [dayStart], never from now.
         // Closing yesterday late at night must close YESTERDAY's shift; resolving by the
         // clock would write last night's count onto this morning's takings.
+        // [pickDaySession], not [pickSurvivingSession]: if ANY session of this day carries a
+        // count the day is settled, and this must be handed that row so the guard below sees
+        // it. An unmergeable leftover session ranking ahead of the counted one is how the
+        // takings get moved into the safe twice on a day that was already counted.
         val daySession =
-            pickSurvivingSession(cashSessionDao.forDayOnce(businessId, dayStart, startOfNextDay(dayStart)))
+            pickDaySession(cashSessionDao.forDayOnce(businessId, dayStart, startOfNextDay(dayStart)))
         // Already counted: the DayClose row above is normally what catches a repeat, but a
         // shift counted from another device and pulled down gets here first. Same rule.
         if (daySession?.countedCash != null) return null
@@ -1005,9 +1047,12 @@ class PosRepository(private val db: PosDatabase) {
      * A day counted on ANOTHER device, seen through this one, as the [DayClose] the screens
      * already know how to render. Null when nobody has counted the day yet.
      *
-     * Resolved with [pickSurvivingSession] rather than "the first row", so two phones that
-     * both opened a shift before seeing each other read the count off the SAME session —
-     * the one the merge will keep — instead of disagreeing about whether the day is closed.
+     * Resolved with [pickDaySession] rather than "the first row", so two phones that both
+     * opened a shift before seeing each other read the count off the SAME session. It asks
+     * for the COUNTED session and not merely the surviving one on purpose: a day holding two
+     * sessions stops being mergeable the moment a close closes one of them, and the leftover
+     * uncounted session — opened first, so ranked first — would otherwise hide a count this
+     * device is holding and offer the day up to be counted again. See [pickDaySession].
      *
      * `variance` is recomputed from counted − expected rather than carried: it is GENERATED
      * on the cloud and derived everywhere else, and a third copy is how a shop ends up with
@@ -1018,7 +1063,7 @@ class PosRepository(private val db: PosDatabase) {
         dayStart: Long,
         sessions: List<CashSession>,
     ): DayClose? {
-        val s = pickSurvivingSession(sessions.filter { !it.deleted }) ?: return null
+        val s = pickDaySession(sessions) ?: return null
         val counted = s.countedCash ?: return null
         val expected = s.expectedCash ?: 0.0
         return DayClose(
@@ -3847,6 +3892,21 @@ class PosRepository(private val db: PosDatabase) {
     }
 
     /**
+     * What may STILL be handed back on a refund — [Refund.payableTotal] less every payout
+     * already made against it.
+     *
+     * The ceiling [recordRefundPayout] enforces, exposed so the screen can enforce the SAME
+     * one while the figure is being typed. A clamp that only exists in the repository is a
+     * cashier reading $100 off the phone, telling the customer $100, and the till handing
+     * over $40 — the app quietly doing the right thing with the money and the wrong thing to
+     * the person at the counter.
+     */
+    suspend fun refundStillOwed(refundId: String): Double {
+        val refund = refundDao.getById(refundId) ?: return 0.0
+        return (refund.payableTotal - refundDao.paidSoFar(refundId)).coerceAtLeast(0.0)
+    }
+
+    /**
      * Pay off part or all of a refund the shop still owes a customer (prompt §11 —
      * "money over time, like change"). Writes a [RefundPayment] (records the method)
      * plus a `refund_paid` credit row that reduces the aged "we owe you" balance, and
@@ -3868,9 +3928,10 @@ class PosRepository(private val db: PosDatabase) {
         // ★ NEVER PAST WHAT IS OWED. Instalments accumulate, so without this the same
         // refund could be paid out twice — and on a refund whose unpaid part was cancelled
         // off the account, a single payout of the GOODS value would hand over money the
-        // sale never collected. Same ceiling the refund was created under.
-        val stillOwed = (refund.payableTotal - refundDao.paidSoFar(refundId)).coerceAtLeast(0.0)
-        val amount = minOf(tender.amount, stillOwed)
+        // sale never collected. Same ceiling the refund was created under, and the same one
+        // [refundStillOwed] hands the screen so the cashier is stopped at the keypad rather
+        // than silently corrected here.
+        val amount = minOf(tender.amount, refundStillOwed(refundId))
         if (amount <= CENT) return
         val stamp = now()
         db.withTransaction {

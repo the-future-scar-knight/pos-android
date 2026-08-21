@@ -137,6 +137,57 @@ fun <T : DaySessionRow> countToRescue(winner: T, losers: List<T>): T? {
 }
 
 /**
+ * Reconcile a shift arriving on the wire against the one this device already holds, so that
+ * A COUNT IS NEVER UN-COUNTED BY A ROW THAT SIMPLY HAS NOTHING TO SAY ABOUT IT.
+ *
+ * ══ THE BUG THIS EXISTS FOR ══
+ * The pull is last-writer-wins on `updated_at`, and the losing writer here was the one
+ * holding the money. On the owner's two phones, 17 Aug: the cashier's phone counted the
+ * drawer and moved $61 into the safe, writing the count onto the day's shift. Before that
+ * count reached the database, the owner's phone — still showing the day as open, because it
+ * had not pulled yet — hit midnight, rolled the day over, and published the SAME shift id as
+ * `status = closed, counted_cash = null, note = "Closed automatically at end of trading day"`
+ * with a newer stamp. That row is still in the database, on a day the shop demonstrably
+ * counted. The cashier's phone then pulled it, found it newer, and overwrote its own count
+ * with the null — so no device anywhere held the figure, the shared row said the day had
+ * never been counted, and every till in the shop went back to offering to count it.
+ *
+ * ══ WHY A NULL CANNOT BE A DELETION ══
+ * `counted_cash` only ever goes from null to a figure: a count is a physical measurement
+ * somebody took at a drawer, and nothing in this app or the web POS ever revokes one. So a
+ * wire row with no count carries NO INFORMATION about the count — it is a row written by a
+ * device that had not heard yet — and a merge that lets it win is losing data to silence.
+ * A wire row that DOES carry a count is a different matter and is taken as-is: two counts on
+ * one day cannot legitimately exist, and if they somehow do, last-writer-wins settles it the
+ * same way on every device rather than each phone preferring its own.
+ *
+ * The rescued row is marked dirty on purpose. It republishes the count in the same pass (see
+ * `PosSyncEngine.pushSettledShifts`), which is what repairs the shared row for the OTHER
+ * devices — without it this device alone would remember, and the shop's own database would
+ * still be telling the web POS that an already-counted day is there for the counting.
+ */
+fun reconcilePulledSession(incoming: CashSession, local: CashSession?): CashSession {
+    val count = local?.countedCash ?: return incoming
+    if (incoming.countedCash != null) return incoming
+    return incoming.copy(
+        // The whole settled half travels together. Half a close — a count with the closing
+        // figures of a different write — is not a state any screen here knows how to read.
+        status = SessionStatus.CLOSED,
+        closedAt = local.closedAt ?: incoming.closedAt,
+        closedBy = local.closedBy ?: incoming.closedBy,
+        closedByName = local.closedByName ?: incoming.closedByName,
+        countedCash = count,
+        expectedCash = local.expectedCash,
+        movedToSafe = local.movedToSafe,
+        floatTarget = local.floatTarget,
+        // The close's own note outranks the rollover's, which is a note about a day ENDING
+        // and not about the count that settled it.
+        note = local.note ?: incoming.note,
+        pendingSync = true,
+    )
+}
+
+/**
  * Which of the shared schema's movement types a cash movement is, given how this app
  * models the same money. The cloud CHECK-constrains the vocabulary:
  *

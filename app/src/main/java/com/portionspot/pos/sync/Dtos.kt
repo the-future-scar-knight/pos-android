@@ -55,6 +55,9 @@ internal object IsoTime {
 
     private val FRACTION = Regex("""\.(\d+)""")
 
+    /** A trailing UTC offset: `+02`, `+02:00` or `+0200`, and the negative forms. */
+    private val ZONE = Regex("""([+-])(\d{2}):?(\d{2})?$""")
+
     private fun formatter() = SimpleDateFormat(PATTERN, Locale.US)
         .apply { timeZone = TimeZone.getTimeZone("UTC") }
 
@@ -70,18 +73,69 @@ internal object IsoTime {
     private fun normalizeFraction(iso: String): String =
         FRACTION.replace(iso) { m -> "." + m.groupValues[1].padEnd(3, '0').take(3) }
 
+    /**
+     * Rewrite the zone into the RFC-822 form (`+0000`) that the `Z` pattern letter reads.
+     *
+     * ★★ THIS IS WHY EVERY CLOUD DATE READ AS 1970 ON ANDROID 6. ★★
+     *
+     * The parser used to offer `yyyy-MM-dd'T'HH:mm:ss.SSSXXX`, and the `X` pattern letter
+     * — ISO-8601 zone, the one that reads `+00:00` — **only exists in SimpleDateFormat
+     * from API 24**. On anything older it throws `Unknown pattern character 'X'`. This
+     * app's floor is API 23, and the shop runs a Sunmi handheld on Android 6.
+     *
+     * Every X-bearing pattern therefore threw, the two survivors both demanded a literal
+     * `Z` that PostgREST never sends (it sends `+00:00`), and [toMillis] fell through to
+     * its `0L`. Not for one column — for EVERY timestamp the cloud returned, on that whole
+     * class of device, silently, because the throw was swallowed as "unparseable date".
+     *
+     * What that did to the till: `ItemDto.baselineStamp()` became 0, so `stockBaseAt`
+     * became 0, so [com.portionspot.pos.data.stockOnHandFromDelta] returned null — "no
+     * baseline, leave this item alone" — and the item kept the cloud's `stock_qty` of 0.
+     * A product the owner had just stocked with 5 read **Out of stock** on the handheld,
+     * permanently: the next pull found the row unchanged, took the baseline branch, and
+     * wrote the same 0 back. The same zero is what printed a closed day as "1 January".
+     *
+     * `Z` (RFC 822) has been supported since API 1. Normalising to it means one code path
+     * for every Android version, rather than a parser whose correctness depends on which
+     * handset the shop happened to buy.
+     */
+    private fun normalizeZone(iso: String): String {
+        if (iso.endsWith("Z") || iso.endsWith("z")) return iso.dropLast(1) + "+0000"
+        val t = iso.indexOf('T')
+        val m = ZONE.find(iso) ?: return iso
+        // An offset only counts AFTER the time. Without this guard a bare date like
+        // "2026-08-20" matches its own "-20" and is rewritten into nonsense.
+        if (t < 0 || m.range.first < t) return iso
+        val (sign, hh, mm) = m.destructured
+        return iso.substring(0, m.range.first) + sign + hh + mm.ifEmpty { "00" }
+    }
+
+    /**
+     * Every pattern this parser will try, in order — zoned first, then the zone-less forms
+     * read as UTC (the server's clock is UTC; reading them in the handset's zone would
+     * shift the instant by wherever the phone thinks it is).
+     *
+     * ★ NOT PRIVATE, and that is deliberate. `IsoTimeTest` asserts that no pattern here
+     * contains `X`. A unit test cannot catch the real bug any other way: these tests run on
+     * DESKTOP Java, where `X` has worked since Java 7, so the suite passed green the entire
+     * time the shop's Android 6 handheld was reading every cloud date as 1970. The only
+     * thing a JVM test can check is that the forbidden letter is absent.
+     */
+    internal val PARSE_PATTERNS = listOf(
+        "yyyy-MM-dd'T'HH:mm:ss.SSSZ",
+        "yyyy-MM-dd'T'HH:mm:ssZ",
+        "yyyy-MM-dd'T'HH:mm:ss.SSS",
+        "yyyy-MM-dd'T'HH:mm:ss",
+        "yyyy-MM-dd",
+    )
+
     /** Parse the several timestamp shapes PostgREST emits (with/without millis or zone). */
     fun toMillis(iso: String?): Long {
         if (iso.isNullOrBlank()) return 0L
-        val normalized = normalizeFraction(iso)
-        val patterns = listOf(
-            PATTERN,
-            "yyyy-MM-dd'T'HH:mm:ss'Z'",
-            "yyyy-MM-dd'T'HH:mm:ss.SSSXXX",
-            "yyyy-MM-dd'T'HH:mm:ssXXX",
-            "yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX",
-        )
-        for (p in patterns) {
+        // Postgres renders a space between date and time in some contexts; PostgREST uses
+        // 'T'. Accept both rather than depending on which produced the string.
+        val normalized = normalizeZone(normalizeFraction(iso.trim().replaceFirst(' ', 'T')))
+        for (p in PARSE_PATTERNS) {
             runCatching {
                 SimpleDateFormat(p, Locale.US)
                     .apply { timeZone = TimeZone.getTimeZone("UTC") }
@@ -866,10 +920,19 @@ fun MobileMoneyReceipt.toPush() = MobileMoneyPushDto(
 // cloud row per device. `local_id` is still sent (it is this device's row id, useful
 // for tracing) but the cloud column is deliberately non-unique.
 //
-// TYPE RULES:
-//   • created_at / updated_at are TIMESTAMPTZ -> fixed-format UTC ISO via [IsoTime]
-//     (the `updated_at=gt.<cursor>` pull depends on it).
-//   • event_at / read_at are plain BIGINT epoch ms -> send the Long as-is.
+// TYPE RULES — CHECKED AGAINST THE LIVE TABLE, 19 AUG. All four instants are
+// TIMESTAMPTZ:
+//   • created_at / updated_at (the `updated_at=gt.<cursor>` pull depends on the
+//     fixed-format UTC ISO [IsoTime] produces), AND
+//   • event_at / read_at, which this file used to declare as BIGINT epoch ms.
+//     ★ That was wrong in BOTH directions and silently so, because the table was
+//     empty: a pull would have thrown decoding "2026-08-18T17:40:49Z" into a Long
+//     and taken the whole notifications pass down with it, and a push would have
+//     been refused by Postgres as invalid input for a timestamp. Nothing was ever
+//     observed because nothing has ever been written here.
+//   • occurrence / target_staff_id EXIST on the cloud table and have no local
+//     column yet. They are declared here so a row this device writes does not blank
+//     what another client set, and so the gap is visible rather than assumed away.
 //   • pushedAt is NOT in the contract at all: it is device-local state recording
 //     whether THIS phone already fired its own heads-up notification. It is never
 //     sent, and a pull must preserve the local value.
@@ -888,10 +951,12 @@ data class NotificationDto(
     val audience: String = "admin",
     @SerialName("ref_type") val refType: String? = null,
     @SerialName("ref_id") val refId: String? = null,
-    @SerialName("event_at") val eventAt: Long? = null,
-    @SerialName("read_at") val readAt: Long? = null,
+    @SerialName("event_at") val eventAt: String? = null,
+    @SerialName("read_at") val readAt: String? = null,
     @SerialName("created_at") val createdAt: String? = null,
     @SerialName("updated_at") val updatedAt: String? = null,
+    val occurrence: Int = 1,
+    @SerialName("target_staff_id") val targetStaffId: String? = null,
     val deleted: Boolean = false,
 ) {
     fun bridgeId(): String = localId?.ifBlank { null } ?: "notif-${newId()}"
@@ -920,8 +985,15 @@ fun NotificationDto.toNotification(businessId: String, local: AppNotification?):
         audience = audience.ifBlank { "admin" },   // audience IS shared content
         refType = refType,
         refId = refId,
-        eventAt = eventAt ?: base.eventAt,
-        readAt = readAt,                // read-state IS shared
+        eventAt = IsoTime.toMillis(eventAt).takeIf { it > 0 } ?: base.eventAt,
+        // ★ READ-STATE DOES NOT TRAVEL, and the column it would travel in is the reason.
+        // `notifications.read_at` is ONE flag for the whole shop, so pushing it would mean
+        // the owner clearing his feed clears the cashier's — every alert she has not looked
+        // at yet marked read by somebody else's thumb. The database already has the right
+        // answer for this (`notification_reads`, per person, keyed on the dedupe key) and
+        // this app has no local table for it yet, so read-state stays where it already is:
+        // on the device that did the reading. Neither pushed nor applied here.
+        readAt = base.readAt,
         pushedAt = base.pushedAt,       // device-local: never overwritten by a pull
         createdAt = IsoTime.toMillis(createdAt).takeIf { it > 0 } ?: base.createdAt,
         updatedAt = IsoTime.toMillis(updatedAt),
@@ -942,8 +1014,8 @@ data class NotificationPushDto(
     val audience: String = "admin",
     @SerialName("ref_type") val refType: String? = null,
     @SerialName("ref_id") val refId: String? = null,
-    @SerialName("event_at") val eventAt: Long,
-    @SerialName("read_at") val readAt: Long? = null,
+    @SerialName("event_at") val eventAt: String,
+    // No `read_at`: it is shop-wide on the cloud and per-device here. See [toNotification].
     @SerialName("created_at") val createdAt: String,
     @SerialName("updated_at") val updatedAt: String,
     val deleted: Boolean = false,
@@ -961,8 +1033,7 @@ fun AppNotification.toNotificationPush() = NotificationPushDto(
     audience = audience,
     refType = refType,
     refId = refId,
-    eventAt = eventAt,
-    readAt = readAt,
+    eventAt = IsoTime.toIso(eventAt),
     createdAt = IsoTime.toIso(createdAt),
     updatedAt = IsoTime.toIso(updatedAt),
     deleted = deleted,

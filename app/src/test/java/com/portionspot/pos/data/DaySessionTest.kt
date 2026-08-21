@@ -448,4 +448,81 @@ class DaySessionTest {
         assertNull(close(null))
         assertNull(close(S("a", today, deleted = true)))
     }
+
+    // ──────────────────── which session speaks for the day (pickDaySession) ────────────────────
+
+    @Test
+    fun aCountedSessionOutranksAnOlderUncountedOne() {
+        // The state the cash screen kept getting wrong. Two sessions for one day — two
+        // devices offline from each other each opened one — and the count landed on the
+        // YOUNGER of them. The merge cannot collapse the pair any more (the count closed
+        // one of them), so the older uncounted row would go on winning forever and the day
+        // would read as never counted on the phone that counted it.
+        val older = S("aaa", at(2026, 8, 18, 7, 0))
+        val counted = S("zzz", at(2026, 8, 18, 9, 0), status = SessionStatus.CLOSED, countedCash = 61.0)
+        assertEquals(counted, pickDaySession(listOf(older, counted)))
+        assertEquals(counted, pickDaySession(listOf(counted, older)))
+    }
+
+    @Test
+    fun withNoCountAnywhereItPicksExactlyWhatTheMergeWould() {
+        // The uncounted case must not drift from the merge's survivor, or the device writes
+        // its count onto a row the merge is about to close.
+        val rows = listOf(
+            S("d4", at(2026, 8, 18, 11, 0)),
+            S("a1", at(2026, 8, 18, 7, 0)),
+            S("c3", at(2026, 8, 18, 7, 0)),
+        )
+        assertEquals(pickSurvivingSession(rows), pickDaySession(rows))
+    }
+
+    @Test
+    fun twoDevicesReadTheSameCountOffTheSameRow() {
+        // Same requirement as everywhere else here: the answer cannot depend on the order
+        // the rows were pulled in, or two phones disagree about whether the day is settled.
+        val rows = listOf(
+            S("m", at(2026, 8, 18, 8, 0)),
+            S("b", at(2026, 8, 18, 9, 0), status = SessionStatus.CLOSED, countedCash = 61.0),
+            S("z", at(2026, 8, 18, 6, 0)),
+        )
+        val expected = pickDaySession(rows)
+        assertEquals("b", expected!!.id)
+        val r = Random(11)
+        repeat(100) { assertEquals(expected, pickDaySession(rows.shuffled(r))) }
+    }
+
+    @Test
+    fun aTombstonedCountDoesNotSettleTheDay() {
+        val deletedCount = S("zzz", at(2026, 8, 18, 9, 0), deleted = true, countedCash = 61.0)
+        val live = S("aaa", at(2026, 8, 18, 7, 0))
+        assertEquals(live, pickDaySession(listOf(deletedCount, live)))
+        assertNull(pickDaySession(listOf(deletedCount)))
+    }
+
+    @Test
+    fun aDayWithNoSessionsHasNothingToSpeakForIt() {
+        assertNull(pickDaySession(emptyList<S>()))
+    }
+
+    @Test
+    fun theCloseGuardSeesACountHeldOnANonSurvivingSession() {
+        // The two rules together, which is how they are actually used: [pickDaySession]
+        // resolves the day's row and [planDayClose] refuses to count it twice. Before this
+        // the pair let a settled day be counted again — moving the takings into the safe a
+        // second time, out of a drawer that no longer held them.
+        val rows = listOf(
+            S("aaa", at(2026, 8, 18, 7, 0)),
+            S("zzz", at(2026, 8, 18, 9, 0), status = SessionStatus.CLOSED, countedCash = 61.0),
+        )
+        assertNull(
+            planDayClose(
+                session = pickDaySession(rows),
+                closedAt = at(2026, 8, 18, 18, 0),
+                countedCash = 61.0,
+                expectedCash = 58.0,
+                movedToSafe = 41.0,
+                floatTarget = 20.0,
+            )
+        )
+    }
 }

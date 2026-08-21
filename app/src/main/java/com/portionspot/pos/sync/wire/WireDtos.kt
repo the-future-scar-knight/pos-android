@@ -29,6 +29,7 @@ import com.portionspot.pos.data.SaleEntity
 import com.portionspot.pos.data.SaleLine
 import com.portionspot.pos.data.SalePayment
 import com.portionspot.pos.data.StockMovement
+import com.portionspot.pos.data.StaffRequest
 import com.portionspot.pos.data.Supplier
 import com.portionspot.pos.data.saleLineDiscountTotal
 import com.portionspot.pos.data.saleMarginFromLines
@@ -1673,10 +1674,22 @@ fun Supplier.toPush(): SupplierPushDto = SupplierPushDto(
 )
 
 // ─────────────────────────────────── expenses ───────────────────────────────────
-// NINE columns on the cloud against THIRTY-ONE fields locally. The approval lifecycle,
-// the cash/payable/capital funding split and the whole recurrence engine have no home on
-// the shared schema, which is why the pull below is a MERGE onto the local row and not a
-// replacement: applying a wire row wholesale would wipe every one of them.
+// SIXTEEN columns on the cloud against THIRTY-ONE fields locally. The funding split
+// (cash / payable / capital) and the whole recurrence engine still have no home on the
+// shared schema, which is why the pull below is a MERGE onto the local row and not a
+// replacement: applying a wire row wholesale would wipe both.
+//
+// * THE APPROVAL LIFECYCLE TRAVELS AS OF 19 AUGUST and did not before. It had nowhere to
+// go, and the cost of that landed on two real phones: a cashier posted an expense, it
+// arrived on the owner's phone already APPROVED - synthesised, because the pull had no
+// status to read - dropped his net profit, and stayed `pending` on hers. Two phones
+// reporting different profit for one shop, with nothing on either saying why.
+//
+// The funding split stays local ON PURPOSE, and it is not the same kind of fact: a cash
+// portion means "out of THIS drawer", and there is no `cash_txns` row on another device
+// for money this one spent. That money reaches the other phones as `cash_movements`,
+// which is its own table and already pulls. See
+// `supabase/2026-08-19-expense-approval.sql`.
 
 @Serializable
 data class ExpenseDto(
@@ -1688,37 +1701,67 @@ data class ExpenseDto(
      *  parsing it as one yields 0 and buckets the cost on 1 January 1970. */
     val date: String? = null,
     val description: String? = null,
+    // -- the approval lifecycle, added 19 Aug --
+    val status: String? = null,
+    @SerialName("submitted_by") val submittedBy: String? = null,
+    @SerialName("submitted_by_name") val submittedByName: String? = null,
+    @SerialName("approved_by") val approvedBy: String? = null,
+    @SerialName("approved_by_name") val approvedByName: String? = null,
+    @SerialName("approved_at") val approvedAt: String? = null,
+    @SerialName("posted_at") val postedAt: String? = null,
     @SerialName("updated_at") val updatedAt: String? = null,
     val deleted: Boolean = false,
 )
 
 /**
- * Merge a pulled expense onto the local row — only the five fields the shared table
- * actually has. Everything else on [Expense] is preserved from [local].
+ * Merge a pulled expense onto the local row.
  *
- * ★ A row authored on the WEB arrives with no lifecycle at all, because the shared table
- * has no column for one. Left at the entity's defaults it would land as `status =
- * "pending"`, and a pending expense is invisible to the dashboard's net-profit line and
- * sits in the admin's approval queue forever waiting for a decision about a cost that was
- * already incurred somewhere else. So a FIRST pull synthesises the only reading that
- * makes sense: approved and posted, stamped with the row's own clock.
+ * A ROW FROM A CLIENT WITH NO APPROVAL STEP still arrives with no status - the web does
+ * not write one, and the column defaults to `approved` precisely so that it reads as what
+ * it is. Left at the ENTITY's default it would land as `pending`, which withdraws a cost
+ * somebody has already paid from the books and files it in an approval queue for a
+ * decision nobody remembers making. So when the wire says nothing, this still synthesises
+ * approved-and-posted, stamped with the row's own clock. That was the whole of the old
+ * behaviour and it was correct - for the only writer that existed at the time.
  *
- * The funding split is deliberately left at zero rather than booked to cash. There is no
- * `cash_txns` row on this device for money another client spent, so claiming it came out
- * of this drawer would make the shop's cash-on-hand disagree with the money in it.
+ * WHEN THE WIRE DOES CARRY A STATUS, THE WHOLE LIFECYCLE IS TAKEN FROM IT, nulls and all.
+ * Falling back to the local value per field would leave a stale `approvedAt` sitting on a
+ * row the other phone has since put back to pending - an expense approved by nobody, at a
+ * time, which is worse than either state on its own. The caller only reaches here when the
+ * wire row is the newer one, so the wire is the better-informed writer by construction.
+ *
+ * The funding split is deliberately left alone. There is no `cash_txns` row on this device
+ * for money another device spent, so claiming it came out of this drawer would make the
+ * shop's cash-on-hand disagree with the money in it.
  */
 fun ExpenseDto.toExpense(businessId: String, local: Expense?): Expense {
     val stamp = IsoTime.toMillis(updatedAt)
+    val wireStatus = status?.trim()?.ifBlank { null }
+    val approvedAtMs = IsoTime.toMillis(approvedAt).takeIf { it > 0 }
+    val postedAtMs = IsoTime.toMillis(postedAt).takeIf { it > 0 }
     val base = local ?: Expense(
         id = id,
         businessId = businessId,
         date = date?.ifBlank { null }.orEmpty(),
-        status = "approved",
-        approvedAt = stamp.takeIf { it > 0 },
-        postedAt = stamp.takeIf { it > 0 },
+        status = wireStatus ?: "approved",
+        // Synthesised ONLY for the writer that has no lifecycle. A row that did carry one
+        // gets exactly the instants it carried, including none at all.
+        approvedAt = if (wireStatus == null) stamp.takeIf { it > 0 } else approvedAtMs,
+        postedAt = if (wireStatus == null) stamp.takeIf { it > 0 } else postedAtMs,
         createdAt = stamp.takeIf { it > 0 } ?: now(),
     )
-    return base.copy(
+    val lifecycle =
+        if (wireStatus == null) base
+        else base.copy(
+            status = wireStatus,
+            submittedBy = submittedBy,
+            submittedByName = submittedByName,
+            approvedBy = approvedBy,
+            approvedByName = approvedByName,
+            approvedAt = approvedAtMs,
+            postedAt = postedAtMs,
+        )
+    return lifecycle.copy(
         id = id,
         businessId = businessId,
         category = category?.ifBlank { null } ?: base.category,
@@ -1740,10 +1783,23 @@ data class ExpensePushDto(
     /** Straight through: both sides speak "yyyy-MM-dd". */
     val date: String? = null,
     val description: String? = null,
+    val status: String = "pending",
+    @SerialName("submitted_by") val submittedBy: String? = null,
+    @SerialName("submitted_by_name") val submittedByName: String? = null,
+    @SerialName("approved_by") val approvedBy: String? = null,
+    @SerialName("approved_by_name") val approvedByName: String? = null,
+    @SerialName("approved_at") val approvedAt: String? = null,
+    @SerialName("posted_at") val postedAt: String? = null,
     val deleted: Boolean = false,
     @SerialName("client_updated_at") val clientUpdatedAt: String,
 )
 
+/**
+ * THE STATUS IS ALWAYS SENT, never left to the column default. That default is `approved`
+ * - it exists for the web, which has no approval step - so a phone that omitted the field
+ * would have every pending expense it raised arrive at the owner already approved, which
+ * is the exact failure the column was added to end.
+ */
 fun Expense.toPush(): ExpensePushDto = ExpensePushDto(
     id = id,
     businessId = businessId,
@@ -1751,6 +1807,13 @@ fun Expense.toPush(): ExpensePushDto = ExpensePushDto(
     amount = amount,
     date = date.ifBlank { null },
     description = description?.ifBlank { null },
+    status = status.ifBlank { "pending" },
+    submittedBy = submittedBy?.ifBlank { null },
+    submittedByName = submittedByName?.ifBlank { null },
+    approvedBy = approvedBy?.ifBlank { null },
+    approvedByName = approvedByName?.ifBlank { null },
+    approvedAt = approvedAt?.let { IsoTime.toIso(it) },
+    postedAt = postedAt?.let { IsoTime.toIso(it) },
     deleted = deleted,
     clientUpdatedAt = IsoTime.toIso(updatedAt),
 )
@@ -2050,4 +2113,132 @@ fun PurchaseOrderLine.toPush(stamp: Long): PurchaseOrderItemPushDto = PurchaseOr
     // nothing in the box" and close the arrival prompt on an order still in transit.
     receivedQty = receivedQty,
     clientUpdatedAt = IsoTime.toIso(stamp),
+)
+
+
+// ─────────────────────────────── staff_requests ───────────────────────────────
+/**
+ * A cashier asking the owner for permission, and the owner's answer — on the wire at last.
+ *
+ * ══ WHY THIS WAS MISSING ══
+ * The whole raise → decide → apply lifecycle has existed on the device for months, and none
+ * of it ever left the phone. An older DTO pair was DELETED from `sync/Dtos.kt` with the note
+ * that "`staff_requests` has no cloud table at all, on this database or any other" — true
+ * when it was written, and no longer: the table is there, twenty columns of it, with a
+ * permissive tenant read/write policy. Until now a cashier tapping "ask the owner" raised a
+ * request that only the cashier's own phone could see, and an owner who approved one approved
+ * it into a screen the cashier would never look at. It was a doorbell wired to its own hallway.
+ *
+ * ══ WHAT DOES NOT TRAVEL ══
+ * [StaffRequest.applied] is on the cloud but is DEVICE-LOCAL in effect: it records that the
+ * approval was consumed — the discount actually taken, the void actually performed — and the
+ * device that consumes it is the cashier's. It is pulled (an admin device may legitimately set
+ * it) and pushed, but a pull never clears a local `true`: the goods are already out of the
+ * door, and a wire row saying otherwise cannot put them back.
+ */
+@Serializable
+data class StaffRequestDto(
+    val id: String,
+    val type: String = "",
+    @SerialName("target_type") val targetType: String? = null,
+    @SerialName("target_id") val targetId: String? = null,
+    @SerialName("target_name") val targetName: String? = null,
+    val amount: String? = null,
+    val note: String? = null,
+    @SerialName("requested_by") val requestedBy: String? = null,
+    @SerialName("requested_by_name") val requestedByName: String? = null,
+    val status: String = "pending",
+    @SerialName("decided_by") val decidedBy: String? = null,
+    @SerialName("decided_by_name") val decidedByName: String? = null,
+    @SerialName("decided_at") val decidedAt: String? = null,
+    val applied: Boolean = false,
+    @SerialName("created_at") val createdAt: String? = null,
+    @SerialName("updated_at") val updatedAt: String? = null,
+    @SerialName("local_id") val localId: String? = null,
+    val deleted: Boolean = false,
+) {
+    fun cursorStamp(): String = updatedAt ?: createdAt ?: IsoTime.EPOCH
+}
+
+fun StaffRequestDto.toStaffRequest(businessId: String, local: StaffRequest?): StaffRequest {
+    val base = local ?: StaffRequest(id = id, businessId = businessId, type = type)
+    return base.copy(
+        id = id,
+        // The cloud's own key for the row. Kept from [local] when the wire has none, so a
+        // row this device raised keeps pushing under the id it first went up with.
+        localId = localId?.ifBlank { null } ?: base.localId,
+        businessId = businessId,
+        type = type.ifBlank { base.type },
+        targetType = targetType,
+        targetId = targetId,
+        targetName = targetName,
+        amount = amount?.toDoubleOrNull(),
+        note = note,
+        requestedBy = requestedBy,
+        requestedByName = requestedByName,
+        status = status.ifBlank { base.status },
+        decidedBy = decidedBy,
+        decidedByName = decidedByName,
+        decidedAt = IsoTime.toMillis(decidedAt).takeIf { it > 0 },
+        // Never un-applied by the wire — see the header. An approval already spent on a
+        // discount or a void cannot be returned to the shelf by a row arriving late.
+        applied = applied || base.applied,
+        createdAt = IsoTime.toMillis(createdAt).takeIf { it > 0 } ?: base.createdAt,
+        updatedAt = IsoTime.toMillis(cursorStamp()),
+        deleted = deleted,
+        pendingSync = false,
+    )
+}
+
+@Serializable
+data class StaffRequestPushDto(
+    val id: String,
+    @SerialName("business_id") val businessId: String,
+    val type: String,
+    @SerialName("target_type") val targetType: String? = null,
+    @SerialName("target_id") val targetId: String? = null,
+    @SerialName("target_name") val targetName: String? = null,
+    val amount: Double? = null,
+    val note: String? = null,
+    @SerialName("requested_by") val requestedBy: String? = null,
+    @SerialName("requested_by_name") val requestedByName: String? = null,
+    val status: String,
+    @SerialName("decided_by") val decidedBy: String? = null,
+    @SerialName("decided_by_name") val decidedByName: String? = null,
+    @SerialName("decided_at") val decidedAt: String? = null,
+    val applied: Boolean = false,
+    @SerialName("created_at") val createdAt: String,
+    @SerialName("local_id") val localId: String? = null,
+    val deleted: Boolean = false,
+    @SerialName("client_updated_at") val clientUpdatedAt: String,
+)
+
+/**
+ * `id` is a `uuid` on the cloud with NO default, so a row whose local id is not one cannot
+ * go up at all — and a rejected batch fails WHOLE, taking every other request with it. This
+ * app mints uuids ([newId]), so the only rows this can catch are foreign or hand-made ones,
+ * which the engine drops rather than sending.
+ */
+fun StaffRequest.toPush(): StaffRequestPushDto = StaffRequestPushDto(
+    id = id,
+    businessId = businessId,
+    // NOT NULL on the cloud, free-form here. A request with no type is still a request
+    // somebody is waiting on an answer to.
+    type = type.ifBlank { "other" },
+    targetType = targetType?.ifBlank { null },
+    targetId = targetId?.ifBlank { null },
+    targetName = targetName?.ifBlank { null },
+    amount = amount,
+    note = note?.ifBlank { null },
+    requestedBy = requestedBy?.ifBlank { null },
+    requestedByName = requestedByName?.ifBlank { null },
+    status = status.ifBlank { "pending" },
+    decidedBy = decidedBy?.ifBlank { null },
+    decidedByName = decidedByName?.ifBlank { null },
+    decidedAt = decidedAt?.let { IsoTime.toIso(it) },
+    applied = applied,
+    createdAt = IsoTime.toIso(createdAt),
+    localId = localId.ifBlank { null },
+    deleted = deleted,
+    clientUpdatedAt = IsoTime.toIso(updatedAt),
 )

@@ -427,4 +427,90 @@ class CashSessionMergeTest {
             assertEquals(expected, countToRescue(winner, losers.shuffled(r)))
         }
     }
+
+    // ──────────────────── a count survives the wire (reconcilePulledSession) ────────────────────
+
+    private fun session(
+        id: String = "s1",
+        status: String = SessionStatus.OPEN,
+        countedCash: Double? = null,
+        expectedCash: Double? = null,
+        movedToSafe: Double = 0.0,
+        floatTarget: Double = 0.0,
+        note: String? = null,
+        closedAt: Long? = null,
+        updatedAt: Long = 1_000L,
+        pendingSync: Boolean = false,
+    ) = CashSession(
+        id = id, businessId = "biz", status = status, openedAt = 500L,
+        closedAt = closedAt, countedCash = countedCash, expectedCash = expectedCash,
+        movedToSafe = movedToSafe, floatTarget = floatTarget, note = note,
+        updatedAt = updatedAt, pendingSync = pendingSync,
+    )
+
+    @Test
+    fun aWireRowWithNoCountCannotUnCountACountedShift() {
+        // The 17 Aug failure, exactly: the phone that counted the drawer pulls the OTHER
+        // phone's midnight rollover, which is newer and says counted_cash = null.
+        val local = session(
+            status = SessionStatus.CLOSED, countedCash = 61.0, expectedCash = 58.0,
+            movedToSafe = 61.0, floatTarget = 20.0, note = "Counted at close",
+            closedAt = 9_000L, updatedAt = 9_000L,
+        )
+        val wire = session(
+            status = SessionStatus.CLOSED, note = DAY_ROLLOVER_NOTE,
+            closedAt = 12_000L, updatedAt = 12_000L,
+        )
+        val out = reconcilePulledSession(wire, local)
+        assertEquals(61.0, out.countedCash!!, 0.001)
+        assertEquals(58.0, out.expectedCash!!, 0.001)
+        assertEquals(61.0, out.movedToSafe, 0.001)
+        assertEquals(20.0, out.floatTarget, 0.001)
+        assertEquals(9_000L, out.closedAt)
+        assertEquals("Counted at close", out.note)
+        assertEquals(SessionStatus.CLOSED, out.status)
+    }
+
+    @Test
+    fun theRescuedCountIsRepublished() {
+        // Keeping it on this device alone is half a fix: the shared row still tells every
+        // other till the day was never counted. Dirty => it goes back up in the same pass.
+        val local = session(status = SessionStatus.CLOSED, countedCash = 61.0, updatedAt = 9_000L)
+        val out = reconcilePulledSession(session(updatedAt = 12_000L), local)
+        assertTrue(out.pendingSync)
+    }
+
+    @Test
+    fun aWireRowThatCarriesItsOwnCountIsTakenAsItIs() {
+        // Two counts for one day cannot legitimately exist. If they somehow do, the wire
+        // wins on every device rather than each phone preferring the figure it happens to
+        // hold — the same reason the merge rule is fixed rather than local.
+        val local = session(status = SessionStatus.CLOSED, countedCash = 61.0, updatedAt = 9_000L)
+        val wire = session(
+            status = SessionStatus.CLOSED, countedCash = 80.0, expectedCash = 75.0,
+            updatedAt = 12_000L, note = "Recounted",
+        )
+        val out = reconcilePulledSession(wire, local)
+        assertEquals(80.0, out.countedCash!!, 0.001)
+        assertEquals("Recounted", out.note)
+        assertTrue(!out.pendingSync)
+    }
+
+    @Test
+    fun anUncountedLocalRowIsLeftEntirelyToTheWire() {
+        // The ordinary case, and it must stay ordinary: no count to protect, nothing to do.
+        val wire = session(status = SessionStatus.CLOSED, note = DAY_ROLLOVER_NOTE, updatedAt = 12_000L)
+        assertEquals(wire, reconcilePulledSession(wire, session(updatedAt = 9_000L)))
+        assertEquals(wire, reconcilePulledSession(wire, null))
+    }
+
+    @Test
+    fun rescuingIsIdempotent() {
+        // The second pass sees a wire row that no longer contradicts anything.
+        val local = session(status = SessionStatus.CLOSED, countedCash = 61.0, updatedAt = 9_000L)
+        val once = reconcilePulledSession(session(updatedAt = 12_000L), local)
+        val twice = reconcilePulledSession(session(updatedAt = 12_000L), once)
+        assertEquals(once.countedCash, twice.countedCash)
+        assertEquals(once.closedAt, twice.closedAt)
+    }
 }

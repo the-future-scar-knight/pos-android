@@ -204,9 +204,6 @@ class SyncConfig(private val dao: SettingDao) {
          * Local Room tables with NO cloud home, listed so it is a decision rather than an
          * oversight. Each is device-local until the web grows a table for it:
          *
-         *  - `notifications`   the alert feed. Cross-device alerting needs a shared table;
-         *                      until then an alert raised on a cashier phone stays there.
-         *  - `staff_requests`  the admin⇄cashier approval channel (credit-limit asks).
          *  - `day_closes`      the till/safe day-close record. Still local-only, but no
          *                      longer stranded: now that a shift IS a trading day, closing a
          *                      day writes its count, float target and moved-to-safe straight
@@ -226,7 +223,12 @@ class SyncConfig(private val dao: SettingDao) {
          *                      for why the rest of that row is deliberately left alone.
          */
         val LOCAL_ONLY_TABLES = listOf(
-            "notifications", "staff_requests", "day_closes", "outside_funds", "settings"
+            // `notifications` and `staff_requests` left this list on 19 Aug. Both tables
+            // exist on the shared schema with a tenant read/write policy, and both are now
+            // pushed and pulled — see `PosSyncEngine`. They sat here for months after the
+            // tables were created, which is why this list is worth keeping honest: it is
+            // read by people, not by code, and a stale entry here reads as a decision.
+            "day_closes", "outside_funds", "settings"
         )
 
         /**

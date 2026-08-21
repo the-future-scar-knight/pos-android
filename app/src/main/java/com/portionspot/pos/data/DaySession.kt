@@ -292,6 +292,31 @@ fun planDayBackfill(
 // ─────────────────────────── the close, mapped onto the day ───────────────────────────
 
 /**
+ * The session that answers "has this trading day been counted?".
+ *
+ * ★ THE COUNT IS NOT ALWAYS ON THE SURVIVOR, and asking [pickSurvivingSession] alone is how
+ * a settled day reads as unsettled on the very phone that settled it. A day can legitimately
+ * hold more than one session — two devices offline from each other each open one — and the
+ * merge that collapses them only ever ranks OPEN sessions. The moment a close counts one of
+ * them it is closed, the pair stops being mergeable, and the UNCOUNTED one can outrank the
+ * counted one forever: it was opened first, so [pickSurvivingSession] keeps returning it.
+ * The cash screen then goes on offering to close a day that has already been settled, and
+ * [planDayClose] — handed that same row — sees no count and lets the takings move into the
+ * safe a second time, out of a drawer that no longer holds them.
+ *
+ * So a COUNTED session wins outright, and only when none of them carries one does this fall
+ * back to the merge's own survivor — which keeps the uncounted case identical to what every
+ * other rule here picks. Among counted sessions the oldest-then-id order is kept, so two
+ * devices resolving the same day independently read the same figure off the same row.
+ */
+fun <T : DaySessionRow> pickDaySession(sessions: List<T>): T? {
+    val live = sessions.distinctBy { it.id }.filter { !it.deleted }
+    return live.filter { it.countedCash != null }
+        .minWithOrNull(compareBy({ it.openedAt }, { it.id }))
+        ?: pickSurvivingSession(live)
+}
+
+/**
  * The figures a day close writes onto its day's [CashSession] — the closing half of the
  * shift, in the exact shape `public.cash_sessions` is waiting for.
  *

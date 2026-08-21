@@ -38,6 +38,7 @@ import com.portionspot.pos.data.StockMovementDao
 import com.portionspot.pos.data.stockOnHandFromDelta
 import com.portionspot.pos.data.cashMovementCountedElsewhere
 import com.portionspot.pos.data.countToRescue
+import com.portionspot.pos.data.reconcilePulledSession
 import com.portionspot.pos.data.planSessionMerge
 import com.portionspot.pos.data.planDayRollover
 import com.portionspot.pos.data.ShopPolicy
@@ -53,6 +54,8 @@ import com.portionspot.pos.sync.wire.RefundPaymentDto
 import com.portionspot.pos.sync.wire.toRefund
 import com.portionspot.pos.sync.wire.toRefundLine
 import com.portionspot.pos.sync.wire.toRefundPayment
+import com.portionspot.pos.sync.wire.StaffRequestDto
+import com.portionspot.pos.sync.wire.toStaffRequest
 import com.portionspot.pos.sync.wire.StockMovementDto
 import com.portionspot.pos.sync.wire.toStockMovement
 import com.portionspot.pos.sync.wire.CashSessionDto
@@ -121,6 +124,16 @@ sealed class SyncOutcome {
 
 /** Internal result of the push half: how many rows went up, and per-table failures. */
 private data class PushResult(val pushed: Int, val errors: List<String>)
+
+/**
+ * What one pull pass moved, and which tables refused to move it.
+ *
+ * The pull reports errors per TABLE for the same reason the push does: a pass that
+ * fails as a single opaque "Sync failed" tells the owner nothing about which half of
+ * the shop is now out of date, and a pass that swallows the failure entirely tells
+ * them less than nothing — it reports success over a table that has not synced since.
+ */
+private data class PullResult(val pulled: Int, val errors: List<String>)
 
 /**
  * Postgres "new row violates row-level security policy". On a staff-gated database
@@ -259,7 +272,9 @@ class PosSyncEngine(
             // in [pull] (which is read-only by design, and that invariant is worth more
             // than the tidiness of one more line in its list).
             val policyErrors = if (cloudBid == null) emptyList() else syncShopPolicy(api, cloudBid)
-            val pulled = if (cloudBid == null) 0 else pull(api, cloudBid)
+            val pullResult = if (cloudBid == null) PullResult(0, emptyList())
+            else pull(api, cloudBid)
+            val pulled = pullResult.pulled
             // ★ ONE MORE SHIFT PUSH, because the merge happens INSIDE the pull and the push
             // is already behind us. Two tills that each opened a shift for the same day only
             // discover each other during the pull; the merge then resolves them and may
@@ -281,7 +296,7 @@ class PosSyncEngine(
                     "Waiting to identify this shop in the database. It must hold exactly " +
                         "one business before this till can sync; check the Sync screen."
                     )
-            } else pushResult.errors + policyErrors + settleErrors
+            } else pushResult.errors + policyErrors + pullResult.errors + settleErrors
             val at = System.currentTimeMillis()
             config.setLastSyncAt(at)
             // Split timestamps so the owner can SEE the two directions independently:
@@ -738,11 +753,57 @@ class PosSyncEngine(
             rows.size
         }
 
+        // notifications — the shop's alert feed. THE UPSERT KEY IS COMPOSITE:
+        // `business_id,dedupe_key`, never `id`. Two devices that notice the same condition
+        // — one low stock item, one refund the shop owes — mint different row ids and the
+        // SAME dedupe key, so conflicting on id would leave one cloud row per phone and an
+        // owner reading the same alert twice.
+        //
+        // A row with no dedupe key is dropped rather than sent: the column is NOT NULL on
+        // the cloud AND it is the conflict target, so one blank row fails the whole batch
+        // and takes every real alert with it.
+        pushTable("notifications") {
+            val rows = notificationDao.pending().filter { it.dedupeKey.isNotBlank() }
+            if (rows.isEmpty()) return@pushTable 0
+            api.upsert(
+                "notifications",
+                syncJson.encodeToString(
+                    rows.map { it.toNotificationPush().copy(businessId = cloudBid) }
+                ),
+                "business_id,dedupe_key",
+            )
+            notificationDao.markSynced(rows.map { it.id })
+            rows.size
+        }
+
+        // staff_requests — a cashier asking permission, and the owner's answer. Pushed for
+        // the first time here; see [StaffRequestDto] for what was wired to nothing before.
+        //
+        // `id` is a `uuid` with no default on the cloud, and a rejected batch fails WHOLE,
+        // so a row whose id is not a uuid is left on the device instead of being allowed to
+        // take every other request down with it.
+        pushTable("staff_requests") {
+            val rows = staffRequestDao.pending().filter { uuidOrNull(it.id) != null }
+            if (rows.isEmpty()) return@pushTable 0
+            api.upsert(
+                "staff_requests",
+                syncJson.encodeToString(rows.map { it.toPush().copy(businessId = cloudBid) }),
+                "id",
+            )
+            staffRequestDao.markSynced(rows.map { it.id })
+            rows.size
+        }
+
         // ── Deliberately NOT pushed, so this is a decision and not an oversight ──
         //
         // No cloud table exists for these at all, and inventing one from a till would
         // stand up a second schema beside the web's:
-        //   notifications · staff_requests · day_closes · outside_funds
+        //   day_closes · outside_funds
+        //
+        // (`notifications` and `staff_requests` were on this list until 19 Aug. Both tables
+        // now exist on the shared schema, with a tenant read/write policy, so both are
+        // pushed above. The note stayed accurate for months after it stopped being true,
+        // which is the argument for naming the tables rather than the category.)
         //
         // `cash_txns` has no table of its own either: it is split across `cash_movements`
         // and `cash_sessions` above, and a sale's or refund's drawer movement is dropped
@@ -808,23 +869,65 @@ class PosSyncEngine(
      * Parents before children throughout: customers before the sales and credit rows
      * that reference them, and sale headers before their lines and tenders.
      */
-    private suspend fun pull(api: SupabaseRest, cloudBid: String): Int {
-        val bid = businessDao.getOnce()?.id ?: return 0
+    private suspend fun pull(api: SupabaseRest, cloudBid: String): PullResult {
+        val bid = businessDao.getOnce()?.id ?: return PullResult(0, emptyList())
         var n = 0
-        n += pullItems(api, bid, cloudBid)
-        n += pullItemAttributes(api, bid, cloudBid)
-        n += pullCustomersWire(api, bid, cloudBid)
-        n += pullSalesWire(api, bid, cloudBid)
-        n += pullSaleItems(api, bid, cloudBid)
-        n += pullSalePayments(api, bid, cloudBid)
+        val errors = mutableListOf<String>()
+
+        // ★ ONE TABLE'S FAILURE IS ONE TABLE'S FAILURE.
+        //
+        // This list used to be a bare sequence of `n += pullX(...)`, so the FIRST throw
+        // anywhere in it abandoned every step behind it and the whole pass was reported
+        // as a single "Sync failed". Position in this list therefore decided whether a
+        // table synced at all: `items` is first and always arrived, while
+        // `stock_movements` is twelfth, `notifications` thirteenth and `staff` last.
+        //
+        // What that looks like from behind the counter is not a sync error. It is a
+        // product that arrives on the cashier's phone with the right name, the right
+        // price and NO STOCK — because the catalogue row was pulled and the ledger row
+        // that carries its opening count never was. The alerts stop arriving on that
+        // phone at the same moment, for the same reason, and nothing on screen connects
+        // the two. If the offending row is permanent, so is the silence: every pass dies
+        // in the same place, forever, and the tables in front of the failure keep syncing
+        // perfectly, which is what makes it look like the app is working.
+        //
+        // The push has had this isolation since it was written ([pushTable]); the pull
+        // never did. A failure is now recorded against the table that caused it and the
+        // remaining tables still get their turn, so the owner is told WHICH table is
+        // failing instead of being shown a working app with a hole in it.
+        suspend fun step(table: String, block: suspend () -> Int) {
+            try {
+                n += block()
+            } catch (e: Exception) {
+                errors.add("$table: ${e.message ?: e.javaClass.simpleName}")
+            }
+        }
+
+        // The derived steps — the repairs and recomputes that run BETWEEN the pulls and
+        // read only what has already landed. Isolated for exactly the same reason: a
+        // throw inside a recompute is not a reason to stop pulling the tables behind it.
+        suspend fun derive(what: String, block: suspend () -> Unit) {
+            try {
+                block()
+            } catch (e: Exception) {
+                errors.add("$what: ${e.message ?: e.javaClass.simpleName}")
+            }
+        }
+
+        step("items") { pullItems(api, bid, cloudBid) }
+        step("item_attributes") { pullItemAttributes(api, bid, cloudBid) }
+        step("customers") { pullCustomersWire(api, bid, cloudBid) }
+        step("sales") { pullSalesWire(api, bid, cloudBid) }
+        step("sale_items") { pullSaleItems(api, bid, cloudBid) }
+        step("sale_payments") { pullSalePayments(api, bid, cloudBid) }
         // Runs every pass, not just when sales came down: devices that already
         // double-counted need the repair even once their cursor is past those rows.
-        healDuplicateSales(bid)
-        n += pullCreditWire(api, bid, cloudBid)
-        n += pullMobileMoney(api, bid, cloudBid)
-        n += pullRefunds(api, bid, cloudBid)
-        n += pullRefundItems(api, bid, cloudBid)
-        n += pullRefundPayments(api, bid, cloudBid)
+        derive("duplicate-sale repair") { healDuplicateSales(bid) }
+        step("credit_txns") { pullCreditWire(api, bid, cloudBid) }
+        step("mobile_money_receipts") { pullMobileMoney(api, bid, cloudBid) }
+        step("refunds") { pullRefunds(api, bid, cloudBid) }
+        step("refund_items") { pullRefundItems(api, bid, cloudBid) }
+        step("refund_payments") { pullRefundPayments(api, bid, cloudBid) }
         // AFTER both tender pulls: a pull writes another till's sale, its lines and its
         // tenders but NO cash-ledger row, so without this each phone's drawer counts only
         // its own takings — and the day close then measures the real, shared drawer against
@@ -832,17 +935,23 @@ class PosSyncEngine(
         // for the same reason recomputeStockFromLedger sits after its ledger: a sale's cash
         // is its tenders less the change given, so reconciling before `sale_payments` and
         // `refund_payments` have landed would read a sale with no tenders and book zero.
-        reconcileCash(bid)
-        n += pullStockMovements(api, bid, cloudBid)
+        derive("cash reconcile") { reconcileCash(bid) }
+        step("stock_movements") { pullStockMovements(api, bid, cloudBid) }
         // AFTER the ledger lands: items.stock_qty is a CACHE of these rows, so the
         // pulled cache is only as good as the movements behind it. Recomputing here is
         // what makes another till's sale show up as stock leaving this one.
-        recomputeStockFromLedger(bid)
-        n += pullCashSessions(api, bid, cloudBid)
+        derive("stock recompute") { recomputeStockFromLedger(bid) }
+        step("cash_sessions") { pullCashSessions(api, bid, cloudBid) }
+        // ★ [pullNotifications] EXISTED AND WAS NEVER CALLED — declared, complete, and
+        // unreachable, with no push counterpart either. So "the alert feed syncs" has been
+        // true of the code and false of the app for as long as the function has been there.
+        // Called here, next to the requests pull it belongs beside.
+        step("notifications") { pullNotifications(api, bid, cloudBid) }
+        step("staff_requests") { pullStaffRequests(api, bid, cloudBid) }
         // AFTER the session pull, because that pull is the moment two tills that were
         // offline from each other finally see each other's shift. Resolving before it
         // would just re-decide a conflict this device cannot yet know exists.
-        mergeOpenSessions(bid)
+        derive("shift merge") { mergeOpenSessions(bid) }
         // The other half of the drawer, and it sits HERE for two reasons. A movement names
         // the shift it happened in, so the shifts land first — nothing local enforces that
         // link, but a pass that showed a phone a day's cash before it had heard of the day
@@ -851,18 +960,18 @@ class PosSyncEngine(
         // these two write to the same ledger from opposite sources and must not be read as
         // one step, because only reconcileCash is allowed to touch a sale's or refund's
         // drawer row and only this is allowed to import anything else.
-        n += pullCashMovements(api, bid, cloudBid)
+        step("cash_movements") { pullCashMovements(api, bid, cloudBid) }
         // ── Accounting spine + supplier orders ──
         // Suppliers before the orders that name them, and orders before their lines.
-        n += pullSuppliers(api, bid, cloudBid)
-        n += pullPurchaseOrders(api, bid, cloudBid)
-        n += pullPurchaseOrderLines(api, cloudBid)
-        n += pullExpenses(api, bid, cloudBid)
-        n += pullAudit(api, bid, cloudBid)
+        step("suppliers") { pullSuppliers(api, bid, cloudBid) }
+        step("purchase_orders") { pullPurchaseOrders(api, bid, cloudBid) }
+        step("purchase_order_items") { pullPurchaseOrderLines(api, cloudBid) }
+        step("expenses") { pullExpenses(api, bid, cloudBid) }
+        step("audit_entries") { pullAudit(api, bid, cloudBid) }
         // The roster + the credential behind it. Last because nothing else waits on it,
         // and deliberately NOT stamped with `bid` — see [pullStaff].
-        n += pullStaff(api, cloudBid)
-        return n
+        step("staff") { pullStaff(api, cloudBid) }
+        return PullResult(n, errors)
     }
 
     /**
@@ -1122,7 +1231,13 @@ class PosSyncEngine(
         for (dto in rows) {
             val local = cashSessionDao.getById(dto.id)
             if (local == null || IsoTime.toMillis(dto.cursorStamp()) > local.updatedAt) {
-                cashSessionDao.upsert(dto.toCashSession(bid, local))
+                // ★ NEWER DOES NOT MEAN BETTER-INFORMED. A shift this device has COUNTED is
+                // never un-counted by a wire row that carries no count — that row was written
+                // by a device which had not heard about the close yet, and letting it win
+                // loses the one figure in this table that came off a physical drawer. See
+                // [reconcilePulledSession]; it re-flags the row so the count goes back up in
+                // this same pass and repairs the shared row for everyone else.
+                cashSessionDao.upsert(reconcilePulledSession(dto.toCashSession(bid, local), local))
                 applied++
             }
         }
@@ -1515,6 +1630,35 @@ class PosSyncEngine(
             }
         }
         config.setCursor("notifications", rows.maxOf { it.cursorStamp() })
+        return applied
+    }
+
+    /**
+     * `staff_requests` → the local approval queue, keyed by id.
+     *
+     * THIS IS THE HALF THAT MAKES THE FEATURE A FEATURE. A cashier raising a request and an
+     * owner answering it are two people on two phones; without the pull, each was talking
+     * into their own device. Keyed by id — unlike `notifications`, a request is one specific
+     * person's specific question and two devices must never coalesce two of them.
+     *
+     * Last-writer-wins on `updated_at`, with one exception carried by
+     * [StaffRequestDto.toStaffRequest]: a locally-applied approval is never un-applied by a
+     * row arriving afterwards.
+     */
+    private suspend fun pullStaffRequests(api: SupabaseRest, bid: String, cloudBid: String): Int {
+        val rows = syncJson.decodeFromString<List<StaffRequestDto>>(
+            api.selectSince("staff_requests", cloudBid, config.cursor("staff_requests"), PAGE)
+        )
+        if (rows.isEmpty()) return 0
+        var applied = 0
+        for (dto in rows) {
+            val local = staffRequestDao.getById(dto.id)
+            if (local == null || IsoTime.toMillis(dto.cursorStamp()) > local.updatedAt) {
+                staffRequestDao.upsert(dto.toStaffRequest(bid, local))
+                applied++
+            }
+        }
+        config.setCursor("staff_requests", rows.maxOf { it.cursorStamp() })
         return applied
     }
 

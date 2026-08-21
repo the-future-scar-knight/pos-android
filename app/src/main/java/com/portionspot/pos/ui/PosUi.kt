@@ -1611,6 +1611,32 @@ private fun NotificationCard(n: com.portionspot.pos.data.AppNotification, onClic
  * payment methods, void a wrongful refund, and the audit-log viewer. (Server-enforced
  * cashier account CRUD is deferred with the sync-parity phase.)
  */
+/**
+ * The admin console's groups, so it is not one endless scroll.
+ *
+ * Twelve sections in a single column meant the owner scrolled past the day's cash to reach
+ * the audit log and past the audit log to reach a cashier's PIN. The split is by WHAT THE
+ * OWNER CAME TO DO, not by which table the data sits in:
+ *
+ *  - [Money]  the daily handling — where the cash is, what is owed, closing the day.
+ *  - [Review] reading back what already happened. Nothing here changes a figure except
+ *             voiding a refund, which is the one correction that belongs beside the
+ *             evidence for it rather than in with the day's takings.
+ *  - [People] this session and the staff who hold the others. Account sits here rather
+ *             than pinned to the top because handing the phone over IS a people action.
+ *  - [Data]   the catalogue repair and the destructive buttons, kept behind their own tab
+ *             so nothing in the danger zone is ever one careless scroll from a thumb.
+ *
+ * Mirrors [SettingsCat] deliberately — one grouping idiom in this app, not two. All the
+ * state stays in the one composable, so switching tabs never loses an unsaved edit.
+ */
+private enum class AdminCat(val label: String) {
+    Money("Money"),
+    Review("Review"),
+    People("People"),
+    Data("Data"),
+}
+
 @Composable
 private fun AdminManageScreen(vm: PosViewModel, currency: String) {
     val t = LocalPosTokens.current
@@ -1645,6 +1671,8 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
     val pendingExpenses by vm.pendingExpenses.collectAsState()
     val templates by vm.recurringTemplates.collectAsState()
 
+    // Which group is on screen. Money first: it is what the owner opens this for.
+    var adminCat by remember { mutableStateOf(AdminCat.Money) }
     var writeOffFor by remember { mutableStateOf<DebtAgingRow?>(null) }
     var voidFor by remember { mutableStateOf<String?>(null) }
     var countedCash by remember { mutableStateOf("") }
@@ -1669,8 +1697,12 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
         item {
             Spacer(Modifier.height(10.dp))
             Text("Admin console", color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 22.sp)
+            Spacer(Modifier.height(10.dp))
+            AdminCategoryBar(selected = adminCat, onSelect = { adminCat = it })
         }
 
+
+      if (adminCat == AdminCat.People) {
         // ---- Account (switch to a cashier / sign this admin out) ----
         item { AdminSectionHeader("Account") }
         item {
@@ -1691,7 +1723,10 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
                 ) { Text("Sign out") }
             }
         }
+      }
 
+
+      if (adminCat == AdminCat.Money) {
         // ---- Till & safe (the owner's own cash model, §1–§6) ----
         // Put FIRST in the cash area on purpose: "where is my money and how much of it is
         // mine" is the question the owner opens this screen to answer. Closing the day,
@@ -1952,7 +1987,10 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
                 }
             }
         }
+      }
 
+
+      if (adminCat == AdminCat.Review) {
         // ---- Force-disable payment methods ----
         item { AdminSectionHeader("Payment methods") }
         item {
@@ -2065,7 +2103,10 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
                 }
             }
         }
+      }
 
+
+      if (adminCat == AdminCat.People) {
         // ---- Cashiers (staff accounts) ----
         item { AdminSectionHeader("Cashiers") }
         if (syncConnection == null) {
@@ -2143,7 +2184,10 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
                 }
             }
         }
+      }
 
+
+      if (adminCat == AdminCat.Data) {
         // ---- Catalogue maintenance (safe — leaves sales/customers alone) ----
         item { AdminSectionHeader("Catalogue") }
         item {
@@ -2170,6 +2214,8 @@ private fun AdminManageScreen(vm: PosViewModel, currency: String) {
                 colors = ButtonDefaults.outlinedButtonColors(contentColor = t.danger)
             ) { Text("Reset local data") }
         }
+
+      }
 
         item { Spacer(Modifier.height(24.dp)) }
     }
@@ -9462,6 +9508,11 @@ private fun DashboardScreen(vm: PosViewModel, business: Business) {
     val costedRevenue = cashBasis.costedRevenue
     val dashExpenses by vm.dashExpenses.collectAsState()
     val cashOnHand by vm.cashOnHand.collectAsState()
+    // The same money, split by where it physically is. Shown UNDER the cash card because
+    // the owner reads "Cash on hand" here and "Till" on the Cash screen and cannot see from
+    // either that one contains the other — see the note below the card.
+    val till by vm.tillBalance.collectAsState()
+    val safe by vm.safeBalance.collectAsState()
     val dailyBars by vm.dashDailyBars.collectAsState()
     val items by vm.items.collectAsState()
     val customers by vm.customers.collectAsState()
@@ -9635,6 +9686,16 @@ private fun DashboardScreen(vm: PosViewModel, business: Business) {
                     valueColor = t.danger, sub = periodLabel)
             }
         }
+        // ★ SAYS WHAT THE FIGURE ABOVE IS MADE OF. "Cash on hand" is the till PLUS the safe,
+        // and nothing on either screen said so: the owner reads $120 here, opens the Cash
+        // screen, sees a till of $20, and has no way to tell whether the app has lost $100 or
+        // whether the day's takings are simply sitting in the safe where he put them. The
+        // two are the same money — moving it between them changes neither figure's total.
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "Till ${money(till, currency)} · Safe ${money(safe, currency)} — cash on hand is the two together.",
+            color = t.inkTertiary, fontSize = 11.sp
+        )
         if (kotlin.math.abs(cashVariance) > 0.005) {
             Spacer(Modifier.height(6.dp))
             Text(
@@ -10188,6 +10249,48 @@ private fun ReportStatRow(label: String, value: String) {
 
 // ───────────────────────── RECEIPTS ─────────────────────────
 
+/**
+ * Does [haystack] contain [q], ignoring case? Null and blank never match — a customer-less
+ * walk-in must not be returned by every query just because its name field is empty.
+ */
+private fun matches(haystack: String?, q: String): Boolean =
+    !haystack.isNullOrBlank() && haystack.contains(q, ignoreCase = true)
+
+/**
+ * An amount rendered the way a person would type it when searching: plain digits and a
+ * decimal point, no currency symbol and no thousands separator, so "12.5" finds $12.50 and
+ * typing the symbol does not stop it matching. Deliberately NOT [money] — that formats for
+ * reading, and matching against its output would make the search depend on the shop's
+ * currency setting.
+ */
+private fun amountText(v: Double): String = String.format(Locale.US, "%.2f", v)
+
+/**
+ * Receipts matching [query] — receipt number, customer, mobile-money reference, or amount.
+ *
+ * A blank query returns the list untouched rather than an empty one: the field starts empty
+ * and a search that hides everything until you type is a screen that looks broken.
+ */
+private fun filterSales(sales: List<SaleEntity>, query: String): List<SaleEntity> {
+    val q = query.trim()
+    if (q.isBlank()) return sales
+    return sales.filter { s ->
+        matches(s.receiptNo, q) || matches(s.customerName, q) ||
+            matches(s.paymentRef, q) || amountText(s.total).contains(q)
+    }
+}
+
+/** Refunds matching [query] — the sale's receipt number, customer, reason, or amount. */
+private fun filterRefunds(rows: List<RefundWithLines>, query: String): List<RefundWithLines> {
+    val q = query.trim()
+    if (q.isBlank()) return rows
+    return rows.filter { rw ->
+        val r = rw.refund
+        matches(r.saleReceiptNo, q) || matches(r.customerName, q) ||
+            matches(r.reason, q) || amountText(r.refundTotal).contains(q)
+    }
+}
+
 @Composable
 private fun ReceiptsScreen(
     vm: PosViewModel,
@@ -10211,6 +10314,10 @@ private fun ReceiptsScreen(
     // until the money comes in, and it shows underneath as exactly that.
     val todayMoney by vm.todayCashBasis.collectAsState()
     val countToday by vm.todayCount.collectAsState()
+    var search by remember { mutableStateOf("") }
+    // The receipt number, who it was for, the mobile-money reference and the amount —
+    // what a customer at the counter can actually tell you when they want their receipt.
+    val shownSales = remember(sales, search) { filterSales(sales, search) }
     var refundFor by remember { mutableStateOf<SaleEntity?>(null) }
     var detailFor by remember { mutableStateOf<SaleEntity?>(null) }
     var editFor by remember { mutableStateOf<SaleEntity?>(null) }
@@ -10277,12 +10384,26 @@ private fun ReceiptsScreen(
                 ),
                 if (showQuotes) "quotes" else "receipts"
             ) { showQuotes = it == "quotes" }
+            // Only over the receipts list. Quotes are a different list with its own
+            // rendering, and a search box that silently stops filtering when you switch
+            // tabs is worse than not having one.
+            if (!showQuotes && sales.isNotEmpty()) {
+                Spacer(Modifier.height(10.dp))
+                PosField(
+                    value = search, onValueChange = { search = it },
+                    label = "Search receipts", placeholder = "Receipt no, customer, reference or amount",
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
         }
         if (showQuotes) {
             QuotesList(quotes, currency, business, printer, vm)
-        } else if (sales.isEmpty()) {
+        } else if (shownSales.isEmpty()) {
             Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                Text("No sales yet", color = t.inkTertiary)
+                Text(
+                    if (sales.isEmpty()) "No sales yet" else "No receipts match your search.",
+                    color = t.inkTertiary
+                )
             }
         } else {
             LazyColumn(
@@ -10292,7 +10413,7 @@ private fun ReceiptsScreen(
                 contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 88.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                items(sales, key = { it.id }) { sale ->
+                items(shownSales, key = { it.id }) { sale ->
                     val refunded = refundedBySale[sale.id] ?: 0.0
                     val fullyRefunded = refunded > 0.0 && refunded >= sale.total - 0.01
                     Row(
@@ -10979,6 +11100,27 @@ private fun refundMethodLabel(code: String): String = when (code) {
 private val REFUND_METHODS = listOf("cash", "ecocash", "innbucks", "card", "bank", "store_credit")
 
 /**
+ * A money entry clamped, AS IT IS TYPED, to what the till may actually hand over.
+ *
+ * ★ THE FIELD IS A PROMISE MADE ACROSS A COUNTER. Both refund screens already clamped the
+ * figure downstream — the dialog against what the sale collected, the repository against
+ * what the refund still owes — so nothing was ever over-paid. What went wrong was quieter
+ * than that and lands on a person: a cashier could type 100 against a $40 payable, read 100
+ * back off the phone, say "one hundred" out loud, and only then find the button offering to
+ * hand back forty. Clamping at the keystroke makes the number on screen the number that
+ * leaves the drawer, which is the only version a customer standing there can check.
+ *
+ * Part-typed input — "", ".", "12." — has no value yet and is passed through untouched. A
+ * clamp that reformats mid-keystroke takes the decimal point away as fast as it is typed.
+ */
+private fun cappedMoneyInput(raw: String, cap: Double): String {
+    val cleaned = raw.filter { ch -> ch.isDigit() || ch == '.' }
+    val typed = cleaned.toDoubleOrNull() ?: return cleaned
+    return if (typed > cap + 0.005) String.format(Locale.US, "%.2f", cap.coerceAtLeast(0.0))
+    else cleaned
+}
+
+/**
  * Cashier refund flow (prompt §11): pick returned lines/quantities, toggle restock
  * per line, choose the payout method and how much goes back now. The refund total is
  * proportional to what was paid (discount + VAT carried). Any shortfall is owed to the
@@ -11215,10 +11357,14 @@ private fun RefundDialog(
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                         PosField(
                             value = payoutText,
-                            onValueChange = {
-                                payoutText = it.filter { ch -> ch.isDigit() || ch == '.' }
-                            },
-                            label = if (payouts.isEmpty()) "Paying back now" else "Add another payout",
+                            // Capped at what is still to hand back on THIS refund — see
+                            // [cappedMoneyInput]. [pendingEntry] below clamps to the same
+                            // figure, so this changes no money; it stops the screen quoting
+                            // one number while the till honours another.
+                            onValueChange = { payoutText = cappedMoneyInput(it, leftToPay) },
+                            label = if (payouts.isEmpty())
+                                "Paying back now (max ${money(leftToPay, currency)})"
+                            else "Add another payout (max ${money(leftToPay, currency)})",
                             placeholder = money(leftToPay, currency),
                             keyboardType = KeyboardType.Decimal,
                             modifier = Modifier.weight(1f)
@@ -11271,14 +11417,30 @@ private fun RefundsScreen(vm: PosViewModel, business: Business, printer: Printer
     val caps by vm.allowedCaps.collectAsState()
     val canPayOut = com.portionspot.pos.auth.Capability.PROCESS_REFUNDS in caps
     var payoutFor by remember { mutableStateOf<Refund?>(null) }
+    var search by remember { mutableStateOf("") }
+    // Matched against the receipt the goods came back on, who brought them, why, and the
+    // amount — the four things someone actually has in hand when they go looking for a
+    // refund. Recomputed only when the list or the query moves.
+    val shown = remember(refunds, search) { filterRefunds(refunds, search) }
 
     Column(Modifier.fillMaxSize()) {
         Column(Modifier.padding(12.dp)) {
             Text("Refunds", color = t.inkPrimary, fontWeight = FontWeight.Black, fontSize = 22.sp)
+            if (refunds.isNotEmpty()) {
+                Spacer(Modifier.height(10.dp))
+                PosField(
+                    value = search, onValueChange = { search = it },
+                    label = "Search refunds", placeholder = "Receipt no, customer, reason or amount",
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
         }
-        if (refunds.isEmpty()) {
+        if (shown.isEmpty()) {
             Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                Text("No refunds yet", color = t.inkTertiary)
+                Text(
+                    if (refunds.isEmpty()) "No refunds yet" else "No refunds match your search.",
+                    color = t.inkTertiary
+                )
             }
         } else {
             LazyColumn(
@@ -11287,7 +11449,7 @@ private fun RefundsScreen(vm: PosViewModel, business: Business, printer: Printer
                 contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 96.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                items(refunds, key = { it.refund.id }) { rw ->
+                items(shown, key = { it.refund.id }) { rw ->
                     val r = rw.refund
                     val owed = r.status == "owed"
                     Column(
@@ -11361,13 +11523,21 @@ private fun RefundPayoutDialog(
     var amountText by remember(refund.id) { mutableStateOf("") }
     var method by remember(refund.id) { mutableStateOf("cash") }
     var methodOpen by remember { mutableStateOf(false) }
-    val amount = amountText.toDoubleOrNull() ?: 0.0
+    // ★ WHAT IS STILL OWED, ASKED BEFORE ANYTHING IS OFFERED. Payouts are instalments, so
+    // the ceiling is not [Refund.payableTotal] but that less everything already handed over
+    // — a refund half paid last week may not be paid in full again this one. The repository
+    // clamps to the same figure regardless ([PosRepository.recordRefundPayout]); read here
+    // so the cashier is stopped at the keypad instead of finding out afterwards.
+    var stillOwed by remember(refund.id) { mutableStateOf<Double?>(null) }
+    LaunchedEffect(refund.id) { stillOwed = vm.refundStillOwed(refund.id) }
+    val owed = stillOwed
+    val amount = (amountText.toDoubleOrNull() ?: 0.0).coerceAtMost(owed ?: 0.0)
 
     PosContainedForm(
         title = "Record refund payout",
         onDismiss = onDismiss,
         confirmLabel = "Record",
-        confirmEnabled = amount > 0.0,
+        confirmEnabled = owed != null && amount > 0.0,
         onConfirm = {
             vm.recordRefundPayout(refund.id, Tender(method = method, amount = amount)) {
                 Toast.makeText(context, "Payout recorded", Toast.LENGTH_SHORT).show()
@@ -11399,13 +11569,28 @@ private fun RefundPayoutDialog(
                 }
             }
         }
-        PosField(
-            value = amountText,
-            onValueChange = { amountText = it.filter { ch -> ch.isDigit() || ch == '.' } },
-            label = "Amount handed back",
-            keyboardType = KeyboardType.Decimal,
-            modifier = Modifier.fillMaxWidth()
-        )
+        if (owed == null) {
+            Text("Reading what's still owed…", fontSize = 12.sp, color = t.inkTertiary)
+        } else {
+            PosField(
+                value = amountText,
+                // Capped as it is typed at what is left on this refund — see
+                // [cappedMoneyInput]. Nothing past it could ever have been paid out; the
+                // figure on screen now says so before the cashier reads it to the customer.
+                onValueChange = { amountText = cappedMoneyInput(it, owed) },
+                label = "Amount handed back (max ${money(owed, currency)})",
+                placeholder = money(owed, currency),
+                keyboardType = KeyboardType.Decimal,
+                modifier = Modifier.fillMaxWidth()
+            )
+            if (owed + 0.005 < refund.payableTotal) {
+                Text(
+                    "${money(refund.payableTotal - owed, currency)} of this refund has " +
+                        "already been handed back.",
+                    fontSize = 12.sp, color = t.inkTertiary
+                )
+            }
+        }
     }
 }
 
@@ -12480,6 +12665,23 @@ private fun SettingsSectionHeader(title: String) {
 }
 
 /** Horizontal, scrollable category picker at the top of Settings (mobile-first). */
+/** The admin console's group picker. Same chip row as [SettingsCategoryBar]. */
+@Composable
+private fun AdminCategoryBar(selected: AdminCat, onSelect: (AdminCat) -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        AdminCat.entries.forEach { cat ->
+            FilterChip(
+                selected = selected == cat,
+                onClick = { onSelect(cat) },
+                label = { Text(cat.label) }
+            )
+        }
+    }
+}
+
 @Composable
 private fun SettingsCategoryBar(
     selected: SettingsCat,

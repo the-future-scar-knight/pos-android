@@ -1873,6 +1873,9 @@ class PosViewModel(
         }
     }
 
+    /** What may still be handed back on a refund — the ceiling the payout field caps at. */
+    suspend fun refundStillOwed(refundId: String): Double = repo.refundStillOwed(refundId)
+
     /** Pay off part/all of a refund the shop still owes (writes a payout + refund_paid). */
     fun recordRefundPayout(refundId: String, tender: Tender, onDone: () -> Unit = {}) {
         if (tender.amount <= 0) return

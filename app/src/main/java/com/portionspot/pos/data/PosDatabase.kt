@@ -1090,6 +1090,37 @@ val MIGRATION_42_43 = object : Migration(42, 43) {
     }
 }
 
+/**
+ * v43 → v44: re-read everything, because this device may have parsed every cloud date as
+ * 1970.
+ *
+ * `IsoTime.toMillis` offered only `X`-bearing zone patterns, and `X` does not exist in
+ * SimpleDateFormat below **API 24**. On Android 6 — the shop's Sunmi handheld — every
+ * pattern threw, the throw was swallowed, and every timestamp the cloud returned became
+ * 0L. The visible damage was a freshly-stocked product reading **Out of stock** (a
+ * `stockBaseAt` of 0 means "no baseline", so the ledger is never applied and the cloud's
+ * `stock_qty` of 0 stands), and a day close printed as 1 January.
+ *
+ * Fixing the parser is not enough on its own. The pull cursors are STRINGS off the server
+ * and were never damaged, so they sit past every row that was mis-parsed: those rows are
+ * simply never offered again, and a corrected parser never gets to see them. The stamps
+ * stay 0 forever on exactly the devices that were broken.
+ *
+ * So the cursors go. Every table is re-read once, from the beginning, and re-mapped with a
+ * parser that works on every Android this app supports. Rows are keyed by id and upserted,
+ * so a re-read overwrites in place rather than duplicating — the same repair 38→39 used
+ * when the stock baseline was first introduced.
+ *
+ * Runs for EVERY device, not just the old ones: nothing on a handset records which parser
+ * wrote a given row, and one wasted re-pull on a healthy phone is a far smaller price than
+ * leaving a broken one to look healthy.
+ */
+val MIGRATION_43_44 = object : Migration(43, 44) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("DELETE FROM settings WHERE key LIKE 'cursor_%'")
+    }
+}
+
 @Database(
     entities = [
         Business::class,
@@ -1119,7 +1150,7 @@ val MIGRATION_42_43 = object : Migration(42, 43) {
         CashSession::class,
         StaffMember::class
     ],
-    version = 43,
+    version = 44,
     exportSchema = false
 )
 abstract class PosDatabase : RoomDatabase() {
@@ -1177,7 +1208,7 @@ abstract class PosDatabase : RoomDatabase() {
                         MIGRATION_32_33, MIGRATION_33_34, MIGRATION_34_35,
                         MIGRATION_35_36, MIGRATION_36_37, MIGRATION_37_38,
                         MIGRATION_38_39, MIGRATION_39_40, MIGRATION_40_41,
-                        MIGRATION_41_42, MIGRATION_42_43
+                        MIGRATION_41_42, MIGRATION_42_43, MIGRATION_43_44
                     )
                     .fallbackToDestructiveMigration()
                     .build()
