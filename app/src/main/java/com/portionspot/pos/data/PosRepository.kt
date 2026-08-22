@@ -235,6 +235,11 @@ class PosRepository(private val db: PosDatabase) {
     fun salesSummaryFlow(businessId: String, from: Long, to: Long): Flow<SalesSummary> =
         saleDao.observeSummary(businessId, from, to)
 
+    /** The per-item markup handed back with returned goods in this window. Pair with
+     *  [SalesSummary.markup] to report what the counter actually kept. */
+    fun refundedMarkupFlow(businessId: String, from: Long, to: Long): Flow<Double> =
+        saleDao.observeRefundedMarkup(businessId, from, to)
+
     fun methodBreakdownFlow(businessId: String, from: Long, to: Long): Flow<List<MethodBreakdown>> =
         saleDao.observeMethodBreakdown(businessId, from, to)
 

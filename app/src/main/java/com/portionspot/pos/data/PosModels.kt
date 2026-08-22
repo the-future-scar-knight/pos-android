@@ -604,6 +604,10 @@ data class SalesSummary(
     val gross: Double = 0.0,
     val vat: Double = 0.0,
     val discount: Double = 0.0,
+    /** Σ per-item markup charged on sales in the window — the mirror of [discount]. GROSS:
+     *  what was added at the counter, before anything came back. The returned share is a
+     *  separate figure (`observeRefundedMarkup`) because the two are on different dates. */
+    val markup: Double = 0.0,
     val net: Double = 0.0
 )
 

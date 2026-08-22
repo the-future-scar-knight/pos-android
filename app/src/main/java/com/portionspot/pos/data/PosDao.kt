@@ -353,6 +353,7 @@ interface SaleDao {
             "COALESCE(SUM(total), 0) AS gross, " +
             "COALESCE(SUM(taxTotal), 0) AS vat, " +
             "COALESCE(SUM(discountTotal), 0) AS discount, " +
+            "COALESCE(SUM(markupTotal), 0) AS markup, " +
             "COALESCE(SUM(total - taxTotal), 0) AS net " +
             "FROM sales WHERE businessId = :businessId AND deleted = 0 " +
             "AND status = 'completed' AND soldAt >= :from AND soldAt < :to"
@@ -386,6 +387,32 @@ interface SaleDao {
             ") >= s.total - 0.01"
     )
     fun observeFullyRefundedCount(businessId: String, from: Long, to: Long): Flow<Int>
+
+    /**
+     * The markup handed BACK in this window — the per-item markup riding on goods that were
+     * returned, pro-rated by how much of each line came back.
+     *
+     * ★ WHY THIS IS NOT `SUM(markupTotal)` OVER REFUNDED SALES. A refund is usually partial:
+     * two of the five a customer bought. The markup that came back with them is the LINE's
+     * markup scaled by the returned share, exactly as [com.portionspot.pos.data.refundLineValue]
+     * values the goods themselves. Refunding two of five and reversing the whole sale's
+     * markup would report the cashier as having earned nothing on the three still sold.
+     *
+     * Windowed on the REFUND's own date, not the sale's — the same rule the rest of the
+     * money screens follow, so a return in August never reaches back into July's figures.
+     *
+     * `li.qty` is guarded: a zero-quantity line cannot be divided by, and a line that
+     * somehow carries one contributes nothing rather than crashing the whole aggregate.
+     */
+    @Query(
+        "SELECT COALESCE(SUM(li.lineMarkup * (ri.qty / li.qty)), 0) " +
+            "FROM refund_items ri " +
+            "JOIN refunds r ON r.id = ri.refundId " +
+            "JOIN sale_items li ON li.id = ri.saleLineId " +
+            "WHERE r.businessId = :businessId AND r.deleted = 0 " +
+            "AND li.qty > 0 AND r.createdAt >= :from AND r.createdAt < :to"
+    )
+    fun observeRefundedMarkup(businessId: String, from: Long, to: Long): Flow<Double>
 
     // ---- dashboard ----
     /** Best-selling lines in a window (grouped by snapshot name, so ad-hoc lines count too). */

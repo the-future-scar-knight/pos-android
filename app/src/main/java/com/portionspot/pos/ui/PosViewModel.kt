@@ -686,6 +686,15 @@ class PosViewModel(
             }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
+    /** The per-item markup returned with refunded goods in the report window. */
+    val reportRefundedMarkup: StateFlow<Double> =
+        combine(businessId.filterNotNull(), _reportRange) { bid, range -> bid to range }
+            .flatMapLatest { (bid, range) ->
+                val (from, to) = rangeBounds(range)
+                repo.refundedMarkupFlow(bid, from, to)
+            }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0.0)
+
     /** Money refunded in the report window — subtract from gross for net takings. */
     val reportRefunds: StateFlow<Double> =
         combine(businessId.filterNotNull(), _reportRange) { bid, range -> bid to range }
@@ -751,6 +760,19 @@ class PosViewModel(
         dashKey.flatMapLatest { (bid, range) ->
             val (from, to) = rangeBounds(range)
             repo.postedExpensesBetweenFlow(bid, from, to)
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0.0)
+
+    /**
+     * The per-item markup returned with refunded goods in the dashboard window.
+     *
+     * Its partner, the markup CHARGED, already rides on [dashSummary] as
+     * [SalesSummary.markup] — one more column on a query that was already running rather
+     * than a second trip for a figure the same rows carry.
+     */
+    val dashRefundedMarkup: StateFlow<Double> =
+        dashKey.flatMapLatest { (bid, range) ->
+            val (from, to) = rangeBounds(range)
+            repo.refundedMarkupFlow(bid, from, to)
         }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0.0)
 
     /**

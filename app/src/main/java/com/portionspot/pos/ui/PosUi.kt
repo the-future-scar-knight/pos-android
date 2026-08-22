@@ -9507,6 +9507,10 @@ private fun DashboardScreen(vm: PosViewModel, business: Business) {
     val grossProfit = cashBasis.grossProfit
     val costedRevenue = cashBasis.costedRevenue
     val dashExpenses by vm.dashExpenses.collectAsState()
+    // What the counter ADDED on top of list price, and what came back with returned goods.
+    // Cashier markup is invisible on a receipt by design — it folds into the line — so this
+    // tile is the only place the owner can see how much of the day's takings it accounts for.
+    val markupBack by vm.dashRefundedMarkup.collectAsState()
     val cashOnHand by vm.cashOnHand.collectAsState()
     // The same money, split by where it physically is. Shown UNDER the cash card because
     // the owner reads "Cash on hand" here and "Till" on the Cash screen and cannot see from
@@ -9684,6 +9688,36 @@ private fun DashboardScreen(vm: PosViewModel, business: Business) {
             } else {
                 DashKpiCard("Expenses", money(dashExpenses, currency), Modifier.weight(1f),
                     valueColor = t.danger, sub = periodLabel)
+            }
+        }
+        // ── Markup added (§ cashier markup) ──
+        // Shown only when there IS any: a shop that never marks up should not be asked to
+        // read a row of zeros forever, and a tile that is usually blank teaches the owner
+        // to stop looking at the one day it is not.
+        val markupNet = summary.markup - markupBack
+        if (summary.markup > 0.005 || kotlin.math.abs(markupBack) > 0.005) {
+            Spacer(Modifier.height(10.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                DashKpiCard(
+                    "Markup added", money(markupNet, currency), Modifier.weight(1f),
+                    valueColor = if (markupNet < 0) t.danger else t.success, sub = periodLabel
+                )
+                DashKpiCard(
+                    "Of takings",
+                    if (summary.gross > 0.005) "${trimPct(markupNet / summary.gross * 100)}%" else "—",
+                    Modifier.weight(1f), sub = periodLabel
+                )
+            }
+            if (markupBack > 0.005) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    // The two are on different clocks and the sentence says so, because a
+                    // return in this window can belong to a sale from a previous one — which
+                    // is how a quiet week can show more markup handed back than charged.
+                    "${money(summary.markup, currency)} charged, less ${money(markupBack, currency)} " +
+                        "that went back with returned goods.",
+                    color = t.inkTertiary, fontSize = 11.sp
+                )
             }
         }
         // ★ SAYS WHAT THE FIGURE ABOVE IS MADE OF. "Cash on hand" is the till PLUS the safe,
@@ -10079,6 +10113,7 @@ private fun ReportsScreen(vm: PosViewModel, business: Business) {
     val summary by vm.reportSummary.collectAsState()
     val breakdown by vm.reportBreakdown.collectAsState()
     val refunds by vm.reportRefunds.collectAsState()
+    val markupBack by vm.reportRefundedMarkup.collectAsState()
     val fullyRefunded by vm.reportFullyRefunded.collectAsState()
     // ★ CASH BASIS (§5): what was actually COLLECTED in this window, what was handed back,
     // what belongs to ZIMRA, and the cost of the goods behind the rest. Billed-but-unpaid
@@ -10132,6 +10167,15 @@ private fun ReportsScreen(vm: PosViewModel, business: Business) {
                 ReportStatRow("VAT collected (${trimPct(business.vatPercent)}%)", money(summary.vat, currency))
             }
             ReportStatRow("Discounts given", money(summary.discount, currency))
+            // The mirror of the line above: one takes off the list price, the other adds to
+            // it. Shown only when the shop uses markup at all.
+            if (summary.markup > 0.005 || kotlin.math.abs(markupBack) > 0.005) {
+                ReportStatRow("Markup added", money(summary.markup, currency))
+                if (markupBack > 0.005) {
+                    ReportStatRow("Markup returned with goods", "-${money(markupBack, currency)}")
+                    ReportStatRow("Markup kept", money(summary.markup - markupBack, currency))
+                }
+            }
             if (refunds > 0.0) {
                 ReportStatRow("Gross sales", money(summary.gross, currency))
                 ReportStatRow("Refunds paid", "-${money(refunds, currency)}")

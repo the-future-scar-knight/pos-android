@@ -6,7 +6,9 @@ import android.os.Handler
 import android.os.Looper
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
@@ -16,6 +18,8 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -27,7 +31,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -40,6 +46,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.google.zxing.BarcodeFormat
@@ -50,6 +57,7 @@ import com.google.zxing.Result
 import com.google.zxing.PlanarYUVLuminanceSource
 import com.google.zxing.common.HybridBinarizer
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import android.util.Size
@@ -88,10 +96,23 @@ fun BarcodeScannerDialog(
         title = { Text("Scan barcode") },
         text = {
             if (granted) {
-                CameraPreview(
-                    onDecoded = { code -> onResult(code) },
-                    modifier = Modifier.fillMaxWidth().height(280.dp)
-                )
+                Column(Modifier.fillMaxWidth()) {
+                    CameraPreview(
+                        onDecoded = { code -> onResult(code) },
+                        modifier = Modifier.fillMaxWidth().height(280.dp)
+                    )
+                    // Says the one thing no amount of focus code can fix: a phone camera has
+                    // a minimum focus distance of roughly a hand's width, and inside it the
+                    // lens physically cannot resolve. Without this the cashier's instinct on
+                    // a stubborn code is to move CLOSER, which is the one move that
+                    // guarantees it will never read.
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "Hold about a hand's width away and keep the code inside the box. " +
+                            "Tap the picture to refocus.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
             } else {
                 Box(Modifier.fillMaxWidth().height(120.dp), contentAlignment = Alignment.Center) {
                     Text(
@@ -120,6 +141,11 @@ private fun CameraPreview(
     val turnedNext = remember { AtomicBoolean(false) }
     // The last code seen but not yet trusted - see [decodeFrame]'s confirmation rule.
     val lastSeen = remember { AtomicReference<String?>(null) }
+    // The bound camera and the preview surface, kept so focus can be driven after binding.
+    // Null until CameraX finishes binding, which is why every use below is null-safe rather
+    // than assumed — the dialog can be dismissed mid-bind.
+    var camera by remember { mutableStateOf<Camera?>(null) }
+    var previewRef by remember { mutableStateOf<PreviewView?>(null) }
     val reader = remember {
         MultiFormatReader().apply {
             // Zimbabwe retail runs on 1D product barcodes, not QR. Naming the exact
@@ -155,7 +181,26 @@ private fun CameraPreview(
             .background(Color.Black)
     ) {
     AndroidView(
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier
+            .fillMaxSize()
+            // Manual override. The automatic drive above aims at the band, which is right
+            // almost always; this is for the time it is not — a label lit from behind, or a
+            // barcode the cashier wants read from the edge of the frame.
+            .pointerInput(camera, previewRef) {
+                detectTapGestures { offset ->
+                    val cam = camera ?: return@detectTapGestures
+                    val view = previewRef ?: return@detectTapGestures
+                    runCatching {
+                        val point = view.meteringPointFactory.createPoint(offset.x, offset.y)
+                        cam.cameraControl.startFocusAndMetering(
+                            FocusMeteringAction.Builder(
+                                point,
+                                FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE
+                            ).setAutoCancelDuration(3, TimeUnit.SECONDS).build()
+                        )
+                    }
+                }
+            },
         factory = { ctx ->
             val previewView = PreviewView(ctx).apply {
                 // COMPATIBLE (TextureView) avoids the SurfaceView punch-through that
@@ -163,7 +208,7 @@ private fun CameraPreview(
                 // rounded box without letterbox gaps while keeping the frame upright.
                 implementationMode = PreviewView.ImplementationMode.COMPATIBLE
                 scaleType = PreviewView.ScaleType.FILL_CENTER
-            }
+            }.also { previewRef = it }
             val providerFuture = ProcessCameraProvider.getInstance(ctx)
             providerFuture.addListener({
                 val provider = providerFuture.get()
@@ -200,7 +245,7 @@ private fun CameraPreview(
                         preview,
                         analysis
                     )
-                }
+                }.onSuccess { camera = it }
             }, ContextCompat.getMainExecutor(ctx))
             previewView
         }
@@ -216,6 +261,51 @@ private fun CameraPreview(
             .fillMaxHeight(BAND.toFloat())
             .border(1.dp, Color.White.copy(alpha = 0.55f), RoundedCornerShape(6.dp))
     )
+    }
+
+    /**
+     * Focus ON THE BAND, and keep asking.
+     *
+     * ★ WHY A BARCODE UP CLOSE WAS THE ONE THAT WOULD NOT READ. Left alone, CameraX runs
+     * continuous autofocus metered across the whole frame, so the lens settles on whatever
+     * dominates it — the shelf, the counter, the cashier's hand — rather than on the label.
+     * At arm's length that costs nothing: the depth of field is deep enough that the barcode
+     * is sharp anyway. Up close the depth of field collapses to a couple of centimetres, so
+     * focusing on the background means the barcode is properly, unreadably blurred. That is
+     * exactly the complaint — fast at a distance, hopeless near.
+     *
+     * So the metering point is the CENTRE OF THE DECODE BAND, the same rectangle drawn on
+     * screen and the only part of the frame anything reads.
+     *
+     * ★ AND IT REPEATS. One `startFocusAndMetering` is a single sweep: it converges, the
+     * action auto-cancels, and the lens is then free to drift on the next scene change —
+     * which is guaranteed here, because the person is moving the phone toward the label
+     * while it focuses. Re-driving it every second and a half means the lens keeps chasing
+     * the barcode the whole time someone is lining it up, instead of settling once on
+     * whatever happened to be in view at the instant the dialog opened.
+     *
+     * Stops as soon as a code is accepted — the dialog is closing and a focus sweep against
+     * a dying preview is a wasted round-trip that can outlive the surface it metered.
+     */
+    LaunchedEffect(camera, previewRef) {
+        val cam = camera ?: return@LaunchedEffect
+        val view = previewRef ?: return@LaunchedEffect
+        while (!decoded.get()) {
+            val w = view.width.toFloat()
+            val h = view.height.toFloat()
+            if (w > 0f && h > 0f) {
+                runCatching {
+                    val point = view.meteringPointFactory.createPoint(w / 2f, h / 2f)
+                    cam.cameraControl.startFocusAndMetering(
+                        FocusMeteringAction.Builder(
+                            point,
+                            FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE
+                        ).setAutoCancelDuration(2, TimeUnit.SECONDS).build()
+                    )
+                }
+            }
+            kotlinx.coroutines.delay(1_500)
+        }
     }
 
     DisposableEffect(Unit) {
