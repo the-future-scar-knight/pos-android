@@ -10,9 +10,19 @@ plugins {
 }
 
 // Release signing is driven by an untracked keystore.properties at the project
-// root (see keystore.properties.example). When it's absent — CI, a fresh clone,
-// or before the shop owner has generated a keystore — we fall back to debug
-// signing so the release variant still assembles and R8 can be verified.
+// root (see keystore.properties.example).
+//
+// ★ A RELEASE APK MUST NEVER BE SIGNED WITH THE DEBUG KEY. This used to fall back
+// to debug signing when keystore.properties was absent, so a fresh clone produced an
+// installable APK that looked like a release build and gave no hint it wasn't one.
+// The damage is not abstract: Android refuses to update an installed app whose signing
+// certificate changed, so the day the real keystore finally arrives the shop has to
+// UNINSTALL first — and uninstalling wipes the Room database, which IS the books.
+// A till that has to be wiped to be updated is worse than a till that won't build.
+//
+// So: no keystore.properties => the release variant is left UNSIGNED (never debug-signed)
+// and any task that would produce a release artifact fails with instructions. Debug
+// builds and unit tests are untouched and still work on a fresh clone.
 val keystorePropsFile = rootProject.file("keystore.properties")
 val keystoreProps = Properties().apply {
     if (keystorePropsFile.exists()) FileInputStream(keystorePropsFile).use { load(it) }
@@ -58,11 +68,11 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            // Real keystore when present, otherwise debug so the build still works.
-            signingConfig = if (keystorePropsFile.exists())
-                signingConfigs.getByName("release")
-            else
-                signingConfigs.getByName("debug")
+            // Real keystore, or nothing at all. `findByName` returns null when
+            // keystore.properties is absent, which leaves the artifact unsigned —
+            // uninstallable, and therefore unshippable by accident. The task-graph
+            // check below turns that into a clear failure instead of a puzzle.
+            signingConfig = signingConfigs.findByName("release")
         }
     }
     compileOptions {
@@ -128,4 +138,39 @@ dependencies {
     // ---- Product images: Compose image loader with memory/disk cache. Loads
     // local files (freshly-picked, offline) and remote Supabase Storage URLs. ----
     implementation(libs.coil.compose)
+}
+
+// ★ NO KEYSTORE => NO RELEASE ARTIFACT. Checked against the task graph rather than at
+// configuration time so a fresh clone can still run `assembleDebug` and the unit tests;
+// only a task that would actually emit a release APK/AAB is stopped. Paired with the
+// unsigned `signingConfig` above: even if this check is somehow bypassed, what comes out
+// cannot be installed, so a debug-signed build can never reach the shop's phone by
+// accident. See the note at the top of this file for why that matters more than it sounds.
+gradle.taskGraph.whenReady {
+    if (keystorePropsFile.exists()) return@whenReady
+    val releaseTask = allTasks.firstOrNull { t ->
+        t.project.path == project.path &&
+            Regex("^(assemble|bundle|install|package)Release").containsMatchIn(t.name)
+    } ?: return@whenReady
+    throw GradleException(
+        """
+        Refusing to build ${releaseTask.name}: no release keystore.
+
+        keystore.properties is missing, so this release build would be unsigned.
+        It used to fall back to the DEBUG key, which produced an APK that installed
+        fine and then could never be updated by a properly signed one without
+        uninstalling — and uninstalling this app erases the shop's local database.
+
+        To build a real release:
+          1. Generate the keystore once, from the pos-android/ folder:
+               keytool -genkeypair -v -keystore spot-pos-release.jks \
+                 -alias spot-pos -keyalg RSA -keysize 2048 -validity 10000
+          2. cp keystore.properties.example keystore.properties
+          3. Fill in the four values with the passwords you just chose.
+          4. Back up the .jks file AND those passwords somewhere off this machine.
+             Losing them means never being able to update the installed app again.
+
+        For a test build that does not need signing, use assembleDebug.
+        """.trimIndent()
+    )
 }
