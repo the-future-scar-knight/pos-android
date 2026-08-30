@@ -2690,6 +2690,30 @@ class PosRepository(private val db: PosDatabase) {
         // Credit must be tied to a customer; the unpaid shortfall goes on account.
         val credit = onCredit && customer != null
         val owed = if (credit) (total - amountPaid).coerceAtLeast(0.0) else 0.0
+        // ★ MONEY SHORT AND NOBODY OWES IT IS NOT A SALE. Without this the shortfall on a
+        // non-credit sale simply evaporated: `owed` is only computed for a credit sale, so
+        // $50 tendered against a $100 total wrote a sale of $100 marked `paid` with $50
+        // recorded — the drawer $50 light at closing with nothing anywhere saying why.
+        // The pay dialog already refuses to complete unless the sale is fully paid or a
+        // valid credit sale ([PosUi] `valid = fullyPaid || creditValid`), so no cashier can
+        // reach this today. It throws anyway, because a screen is a place a person is
+        // stopped and this is the place the LEDGER is: a future caller — a repeat-sale
+        // shortcut, a pulled order, a test — must not be able to write the shop poorer
+        // than its books. `credit && customer == null` is caught by the same test: the
+        // shortfall has no account to sit on, so it is not on credit, it is missing.
+        //
+        // The tolerance carries the rounding step, and that is not slack — it is a real
+        // gap between the two screens. The pay dialog quotes the UNROUNDED total, while
+        // `total` above is rounded to [totalRounding]; rounding UP can therefore leave a
+        // sale legitimately short by up to half a step against a cashier who tendered
+        // exactly what the screen asked for. Half a step is the most that gap can ever be,
+        // so anything past it is a genuine shortfall rather than the rounding setting.
+        val shortfall = total - amountPaid - owed
+        require(shortfall <= CENT + totalRounding / 2.0) {
+            "Underpaid sale: total $total, tendered $amountPaid, on account $owed. " +
+                "A shortfall must go on a customer's account (onCredit with a customer) " +
+                "or be tendered — it cannot be recorded as paid."
+        }
         // Overpayment is change. The cashier records how much was ACTUALLY handed back
         // ([changeGiven]) — which is deliberately NOT clamped to the change due, because
         // both directions of error are real and must be reconciled:
@@ -3723,12 +3747,34 @@ class PosRepository(private val db: PosDatabase) {
         // so a payout gets its shift the same way a sale does.
         val daySessionId = currentDaySessionId(businessId, stamp)
 
+        // ★ NOTHING COMES BACK TWICE. Each requested quantity is clamped here to what that
+        // sale line still has outstanding — units sold, less every unit already returned on
+        // a live refund — and lines with nothing left are dropped.
+        //
+        // The MONEY was already safe: [refundSettlement] nets off `alreadyRefunded`, so a
+        // sale refunded twice paid out nothing the second time. The GOODS were not. The
+        // restock loop below trusted its input, so refunding the same two brake pads twice
+        // put four on the shelf: `items.stockQty` +2 too high with a matching `return`
+        // movement to make it look deliberate, and stock is the one figure here that no
+        // later cash count can catch — the drawer still balances while the shelf lies.
+        //
+        // The dialog caps the stepper the same way ([PosUi] `maxReturn = qty - already`),
+        // so a cashier cannot reach this. It is enforced here anyway for the reason the
+        // payout clamp above exists: the screen is where a person is stopped, and this is
+        // where the ledger is written.
+        val clamped = lines.mapNotNull { inp ->
+            val outstanding = (inp.saleLine.qty - refundDao.qtyReturnedForLine(inp.saleLine.id))
+                .coerceAtLeast(0.0)
+            val qty = inp.qtyReturned.coerceIn(0.0, outstanding)
+            if (qty <= 0.0) null else inp.copy(qtyReturned = qty)
+        }
+
         // Returned goods valued net of each line's OWN discount/markup, measured against
         // the whole sale on the SAME basis; the ratio then folds in the whole-sale
         // discount + VAT. Both sides must use returnedLineValue — sale.subtotal is the
         // GROSS goods value (per-item adjustments live in the sale's discount/markup
         // totals), so pairing it with a net numerator would break a full return.
-        val returnedSubtotal = lines.sumOf { returnedLineValue(it.saleLine, it.qtyReturned) }
+        val returnedSubtotal = clamped.sumOf { returnedLineValue(it.saleLine, it.qtyReturned) }
         val goodsValue = saleGoodsValue(saleDao.linesForSale(sale.id))
         val refundTotal = computeRefundTotal(returnedSubtotal, goodsValue, sale.total).refundTotal
 
@@ -3760,7 +3806,7 @@ class PosRepository(private val db: PosDatabase) {
             sessionId = daySessionId,
             updatedAt = stamp
         )
-        val refundLines = lines.map { inp ->
+        val refundLines = clamped.map { inp ->
             RefundLine(
                 refundId = refundId,
                 businessId = businessId,
@@ -3829,7 +3875,7 @@ class PosRepository(private val db: PosDatabase) {
             // Put returned goods back on the shelf (unless damaged). Box lines return
             // qty * unitsPerLine stock units — the multiplier applied once, same as
             // the checkout draw-down, only with the opposite sign.
-            for (inp in lines) {
+            for (inp in clamped) {
                 if (!inp.restock) continue
                 val item = inp.saleLine.itemId?.let { itemDao.getById(it) } ?: continue
                 if (!item.trackStock) continue
