@@ -15,6 +15,7 @@ import {
   verifyReply,
   isPaidStatus,
   normaliseStatus,
+  fetchPollUrl,
   json,
 } from "../_shared/paynow.ts";
 import { getIntent, patchIntent, nowIso } from "../_shared/db.ts";
@@ -58,8 +59,7 @@ Deno.serve(async (req) => {
 
   let replyText: string;
   try {
-    const resp = await fetch(pollUrl, { method: "GET" });
-    replyText = await resp.text();
+    replyText = await fetchPollUrl(pollUrl);
   } catch (e) {
     return json({ ok: false, error: `Could not reach Paynow: ${(e as Error).message}` }, 502);
   }
@@ -77,6 +77,7 @@ Deno.serve(async (req) => {
   try {
     await patchIntent(reference, {
       status: mapped,
+      raw_status: rawStatus ?? null,
       paynow_reference: paynowReference,
       updated_at: nowIso(),
     });

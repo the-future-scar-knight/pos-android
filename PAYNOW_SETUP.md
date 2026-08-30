@@ -30,8 +30,12 @@ not in the app.
 ### 1. Create the table
 
 Run `supabase-setup.sql` in your project's SQL Editor (you may have already
-done this for Cloud sync — it's safe to re-run). It now also creates the
-locked-down `payment_intents` table the functions use.
+done this for Cloud sync — it's safe to re-run). It creates the locked-down
+`payment_intents` table the functions use, in section 7d.
+
+This step is **not optional and not silent**: if `payment_intents` is missing,
+`paynow-initiate` now refuses the payment rather than handing the counter a QR
+code it will never be able to confirm.
 
 ### 2. Log in and link the CLI to your project
 
@@ -51,10 +55,23 @@ app or in any table.
 ```bash
 supabase secrets set PAYNOW_INTEGRATION_ID=your_integration_id
 supabase secrets set PAYNOW_INTEGRATION_KEY=your_integration_key
+supabase secrets set PAYNOW_AUTH_EMAIL=your_paynow_account_email
 ```
 
 (`SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are provided automatically — you
 do not set those.)
+
+**`PAYNOW_AUTH_EMAIL` must be the email you log into Paynow with** — the account
+that owns the integration, not the shop's customer-facing address. Paynow's test
+mode is strict about this:
+
+> After creating a transaction ONLY THE MERCHANT ACCOUNT USED TO CREATE THE
+> INTEGRATION can login and Fake a Payment. Any other users will get a message
+> saying the merchant is in testing and they cannot proceed with payment.
+
+Get it wrong and nothing errors — you just get a transaction that nobody is
+allowed to pay. That is why it is a secret here and not an editable setting in
+the app: the till never sends it.
 
 ### 4. Deploy the three functions
 
@@ -95,6 +112,22 @@ checkout, picking **Paynow** now shows a **Generate QR** button.
    the money received (hash-verified server-side), the app fills in the Paynow
    reference and lets the cashier **complete the sale**. The webhook updates the
    record too, so a payment is never missed even if the app was closed.
+
+## Testing before you go live
+
+A new integration starts in **test mode**, where no money moves.
+
+1. Ring up a sale, pick **Paynow**, tap **Generate Paynow QR**.
+2. Scan it, or open the URL on any browser.
+3. **Log into Paynow as the merchant account** (the same email as
+   `PAYNOW_AUTH_EMAIL`). No other account is allowed to pay a test transaction.
+4. Choose **[TESTING: Faked Success]** and **Make Payment**.
+5. The counter should flip to paid within a few seconds — the app polls every
+   4.5s, and the webhook updates the record even if the app was closed.
+
+When you are happy, go to the Integration Keys section on Paynow and click
+**Request to be Set Live**. Paynow checks you have completed at least one
+successful test transaction first.
 
 ## Security notes
 

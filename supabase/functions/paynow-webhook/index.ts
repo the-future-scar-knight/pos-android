@@ -41,10 +41,12 @@ Deno.serve(async (req) => {
   // Once paid, stay paid — never downgrade on a late duplicate callback.
   if (intent.status === "paid") return new Response("ok", { status: 200 });
 
-  const mapped = normaliseStatus(field(reply, "status"));
+  const rawStatus = field(reply, "status");
+  const mapped = normaliseStatus(rawStatus);
   try {
     await patchIntent(reference, {
       status: mapped,
+      raw_status: rawStatus ?? null,
       paynow_reference: field(reply, "paynowreference") ?? intent.paynow_reference ?? null,
       updated_at: nowIso(),
     });

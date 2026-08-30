@@ -2,14 +2,19 @@
 // a QR at the counter. The secret Integration Key is read from a Function
 // secret and used only here, server-side; it never goes to the app.
 //
-// Request  (POST JSON): { amount: number, reference?: string, authemail?: string,
-//                         businessId?: string }
+// Request  (POST JSON): { amount: number, reference?: string,
+//                         businessId?: string, currency?: string }
 // Response (JSON):      { ok: true, reference, browserUrl, pollUrl }
 //                    or { ok: false, error }
+//
+// NB: `authemail` is deliberately NOT accepted from the caller. It must be the
+// merchant's own Paynow account email (see paynowAuthEmail), and letting a till
+// choose it is how you end up with a transaction nobody can pay.
 
 import {
   PAYNOW_INITIATE_URL,
   paynowCredentials,
+  paynowAuthEmail,
   paynowHash,
   parseForm,
   field,
@@ -36,15 +41,21 @@ Deno.serve(async (req) => {
   }
   const amount = amountNum.toFixed(2);
   const reference = String(body.reference ?? crypto.randomUUID());
-  const authemail = String(body.authemail ?? "");
   const businessId = body.businessId != null ? String(body.businessId) : null;
+  const currency = body.currency != null ? String(body.currency) : "USD";
 
   let creds: { id: string; key: string };
+  let authemail: string;
   try {
     creds = paynowCredentials();
+    authemail = paynowAuthEmail();
   } catch (e) {
     return json({ ok: false, error: (e as Error).message }, 500);
   }
+
+  // A merchant trace lets us find this transaction again if the reply below
+  // never reaches us. Max 32 chars, unique per merchant — a bare UUID hex is 32.
+  const merchantTrace = crypto.randomUUID().replace(/-/g, "");
 
   const origin = Deno.env.get("SUPABASE_URL")!;
   const resulturl = `${origin}/functions/v1/paynow-webhook`;
@@ -52,8 +63,9 @@ Deno.serve(async (req) => {
   // them back to a neutral page. The POS itself confirms via polling/webhook.
   const returnurl = "https://www.paynow.co.zw/";
 
-  // Field order here is the order we hash AND the order we send (Paynow
-  // validates the hash over the received fields in order).
+  // Field order here is the order we hash AND the order we send. Paynow rebuilds
+  // the hash from the fields as received, with `hash` last, so the two only ever
+  // have to agree with each other — not with any canonical ordering.
   const fields: Array<[string, string]> = [
     ["resulturl", resulturl],
     ["returnurl", returnurl],
@@ -62,6 +74,7 @@ Deno.serve(async (req) => {
     ["id", creds.id],
     ["additionalinfo", "ON-SPOT POS sale"],
     ["authemail", authemail],
+    ["merchanttrace", merchantTrace],
     ["status", "Message"],
   ];
   const hash = await paynowHash(fields, creds.key);
@@ -95,29 +108,41 @@ Deno.serve(async (req) => {
   const pollUrl = field(reply, "pollurl") ?? "";
   const stamp = nowIso();
 
+  // An intent we cannot record is an intent we cannot poll: paynow-status looks
+  // the poll URL up by reference, so a missing row means the cashier watches
+  // "Unknown reference" forever while the customer's money moves. Fail here,
+  // loudly, before any QR is shown. The transaction is left unpaid at Paynow and
+  // the trace below is how it is found again if it ever mattered.
   try {
     await upsertIntent({
       id: reference,
       business_id: businessId,
       sale_id: null,
       amount: amountNum,
+      currency,
       status: "sent",
       paynow_reference: null,
       paynow_poll_url: pollUrl,
       browser_url: browserUrl,
+      method: null,
+      phone: null,
+      merchant_trace: merchantTrace,
+      raw_status: field(reply, "status") ?? null,
       created_at: stamp,
       updated_at: stamp,
     });
   } catch (e) {
-    // The transaction exists at Paynow; surface the bookkeeping error but still
-    // give the caller the URL so a sale isn't lost.
+    console.error(
+      `intent not recorded (reference=${reference} trace=${merchantTrace}):`,
+      e,
+    );
     return json({
-      ok: true,
-      reference,
-      browserUrl,
-      pollUrl,
-      warning: `intent not recorded: ${(e as Error).message}`,
-    });
+      ok: false,
+      error:
+        "The payment could not be recorded, so it cannot be confirmed later. " +
+        "Nothing has been charged. Check that payment_intents exists (run " +
+        `supabase-setup.sql). Trace: ${merchantTrace}`,
+    }, 500);
   }
 
   return json({ ok: true, reference, browserUrl, pollUrl });

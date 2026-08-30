@@ -933,6 +933,64 @@ exception when others then
 end ${'$'}${'$'};
 
 -- ---------------------------------------------------------------------------
+-- 7d) Paynow payment intents — the ONE table the tills may not read.
+--
+-- Written ONLY by the paynow-* Edge Functions with the service-role key. It
+-- holds the merchant reference, Paynow's poll URL and the settled status of
+-- every online payment, which is precisely the data that must not be reachable
+-- with the anon key every till carries: anyone who can read `paynow_poll_url`
+-- can poll a stranger's transaction, and anyone who can write `status` can mark
+-- an unpaid sale paid.
+--
+-- So this table is the deliberate exception to section 8 — RLS is ON and there
+-- is NO anon/authenticated policy at all. Service role bypasses RLS, so the
+-- functions keep working and nothing else can touch it. Do NOT add it to the
+-- table-name lists in sections 8 or 9; being absent from them is the point.
+-- ---------------------------------------------------------------------------
+create table if not exists public.payment_intents (
+    -- OUR merchant reference — what we send Paynow as `reference`, and the id
+    -- the webhook matches an incoming status update back to.
+    id                text primary key,
+    business_id       uuid,
+    -- Set once a paid intent has been turned into a sale; null while pending.
+    sale_id           uuid,
+    amount            numeric not null default 0,
+    currency          text default 'USD',
+    -- Our own small vocabulary: created | sent | paid | cancelled | failed.
+    status            text not null default 'created',
+    -- Paynow's own reference. Null until Paynow first reports one, which for a
+    -- mobile transaction is the first status update, NOT the initiate reply.
+    paynow_reference  text,
+    paynow_poll_url   text,
+    -- The Paynow page rendered as a QR at the counter (web/initiatetransaction).
+    browser_url       text,
+    -- Express checkout (remotetransaction) only.
+    method            text,
+    phone             text,
+    -- Unique per merchant, max 32 chars. Lets /interface/trace find a
+    -- transaction whose initiate reply we never received.
+    merchant_trace    text,
+    -- Paynow's status string verbatim, before it is folded into `status`.
+    -- "Awaiting Delivery" and "Delivered" both mean the money is in.
+    raw_status        text,
+    created_at        timestamptz not null default now(),
+    updated_at        timestamptz not null default now()
+);
+
+create unique index if not exists idx_payment_intents_trace
+    on public.payment_intents (merchant_trace)
+    where merchant_trace is not null;
+
+-- The "payments that never settled" list an admin screen reads.
+create index if not exists idx_payment_intents_unsettled
+    on public.payment_intents (business_id, created_at desc)
+    where status not in ('paid', 'cancelled', 'failed');
+
+alter table public.payment_intents enable row level security;
+revoke all on public.payment_intents from anon, authenticated;
+grant all on public.payment_intents to service_role;
+
+-- ---------------------------------------------------------------------------
 -- 8) Row-level security — one tenant policy per table, matching the live shop.
 --
 -- ★ `staff_requests` is on the SAME uniform policy as every other table, and

@@ -42,12 +42,19 @@ class PaynowClient(private val connection: Connection) {
 
     private fun fn(name: String) = "${connection.url}/functions/v1/$name"
 
-    /** Start a payment of [amount]; returns the reference + URL to show as a QR. */
-    fun initiate(amount: Double, authEmail: String? = null, businessId: String? = null): PaynowInit {
+    /**
+     * Start a payment of [amount]; returns the reference + URL to show as a QR.
+     *
+     * No `authemail` is sent. Paynow requires that field to be the MERCHANT's own
+     * account email — in test mode only that account may complete the payment —
+     * so it is a property of the integration, not of the shop's profile. It lives
+     * in the PAYNOW_AUTH_EMAIL Function secret next to the Integration Key, where
+     * a cashier cannot edit it into something unpayable.
+     */
+    fun initiate(amount: Double, businessId: String? = null): PaynowInit {
         val body = buildString {
             append("{")
             append("\"amount\":").append(amount)
-            if (!authEmail.isNullOrBlank()) append(",\"authemail\":").append(quote(authEmail))
             if (!businessId.isNullOrBlank()) append(",\"businessId\":").append(quote(businessId))
             append("}")
         }

@@ -11,10 +11,16 @@ export interface PaymentIntent {
   business_id?: string | null;
   sale_id?: string | null;
   amount: number;
+  currency?: string | null;
   status: string;
   paynow_reference?: string | null;
   paynow_poll_url?: string | null;
   browser_url?: string | null;
+  method?: string | null;
+  phone?: string | null;
+  merchant_trace?: string | null;
+  /** Paynow's status verbatim, before normaliseStatus folds it down. */
+  raw_status?: string | null;
   created_at: string;
   updated_at: string;
 }

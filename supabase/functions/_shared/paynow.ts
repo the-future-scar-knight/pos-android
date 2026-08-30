@@ -138,3 +138,62 @@ export function json(body: unknown, status = 200): Response {
     },
   });
 }
+
+/**
+ * Express Checkout (push the prompt to the customer's handset instead of
+ * showing a QR). Not used yet — the QR flow above is what ships today.
+ */
+export const PAYNOW_REMOTE_URL =
+  "https://www.paynow.co.zw/interface/remotetransaction";
+
+/**
+ * Merchant-trace recovery. If we never received the initiate reply we cannot
+ * poll, but Paynow can still find the transaction by the `merchanttrace` we
+ * sent. Replies with a normal status update, or `status=NotFound`.
+ */
+export const PAYNOW_TRACE_URL = "https://www.paynow.co.zw/interface/trace";
+
+/**
+ * The merchant's own Paynow account email.
+ *
+ * This is a property of the INTEGRATION, not of the shop's profile, so it lives
+ * beside the other two secrets rather than in a synced `businesses` column that
+ * a cashier could edit. Paynow's test mode is unforgiving about it:
+ *
+ *   "After creating a transaction ONLY THE MERCHANT ACCOUNT USED TO CREATE THE
+ *    INTEGRATION can login and Fake a Payment ... If you include the authemail
+ *    field, make sure its your merchant account email address, otherwise you
+ *    won't be able to complete the test transaction."
+ *
+ * Sending the shop's customer-facing email here does not fail loudly — it
+ * produces a transaction nobody is allowed to pay.
+ */
+export function paynowAuthEmail(): string {
+  const email = Deno.env.get("PAYNOW_AUTH_EMAIL")?.trim();
+  if (!email) {
+    throw new Error(
+      "Paynow is not configured: set PAYNOW_AUTH_EMAIL (your Paynow ACCOUNT " +
+        "email) as an Edge Function secret.",
+    );
+  }
+  return email;
+}
+
+/**
+ * Poll a transaction's current status.
+ *
+ * Paynow documents this as "an empty HTTP POST to the pollurl", but several of
+ * their own SDKs use GET and the endpoint has historically answered both. We
+ * follow the documentation first and fall back rather than let one wrong verb
+ * strand a paid sale.
+ */
+export async function fetchPollUrl(pollUrl: string): Promise<string> {
+  const resp = await fetch(pollUrl, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: "",
+  });
+  if (resp.ok) return await resp.text();
+  const fallback = await fetch(pollUrl, { method: "GET" });
+  return await fallback.text();
+}

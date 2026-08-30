@@ -1,5 +1,6 @@
 package com.portionspot.pos.ui
 
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -1408,6 +1409,14 @@ class PosViewModel(
                 if (onCredit && customer != null) sweepNotifications()
                 // Money moved: get it to the cloud within seconds, not the 15-min cycle.
                 nudgeSync("checkout")
+            } catch (e: IllegalArgumentException) {
+                // The repository refused to write the sale — today only the underpaid-sale
+                // guard does this, and the pay dialog already makes that unreachable. It is
+                // caught rather than allowed to propagate because an uncaught throw in
+                // viewModelScope kills the process, and a till that dies mid-sale loses the
+                // cashier's whole cart. The cart is deliberately left standing: nothing was
+                // written, so the sale can simply be taken again.
+                Log.e("PosViewModel", "checkout rejected: ${e.message}")
             } finally {
                 checkoutInFlight = false
             }
@@ -3014,7 +3023,6 @@ class PosViewModel(
             val result = withContext(Dispatchers.IO) {
                 PaynowClient(conn).initiate(
                     amount = amount,
-                    authEmail = biz?.email,
                     businessId = biz?.id
                 )
             }
